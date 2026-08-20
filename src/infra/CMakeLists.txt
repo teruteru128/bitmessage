@@ -3,6 +3,7 @@ add_library(bm_infra STATIC
     network.c
     object.c
     peer_manager.c
+    peer_connector.c
     object_store.c
 )
 

@@ -30,7 +30,7 @@ fail() {
     exit 1
 }
 
-"$BITMESSAGED" >bitmessaged.log 2>&1 &
+BM_NO_CONNECT=1 "$BITMESSAGED" >bitmessaged.log 2>&1 &
 PID=$!
 
 for _ in $(seq 1 50); do

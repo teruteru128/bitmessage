@@ -35,3 +35,7 @@ add_test(NAME api_server COMMAND test_api_server)
 add_test(NAME cli_integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
+
+add_executable(test_network_testnet test_network_testnet.c)
+target_link_libraries(test_network_testnet PRIVATE bm_infra bm_common)
+add_test(NAME network_testnet COMMAND test_network_testnet)

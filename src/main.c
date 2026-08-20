@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 
 #include "common/db_common.h"
 #include "common/queue.h"
@@ -19,8 +20,14 @@
 #include "core/messages_store.h"
 #include "core/send_pipeline.h"
 #include "core/trial_decrypt.h"
+#include "infra/network.h"
 #include "infra/object_store.h"
+#include "infra/peer_connector.h"
 #include "infra/peer_manager.h"
+#include "infra/protocol.h"
+
+#define BM_USER_AGENT "/bitmessage-c:0.1.0/"
+#define BM_MAX_OUTBOUND 3
 
 /* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */
 struct bm_queues
@@ -126,15 +133,54 @@ int main(void)
     fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s (この起動でのみ有効、設定ファイル未実装)\n",
             api_password);
 
+    /* testnet切り替え。設定ファイル未実装のため環境変数BM_TESTNET=1で切り替える(既定mainnet)。
+     * inbound(サーバーソケットでの待ち受け)は自宅環境のISP事情でTor実装まで現実的でないため、
+     * v1はoutbound接続のみ(peer_connector参照)。 */
+    int testnet = getenv("BM_TESTNET") != NULL && strcmp(getenv("BM_TESTNET"), "1") == 0;
+    bm_protocol_set_testnet(testnet);
+    fprintf(stderr, "[network] mode=%s\n", testnet ? "testnet" : "mainnet");
+
+    int epfd = epoll_create1(0);
+    if (epfd == -1)
+    {
+        perror("epoll_create1");
+        return EXIT_FAILURE;
+    }
+
     /* §1.1のスレッド一覧。trial_decrypt/send_pipelineは現状即returnするTODOスタブ。
-     * api_serverはaccept()でブロックし続けるため、TODO: グレースフルシャットダウン
-     * (self-pipe trick等でaccept()を割り込み可能にする)が未実装。当面はdetachし、
+     * api_server/network_epollはブロッキング待受(accept()/epoll_wait())でグレースフル
+     * シャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。当面はdetachし、
      * プロセス終了時に道連れで終わらせる(pthread_joinすると永久にブロックしてしまうため)。 */
-    pthread_t th_trial_decrypt, th_send_pipeline, th_api_server;
+    pthread_t th_trial_decrypt, th_send_pipeline, th_api_server, th_network;
     pthread_create(&th_trial_decrypt, NULL, bm_trial_decrypt_thread, NULL);
     pthread_create(&th_send_pipeline, NULL, bm_send_pipeline_thread, NULL);
     pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
     pthread_detach(th_api_server);
+
+    struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));
+    net_args->epfd = epfd;
+    net_args->handler = NULL; /* default_dispatch(version/verack/ping等の最小限の応答) */
+    net_args->user_data = NULL;
+    pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
+    pthread_detach(th_network);
+
+    /* BM_NO_CONNECT=1で実接続を抑止できる(自動テスト用。cli_integration等が本物のネットワークへ
+     * 接続しに行くとCI環境の到達性次第で数十秒単位で遅くなる/非決定的になるため)。 */
+    if (getenv("BM_NO_CONNECT") != NULL && strcmp(getenv("BM_NO_CONNECT"), "1") == 0)
+    {
+        fprintf(stderr, "[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
+    }
+    else
+    {
+        struct bm_peer_connector_config pc_config;
+        pc_config.epfd = epfd;
+        pc_config.peers_db = peers_db;
+        pc_config.testnet = testnet;
+        pc_config.max_outbound = BM_MAX_OUTBOUND;
+        pc_config.user_agent = BM_USER_AGENT;
+        int connected = bm_peer_connector_connect_initial(&pc_config);
+        fprintf(stderr, "[peer_connector] %d outbound connection(s) established\n", connected);
+    }
 
     /* SIGINT/SIGTERMをブロックしてsigwaitで待つ(全スレッドが実装されればここが本体のライフサイクルになる) */
     sigset_t set;

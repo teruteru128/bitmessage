@@ -34,4 +34,11 @@ int bm_peer_manager_upsert(sqlite3 *db, const struct bm_peer_entry *entry);
 int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *results,
                               int max_results, int *out_count);
 
+/*
+ * hostsテーブルが空ならブートストラップシードノードを投入する(PyBitmessage
+ * knownnodes.pyのDEFAULT_NODES/TESTNET_NODES準拠、2026-08-21確認)。既に1件でも
+ * あれば何もしない(手動追加・既知情報を上書きしないため)。成功時0(0件挿入でも0)。
+ */
+int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet);
+
 #endif /* BM_INFRA_PEER_MANAGER_H */

@@ -208,6 +208,14 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
             conn->length -= consumed;
             continue;
         }
+        if (result == BM_PARSE_BAD_MAGIC)
+        {
+            /* mainnet/testnet取り違え等。1byteずつresyncを試みる(ログは出さない、
+             * ノイズの多いストリームだと大量に出て邪魔になるため) */
+            memmove(conn->recv_buffer, conn->recv_buffer + consumed, conn->length - consumed);
+            conn->length -= consumed;
+            continue;
+        }
 
         /* BM_PARSE_OK */
         memmove(conn->recv_buffer, conn->recv_buffer + consumed, conn->length - consumed);
@@ -218,13 +226,6 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
 
     return 0;
 }
-
-struct bm_epoll_thread_args
-{
-    int epfd;
-    bm_command_handler_fn handler;
-    void *user_data;
-};
 
 void *bm_network_epoll_thread(void *arg)
 {

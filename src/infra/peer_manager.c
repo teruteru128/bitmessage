@@ -1,8 +1,35 @@
 #include "peer_manager.h"
 
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "../common/db_common.h"
+
+struct bootstrap_node
+{
+    const char *ip;
+    int port;
+};
+
+/* PyBitmessage src/network/knownnodes.py の DEFAULT_NODES(2026-08-21確認) */
+static const struct bootstrap_node MAINNET_SEEDS[] = {
+    {"5.45.99.75", 8444},
+    {"75.167.159.54", 8444},
+    {"95.165.168.168", 8444},
+    {"85.180.139.241", 8444},
+    {"158.222.217.190", 8080},
+    {"178.62.12.187", 8448},
+    {"24.188.198.204", 8111},
+    {"109.147.204.113", 1195},
+    {"178.11.46.221", 8444},
+};
+
+/* 同ファイルの TESTNET_NODES */
+static const struct bootstrap_node TESTNET_SEEDS[] = {
+    {"46.62.252.34", 8444},
+    {"5.78.198.100", 8444},
+};
 
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS hosts ("
@@ -89,5 +116,50 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
     {
         *out_count = count;
     }
+    return 0;
+}
+
+int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
+{
+    sqlite3_stmt *count_stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM hosts;", -1, &count_stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    int existing = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW)
+    {
+        existing = sqlite3_column_int(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+    if (existing > 0)
+    {
+        return 0; /* 既に何かある場合は上書きしない */
+    }
+
+    const struct bootstrap_node *seeds = testnet ? TESTNET_SEEDS : MAINNET_SEEDS;
+    size_t seed_count = testnet
+        ? sizeof(TESTNET_SEEDS) / sizeof(TESTNET_SEEDS[0])
+        : sizeof(MAINNET_SEEDS) / sizeof(MAINNET_SEEDS[0]);
+
+    int64_t now = (int64_t)time(NULL);
+    for (size_t i = 0; i < seed_count; i++)
+    {
+        struct bm_peer_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        strncpy(entry.ip_address, seeds[i].ip, sizeof(entry.ip_address) - 1);
+        entry.port = seeds[i].port;
+        entry.stream = 1;
+        entry.services = 1;
+        entry.last_seen = now;
+        entry.rating = 0.0;
+        strncpy(entry.source, "seed", sizeof(entry.source) - 1);
+        if (bm_peer_manager_upsert(db, &entry) != 0)
+        {
+            return -1;
+        }
+    }
+    fprintf(stderr, "[peer_manager] seeded %zu bootstrap nodes (%s)\n", seed_count,
+            testnet ? "testnet" : "mainnet");
     return 0;
 }

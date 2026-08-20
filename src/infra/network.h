@@ -55,7 +55,17 @@ int bm_post_version(int sock, const char *user_agent_str, int version,
  */
 int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn handler, void *user_data);
 
-/* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う */
+/* bm_network_epoll_threadへ渡す引数。handler=NULLならdefault_dispatch(version/verack/ping等の
+ * 最小限のハンドリング)を使う。pthread_createのarg用にmallocして渡す(スレッド側でfreeする) */
+struct bm_epoll_thread_args
+{
+    int epfd;
+    bm_command_handler_fn handler;
+    void *user_data;
+};
+
+/* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。
+ * argは struct bm_epoll_thread_args* (malloc済み、スレッド終了時にfreeされる) */
 void *bm_network_epoll_thread(void *arg);
 
 #endif /* BM_INFRA_NETWORK_H */

@@ -12,8 +12,23 @@
 #include "../common/hash.h"
 #include "../common/varint.h"
 
-const unsigned char bm_magicbytes[4] = {0xe9, 0xbe, 0xb4, 0xd9};
+static const unsigned char MAGIC_MAINNET[4] = {0xe9, 0xbe, 0xb4, 0xd9};
+static const unsigned char MAGIC_TESTNET[4] = {0xfb, 0x11, 0x09, 0x07};
+
+unsigned char bm_magicbytes[4] = {0xe9, 0xbe, 0xb4, 0xd9}; /* 既定mainnet */
 const unsigned char bm_empty_payload_checksum[4] = {0xcf, 0x83, 0xe1, 0x35};
+static int g_is_testnet = 0;
+
+void bm_protocol_set_testnet(int enabled)
+{
+    g_is_testnet = enabled ? 1 : 0;
+    memcpy(bm_magicbytes, g_is_testnet ? MAGIC_TESTNET : MAGIC_MAINNET, 4);
+}
+
+int bm_protocol_is_testnet(void)
+{
+    return g_is_testnet;
+}
 
 static uint32_t read_be32(const unsigned char *p)
 {
@@ -47,6 +62,17 @@ enum bm_parse_result bm_parse_message(const unsigned char *data, size_t data_len
     if (data_len < BM_MESSAGE_HEADER_SIZE)
     {
         return BM_PARSE_INCOMPLETE;
+    }
+
+    if (memcmp(data, bm_magicbytes, 4) != 0)
+    {
+        /* mainnet/testnet取り違え、または単なるノイズ。1byteだけ進めてresyncを試みる
+         * (次の呼び出しで先頭がずれた状態から再度magic bytesを探すことになる) */
+        if (out_consumed)
+        {
+            *out_consumed = 1;
+        }
+        return BM_PARSE_BAD_MAGIC;
     }
 
     uint32_t length = read_be32(data + 16);

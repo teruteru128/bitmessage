@@ -18,8 +18,15 @@
 
 #define BM_MESSAGE_HEADER_SIZE 24
 
-extern const unsigned char bm_magicbytes[4];
+/* 現在有効なmagic bytes(既定mainnet)。bm_protocol_set_testnetで切り替える。
+ * mainnet=0xE9BEB4D9, testnet=0xFB110907(PyBitmessage protocol.py準拠)。 */
+extern unsigned char bm_magicbytes[4];
 extern const unsigned char bm_empty_payload_checksum[4];
+
+/* testnetモードのon/off。bm_magicbytesを書き換える(プロセス全体で1つ、mainnet/testnet同時稼働は
+ * 想定しない)。以後の送受信メッセージは新しいmagic bytesで扱われる。 */
+void bm_protocol_set_testnet(int enabled);
+int bm_protocol_is_testnet(void);
 
 struct bm_message
 {
@@ -68,6 +75,7 @@ enum bm_parse_result
     BM_PARSE_OK,
     BM_PARSE_INCOMPLETE,     /* データ不足。追加受信を待つ */
     BM_PARSE_BAD_CHECKSUM,   /* checksum不一致。このメッセージは破棄しresyncが必要 */
+    BM_PARSE_BAD_MAGIC,      /* magic bytes不一致(mainnet/testnet取り違え等)。1byteスキップしてresync */
 };
 
 /*
