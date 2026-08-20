@@ -3,3 +3,7 @@
 add_executable(test_address_vectors test_address_vectors.c)
 target_link_libraries(test_address_vectors PRIVATE bm_core)
 add_test(NAME address_vectors COMMAND test_address_vectors)
+
+add_executable(test_crypto_roundtrip test_crypto_roundtrip.c)
+target_link_libraries(test_crypto_roundtrip PRIVATE bm_core)
+add_test(NAME crypto_roundtrip COMMAND test_crypto_roundtrip)

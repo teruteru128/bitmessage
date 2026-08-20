@@ -196,6 +196,10 @@ CREATE TABLE IF NOT EXISTS address_book (
 
 ### 3.1 ECIES暗号化(メッセージ本体・pubkey v4・broadcastの暗号化に共通)
 
+**実装済み(`src/core/crypto.c`)。PyBitmessage本家の`pyelliptic`と実際にPython⇔Cで暗号文・平文を
+相互に暗号化/復号できることをクロス検証済み(2026-08-20、`highlevelcrypto.encrypt/decrypt`との
+往復で平文一致を確認)。**
+
 PyBitmessageは`pyelliptic.ECC.raw_encrypt`をそのまま使っている。**この関数の一時公開鍵エンコードは
 標準の0x04+X+Yではなく、pyelliptic独自のTLV形式である点が実装上の最重要注意点**(ここを素朴に
 `EC_POINT_point2oct`の65byte形式で実装すると本物のBitmessageネットワークと相互運用できなくなる)。
@@ -221,6 +225,13 @@ PyBitmessageは`pyelliptic.ECC.raw_encrypt`をそのまま使っている。**�
 `ECDH_compute_key(buf, 32, ...)`で明示的に32byte出力を指定している)。
 
 ### 3.2 ECDSA署名
+
+**実装済み(`src/core/crypto.c`)。`highlevelcrypto.sign/verify`(digestAlg="sha256")とのクロス検証済み
+(2026-08-20、Python生成署名をCで検証、C生成署名をPythonで検証、双方向で成功)。
+OpenSSL 3.0で`EC_KEY`/`ECDSA_sign`/`ECDSA_verify`系が非推奨になっているが、生成される署名は
+ビット単位で同一でありAPI自体は当面removeされない見込みのため、EVP_PKEY+OSSL_PARAM経由への
+書き換えはコストに見合わないと判断しあえてそのまま使っている(§3.5の規律は維持: ヘッダには
+`EC_KEY`型を露出させていない)。**
 
 - curve: secp256k1、ハッシュ: **SHA256のみ実装する**(確定、§8-2)。SHA1はPyBitmessageがSHA256移行(サポート追加
   2015-03-27、デフォルト化2019-11-18)前の旧クライアントと会話するための検証専用フォールバックだったが、
