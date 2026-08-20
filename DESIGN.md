@@ -732,10 +732,19 @@ bitmessage/
       api_server.c/.h                       -- JSON-RPCサーバー(§6)
     pow/                      -- 計算層
       pow_engine.c/.h              -- target計算・trial value・ワーカースレッドプール(§4)
+    cli/                      -- フロント層(CLIクライアント、テスト・スクリプト用途)
+      main.c                       -- サブコマンド(list-addresses/create-address/unlock/lock/
+                                        lock-all/delete)、環境変数BM_API_*でdaemonへ接続
+      http_client.c/.h              -- api_server.c宛ての最小HTTP/1.1クライアント
     main.c                    -- DB初期化、鍵ロード、全スレッド起動、シグナルハンドリング
   tests/
   .gitignore
 ```
+
+CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント分離」というグランドデザイン方針に沿い、
+まずは自動テスト・スクリプトから叩きやすい一発コマンド型として用意した(TUIはncurses等の依存や
+自動テストとの相性で後回し、2026-08-20の会話で決定)。`api_server.c`と同じJSON-RPC 2.0 APIを
+そのまま経由するので、将来的なGUI/TUIクライアントもここで確立したプロトコルをそのまま使える。
 
 - ビルドシステムはlibstudy同様CMake。ビルドディレクトリ名も揃えて`build-<Debug|Release|...>/`とする
 - 依存: OpenSSL(EVP/EC/RIPEMD)、SQLite3、pthread(Threads)。libstudyが依存しているCURL/GnuTLS/Gettext/xmlrpc-c/

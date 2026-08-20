@@ -31,3 +31,7 @@ add_test(NAME json COMMAND test_json)
 add_executable(test_api_server test_api_server.c)
 target_link_libraries(test_api_server PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME api_server COMMAND test_api_server)
+
+add_test(NAME cli_integration
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
+                 $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
