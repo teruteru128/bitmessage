@@ -4,10 +4,12 @@
  * まずスレッド起動〜終了までの骨格を通し、各モジュールを順次実装で埋めていく方針。
  */
 
+#include <openssl/rand.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "common/db_common.h"
 #include "common/queue.h"
@@ -101,11 +103,38 @@ int main(void)
     bm_keyring_t keyring;
     bm_keyring_init(&keyring);
 
-    /* §1.1のスレッド一覧。現状ほとんどが即returnするTODOスタブ */
+    /* §6.1: apiusername/apipasswordはランダム生成し起動時に表示する(設定ファイル未実装のため)。
+     * bitmessagedプロセスが生きている間、mainのローカル変数としてこのconfigを保持し続ける
+     * (api_server_threadはmain終了までこのconfigを参照し続けるため)。 */
+    unsigned char api_password_raw[16];
+    RAND_bytes(api_password_raw, sizeof(api_password_raw));
+    char api_password[sizeof(api_password_raw) * 2 + 1];
+    for (size_t i = 0; i < sizeof(api_password_raw); i++)
+    {
+        snprintf(api_password + i * 2, 3, "%02x", api_password_raw[i]);
+    }
+
+    struct bm_api_server_config api_config;
+    memset(&api_config, 0, sizeof(api_config));
+    api_config.bind_address = "127.0.0.1";
+    api_config.port = 8442;
+    api_config.username = "bitmessage";
+    api_config.password = api_password;
+    api_config.keyring = &keyring;
+    api_config.identity_db = identity_db;
+    api_config.messages_db = messages_db;
+    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s (この起動でのみ有効、設定ファイル未実装)\n",
+            api_password);
+
+    /* §1.1のスレッド一覧。trial_decrypt/send_pipelineは現状即returnするTODOスタブ。
+     * api_serverはaccept()でブロックし続けるため、TODO: グレースフルシャットダウン
+     * (self-pipe trick等でaccept()を割り込み可能にする)が未実装。当面はdetachし、
+     * プロセス終了時に道連れで終わらせる(pthread_joinすると永久にブロックしてしまうため)。 */
     pthread_t th_trial_decrypt, th_send_pipeline, th_api_server;
     pthread_create(&th_trial_decrypt, NULL, bm_trial_decrypt_thread, NULL);
     pthread_create(&th_send_pipeline, NULL, bm_send_pipeline_thread, NULL);
-    pthread_create(&th_api_server, NULL, bm_api_server_thread, NULL);
+    pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
+    pthread_detach(th_api_server);
 
     /* SIGINT/SIGTERMをブロックしてsigwaitで待つ(全スレッドが実装されればここが本体のライフサイクルになる) */
     sigset_t set;
@@ -121,7 +150,7 @@ int main(void)
 
     pthread_join(th_trial_decrypt, NULL);
     pthread_join(th_send_pipeline, NULL);
-    pthread_join(th_api_server, NULL);
+    /* th_api_serverはdetach済み(上記コメント参照)。プロセス終了と共に破棄される */
 
     queues_destroy(&queues);
     bm_keyring_destroy(&keyring);

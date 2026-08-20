@@ -1,5 +1,6 @@
 #include "identity_store.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "../common/db_common.h"
@@ -178,4 +179,42 @@ int bm_identity_store_delete(sqlite3 *db, const char *address)
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT address, label, enabled FROM identities ORDER BY created_time;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+
+    size_t cap = 8;
+    size_t count = 0;
+    struct bm_identity_summary *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        memset(&list[count], 0, sizeof(list[count]));
+        const unsigned char *address = sqlite3_column_text(stmt, 0);
+        strncpy(list[count].address, (const char *)address, BM_IDENTITY_ADDRESS_MAX - 1);
+        const unsigned char *label = sqlite3_column_text(stmt, 1);
+        if (label != NULL)
+        {
+            strncpy(list[count].label, (const char *)label, BM_IDENTITY_LABEL_MAX - 1);
+        }
+        list[count].enabled = sqlite3_column_int(stmt, 2);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
 }

@@ -519,6 +519,19 @@ msg送信時、受信側の`bitfield`が`BITFIELD_DOESACK`を要求していれ�
 
 ## 6. API層(フロント⇄コア暗号層)方針決定
 
+**実装済み(`src/core/api_server.c`)。自前JSON-RPC 2.0(`src/common/json.c`、外部JSONライブラリ非依存の
+最小実装)+HTTP/1.1(自前、ブロッキングI/O、1接続1リクエスト)。HTTP Basic認証、`§6.2`の
+`unlockAddress`/`lockAddress`/`lockAllAddresses`/`deleteAddress`/`listAddresses`/
+`createDeterministicAddress`を実装。`apiusername`/`apipassword`は設定ファイル未実装のため
+起動毎にランダム生成し標準エラー出力へ表示する(`main.c`)。`tests/test_api_server.c`で
+実ソケット越しのHTTPリクエストにより認証拒否・全メソッドの疎通・エラーハンドリングを検証済み
+(2026-08-20)。`sendMessage`(send_pipeline.c連携)・`getInboxMessages`等はハンドラ辞書
+(`METHODS[]`配列)に追加するだけの構造になっているが未実装(TODO)。
+
+既知の制限: `bm_api_server_serve_forever`の`accept()`はブロッキングでシグナル等による
+グレースフルシャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。
+v1の`main.c`ではこのスレッドを`pthread_detach`し、プロセス終了時に道連れで終わらせている。
+
 出典: PyBitmessage `src/api.py`(モジュールdocstring, `singleAPI.run`, `CommandHandler`, `command`デコレータ)
 
 ### 6.0 PyBitmessageの実際の設計(判明した事実)

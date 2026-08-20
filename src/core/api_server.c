@@ -1,11 +1,588 @@
 #include "api_server.h"
 
-#include <stddef.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <openssl/evp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "../common/json.h"
+#include "address.h"
+#include "identity_store.h"
+
+#define MAX_REQUEST_SIZE (1 * 1024 * 1024) /* 1MiB上限、DoS対策 */
+
+static char *dup_cstr(const char *s)
+{
+    size_t len = strlen(s);
+    char *out = malloc(len + 1);
+    memcpy(out, s, len + 1);
+    return out;
+}
+
+/* --- HTTP Basic認証 --- */
+
+static int base64_decode(const char *b64, unsigned char *out, size_t out_cap, size_t *out_len)
+{
+    size_t in_len = strlen(b64);
+    if (in_len == 0 || in_len % 4 != 0)
+    {
+        return -1;
+    }
+    size_t max_out = (in_len / 4) * 3;
+    if (max_out > out_cap)
+    {
+        return -1;
+    }
+    int n = EVP_DecodeBlock(out, (const unsigned char *)b64, (int)in_len);
+    if (n < 0)
+    {
+        return -1;
+    }
+    size_t actual = (size_t)n;
+    if (in_len >= 1 && b64[in_len - 1] == '=' && actual > 0)
+    {
+        actual--;
+    }
+    if (in_len >= 2 && b64[in_len - 2] == '=' && actual > 0)
+    {
+        actual--;
+    }
+    *out_len = actual;
+    return 0;
+}
+
+/* 定数時間比較(タイミング攻撃対策) */
+static int constant_time_equal(const char *a, size_t a_len, const char *b, size_t b_len)
+{
+    if (a_len != b_len)
+    {
+        return 0;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a_len; i++)
+    {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+static int check_basic_auth(const struct bm_api_server_config *config, const char *auth_header)
+{
+    if (config->username == NULL)
+    {
+        return 1; /* 認証設定なし(テスト用) */
+    }
+    if (auth_header == NULL || strncmp(auth_header, "Basic ", 6) != 0)
+    {
+        return 0;
+    }
+    unsigned char decoded[256];
+    size_t decoded_len = 0;
+    if (base64_decode(auth_header + 6, decoded, sizeof(decoded) - 1, &decoded_len) != 0)
+    {
+        return 0;
+    }
+    decoded[decoded_len] = '\0';
+
+    char expected[256];
+    snprintf(expected, sizeof(expected), "%s:%s", config->username, config->password);
+    return constant_time_equal((const char *)decoded, decoded_len, expected, strlen(expected));
+}
+
+/* --- ハンドラ辞書(§6.0-6.1) --- */
+
+typedef bm_json_value_t *(*bm_api_handler_fn)(const struct bm_api_server_config *config,
+                                               const bm_json_value_t *params, char **out_error);
+
+struct bm_api_method
+{
+    const char *name;
+    bm_api_handler_fn handler;
+};
+
+static const char *param_str(const bm_json_value_t *params, size_t i)
+{
+    return bm_json_as_string(bm_json_array_get(params, i));
+}
+
+static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *passphrase = param_str(params, 1);
+    if (address == NULL || passphrase == NULL)
+    {
+        *out_error = dup_cstr("unlockAddress requires [address, passphrase]");
+        return NULL;
+    }
+    int rc = bm_keyring_unlock(config->keyring, config->identity_db, address, passphrase);
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_lockAddress(const struct bm_api_server_config *config,
+                                       const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("lockAddress requires [address]");
+        return NULL;
+    }
+    int rc = bm_keyring_lock(config->keyring, address);
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_lockAllAddresses(const struct bm_api_server_config *config,
+                                            const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    (void)out_error;
+    bm_keyring_lock_all(config->keyring);
+    return bm_json_new_bool(1);
+}
+
+static bm_json_value_t *h_deleteAddress(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("deleteAddress requires [address]");
+        return NULL;
+    }
+    int rc = bm_keyring_delete_identity(config->keyring, config->identity_db, address);
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_listAddresses(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    struct bm_identity_summary *list = NULL;
+    size_t count = 0;
+    if (bm_identity_store_list(config->identity_db, &list, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list identities");
+        return NULL;
+    }
+
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        struct bm_unlocked_identity dummy;
+        int unlocked = bm_keyring_find_by_address(config->keyring, list[i].address, &dummy) ? 1 : 0;
+
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
+        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
+        bm_json_object_set(entry, "enabled", bm_json_new_bool(list[i].enabled));
+        bm_json_object_set(entry, "unlocked", bm_json_new_bool(unlocked));
+        bm_json_array_append(arr, entry);
+    }
+    free(list);
+    return arr;
+}
+
+static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_config *config,
+                                                       const bm_json_value_t *params, char **out_error)
+{
+    const char *passphrase = param_str(params, 0);
+    const bm_json_value_t *version_v = bm_json_array_get(params, 1);
+    const bm_json_value_t *stream_v = bm_json_array_get(params, 2);
+    const bm_json_value_t *null_bytes_v = bm_json_array_get(params, 3);
+    const char *label = param_str(params, 4);
+    const char *store_passphrase = param_str(params, 5);
+
+    if (passphrase == NULL || version_v == NULL || stream_v == NULL || null_bytes_v == NULL
+        || store_passphrase == NULL)
+    {
+        *out_error = dup_cstr("createDeterministicAddress requires "
+                               "[passphrase, addressVersion, stream, ripeNullBytes, label, storePassphrase]");
+        return NULL;
+    }
+
+    uint64_t version = (uint64_t)bm_json_as_number(version_v);
+    uint64_t stream = (uint64_t)bm_json_as_number(stream_v);
+    int null_bytes = (int)bm_json_as_number(null_bytes_v);
+    if (version < 3 || version > 4)
+    {
+        *out_error = dup_cstr("addressVersion must be 3 or 4");
+        return NULL;
+    }
+
+    struct bm_generated_address gen;
+    if (bm_address_generate_deterministic(passphrase, null_bytes, &gen) != 0)
+    {
+        *out_error = dup_cstr("address generation failed");
+        return NULL;
+    }
+    char *address = bm_address_encode(version, stream, gen.ripe, BM_RIPE_LEN);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("address encoding failed");
+        return NULL;
+    }
+
+    int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
+                                         (int)version, (int)stream, gen.pub_signing, gen.pub_encryption,
+                                         gen.priv_signing, gen.priv_encryption, store_passphrase, 1000, 1000);
+    if (rc != 0)
+    {
+        free(address);
+        *out_error = dup_cstr("failed to store identity (duplicate address?)");
+        return NULL;
+    }
+
+    bm_json_value_t *result = bm_json_new_string(address);
+    free(address);
+    return result;
+}
+
+static const struct bm_api_method METHODS[] = {
+    {"unlockAddress", h_unlockAddress},
+    {"lockAddress", h_lockAddress},
+    {"lockAllAddresses", h_lockAllAddresses},
+    {"deleteAddress", h_deleteAddress},
+    {"listAddresses", h_listAddresses},
+    {"createDeterministicAddress", h_createDeterministicAddress},
+    /* TODO: sendMessage(send_pipeline.c連携)、getInboxMessages等(messages_store.c連携)。
+     * §6.1のハンドラ辞書パターンに沿ってこの配列へ追加していけば良い。 */
+};
+#define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
+
+/* --- JSON-RPC 2.0処理 --- */
+
+static char *build_response(const bm_json_value_t *id, bm_json_value_t *result, const char *error_msg)
+{
+    bm_json_value_t *resp = bm_json_new_object();
+    bm_json_object_set(resp, "jsonrpc", bm_json_new_string("2.0"));
+    if (error_msg != NULL)
+    {
+        bm_json_value_t *err = bm_json_new_object();
+        bm_json_object_set(err, "code", bm_json_new_number(-32000));
+        bm_json_object_set(err, "message", bm_json_new_string(error_msg));
+        bm_json_object_set(resp, "error", err);
+        bm_json_free(result);
+    }
+    else
+    {
+        bm_json_object_set(resp, "result", result != NULL ? result : bm_json_new_null());
+    }
+    if (id != NULL)
+    {
+        /* idはリクエストの値をそのまま複製して返す(number/string/nullいずれか) */
+        if (id->type == BM_JSON_STRING)
+        {
+            bm_json_object_set(resp, "id", bm_json_new_string(id->string));
+        }
+        else if (id->type == BM_JSON_NUMBER)
+        {
+            bm_json_object_set(resp, "id", bm_json_new_number(id->number));
+        }
+        else
+        {
+            bm_json_object_set(resp, "id", bm_json_new_null());
+        }
+    }
+    else
+    {
+        bm_json_object_set(resp, "id", bm_json_new_null());
+    }
+
+    char *text = bm_json_serialize(resp);
+    bm_json_free(resp);
+    return text;
+}
+
+static char *process_jsonrpc_request(const struct bm_api_server_config *config,
+                                      const char *body, size_t body_len)
+{
+    bm_json_value_t *req = bm_json_parse(body, body_len);
+    if (req == NULL || req->type != BM_JSON_OBJECT)
+    {
+        bm_json_free(req);
+        return build_response(NULL, NULL, "Parse error: invalid JSON");
+    }
+
+    const bm_json_value_t *id = bm_json_object_get(req, "id");
+    const char *method = bm_json_as_string(bm_json_object_get(req, "method"));
+    const bm_json_value_t *params = bm_json_object_get(req, "params");
+
+    if (method == NULL)
+    {
+        char *resp = build_response(id, NULL, "Invalid request: missing method");
+        bm_json_free(req);
+        return resp;
+    }
+
+    for (size_t i = 0; i < METHOD_COUNT; i++)
+    {
+        if (strcmp(METHODS[i].name, method) == 0)
+        {
+            char *error_msg = NULL;
+            bm_json_value_t *result = METHODS[i].handler(config, params, &error_msg);
+            char *resp = build_response(id, result, error_msg);
+            free(error_msg);
+            bm_json_free(req);
+            return resp;
+        }
+    }
+
+    char *resp = build_response(id, NULL, "Method not found");
+    bm_json_free(req);
+    return resp;
+}
+
+/* --- HTTPトランスポート --- */
+
+static ssize_t read_until_double_crlf(int fd, unsigned char **buf, size_t *buf_len, size_t *buf_cap)
+{
+    static const char needle[] = "\r\n\r\n";
+    const size_t needle_len = 4;
+
+    for (;;)
+    {
+        if (*buf_len >= needle_len)
+        {
+            for (size_t i = 0; i + needle_len <= *buf_len; i++)
+            {
+                if (memcmp(*buf + i, needle, needle_len) == 0)
+                {
+                    return (ssize_t)(i + needle_len);
+                }
+            }
+        }
+        if (*buf_len + 4096 > *buf_cap)
+        {
+            *buf_cap = (*buf_cap == 0 ? 4096 : *buf_cap * 2);
+            *buf = realloc(*buf, *buf_cap);
+        }
+        ssize_t n = read(fd, *buf + *buf_len, *buf_cap - *buf_len);
+        if (n <= 0)
+        {
+            return -1;
+        }
+        *buf_len += (size_t)n;
+        if (*buf_len > MAX_REQUEST_SIZE)
+        {
+            return -1;
+        }
+    }
+}
+
+static long find_header_value_long(const char *headers, size_t headers_len, const char *name)
+{
+    size_t name_len = strlen(name);
+    for (size_t i = 0; i + name_len < headers_len; i++)
+    {
+        if (strncasecmp(headers + i, name, name_len) == 0 && headers[i + name_len] == ':')
+        {
+            const char *value = headers + i + name_len + 1;
+            while (*value == ' ')
+            {
+                value++;
+            }
+            return strtol(value, NULL, 10);
+        }
+    }
+    return -1;
+}
+
+static char *find_header_value_str(const char *headers, size_t headers_len, const char *name)
+{
+    size_t name_len = strlen(name);
+    for (size_t i = 0; i + name_len < headers_len; i++)
+    {
+        if (strncasecmp(headers + i, name, name_len) == 0 && headers[i + name_len] == ':')
+        {
+            const char *value = headers + i + name_len + 1;
+            while (*value == ' ')
+            {
+                value++;
+            }
+            const char *line_end = memchr(value, '\r', headers_len - (size_t)(value - headers));
+            size_t len = line_end != NULL ? (size_t)(line_end - value) : strlen(value);
+            char *out = malloc(len + 1);
+            memcpy(out, value, len);
+            out[len] = '\0';
+            return out;
+        }
+    }
+    return NULL;
+}
+
+static void write_http_response(int fd, int status, const char *status_text,
+                                 const char *content_type, const char *body,
+                                 const char *extra_header)
+{
+    char header[512];
+    size_t body_len = body != NULL ? strlen(body) : 0;
+    int header_len = snprintf(header, sizeof(header),
+                               "HTTP/1.1 %d %s\r\n"
+                               "Content-Type: %s\r\n"
+                               "Content-Length: %zu\r\n"
+                               "Connection: close\r\n"
+                               "%s"
+                               "\r\n",
+                               status, status_text, content_type, body_len,
+                               extra_header != NULL ? extra_header : "");
+    write(fd, header, (size_t)header_len);
+    if (body_len > 0)
+    {
+        write(fd, body, body_len);
+    }
+}
+
+void bm_api_server_handle_connection(int client_fd, const struct bm_api_server_config *config)
+{
+    unsigned char *buf = NULL;
+    size_t buf_len = 0;
+    size_t buf_cap = 0;
+
+    ssize_t header_end = read_until_double_crlf(client_fd, &buf, &buf_len, &buf_cap);
+    if (header_end < 0)
+    {
+        free(buf);
+        close(client_fd);
+        return;
+    }
+
+    /* リクエストラインの検証(POSTのみ受け付ける) */
+    if (buf_len < 4 || memcmp(buf, "POST", 4) != 0)
+    {
+        write_http_response(client_fd, 405, "Method Not Allowed", "text/plain", "POST only\n", NULL);
+        free(buf);
+        close(client_fd);
+        return;
+    }
+
+    char *headers = (char *)buf;
+    size_t headers_len = (size_t)header_end;
+
+    char *auth_header = find_header_value_str(headers, headers_len, "Authorization");
+    int authorized = check_basic_auth(config, auth_header);
+    free(auth_header);
+    if (!authorized)
+    {
+        write_http_response(client_fd, 401, "Unauthorized", "text/plain", "Unauthorized\n",
+                             "WWW-Authenticate: Basic realm=\"bitmessage\"\r\n");
+        free(buf);
+        close(client_fd);
+        return;
+    }
+
+    long content_length = find_header_value_long(headers, headers_len, "Content-Length");
+    if (content_length < 0 || (size_t)content_length > MAX_REQUEST_SIZE)
+    {
+        write_http_response(client_fd, 400, "Bad Request", "text/plain", "invalid Content-Length\n", NULL);
+        free(buf);
+        close(client_fd);
+        return;
+    }
+
+    size_t body_already = buf_len - (size_t)header_end;
+    size_t body_needed = (size_t)content_length;
+    if (body_already < body_needed)
+    {
+        size_t to_read = body_needed - body_already;
+        if (buf_len + to_read > buf_cap)
+        {
+            buf_cap = buf_len + to_read;
+            buf = realloc(buf, buf_cap);
+        }
+        size_t got = 0;
+        while (got < to_read)
+        {
+            ssize_t n = read(client_fd, buf + buf_len + got, to_read - got);
+            if (n <= 0)
+            {
+                free(buf);
+                close(client_fd);
+                return;
+            }
+            got += (size_t)n;
+        }
+        buf_len += got;
+    }
+
+    const char *body = (const char *)buf + header_end;
+    char *response_json = process_jsonrpc_request(config, body, body_needed);
+    write_http_response(client_fd, 200, "OK", "application/json", response_json, NULL);
+    free(response_json);
+
+    free(buf);
+    close(client_fd);
+}
+
+int bm_api_server_listen(const struct bm_api_server_config *config, int *out_listen_fd)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)config->port);
+    if (inet_pton(AF_INET, config->bind_address, &addr.sin_addr) != 1)
+    {
+        close(fd);
+        return -1;
+    }
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 16) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+    *out_listen_fd = fd;
+    return 0;
+}
+
+void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config)
+{
+    for (;;)
+    {
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+        bm_api_server_handle_connection(client_fd, config);
+    }
+}
 
 void *bm_api_server_thread(void *arg)
 {
-    (void)arg;
-    /* TODO(§6): apiinterface:apiportでJSON-RPC 2.0サーバーを待受ける。
-     * §6.2の鍵ライフサイクル系メソッドを含むハンドラ辞書を実装する。 */
+    const struct bm_api_server_config *config = arg;
+    int listen_fd = -1;
+    if (bm_api_server_listen(config, &listen_fd) != 0)
+    {
+        fprintf(stderr, "[api_server] failed to listen on %s:%d\n", config->bind_address, config->port);
+        return NULL;
+    }
+    fprintf(stderr, "[api_server] listening on %s:%d\n", config->bind_address, config->port);
+    bm_api_server_serve_forever(listen_fd, config);
+    close(listen_fd);
     return NULL;
 }

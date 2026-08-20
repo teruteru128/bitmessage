@@ -23,3 +23,11 @@ add_test(NAME trial_decrypt COMMAND test_trial_decrypt)
 add_executable(test_send_pipeline test_send_pipeline.c)
 target_link_libraries(test_send_pipeline PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME send_pipeline COMMAND test_send_pipeline)
+
+add_executable(test_json test_json.c)
+target_link_libraries(test_json PRIVATE bm_common)
+add_test(NAME json COMMAND test_json)
+
+add_executable(test_api_server test_api_server.c)
+target_link_libraries(test_api_server PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME api_server COMMAND test_api_server)

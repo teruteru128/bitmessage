@@ -5,6 +5,7 @@
  * 平文鍵の復号(unlock)自体はkeyring.cの責務。 */
 
 #include <sqlite3.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define BM_IDENTITY_ADDRESS_MAX 40
@@ -43,5 +44,18 @@ int bm_identity_store_insert(sqlite3 *db, const struct bm_identity_row *row);
 int bm_identity_store_load(sqlite3 *db, const char *address, struct bm_identity_row *out);
 
 int bm_identity_store_delete(sqlite3 *db, const char *address);
+
+struct bm_identity_summary
+{
+    char address[BM_IDENTITY_ADDRESS_MAX];
+    char label[BM_IDENTITY_LABEL_MAX];
+    int enabled;
+};
+
+/*
+ * 全identityの一覧を取得する(malloc、呼び出し側でfreeすること)。成功時0、
+ * *out_countに件数を設定する(0件でも成功)。
+ */
+int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count);
 
 #endif /* BM_CORE_IDENTITY_STORE_H */
