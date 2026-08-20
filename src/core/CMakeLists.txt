@@ -4,6 +4,7 @@ add_library(bm_core STATIC
     keyring.c
     identity_store.c
     messages_store.c
+    message_builder.c
     trial_decrypt.c
     send_pipeline.c
     api_server.c
