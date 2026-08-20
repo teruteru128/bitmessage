@@ -19,3 +19,7 @@ add_test(NAME message_builder COMMAND test_message_builder)
 add_executable(test_trial_decrypt test_trial_decrypt.c)
 target_link_libraries(test_trial_decrypt PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME trial_decrypt COMMAND test_trial_decrypt)
+
+add_executable(test_send_pipeline test_send_pipeline.c)
+target_link_libraries(test_send_pipeline PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME send_pipeline COMMAND test_send_pipeline)

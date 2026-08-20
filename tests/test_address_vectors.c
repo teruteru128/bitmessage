@@ -49,8 +49,51 @@ int main(void)
         free(addr3);
         return EXIT_FAILURE;
     }
-    free(addr3);
-
     printf("OK: deterministic address vector matched (%s)\n", expected_addr3);
+
+    /* decode往復: 既知アドレス(v3)をデコードし、version/stream/ripeが一致することを確認 */
+    uint64_t dec_version = 0, dec_stream = 0;
+    unsigned char dec_ripe[BM_RIPE_LEN];
+    if (bm_address_decode(addr3, &dec_version, &dec_stream, dec_ripe) != 0)
+    {
+        fprintf(stderr, "FAIL: bm_address_decode returned error for %s\n", addr3);
+        free(addr3);
+        return EXIT_FAILURE;
+    }
+    if (dec_version != 3 || dec_stream != 1 || memcmp(dec_ripe, addr.ripe, BM_RIPE_LEN) != 0)
+    {
+        fprintf(stderr, "FAIL: decode round-trip mismatch (version=%llu stream=%llu)\n",
+                (unsigned long long)dec_version, (unsigned long long)dec_stream);
+        free(addr3);
+        return EXIT_FAILURE;
+    }
+    free(addr3);
+    printf("OK: v3 address decode round-trip matched\n");
+
+    /* v4アドレスでも往復させる(先頭ゼロバイト全除去のケース) */
+    char *addr4 = bm_address_encode(4, 1, addr.ripe, BM_RIPE_LEN);
+    if (addr4 == NULL)
+    {
+        fprintf(stderr, "FAIL: bm_address_encode v4\n");
+        return EXIT_FAILURE;
+    }
+    if (bm_address_decode(addr4, &dec_version, &dec_stream, dec_ripe) != 0
+        || dec_version != 4 || dec_stream != 1 || memcmp(dec_ripe, addr.ripe, BM_RIPE_LEN) != 0)
+    {
+        fprintf(stderr, "FAIL: v4 decode round-trip mismatch\n");
+        free(addr4);
+        return EXIT_FAILURE;
+    }
+    printf("OK: v4 address decode round-trip matched (%s)\n", addr4);
+    free(addr4);
+
+    /* 不正な入力の拒否も確認(base58として不正な文字、checksum改竄) */
+    if (bm_address_decode("BM-not_valid_base58!!!", &dec_version, &dec_stream, dec_ripe) == 0)
+    {
+        fprintf(stderr, "FAIL: decode should reject invalid base58 characters\n");
+        return EXIT_FAILURE;
+    }
+    printf("OK: invalid address correctly rejected\n");
+
     return EXIT_SUCCESS;
 }

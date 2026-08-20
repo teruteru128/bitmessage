@@ -25,6 +25,10 @@ struct bm_unlocked_identity
     unsigned char priv_encryption[32];
     unsigned char pub_signing[65];
     unsigned char pub_encryption[65];
+    uint64_t address_version;
+    uint64_t stream;
+    uint64_t nonce_trials_per_byte;
+    uint64_t payload_length_extra_bytes;
     time_t unlocked_at;
     struct bm_unlocked_identity *next;
 };
@@ -68,5 +72,9 @@ int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *addres
 /* ripeで検索する。見つかればtrueを返しoutにコピーする(呼び出し側が用意した領域へ) */
 bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
                               struct bm_unlocked_identity *out);
+
+/* address文字列で検索する(send_pipeline.cがfromアドレスの鍵を引く際に使う) */
+bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
+                                 struct bm_unlocked_identity *out);
 
 #endif /* BM_CORE_KEYRING_H */

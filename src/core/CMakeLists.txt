@@ -11,4 +11,4 @@ add_library(bm_core STATIC
 )
 
 target_include_directories(bm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(bm_core PUBLIC bm_common OpenSSL::Crypto)
+target_link_libraries(bm_core PUBLIC bm_common bm_pow OpenSSL::Crypto)

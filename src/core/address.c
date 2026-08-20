@@ -148,6 +148,112 @@ char *bm_address_encode_wif(const unsigned char priv[BM_PRIVATE_KEY_LEN])
     return bm_base58_encode(raw, sizeof(raw));
 }
 
+int bm_address_decode(const char *address, uint64_t *out_version, uint64_t *out_stream,
+                       unsigned char out_ripe[BM_RIPE_LEN])
+{
+    const char *b58_part = address;
+    if (strncmp(address, "BM-", 3) == 0)
+    {
+        b58_part = address + 3;
+    }
+
+    unsigned char *data = NULL;
+    size_t data_len = 0;
+    if (bm_base58_decode(b58_part, &data, &data_len) != 0)
+    {
+        return -1;
+    }
+    if (data_len < 4)
+    {
+        free(data);
+        return -1;
+    }
+
+    size_t payload_len = data_len - 4;
+    unsigned char checksum[64];
+    bm_double_sha512(data, payload_len, checksum);
+    if (memcmp(checksum, data + payload_len, 4) != 0)
+    {
+        free(data);
+        return -1;
+    }
+
+    size_t offset = 0;
+    uint64_t version = 0;
+    size_t consumed = bm_varint_decode(data, payload_len, &version);
+    /* version 1(旧式フォーマット)・0・5以上は非対応(§8スコープ外) */
+    if (consumed == 0 || version < 2 || version > 4)
+    {
+        free(data);
+        return -1;
+    }
+    offset += consumed;
+
+    uint64_t stream = 0;
+    consumed = bm_varint_decode(data + offset, payload_len - offset, &stream);
+    if (consumed == 0)
+    {
+        free(data);
+        return -1;
+    }
+    offset += consumed;
+
+    size_t ripe_data_len = payload_len - offset;
+    const unsigned char *ripe_data = data + offset;
+
+    if (version == 2 || version == 3)
+    {
+        if (ripe_data_len == 20)
+        {
+            memcpy(out_ripe, ripe_data, 20);
+        }
+        else if (ripe_data_len == 19)
+        {
+            out_ripe[0] = 0;
+            memcpy(out_ripe + 1, ripe_data, 19);
+        }
+        else if (ripe_data_len == 18)
+        {
+            out_ripe[0] = 0;
+            out_ripe[1] = 0;
+            memcpy(out_ripe + 2, ripe_data, 18);
+        }
+        else
+        {
+            free(data);
+            return -1;
+        }
+    }
+    else /* version == 4 */
+    {
+        if (ripe_data_len < 4 || ripe_data_len > 20)
+        {
+            free(data);
+            return -1;
+        }
+        if (ripe_data[0] == 0x00)
+        {
+            /* 非正規エンコーディング(先頭0x00が残っている=非マレアビリティ違反、addresses.py同様拒否) */
+            free(data);
+            return -1;
+        }
+        size_t pad = 20 - ripe_data_len;
+        memset(out_ripe, 0, pad);
+        memcpy(out_ripe + pad, ripe_data, ripe_data_len);
+    }
+
+    free(data);
+    if (out_version != NULL)
+    {
+        *out_version = version;
+    }
+    if (out_stream != NULL)
+    {
+        *out_stream = stream;
+    }
+    return 0;
+}
+
 int bm_address_generate_deterministic(const char *passphrase, int null_bytes,
                                        struct bm_generated_address *out)
 {

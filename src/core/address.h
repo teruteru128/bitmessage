@@ -37,6 +37,15 @@ char *bm_address_encode(uint64_t version, uint64_t stream, const unsigned char *
 /* WIF(Wallet Import Format)文字列にエンコードする(malloc、呼び出し側でfree) */
 char *bm_address_encode_wif(const unsigned char priv[BM_PRIVATE_KEY_LEN]);
 
+/*
+ * "BM-..."(先頭の"BM-"は省略可)をデコードする。addresses.py decodeAddress準拠:
+ * checksum検証(double_sha512)、version範囲(1〜4)、ripe長の妥当性、v4の非マレアビリティ検証
+ * (先頭0x00バイトが残っていたら不正な非正規エンコーディングとして拒否)を行う。
+ * 成功時0、失敗時非0(out_versionにエラー種別は返さない、v1では成否のみ)。
+ */
+int bm_address_decode(const char *address, uint64_t *out_version, uint64_t *out_stream,
+                       unsigned char out_ripe[BM_RIPE_LEN]);
+
 struct bm_generated_address
 {
     unsigned char priv_signing[BM_PRIVATE_KEY_LEN];

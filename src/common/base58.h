@@ -12,9 +12,10 @@
 char *bm_base58_encode(const unsigned char *input, size_t length);
 
 /*
- * TODO(§6.2 importAddress): WIF鍵インポートに必要。まだ未実装。
+ * 純粋な整数変換(PyBitmessage decodeBase58と同じ、先頭ゼロバイトの'1'プレフィックス復元はしない。
+ * BMアドレスのpayloadはversion varintで始まり常に非ゼロなので実害はない)。
  * 成功時は *out に malloc 済みバイト列、*out_len にその長さを設定し 0 を返す。
- * 失敗時は非0を返す。
+ * 失敗時(不正な文字を含む等)は非0を返す。
  */
 int bm_base58_decode(const char *input, unsigned char **out, size_t *out_len);
 

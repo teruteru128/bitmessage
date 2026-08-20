@@ -231,6 +231,10 @@ int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const 
     memcpy(entry->pub_signing, row.signing_pubkey, 65);
     memcpy(entry->pub_encryption, row.encryption_pubkey, 65);
     bm_address_calc_ripe(entry->pub_signing, entry->pub_encryption, entry->ripe);
+    entry->address_version = (uint64_t)row.address_version;
+    entry->stream = (uint64_t)row.stream;
+    entry->nonce_trials_per_byte = row.nonce_trials_per_byte;
+    entry->payload_length_extra_bytes = row.payload_length_extra_bytes;
     entry->unlocked_at = time(NULL);
 
     OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
@@ -294,6 +298,26 @@ bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
     while (cur != NULL)
     {
         if (memcmp(cur->ripe, ripe, 20) == 0)
+        {
+            memcpy(out, cur, sizeof(*out));
+            out->next = NULL;
+            pthread_rwlock_unlock(&kr->lock);
+            return true;
+        }
+        cur = cur->next;
+    }
+    pthread_rwlock_unlock(&kr->lock);
+    return false;
+}
+
+bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
+                                 struct bm_unlocked_identity *out)
+{
+    pthread_rwlock_rdlock(&kr->lock);
+    struct bm_unlocked_identity *cur = kr->head;
+    while (cur != NULL)
+    {
+        if (strncmp(cur->address, address, BM_KEYRING_MAX_ADDRESS_LEN) == 0)
         {
             memcpy(out, cur, sizeof(*out));
             out->next = NULL;
