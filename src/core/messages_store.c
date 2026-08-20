@@ -1,5 +1,6 @@
 #include "messages_store.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "../common/db_common.h"
@@ -59,6 +60,89 @@ int bm_messages_store_insert_inbox(sqlite3 *db, const unsigned char msg_id[32],
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_list_inbox(sqlite3 *db, const char *folder_filter,
+                                  struct bm_inbox_message **out_list, size_t *out_count)
+{
+    static const char *SQL_ALL =
+        "SELECT msg_id, to_address, from_address, subject, body, received_time, read, folder "
+        "FROM inbox ORDER BY received_time DESC;";
+    static const char *SQL_FILTERED =
+        "SELECT msg_id, to_address, from_address, subject, body, received_time, read, folder "
+        "FROM inbox WHERE folder = ?1 ORDER BY received_time DESC;";
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = folder_filter != NULL ? SQL_FILTERED : SQL_ALL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    if (folder_filter != NULL)
+    {
+        sqlite3_bind_text(stmt, 1, folder_filter, -1, SQLITE_TRANSIENT);
+    }
+
+    size_t cap = 8;
+    size_t count = 0;
+    struct bm_inbox_message *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        struct bm_inbox_message *m = &list[count];
+        memset(m, 0, sizeof(*m));
+
+        const void *msg_id = sqlite3_column_blob(stmt, 0);
+        int msg_id_len = sqlite3_column_bytes(stmt, 0);
+        if (msg_id_len == 32)
+        {
+            memcpy(m->msg_id, msg_id, 32);
+        }
+
+        const unsigned char *to_address = sqlite3_column_text(stmt, 1);
+        strncpy(m->to_address, (const char *)to_address, BM_MESSAGES_ADDRESS_MAX - 1);
+        const unsigned char *from_address = sqlite3_column_text(stmt, 2);
+        strncpy(m->from_address, (const char *)from_address, BM_MESSAGES_ADDRESS_MAX - 1);
+
+        const void *subject = sqlite3_column_blob(stmt, 3);
+        int subject_len = sqlite3_column_bytes(stmt, 3);
+        m->subject = malloc((size_t)subject_len + 1);
+        memcpy(m->subject, subject, (size_t)subject_len);
+        m->subject[subject_len] = '\0';
+
+        const void *body = sqlite3_column_blob(stmt, 4);
+        int body_len = sqlite3_column_bytes(stmt, 4);
+        m->body = malloc((size_t)body_len + 1);
+        memcpy(m->body, body, (size_t)body_len);
+        m->body[body_len] = '\0';
+
+        m->received_time = sqlite3_column_int64(stmt, 5);
+        m->read = sqlite3_column_int(stmt, 6);
+        const unsigned char *folder = sqlite3_column_text(stmt, 7);
+        strncpy(m->folder, (const char *)folder, BM_MESSAGES_FOLDER_MAX - 1);
+
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        free(list[i].subject);
+        free(list[i].body);
+    }
+    free(list);
 }
 
 int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char *ack_data, size_t ack_data_len,

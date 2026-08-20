@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "../src/common/json.h"
+#include "../src/core/address.h"
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/messages_store.h"
@@ -32,6 +33,17 @@ static int failures = 0;
             failures++;                                                      \
         }                                                                    \
     } while (0)
+
+static void hex_encode(const unsigned char *data, size_t len, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++)
+    {
+        out[i * 2] = digits[data[i] >> 4];
+        out[i * 2 + 1] = digits[data[i] & 0x0f];
+    }
+    out[len * 2] = '\0';
+}
 
 static sqlite3 *open_fresh_db(const char *path, int (*init_schema)(sqlite3 *))
 {
@@ -293,6 +305,108 @@ int main(void)
 
         free(created_address);
     }
+
+    /* sendMessage: 送信者をAPI経由で作成・unlockし、受信者は(pubkey_cache未実装のため)
+     * テスト側でローカルに鍵を導出してpub_encryptionを直接渡す */
+    resp = do_request(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"createDeterministicAddress\","
+        "\"params\":[\"api_server sendMessage sender\",4,1,1,\"sender\",\"senderpass\"],\"id\":10}",
+        "testuser", "testpass");
+    char *sender_address = NULL;
+    if (resp != NULL)
+    {
+        bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+        const char *addr = v != NULL ? bm_json_as_string(bm_json_object_get(v, "result")) : NULL;
+        CHECK(addr != NULL, "create sender address for sendMessage test");
+        if (addr != NULL)
+        {
+            sender_address = malloc(strlen(addr) + 1);
+            strcpy(sender_address, addr);
+        }
+        bm_json_free(v);
+        free(resp);
+    }
+
+    if (sender_address != NULL)
+    {
+        char unlock_req[256];
+        snprintf(unlock_req, sizeof(unlock_req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddress\",\"params\":[\"%s\",\"senderpass\"],\"id\":11}",
+                 sender_address);
+        resp = do_request(unlock_req, "testuser", "testpass");
+        free(resp);
+
+        struct bm_generated_address recv_gen;
+        CHECK(bm_address_generate_deterministic("api_server sendMessage receiver", 1, &recv_gen) == 0,
+              "generate receiver keys locally (no pubkey_cache yet)");
+        char *recv_address = bm_address_encode(4, 1, recv_gen.ripe, BM_RIPE_LEN);
+        char recv_pubenc_hex[131];
+        hex_encode(recv_gen.pub_encryption, 65, recv_pubenc_hex);
+
+        char send_req[1024];
+        snprintf(send_req, sizeof(send_req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
+                 "\"params\":[\"%s\",\"%s\",\"%s\",\"api test subject\",\"api test body\",3600,1],\"id\":12}",
+                 sender_address, recv_address, recv_pubenc_hex);
+        resp = do_request(send_req, "testuser", "testpass");
+        CHECK(resp != NULL, "sendMessage HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL, "sendMessage returns a result object");
+            if (result != NULL)
+            {
+                double obj_len = bm_json_as_number(bm_json_object_get(result, "objectLength"));
+                CHECK(obj_len > 0, "sendMessage objectLength > 0");
+                const char *inv_hash = bm_json_as_string(bm_json_object_get(result, "inventoryHash"));
+                CHECK(inv_hash != NULL && strlen(inv_hash) == 64, "sendMessage inventoryHash is 32byte hex");
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+
+        free(recv_address);
+    }
+
+    /* getInboxMessages: messages_dbへ直接1件差し込み、API経由で正しく読めることを確認
+     * (trial_decrypt自体はtests/test_trial_decrypt.cで既に検証済みなので、ここではAPI層の
+     * クエリ・JSONシリアライズだけを対象にする) */
+    {
+        unsigned char msg_id[32];
+        memset(msg_id, 0xab, sizeof(msg_id));
+        CHECK(bm_messages_store_insert_inbox(messages_db, msg_id, "BM-toaddress", "BM-fromaddress",
+                                              "inbox test subject", "inbox test body", 1234567890) == 0,
+              "seed one inbox row directly");
+
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getInboxMessages\",\"params\":[],\"id\":13}",
+                           "testuser", "testpass");
+        CHECK(resp != NULL, "getInboxMessages HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_ARRAY && result->item_count == 1,
+                  "getInboxMessages returns 1 entry");
+            if (result != NULL && result->item_count == 1)
+            {
+                bm_json_value_t *entry = bm_json_array_get(result, 0);
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "toAddress")), "BM-toaddress") == 0,
+                      "getInboxMessages toAddress");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "subject")), "inbox test subject") == 0,
+                      "getInboxMessages subject");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "body")), "inbox test body") == 0,
+                      "getInboxMessages body");
+                const char *msg_id_hex = bm_json_as_string(bm_json_object_get(entry, "msgId"));
+                CHECK(msg_id_hex != NULL && strncmp(msg_id_hex, "abababab", 8) == 0,
+                      "getInboxMessages msgId hex matches");
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+    }
+
+    free(sender_address);
 
     /* 存在しないメソッドはエラーを返す */
     resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"noSuchMethod\",\"params\":[],\"id\":7}",

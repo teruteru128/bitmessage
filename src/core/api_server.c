@@ -11,9 +11,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "../common/hash.h"
 #include "../common/json.h"
 #include "address.h"
 #include "identity_store.h"
+#include "messages_store.h"
+#include "send_pipeline.h"
 
 #define MAX_REQUEST_SIZE (1 * 1024 * 1024) /* 1MiB上限、DoS対策 */
 
@@ -109,6 +112,36 @@ struct bm_api_method
 static const char *param_str(const bm_json_value_t *params, size_t i)
 {
     return bm_json_as_string(bm_json_array_get(params, i));
+}
+
+static void hex_encode(const unsigned char *data, size_t len, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++)
+    {
+        out[i * 2] = digits[data[i] >> 4];
+        out[i * 2 + 1] = digits[data[i] & 0x0f];
+    }
+    out[len * 2] = '\0';
+}
+
+/* out_lenバイトちょうど(=strlen(hex)/2)であることを要求する固定長hexデコード */
+static int hex_decode_fixed(const char *hex, unsigned char *out, size_t out_len)
+{
+    if (strlen(hex) != out_len * 2)
+    {
+        return -1;
+    }
+    for (size_t i = 0; i < out_len; i++)
+    {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1)
+        {
+            return -1;
+        }
+        out[i] = (unsigned char)byte;
+    }
+    return 0;
 }
 
 static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *config,
@@ -244,6 +277,104 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
     return result;
 }
 
+/*
+ * sendMessage: [fromAddress, toAddress, toPubEncryptionHex(130桁hex, 65byte),
+ *               subject, body, ttlSeconds?, ackStealthLevel?]
+ *
+ * toPubEncryptionHexは宛先の公開暗号鍵。pubkey_cache(宛先pubkeyの自動解決)が
+ * 未実装のため、v1では呼び出し側が既知の相手の公開鍵を直接渡す必要がある(§5 TODO)。
+ */
+static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
+                                       const bm_json_value_t *params, char **out_error)
+{
+    const char *from_address = param_str(params, 0);
+    const char *to_address = param_str(params, 1);
+    const char *to_pubenc_hex = param_str(params, 2);
+    const char *subject = param_str(params, 3);
+    const char *body = param_str(params, 4);
+    const bm_json_value_t *ttl_v = bm_json_array_get(params, 5);
+    const bm_json_value_t *stealth_v = bm_json_array_get(params, 6);
+
+    if (from_address == NULL || to_address == NULL || to_pubenc_hex == NULL
+        || subject == NULL || body == NULL)
+    {
+        *out_error = dup_cstr("sendMessage requires [fromAddress, toAddress, toPubEncryptionHex, "
+                              "subject, body, ttlSeconds?, ackStealthLevel?]. toPubEncryptionHex is "
+                              "the recipient's public encryption key as 130 hex characters (65 raw "
+                              "bytes, 0x04||X||Y) -- automatic pubkey resolution is not implemented yet.");
+        return NULL;
+    }
+
+    unsigned char to_pub_encryption[65];
+    if (hex_decode_fixed(to_pubenc_hex, to_pub_encryption, sizeof(to_pub_encryption)) != 0)
+    {
+        *out_error = dup_cstr("toPubEncryptionHex must be exactly 130 hex characters (65 bytes)");
+        return NULL;
+    }
+
+    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
+    int ack_stealth_level = stealth_v != NULL ? (int)bm_json_as_number(stealth_v) : 1;
+
+    unsigned char *object = NULL;
+    size_t object_len = 0;
+    int rc = bm_send_pipeline_send_message(config->keyring, config->messages_db, from_address, to_address,
+                                            to_pub_encryption, subject, body, ttl_seconds, ack_stealth_level,
+                                            &object, &object_len);
+    if (rc != 0)
+    {
+        *out_error = dup_cstr("send failed (is fromAddress unlocked? is toAddress a valid BM- address?)");
+        return NULL;
+    }
+
+    unsigned char inv_hash[32];
+    bm_inventory_hash(object, object_len, inv_hash);
+    free(object);
+
+    char inv_hex[65];
+    hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "objectLength", bm_json_new_number((double)object_len));
+    bm_json_object_set(result, "inventoryHash", bm_json_new_string(inv_hex));
+    /* TODO: ネットワーク層とのキュー結線後、broadcast_queueへの投入もここで行う */
+    return result;
+}
+
+/* getInboxMessages: [folder?](省略時は全件、'inbox'/'trash'等で絞り込み可) */
+static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
+                                            const bm_json_value_t *params, char **out_error)
+{
+    const char *folder = param_str(params, 0);
+
+    struct bm_inbox_message *list = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_inbox(config->messages_db, folder, &list, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list inbox");
+        return NULL;
+    }
+
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        char msg_id_hex[65];
+        hex_encode(list[i].msg_id, sizeof(list[i].msg_id), msg_id_hex);
+
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "msgId", bm_json_new_string(msg_id_hex));
+        bm_json_object_set(entry, "toAddress", bm_json_new_string(list[i].to_address));
+        bm_json_object_set(entry, "fromAddress", bm_json_new_string(list[i].from_address));
+        bm_json_object_set(entry, "subject", bm_json_new_string(list[i].subject));
+        bm_json_object_set(entry, "body", bm_json_new_string(list[i].body));
+        bm_json_object_set(entry, "receivedTime", bm_json_new_number((double)list[i].received_time));
+        bm_json_object_set(entry, "read", bm_json_new_bool(list[i].read));
+        bm_json_object_set(entry, "folder", bm_json_new_string(list[i].folder));
+        bm_json_array_append(arr, entry);
+    }
+    bm_inbox_message_list_free(list, count);
+    return arr;
+}
+
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
     {"lockAddress", h_lockAddress},
@@ -251,8 +382,8 @@ static const struct bm_api_method METHODS[] = {
     {"deleteAddress", h_deleteAddress},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
-    /* TODO: sendMessage(send_pipeline.c連携)、getInboxMessages等(messages_store.c連携)。
-     * §6.1のハンドラ辞書パターンに沿ってこの配列へ追加していけば良い。 */
+    {"sendMessage", h_sendMessage},
+    {"getInboxMessages", h_getInboxMessages},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

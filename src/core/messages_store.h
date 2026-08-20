@@ -27,4 +27,27 @@ int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char *ack_data, si
                                    const char *subject, const char *body,
                                    const char *status, int64_t sent_time, int64_t ttl);
 
+#define BM_MESSAGES_ADDRESS_MAX 40
+#define BM_MESSAGES_FOLDER_MAX 16
+
+struct bm_inbox_message
+{
+    unsigned char msg_id[32];
+    char to_address[BM_MESSAGES_ADDRESS_MAX];
+    char from_address[BM_MESSAGES_ADDRESS_MAX];
+    char *subject; /* malloc */
+    char *body;    /* malloc */
+    int64_t received_time;
+    int read;
+    char folder[BM_MESSAGES_FOLDER_MAX];
+};
+
+/*
+ * inboxを一覧する(受信時刻降順)。folder_filterがNULLなら全件(inbox/trash問わず)、
+ * 非NULLならその値のfolderのみ。成功時0、*out_listはmalloc済み配列(bm_inbox_message_list_freeで解放)。
+ */
+int bm_messages_store_list_inbox(sqlite3 *db, const char *folder_filter,
+                                  struct bm_inbox_message **out_list, size_t *out_count);
+void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count);
+
 #endif /* BM_CORE_MESSAGES_STORE_H */

@@ -525,8 +525,12 @@ msg送信時、受信側の`bitfield`が`BITFIELD_DOESACK`を要求していれ�
 `createDeterministicAddress`を実装。`apiusername`/`apipassword`は設定ファイル未実装のため
 起動毎にランダム生成し標準エラー出力へ表示する(`main.c`)。`tests/test_api_server.c`で
 実ソケット越しのHTTPリクエストにより認証拒否・全メソッドの疎通・エラーハンドリングを検証済み
-(2026-08-20)。`sendMessage`(send_pipeline.c連携)・`getInboxMessages`等はハンドラ辞書
-(`METHODS[]`配列)に追加するだけの構造になっているが未実装(TODO)。
+(2026-08-20)。`sendMessage`(send_pipeline.c連携)・`getInboxMessages`(messages_store.c連携)も
+実装済み(2026-08-21)。`sendMessage`は`[fromAddress, toAddress, toPubEncryptionHex, subject, body,
+ttlSeconds?, ackStealthLevel?]`を取り、宛先の公開暗号鍵を呼び出し側が130桁hex(65byte)で直接渡す
+必要がある(`pubkey_cache`未実装のため自動解決はできない、§5 TODOと同じ制限)。応答は
+`{objectLength, inventoryHash}`(完成object本体はAPI経由では返さない設計)。`getInboxMessages`は
+`[folder?]`でinbox一覧を返す。`tests/test_api_server.c`で両方とも実HTTPリクエストで検証済み。
 
 既知の制限: `bm_api_server_serve_forever`の`accept()`はブロッキングでシグナル等による
 グレースフルシャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。
