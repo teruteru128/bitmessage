@@ -544,6 +544,10 @@ api_handler_fn handler; }`の配列をコア層が持ち、HTTPレイヤーとJS
 
 ## 7. 鍵ライフサイクル管理設計(§8-1、ユーザー要望による独自拡張)
 
+**実装済み(`src/core/keyring.c`, `src/core/identity_store.c`)。scrypt(N=2^15,r=8,p=1)でKEK導出、
+AES-256-GCM(AAD=address)でラップ。`tests/test_keyring.c`でcreate→誤passphrase拒否→unlock→
+秘密鍵一致確認→lock→再unlock→delete→完全削除の一連を検証済み(2026-08-20)。**
+
 PyBitmessageは`keys.dat`に秘密鍵を平文保存し、`enabled`は「トライアル復号に使うか」のUIフラグに過ぎず、
 有効なアドレスの鍵は起動直後から常時プロセスメモリ上にある。本実装では**起動時は全アドレスがロック状態**で、
 明示的に`unlockAddress`されるまで秘密鍵の平文はプロセスメモリに存在しない設計にする。
