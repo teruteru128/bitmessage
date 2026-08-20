@@ -246,23 +246,54 @@ deterministic_keys(passphrase, nonce):
 
 **未実装で新規に追加が必要な部分**: 決定性アドレス生成のnonce探索ループ。
 `class_addressGenerator.py`によると、署名鍵nonceと暗号化鍵nonceを(例えば0と1から開始し)ペアで
-インクリメントしながら鍵ペアを生成し続け、`ripe = RIPEMD160(SHA512(signPub[1:] || encPub[1:]))`の
-**先頭Nバイトが0x00になるまで**繰り返す。Nはデフォルト1バイト(`numberOfNullBytesDemandedOnFrontOfRipeHash`)、
-「もっと短いアドレス」オプション選択時は2バイト。ランダムアドレス生成も同じループで、nonce更新の代わりに
-毎回新規ランダム鍵ペアを引く。
+インクリメントしながら鍵ペアを生成し続け、`ripe = RIPEMD160(SHA512(signPub || encPub))`の
+**先頭Nバイトが0x00になるまで**繰り返す。**signPub/encPubは0x04プレフィックス込みの65byteのまま**
+(class_addressGenerator.py:183-184で`highlevelcrypto.random_keys()`が返す65byteをそのまま`to_ripe`に渡している。
+`[1:]`で先頭バイトを落とすのは§5でワイヤに乗せる直前の別処理であり、ripe計算そのものには適用しない。
+既存`bm_sonota.c`の`calcRipe`はこれを正しく実装済み)。Nはデフォルト1バイト
+(`numberOfNullBytesDemandedOnFrontOfRipeHash`)、「もっと短いアドレス」オプション選択時は2バイト。
+ランダムアドレス生成も同じループで、nonce更新の代わりに毎回新規ランダム鍵ペアを引く。
+
+**アドレス文字列エンコード時の先頭ゼロ除去ルール**(`addresses.py:142-171`、既存`bm_sonota.c`の
+`encodeAddress0`は`max`引数を使う独自ロジックで分かりにくいため、以下の単純な規則で書き直す):
+```
+if 2 <= version < 4:
+    if ripe[0:2] == "\x00\x00": ripe = ripe[2:]
+    elif ripe[0:1] == "\x00":   ripe = ripe[1:]
+    # (それ以外はripeを削らない。最大2byteまでしか削らない)
+elif version == 4:
+    ripe = ripe.lstrip("\x00")   # 先頭の0x00を全て(理論上最大20byteまで)削る
+storedBinaryData = encodeVarint(version) || encodeVarint(stream) || ripe
+checksum = double_sha512(storedBinaryData)[0:4]
+address = "BM-" + base58encode(storedBinaryData || checksum)
+```
 
 ### 3.4 ハッシュ関数まとめ
 
 | 用途 | アルゴリズム |
 |---|---|
 | ripeハッシュ(アドレス) | RIPEMD160(SHA512(signPub \|\| encPub)) |
-| チェックサム(アドレス, WIF) | SHA256(SHA256(data))[0:4] |
+| チェックサム(BMアドレス) | **double_sha512**(encodeVarint(version)\|\|encodeVarint(stream)\|\|ripe)[0:4] (`addresses.py:165`。SHA256ではない点に注意、実装時に誤りやすい) |
+| チェックサム(WIF) | SHA256(SHA256(data))[0:4](Bitcoin方式、アドレスとはアルゴリズムが異なる) |
 | メッセージヘッダchecksum | SHA512(payload)[0:4] |
 | inventory hash(objectの識別子) | SHA512(SHA512(payload))[0:32] (`calculateInventoryHash` = double_sha512の先頭32byte) |
 | PoW trial value | SHA512(SHA512(nonce(8byte BE) \|\| SHA512(payload)))[0:8] (§4) |
 | ECIES鍵導出 | SHA512(ECDH共有X座標) |
 | ECIESマック | HMAC-SHA256 |
 | v4アドレスの`tag`/暗号化鍵 | SHA512(encodeVarint(version)\|\|encodeVarint(stream)\|\|ripe) → 前半32byteが鍵、後半32byteがtag |
+
+### 3.5 暗号バックエンドの抽象化方針
+
+暗号ライブラリはOpenSSL固定とする。ripeハッシュ計算(RIPEMD160)を含めsecp256k1のECDSA/ECDHまで一通り揃う
+ライブラリが実質OpenSSLかlibgcryptしかなく(libsodiumはRIPEMD160非対応、mbedTLS 3.x系はRIPEMD160を
+非推奨化)、選択肢が狭い上、現時点で差し替えたい具体的な動機(ライセンス・組み込みターゲット・静的リンク
+サイズ等)もないため、実行時プラガブルな抽象化レイヤーは作らない。
+
+ただし将来の差し替えコストを下げるため、**暗号関連モジュール(`common/hash.*`、および今後実装する
+`core/crypto.*`, `core/address.*`)は公開ヘッダにOpenSSLの型(`EVP_MD*`, `EC_KEY*`, `BIGNUM*`等)を
+一切露出させず、生バイト列(`const unsigned char *`+長さ)の関数シグネチャのみで公開する**という実装規律を
+徹底する。この規律を守っておけば、将来本当にバックエンドを替えたくなっても該当`.c`ファイルの中身を
+書き換えるだけで済み、呼び出し側コードには影響しない。
 
 ## 4. PoW計算エンジン設計
 
@@ -612,3 +643,50 @@ struct unlocked_identity {
   チェック(PyBitmessageは`InvThread`が1秒ループの中で毎回`dandelion_ins.expire()`を呼んでいる)。
   既存§1の`peer_connector_thread`(定期実行スレッド)に相乗りさせるか、専用の`dandelion_thread`を
   新設するかは実装着手時に判断する
+
+## 10. ディレクトリ構成・ビルド方針
+
+§1のスレッド一覧(フロント/コア暗号/インフラ/計算の4層)にモジュールを対応させ、`src/`配下を層ごとの
+サブディレクトリに分ける。`.h`と`.c`は同一ディレクトリに同居させる(libstudyの`include/`+`src/`分離は
+今回は採用しない。インクルードパスの二重管理を避けるため)。
+
+```
+bitmessage/
+  CMakeLists.txt              -- OpenSSL/SQLite3/Threadsをfind_package、サブディレクトリを束ねる
+  DESIGN.md
+  src/
+    common/                   -- どの層からも参照される純粋ユーティリティ
+      queue.c/.h                 -- 層間キュー(§1.2)。libstudy bm_queue.cを移植
+      varint.c/.h                 -- varint/varstrのエンコード/デコード(§5.0)。bm_sonota.cから分離
+      base58.c/.h                  -- Base58エンコード。libstudy changebase.cのbase58encodeを移植
+      hash.c/.h                     -- SHA512/RIPEMD160/HMAC-SHA256のラッパー(§3.4)
+      db_common.c/.h                 -- SQLite初期化共通処理(Google概要案のinit_database相当)
+    infra/                    -- インフラ層(§1のnetwork_epoll_thread等)
+      network.c/.h                -- epoll実装、fd_data。bm_network.cを移植・スタブを実装で埋める
+      protocol.c/.h                 -- message/version/addr/invのparse/encode。bm_protocol.cを移植
+      object.c/.h                    -- object種別の検証・伝播判断(§5, §9のdecide_propagation)
+      peer_manager.c/.h               -- peers.db操作(bm_peer_manager.hの中身を新規実装)
+      object_store.c/.h                -- object_pool.db操作(bm_storage.hの中身を新規実装)
+    core/                     -- コア・暗号層
+      crypto.c/.h                 -- ECIES/ECDSA(§3)。bm_crypto.c(空)を新規実装
+      keyring.c/.h                  -- 鍵ライフサイクル管理(§7)
+      address.c/.h                    -- アドレスエンコード/デコード・鍵導出。bm_sonota.cから移植
+      identity_store.c/.h              -- identity.db操作
+      messages_store.c/.h               -- messages.db操作(inbox/sent/addressbook)
+      trial_decrypt.c/.h                 -- decrypt_worker_thread
+      message_builder.c/.h                -- msg/broadcast/pubkey/getpubkeyの組み立て(§5.1〜5.5)
+      send_pipeline.c/.h                   -- send_pipeline_thread
+      api_server.c/.h                       -- JSON-RPCサーバー(§6)
+    pow/                      -- 計算層
+      pow_engine.c/.h              -- target計算・trial value・ワーカースレッドプール(§4)
+    main.c                    -- DB初期化、鍵ロード、全スレッド起動、シグナルハンドリング
+  tests/
+  .gitignore
+```
+
+- ビルドシステムはlibstudy同様CMake。ビルドディレクトリ名も揃えて`build-<Debug|Release|...>/`とする
+- 依存: OpenSSL(EVP/EC/RIPEMD)、SQLite3、pthread(Threads)。libstudyが依存しているCURL/GnuTLS/Gettext/xmlrpc-c/
+  libuuidはこのプロジェクトでは不要(API層は自前JSON-RPC、多言語対応は初版スコープ外)
+- v1では**実装しない層(pow/message_builder/send_pipeline/api_server等の中身、object.cのDandelion分岐等)は
+  コンパイルは通るがno-op/TODOのスタブとして先に骨組みだけ作る**方針とする。まずスレッド起動〜終了までの
+  骨格を通してから、§1のキュー定義に沿って各モジュールを実装で埋めていく
