@@ -15,3 +15,7 @@ add_test(NAME keyring COMMAND test_keyring)
 add_executable(test_message_builder test_message_builder.c)
 target_link_libraries(test_message_builder PRIVATE bm_core bm_infra)
 add_test(NAME message_builder COMMAND test_message_builder)
+
+add_executable(test_trial_decrypt test_trial_decrypt.c)
+target_link_libraries(test_trial_decrypt PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME trial_decrypt COMMAND test_trial_decrypt)

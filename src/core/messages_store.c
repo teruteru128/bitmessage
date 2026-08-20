@@ -1,5 +1,7 @@
 #include "messages_store.h"
 
+#include <string.h>
+
 #include "../common/db_common.h"
 
 static const char *SCHEMA_SQL =
@@ -31,4 +33,30 @@ static const char *SCHEMA_SQL =
 int bm_messages_store_init_schema(sqlite3 *db)
 {
     return bm_db_init_schema(db, SCHEMA_SQL);
+}
+
+int bm_messages_store_insert_inbox(sqlite3 *db, const unsigned char msg_id[32],
+                                    const char *to_address, const char *from_address,
+                                    const char *subject, const char *body,
+                                    int64_t received_time)
+{
+    static const char *SQL =
+        "INSERT OR IGNORE INTO inbox (msg_id, to_address, from_address, subject, body, received_time) "
+        "VALUES (?1,?2,?3,?4,?5,?6);";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, msg_id, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, to_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, from_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 4, subject, (int)strlen(subject), SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 5, body, (int)strlen(body), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, received_time);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
 }

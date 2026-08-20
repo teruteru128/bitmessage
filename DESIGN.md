@@ -354,8 +354,16 @@ GPU/OpenCLは初版スコープ外(§8)。マルチスレッドCPU実装のみ�
 **実装済み(`src/core/message_builder.c`)。getpubkey/pubkey v2・v3・v4/msg/broadcast/ack(stealth level 0/1/2)
 全て実装。`tests/test_message_builder.c`でmsg(構築→ECIES復号→全フィールド照合→署名検証)、getpubkey v3/v4
 (tag計算含む)、pubkey v3(署名検証)を検証済み(2026-08-20)。エンコーディングはSIMPLE("Subject:...\nBody:...")
-固定(§8、TRIVIAL/EXTENDEDは未対応)。パース側(受信objectの復号・trial_decrypt)は別途`trial_decrypt.c`で
-実装予定。**
+固定(§8、TRIVIAL/EXTENDEDは未対応)。
+
+パース側(受信msgオブジェクトのトライアル復号)も`src/core/trial_decrypt.c`に実装済み。keyring内の
+unlocked鍵全てでECIES復号を試行し、toRipe一致検証(なりすまし転送対策)・署名検証・SIMPLEデコード
+(`\nBody:`分割、PyBitmessage `decodeSimple`と同一規則)まで行い、成功したら`messages_store.c`経由で
+inboxへ保存する(msg_id=inventory hashで重複排除)。`tests/test_trial_decrypt.c`で
+アドレス生成→keyring作成/unlock→message_builder→PoW(pow_engine.c)→trial_decrypt→inbox保存という
+パイプライン全体をend-to-endで検証し、改竄object・重複投入への耐性も確認済み(2026-08-20)。
+getpubkey/pubkey/broadcastのパース、ネットワーク層とのキュー結線(decrypt_worker_thread本体)は
+引き続きTODO。**
 
 出典: PyBitmessage `src/protocol.py`, `src/class_singleWorker.py`, `src/helper_ackPayload.py`
 

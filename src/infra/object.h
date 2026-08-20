@@ -2,10 +2,13 @@
 #define BM_INFRA_OBJECT_H
 
 /*
- * object種別の定数とネットワーク伝播判断。DESIGN.md §5.0, §9。
- * v1スコープではobjectの検証・保存(object_store)・トライアル復号への引き渡しは未実装(TODO)。
- * ここでは§9で決めた「将来の差し込み点」の骨組みだけを用意する。
+ * object種別の定数・共通ヘッダパーサ・ネットワーク伝播判断。DESIGN.md §5.0, §9。
+ * v1スコープではobjectの検証・保存(object_store)への引き渡しは未実装(TODO)。
+ * §9で決めた「将来の差し込み点」の骨組みも用意する。
  */
+
+#include <stddef.h>
+#include <stdint.h>
 
 #include "network.h"
 
@@ -16,6 +19,20 @@ enum bm_object_type
     BM_OBJECT_MSG = 2,
     BM_OBJECT_BROADCAST = 3,
 };
+
+/* §5.0: nonce(8)||expiresTime(8)||objectType(4)||varint(version)||varint(stream) */
+struct bm_object_header
+{
+    uint64_t nonce;
+    uint64_t expires_time;
+    uint32_t object_type;
+    uint64_t version;
+    uint64_t stream;
+    size_t header_len; /* nonce込みで消費したバイト数。data+header_lenが種別依存payloadの先頭 */
+};
+
+/* nonce込みの完全なobjectペイロードから共通ヘッダをパースする。成功時0、データ不足時は非0 */
+int bm_object_parse_header(const unsigned char *data, size_t data_len, struct bm_object_header *out);
 
 /* DESIGN.md §9.2: Dandelion++実装時に中身を差し替える差し込み点。v1は常にFLUFFを返す */
 enum bm_propagation_mode
