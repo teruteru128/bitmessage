@@ -786,3 +786,26 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 - v1では**実装しない層(pow/message_builder/send_pipeline/api_server等の中身、object.cのDandelion分岐等)は
   コンパイルは通るがno-op/TODOのスタブとして先に骨組みだけ作る**方針とする。まずスレッド起動〜終了までの
   骨格を通してから、§1のキュー定義に沿って各モジュールを実装で埋めていく
+
+## 11. 次にやること(引き継ぎメモ、随時更新)
+
+`pubkey_cache`実装完了・push済み(commit `d62a2ef`, 2026-08-21)。ctest 11件全通過。
+次に着手する項目は特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと(このセッションの
+一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
+
+- **`object_sync_thread`本実装**: 現状`default_dispatch`(`src/infra/network.c`)はaddr/inv/objectを
+  受信してもログ出力するだけで、`peer_manager`/`object_store`への永続化配線が無い。実ネットワークから
+  受信した`pubkey`/`getpubkey`オブジェクトを`pubkey_cache.c`のパーサ(`bm_parse_pubkey_v2/v3/v4`)に
+  実際に渡す経路もここに含まれる(現状はmessage_builder.cで構築した自己生成オブジェクトのラウンド
+  トリップテストのみ)。
+- **`peer_connector`の永続化**: 現在`bm_peer_connector_connect_initial()`は起動時一回きりのoutbound接続。
+  再接続・複数peer維持ループが未実装(自宅環境はCGNAT相当でinbound不可、Tor実装までoutbound-onlyの
+  前提は継続、§8参照)。
+- **`api_server`のgraceful shutdown**: `accept()`がブロッキングでSIGINT等に応答できないため現状は
+  `pthread_detach`で逃げている(`main.c`)。self-pipeトリック等で正式に閉じられるようにする。
+- **PoW並列化**: `pow/pow_engine.c`は現状シングルスレッド。
+- **getpubkey要求の自動化**: `send_pipeline.c`は`pubkey_cache`未登録の宛先には送信失敗するのみで、
+  能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。
+
+出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipelineは§5末尾、
+api_serverは§6.1末尾)。
