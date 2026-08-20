@@ -46,6 +46,14 @@ char *bm_address_encode_wif(const unsigned char priv[BM_PRIVATE_KEY_LEN]);
 int bm_address_decode(const char *address, uint64_t *out_version, uint64_t *out_stream,
                        unsigned char out_ripe[BM_RIPE_LEN]);
 
+/*
+ * SHA512(varint(version)||varint(stream)||ripe)。前半32byteがpubkey v4/broadcastの
+ * 暗号化鍵、後半32byteがtag(§3.3, §5.2, §5.4で共通利用)。out_secret/out_tagはNULL可。
+ */
+void bm_address_derive_secret_and_tag(uint64_t version, uint64_t stream, const unsigned char ripe[BM_RIPE_LEN],
+                                       unsigned char out_secret[BM_PRIVATE_KEY_LEN],
+                                       unsigned char out_tag[32]);
+
 struct bm_generated_address
 {
     unsigned char priv_signing[BM_PRIVATE_KEY_LEN];

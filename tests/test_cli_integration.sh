@@ -94,4 +94,29 @@ echo "$SEND_FAIL_OUTPUT" | grep -q "エラー" \
 
 "$CLI" delete "$ADDR2" >/dev/null
 
+# cache-pubkey: 引数検証と、有効な鍵での登録->send-message "-"(cache利用)成功までの配線を確認する。
+CACHE_USAGE_OUTPUT=$("$CLI" cache-pubkey "onlyoneparam" 2>&1 || true)
+echo "$CACHE_USAGE_OUTPUT" | grep -q "使い方" \
+    || fail "cache-pubkey with wrong arg count should print usage (got: $CACHE_USAGE_OUTPUT)"
+
+ADDR3_JSON=$("$CLI" create-address "cli cache-pubkey test sender" 4 1 1 "sender3" "storepass3")
+ADDR3=$(echo "$ADDR3_JSON" | tr -d '"')
+[ "$("$CLI" unlock "$ADDR3" "storepass3")" = "true" ] || fail "unlock sender3 for cache-pubkey test"
+
+ADDR4_JSON=$("$CLI" create-address "cli cache-pubkey test receiver" 4 1 1 "recv4" "storepass4")
+ADDR4=$(echo "$ADDR4_JSON" | tr -d '"')
+
+# create-addressはpubkeyを返さないため、cache-pubkeyの成功パス自体はtests/test_api_server.cで
+# 既にカバーしている(cachePubkey + sendMessage(null)のHTTPテスト)。ここではCLI引数の配線のみ確認する。
+CACHE_BAD_HEX_OUTPUT=$("$CLI" cache-pubkey "$ADDR4" "abcd" "abcd" 2>&1 || true)
+echo "$CACHE_BAD_HEX_OUTPUT" | grep -q "エラー" \
+    || fail "cache-pubkey with invalid hex should report an error (got: $CACHE_BAD_HEX_OUTPUT)"
+
+SEND_DASH_OUTPUT=$("$CLI" send-message "$ADDR3" "$ADDR4" "-" "subj" "body" 2>&1 || true)
+echo "$SEND_DASH_OUTPUT" | grep -q "エラー" \
+    || fail "send-message with '-' and no cached pubkey should fail with an error (got: $SEND_DASH_OUTPUT)"
+
+"$CLI" delete "$ADDR3" >/dev/null
+"$CLI" delete "$ADDR4" >/dev/null
+
 echo "ALL OK"

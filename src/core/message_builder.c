@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../common/hash.h"
 #include "../common/varint.h"
 #include "../infra/object.h" /* BM_OBJECT_* 定数 */
 #include "address.h"
@@ -123,31 +122,6 @@ static void append_pubkey64(struct bytebuf *b, const unsigned char pub65[65])
     bb_append(b, pub65 + 1, 64);
 }
 
-/* §5.1/§5.2/§5.4で使う: SHA512(varint(version)||varint(stream)||ripe)。
- * 前半32byteがv4暗号化用の秘密鍵、後半32byteがtag。 */
-static void derive_addr_secret_and_tag(uint64_t version, uint64_t stream, const unsigned char ripe[20],
-                                        unsigned char out_secret[32], unsigned char out_tag[32])
-{
-    struct bytebuf b;
-    bb_init(&b);
-    bb_append_varint(&b, version);
-    bb_append_varint(&b, stream);
-    bb_append(&b, ripe, 20);
-
-    unsigned char full[64];
-    bm_sha512(b.data, b.len, full);
-    bb_free(&b);
-
-    if (out_secret != NULL)
-    {
-        memcpy(out_secret, full, 32);
-    }
-    if (out_tag != NULL)
-    {
-        memcpy(out_tag, full + 32, 32);
-    }
-}
-
 /* "Subject:%s\nBody:%s"(BITMESSAGE_ENCODING_SIMPLE、§8) */
 static void append_simple_encoded_message(struct bytebuf *b, const char *subject, const char *body)
 {
@@ -180,7 +154,7 @@ unsigned char *bm_build_getpubkey(uint64_t address_version, uint64_t stream,
     else
     {
         unsigned char tag[32];
-        derive_addr_secret_and_tag(address_version, stream, ripe, NULL, tag);
+        bm_address_derive_secret_and_tag(address_version, stream, ripe, NULL, tag);
         bb_append(&b, tag, 32);
     }
 
@@ -233,7 +207,7 @@ unsigned char *bm_build_pubkey_v4(const struct bm_identity_info *id, const unsig
 
     unsigned char priv_enc[32];
     unsigned char tag[32];
-    derive_addr_secret_and_tag(4, id->stream, ripe, priv_enc, tag);
+    bm_address_derive_secret_and_tag(4, id->stream, ripe, priv_enc, tag);
     bb_append(&plain, tag, 32);
 
     struct bytebuf to_encrypt;
@@ -367,7 +341,7 @@ unsigned char *bm_build_broadcast(const struct bm_identity_info *from, const uns
 
     unsigned char priv_enc[32];
     unsigned char tag[32];
-    derive_addr_secret_and_tag(from->address_version, from->stream, from_ripe, priv_enc, tag);
+    bm_address_derive_secret_and_tag(from->address_version, from->stream, from_ripe, priv_enc, tag);
     if (is_v5)
     {
         bb_append(&plain, tag, 32);

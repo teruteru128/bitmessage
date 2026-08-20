@@ -5,6 +5,7 @@ add_library(bm_core STATIC
     identity_store.c
     messages_store.c
     message_builder.c
+    pubkey_cache.c
     trial_decrypt.c
     send_pipeline.c
     api_server.c

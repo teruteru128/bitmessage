@@ -72,6 +72,32 @@ void bm_address_calc_ripe(const unsigned char sign_pub[BM_PUBLIC_KEY_LEN],
     bm_ripemd160(sha512_out, 64, out_ripe);
 }
 
+void bm_address_derive_secret_and_tag(uint64_t version, uint64_t stream, const unsigned char ripe[BM_RIPE_LEN],
+                                       unsigned char out_secret[BM_PRIVATE_KEY_LEN],
+                                       unsigned char out_tag[32])
+{
+    unsigned char buf[9 + 9 + BM_RIPE_LEN]; /* varint最大9byte×2 + ripe20byte */
+    size_t offset = 0;
+    bm_varint_encode(buf + offset, version);
+    offset += bm_varint_size(version);
+    bm_varint_encode(buf + offset, stream);
+    offset += bm_varint_size(stream);
+    memcpy(buf + offset, ripe, BM_RIPE_LEN);
+    offset += BM_RIPE_LEN;
+
+    unsigned char full[64];
+    bm_sha512(buf, offset, full);
+
+    if (out_secret != NULL)
+    {
+        memcpy(out_secret, full, 32);
+    }
+    if (out_tag != NULL)
+    {
+        memcpy(out_tag, full + 32, 32);
+    }
+}
+
 char *bm_address_encode(uint64_t version, uint64_t stream, const unsigned char *ripe, size_t ripe_len)
 {
     if (ripe_len != BM_RIPE_LEN)

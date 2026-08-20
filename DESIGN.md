@@ -169,6 +169,16 @@ CREATE TABLE IF NOT EXISTS pubkey_cache (
 CREATE INDEX IF NOT EXISTS idx_pubkey_cache_tag ON pubkey_cache(tag);
 ```
 
+**実装済み(`src/core/pubkey_cache.c/h`)。** DB CRUD(`bm_pubkey_cache_upsert`/`_lookup_by_ripe`/`_lookup_by_tag`/
+`_mark_used_personally`、upsertは`ON CONFLICT(ripe) DO UPDATE`で`used_personally`を保持)に加え、
+pubkeyオブジェクト(v2/v3/v4)のパーサ・検証を実装(`bm_parse_pubkey_v2/v3/v4`、`message_builder.c`の
+構築処理の逆)。v3は埋め込みECDSA署名を検証、v4は`bm_address_derive_secret_and_tag`(§3.4相当、
+`address.c`に共通化)でtagを算出して候補と突き合わせてから復号・署名検証・ripe一致まで確認する。
+`message_builder.c`で構築したオブジェクトとのラウンドトリップ、改ざん検知、候補違い時の拒否、DB
+upsert/lookupを`tests/test_pubkey_cache.c`で検証済み(2026-08-21)。現状は手動登録(`cachePubkey` API/
+`cache-pubkey` CLI)またはテスト経由のみで、実ネットワークから受信した`pubkey`オブジェクトをこの
+パーサへ流し込む配線は未実装(§9 TODO参照)。
+
 ### 2.4 `messages.db` (コア・暗号層、新規) — 受信/送信ボックス
 
 ```sql
@@ -382,8 +392,12 @@ fromアドレスの鍵を引き、ack object(§5.5)とmsgオブジェクトを�
 `bm_address_decode`(`addresses.py` `decodeAddress`準拠、v2/v3のゼロパディング復元・v4の
 非マレアビリティ検証を含む)を実装した。`tests/test_send_pipeline.c`で送信→sentテーブル記録→
 受信者keyringでのtrial_decrypt→ackPayloadとsent.ack_dataの一致までend-to-endで検証済み
-(2026-08-20)。宛先pubkeyの参照は`pubkey_cache`未実装のため呼び出し側が直接指定する前提
-(getpubkey要求による自動取得はTODO)。**
+(2026-08-20)。宛先pubkeyは呼び出し側が直接指定するか、`to_pub_encryption=NULL`で呼べば
+`pubkey_cache`(§2.3)を`to_ripe`で検索して解決する(未登録なら送信失敗)。PoW難易度も
+pubkey_cacheに宛先のnonce_trials_per_byte/payload_length_extra_bytesがあれば送信元既定値との
+大きい方を採用する。`tests/test_send_pipeline.c`でNULL指定時のフォールバック(未登録で失敗
+→upsert後は成功)まで検証済み(2026-08-21)。getpubkey要求による自動取得(未登録時に能動的に
+取りに行く経路)は引き続きTODO。**
 
 出典: PyBitmessage `src/protocol.py`, `src/class_singleWorker.py`, `src/helper_ackPayload.py`
 
@@ -537,10 +551,14 @@ msg送信時、受信側の`bitfield`が`BITFIELD_DOESACK`を要求していれ�
 実ソケット越しのHTTPリクエストにより認証拒否・全メソッドの疎通・エラーハンドリングを検証済み
 (2026-08-20)。`sendMessage`(send_pipeline.c連携)・`getInboxMessages`(messages_store.c連携)も
 実装済み(2026-08-21)。`sendMessage`は`[fromAddress, toAddress, toPubEncryptionHex, subject, body,
-ttlSeconds?, ackStealthLevel?]`を取り、宛先の公開暗号鍵を呼び出し側が130桁hex(65byte)で直接渡す
-必要がある(`pubkey_cache`未実装のため自動解決はできない、§5 TODOと同じ制限)。応答は
-`{objectLength, inventoryHash}`(完成object本体はAPI経由では返さない設計)。`getInboxMessages`は
-`[folder?]`でinbox一覧を返す。`tests/test_api_server.c`で両方とも実HTTPリクエストで検証済み。
+ttlSeconds?, ackStealthLevel?]`を取り、`toPubEncryptionHex`は130桁hexまたは`null`/空文字が可能で、
+`null`の場合は`pubkey_cache`(§2.3)から解決する。応答は`{objectLength, inventoryHash}`(完成object
+本体はAPI経由では返さない設計)。`cachePubkey`(`[address, signingPubkeyHex, encryptionPubkeyHex]`)を
+新設し、`pubkey_cache`への手動登録に使う。`getInboxMessages`は`[folder?]`でinbox一覧を返す。
+`tests/test_api_server.c`で`cachePubkey`+`sendMessage(toPubEncryptionHex=null)`の一連の流れを含め、
+実HTTPリクエストで検証済み(2026-08-21)。CLI(`bitmessage-cli`)からも`cache-pubkey`コマンドと
+`send-message ... -`(cache利用の合図)で同じ経路を呼べる。`tests/test_cli_integration.sh`で
+引数検証・cache未登録時のエラー伝播まで確認済み(2026-08-21)。
 
 既知の制限: `bm_api_server_serve_forever`の`accept()`はブロッキングでシグナル等による
 グレースフルシャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../common/hash.h"
@@ -16,6 +17,7 @@
 #include "address.h"
 #include "identity_store.h"
 #include "messages_store.h"
+#include "pubkey_cache.h"
 #include "send_pipeline.h"
 
 #define MAX_REQUEST_SIZE (1 * 1024 * 1024) /* 1MiB上限、DoS対策 */
@@ -278,38 +280,94 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
 }
 
 /*
- * sendMessage: [fromAddress, toAddress, toPubEncryptionHex(130桁hex, 65byte),
+ * sendMessage: [fromAddress, toAddress, toPubEncryptionHex(130桁hex, 65byte)|null,
  *               subject, body, ttlSeconds?, ackStealthLevel?]
  *
- * toPubEncryptionHexは宛先の公開暗号鍵。pubkey_cache(宛先pubkeyの自動解決)が
- * 未実装のため、v1では呼び出し側が既知の相手の公開鍵を直接渡す必要がある(§5 TODO)。
+ * toPubEncryptionHexはnull(またはJSON上省略)可。その場合pubkey_cache(§2.3、cachePubkeyメソッド
+ * 参照)をto_addressのripeで検索する。見つからなければ送信失敗(getpubkey要求による自動取得は
+ * 未実装、TODO)。
  */
+
+/*
+ * cachePubkey: [address, signingPubkeyHex(130桁hex), encryptionPubkeyHex(130桁hex)]
+ *
+ * 手動でpubkey_cacheへ相手の公開鍵を登録する。object_sync_thread(実ネットワークから受信した
+ * pubkeyオブジェクトを自動的にcacheへ投入する処理)は未実装(TODO)のため、v1では既に知っている
+ * 相手の公開鍵をこのメソッドで明示的に登録してからsendMessageのtoPubEncryptionHexを省略する、
+ * という使い方を想定する。
+ */
+static bm_json_value_t *h_cachePubkey(const struct bm_api_server_config *config,
+                                       const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *signing_hex = param_str(params, 1);
+    const char *encryption_hex = param_str(params, 2);
+
+    if (address == NULL || signing_hex == NULL || encryption_hex == NULL)
+    {
+        *out_error = dup_cstr("cachePubkey requires [address, signingPubkeyHex, encryptionPubkeyHex] "
+                              "(each 130 hex characters, 65 bytes, 0x04||X||Y)");
+        return NULL;
+    }
+
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char ripe[BM_RIPE_LEN];
+    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    {
+        *out_error = dup_cstr("invalid address");
+        return NULL;
+    }
+
+    struct bm_cached_pubkey entry;
+    memset(&entry, 0, sizeof(entry));
+    memcpy(entry.ripe, ripe, BM_RIPE_LEN);
+    entry.address_version = version;
+    entry.stream = stream;
+    if (hex_decode_fixed(signing_hex, entry.signing_pubkey, sizeof(entry.signing_pubkey)) != 0
+        || hex_decode_fixed(encryption_hex, entry.encryption_pubkey, sizeof(entry.encryption_pubkey)) != 0)
+    {
+        *out_error = dup_cstr("pubkeys must be exactly 130 hex characters (65 bytes) each");
+        return NULL;
+    }
+
+    if (bm_pubkey_cache_upsert(config->identity_db, &entry, (int64_t)time(NULL)) != 0)
+    {
+        *out_error = dup_cstr("failed to store pubkey cache entry");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
 static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
                                        const bm_json_value_t *params, char **out_error)
 {
     const char *from_address = param_str(params, 0);
     const char *to_address = param_str(params, 1);
-    const char *to_pubenc_hex = param_str(params, 2);
+    const char *to_pubenc_hex = param_str(params, 2); /* NULL可(pubkey_cacheへフォールバック) */
     const char *subject = param_str(params, 3);
     const char *body = param_str(params, 4);
     const bm_json_value_t *ttl_v = bm_json_array_get(params, 5);
     const bm_json_value_t *stealth_v = bm_json_array_get(params, 6);
 
-    if (from_address == NULL || to_address == NULL || to_pubenc_hex == NULL
-        || subject == NULL || body == NULL)
+    if (from_address == NULL || to_address == NULL || subject == NULL || body == NULL)
     {
-        *out_error = dup_cstr("sendMessage requires [fromAddress, toAddress, toPubEncryptionHex, "
-                              "subject, body, ttlSeconds?, ackStealthLevel?]. toPubEncryptionHex is "
-                              "the recipient's public encryption key as 130 hex characters (65 raw "
-                              "bytes, 0x04||X||Y) -- automatic pubkey resolution is not implemented yet.");
+        *out_error = dup_cstr("sendMessage requires [fromAddress, toAddress, toPubEncryptionHex|null, "
+                              "subject, body, ttlSeconds?, ackStealthLevel?]. toPubEncryptionHex may be "
+                              "null to look up the recipient's key from pubkey_cache instead.");
         return NULL;
     }
 
     unsigned char to_pub_encryption[65];
-    if (hex_decode_fixed(to_pubenc_hex, to_pub_encryption, sizeof(to_pub_encryption)) != 0)
+    const unsigned char *to_pub_encryption_ptr = NULL;
+    if (to_pubenc_hex != NULL && to_pubenc_hex[0] != '\0')
     {
-        *out_error = dup_cstr("toPubEncryptionHex must be exactly 130 hex characters (65 bytes)");
-        return NULL;
+        if (hex_decode_fixed(to_pubenc_hex, to_pub_encryption, sizeof(to_pub_encryption)) != 0)
+        {
+            *out_error = dup_cstr("toPubEncryptionHex must be exactly 130 hex characters (65 bytes)");
+            return NULL;
+        }
+        to_pub_encryption_ptr = to_pub_encryption;
     }
 
     uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
@@ -317,12 +375,15 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
 
     unsigned char *object = NULL;
     size_t object_len = 0;
-    int rc = bm_send_pipeline_send_message(config->keyring, config->messages_db, from_address, to_address,
-                                            to_pub_encryption, subject, body, ttl_seconds, ack_stealth_level,
+    int rc = bm_send_pipeline_send_message(config->keyring, config->identity_db, config->messages_db,
+                                            from_address, to_address, to_pub_encryption_ptr,
+                                            subject, body, ttl_seconds, ack_stealth_level,
                                             &object, &object_len);
     if (rc != 0)
     {
-        *out_error = dup_cstr("send failed (is fromAddress unlocked? is toAddress a valid BM- address?)");
+        *out_error = dup_cstr("send failed (is fromAddress unlocked? is toAddress valid? if "
+                              "toPubEncryptionHex was omitted, is the recipient's key cached "
+                              "via cachePubkey?)");
         return NULL;
     }
 
@@ -382,6 +443,7 @@ static const struct bm_api_method METHODS[] = {
     {"deleteAddress", h_deleteAddress},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
+    {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},
     {"getInboxMessages", h_getInboxMessages},
 };

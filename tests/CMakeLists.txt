@@ -39,3 +39,7 @@ add_test(NAME cli_integration
 add_executable(test_network_testnet test_network_testnet.c)
 target_link_libraries(test_network_testnet PRIVATE bm_infra bm_common)
 add_test(NAME network_testnet COMMAND test_network_testnet)
+
+add_executable(test_pubkey_cache test_pubkey_cache.c)
+target_link_libraries(test_pubkey_cache PRIVATE bm_core bm_infra)
+add_test(NAME pubkey_cache COMMAND test_pubkey_cache)

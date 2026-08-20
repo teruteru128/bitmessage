@@ -34,9 +34,13 @@ static void print_usage(const char *prog)
             "  lock <address>\n"
             "  lock-all\n"
             "  delete <address>\n"
-            "  send-message <fromAddress> <toAddress> <toPubEncryptionHex> <subject> <body> "
+            "  cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n"
+            "      相手の公開鍵(いずれも130桁hex)を手動でpubkey_cacheへ登録する\n"
+            "      (実ネットワークからの自動取得は未実装のため)\n"
+            "  send-message <fromAddress> <toAddress> <toPubEncryptionHex|-> <subject> <body> "
             "[ttlSeconds] [ackStealthLevel]\n"
-            "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex、pubkey_cache未実装のため直接指定が必要)\n"
+            "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex)。\"-\"を指定するとcache-pubkeyで\n"
+            "      登録済みの鍵を使う\n"
             "  get-inbox [folder]\n",
             prog);
 }
@@ -181,13 +185,11 @@ int main(int argc, char **argv)
         return call_rpc(&env, "deleteAddress", params);
     }
 
-    if (strcmp(cmd, "send-message") == 0)
+    if (strcmp(cmd, "cache-pubkey") == 0)
     {
-        if (argc < 7 || argc > 9)
+        if (argc != 5)
         {
-            fprintf(stderr,
-                    "使い方: %s send-message <fromAddress> <toAddress> <toPubEncryptionHex> "
-                    "<subject> <body> [ttlSeconds] [ackStealthLevel]\n",
+            fprintf(stderr, "使い方: %s cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n",
                     argv[0]);
             bm_json_free(params);
             return EXIT_FAILURE;
@@ -195,6 +197,31 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         bm_json_array_append(params, bm_json_new_string(argv[3]));
         bm_json_array_append(params, bm_json_new_string(argv[4]));
+        return call_rpc(&env, "cachePubkey", params);
+    }
+
+    if (strcmp(cmd, "send-message") == 0)
+    {
+        if (argc < 7 || argc > 9)
+        {
+            fprintf(stderr,
+                    "使い方: %s send-message <fromAddress> <toAddress> <toPubEncryptionHex|-> "
+                    "<subject> <body> [ttlSeconds] [ackStealthLevel]\n",
+                    argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        /* "-" はpubkey_cacheを使う合図(JSON上はnullを送る) */
+        if (strcmp(argv[4], "-") == 0)
+        {
+            bm_json_array_append(params, bm_json_new_null());
+        }
+        else
+        {
+            bm_json_array_append(params, bm_json_new_string(argv[4]));
+        }
         bm_json_array_append(params, bm_json_new_string(argv[5]));
         bm_json_array_append(params, bm_json_new_string(argv[6]));
         if (argc >= 8)

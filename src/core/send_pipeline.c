@@ -9,8 +9,9 @@
 #include "address.h"
 #include "message_builder.h"
 #include "messages_store.h"
+#include "pubkey_cache.h"
 
-int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *messages_db,
+int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite3 *messages_db,
                                    const char *from_address, const char *to_address,
                                    const unsigned char to_pub_encryption[65],
                                    const char *subject, const char *body,
@@ -32,6 +33,21 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *messages_db,
         return -1;
     }
     (void)to_version; /* msgの共通ヘッダstreamにはtoStreamだけが必要(§5.3) */
+
+    /* to_pub_encryptionが指定されなければpubkey_cacheから引く */
+    unsigned char cached_pub_encryption[65];
+    if (to_pub_encryption == NULL)
+    {
+        struct bm_cached_pubkey cached;
+        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &cached) != 0)
+        {
+            OPENSSL_cleanse(&from_id, sizeof(from_id));
+            return -1; /* 宛先のpubkeyが分からない(getpubkey要求の自動化は未実装、TODO) */
+        }
+        memcpy(cached_pub_encryption, cached.encryption_pubkey, 65);
+        to_pub_encryption = cached_pub_encryption;
+        bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
+    }
 
     struct bm_identity_info from_info;
     memset(&from_info, 0, sizeof(from_info));
@@ -65,11 +81,27 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *messages_db,
         return -1;
     }
 
-    /* TODO(§4.1): 本来は宛先pubkeyが要求する難易度とネットワーク既定値の大きい方を使うべきだが、
-     * pubkey_cache未実装のためv1では送信元アイデンティティの設定値で代用する
-     * (identity.dbの既定値は1000=ネットワーク最低要求値と同じなので実害は小さい)。 */
-    uint64_t target = bm_pow_get_target(payload_len, ttl_seconds, from_id.nonce_trials_per_byte,
-                                         from_id.payload_length_extra_bytes);
+    /* §4.1: 宛先pubkeyが要求する難易度とネットワーク既定値(=from_idの既定設定と同値)の
+     * 大きい方を使う。pubkey_cacheに宛先の情報があれば(address_version>=3のみ意味を持つ、
+     * §5.2)そちらを優先し、無ければ送信元の設定値のみを使う。 */
+    uint64_t required_nonce_trials = from_id.nonce_trials_per_byte;
+    uint64_t required_extra_bytes = from_id.payload_length_extra_bytes;
+    {
+        struct bm_cached_pubkey recipient_info;
+        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &recipient_info) == 0
+            && recipient_info.address_version >= 3)
+        {
+            if (recipient_info.nonce_trials_per_byte > required_nonce_trials)
+            {
+                required_nonce_trials = recipient_info.nonce_trials_per_byte;
+            }
+            if (recipient_info.payload_length_extra_bytes > required_extra_bytes)
+            {
+                required_extra_bytes = recipient_info.payload_length_extra_bytes;
+            }
+        }
+    }
+    uint64_t target = bm_pow_get_target(payload_len, ttl_seconds, required_nonce_trials, required_extra_bytes);
     uint64_t nonce = bm_pow_run(payload, payload_len, target);
 
     size_t object_len = 8 + payload_len;

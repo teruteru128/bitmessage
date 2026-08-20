@@ -13,6 +13,7 @@
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
 #include "../src/core/messages_store.h"
+#include "../src/core/pubkey_cache.h"
 #include "../src/core/send_pipeline.h"
 #include "../src/core/trial_decrypt.h"
 
@@ -79,7 +80,7 @@ int main(void)
 
     unsigned char *object = NULL;
     size_t object_len = 0;
-    int rc = bm_send_pipeline_send_message(&kr, messages_db, sender_address, recv_address,
+    int rc = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
                                             recv_gen.pub_encryption, subject, body,
                                             /*ttl_seconds=*/60, /*ack_stealth_level=*/1,
                                             &object, &object_len);
@@ -127,6 +128,40 @@ int main(void)
 
         printf("OK: send_pipeline -> trial_decrypt -> ack_data一致まで確認\n");
         bm_decoded_msg_free(&decoded);
+    }
+
+    /* pubkey_cacheフォールバック: to_pub_encryption=NULLで呼ぶと、cacheに無ければ失敗し、
+     * 事前にbm_pubkey_cache_upsertしておけば成功する(§2.3, core/pubkey_cache.c) */
+    unsigned char *object_no_pubkey = NULL;
+    size_t object_no_pubkey_len = 0;
+    int rc_no_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
+                                                     NULL, subject, body, 60, 1,
+                                                     &object_no_pubkey, &object_no_pubkey_len);
+    CHECK(rc_no_cache != 0, "sendMessage with NULL pubkey should fail when cache is empty");
+
+    struct bm_cached_pubkey cached;
+    memset(&cached, 0, sizeof(cached));
+    memcpy(cached.ripe, recv_gen.ripe, BM_RIPE_LEN);
+    cached.address_version = 4;
+    cached.stream = 1;
+    memcpy(cached.signing_pubkey, recv_gen.pub_signing, 65);
+    memcpy(cached.encryption_pubkey, recv_gen.pub_encryption, 65);
+    cached.nonce_trials_per_byte = 1000;
+    cached.payload_length_extra_bytes = 1000;
+    CHECK(bm_pubkey_cache_upsert(identity_db, &cached, 1234567890) == 0, "seed pubkey_cache for receiver");
+
+    unsigned char *object_from_cache = NULL;
+    size_t object_from_cache_len = 0;
+    int rc_from_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
+                                                       NULL, subject, body, 60, 1,
+                                                       &object_from_cache, &object_from_cache_len);
+    CHECK(rc_from_cache == 0, "sendMessage with NULL pubkey should succeed once cached");
+    CHECK(object_from_cache != NULL && object_from_cache_len > 0, "cache-derived object non-empty");
+    free(object_from_cache);
+
+    if (failures == 0)
+    {
+        printf("OK: pubkey_cache fallback in send_pipeline (fails empty, succeeds once cached)\n");
     }
 
     free(object);

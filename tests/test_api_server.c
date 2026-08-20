@@ -366,6 +366,45 @@ int main(void)
             free(resp);
         }
 
+        /* cachePubkey + sendMessage(toPubEncryptionHex=null): pubkey_cache経由の送信 */
+        char cache_req[1024];
+        snprintf(cache_req, sizeof(cache_req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"cachePubkey\",\"params\":[\"%s\",\"%s\",\"%s\"],\"id\":14}",
+                 recv_address, recv_pubenc_hex /* signingは省略テストなので同じ値を使い回して構わない */,
+                 recv_pubenc_hex);
+        resp = do_request(cache_req, "testuser", "testpass");
+        CHECK(resp != NULL, "cachePubkey HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1,
+                  "cachePubkey returns true");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        char send_req_cached[1024];
+        snprintf(send_req_cached, sizeof(send_req_cached),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
+                 "\"params\":[\"%s\",\"%s\",null,\"cached subject\",\"cached body\",3600,1],\"id\":15}",
+                 sender_address, recv_address);
+        resp = do_request(send_req_cached, "testuser", "testpass");
+        CHECK(resp != NULL, "sendMessage with null toPubEncryptionHex HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL, "sendMessage with cached pubkey succeeds (no error)");
+            if (result != NULL)
+            {
+                double obj_len = bm_json_as_number(bm_json_object_get(result, "objectLength"));
+                CHECK(obj_len > 0, "sendMessage(cached) objectLength > 0");
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+
         free(recv_address);
     }
 
