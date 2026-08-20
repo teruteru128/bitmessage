@@ -73,4 +73,25 @@ AUTH_FAIL_OUTPUT=$(BM_API_PASS="wrongpassword" "$CLI" list-addresses 2>&1 || tru
 echo "$AUTH_FAIL_OUTPUT" | grep -q "認証に失敗" \
     || fail "wrong credentials should be rejected with an auth error (got: $AUTH_FAIL_OUTPUT)"
 
+# get-inbox: 空のDBでは空配列
+[ "$("$CLI" get-inbox)" = "[]" ] || fail "get-inbox should be empty initially"
+
+# send-message: CLI層の引数検証・API層のエラーがCLIまで正しく伝播することを確認する
+# (有効な宛先公開鍵をシェルスクリプトから直接得る手段が無いため、成功パスはtests/test_api_server.cで
+#  カバーする。ここではCLI→API→エラー応答→CLI表示までの配線を検証する)
+ADDR2_JSON=$("$CLI" create-address "cli send-message test" 4 1 1 "sender2" "storepass2")
+ADDR2=$(echo "$ADDR2_JSON" | tr -d '"')
+[ "$("$CLI" unlock "$ADDR2" "storepass2")" = "true" ] || fail "unlock sender2 for send-message test"
+
+SHORT_HEX_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2" "abcd" "subj" "body" 2>&1 || true)
+echo "$SHORT_HEX_OUTPUT" | grep -q "130 hex" \
+    || fail "send-message with too-short pubkey hex should report the 130-hex-char requirement (got: $SHORT_HEX_OUTPUT)"
+
+GARBAGE_HEX=$(printf '00%.0s' $(seq 1 65))
+SEND_FAIL_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2" "$GARBAGE_HEX" "subj" "body" 2>&1 || true)
+echo "$SEND_FAIL_OUTPUT" | grep -q "エラー" \
+    || fail "send-message with a non-curve-point pubkey should fail with an error (got: $SEND_FAIL_OUTPUT)"
+
+"$CLI" delete "$ADDR2" >/dev/null
+
 echo "ALL OK"

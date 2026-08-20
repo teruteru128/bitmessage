@@ -33,7 +33,11 @@ static void print_usage(const char *prog)
             "  unlock <address> <passphrase>\n"
             "  lock <address>\n"
             "  lock-all\n"
-            "  delete <address>\n",
+            "  delete <address>\n"
+            "  send-message <fromAddress> <toAddress> <toPubEncryptionHex> <subject> <body> "
+            "[ttlSeconds] [ackStealthLevel]\n"
+            "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex、pubkey_cache未実装のため直接指定が必要)\n"
+            "  get-inbox [folder]\n",
             prog);
 }
 
@@ -175,6 +179,48 @@ int main(int argc, char **argv)
         }
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         return call_rpc(&env, "deleteAddress", params);
+    }
+
+    if (strcmp(cmd, "send-message") == 0)
+    {
+        if (argc < 7 || argc > 9)
+        {
+            fprintf(stderr,
+                    "使い方: %s send-message <fromAddress> <toAddress> <toPubEncryptionHex> "
+                    "<subject> <body> [ttlSeconds] [ackStealthLevel]\n",
+                    argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_string(argv[4]));
+        bm_json_array_append(params, bm_json_new_string(argv[5]));
+        bm_json_array_append(params, bm_json_new_string(argv[6]));
+        if (argc >= 8)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[7])));
+        }
+        if (argc >= 9)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[8])));
+        }
+        return call_rpc(&env, "sendMessage", params);
+    }
+
+    if (strcmp(cmd, "get-inbox") == 0)
+    {
+        if (argc > 3)
+        {
+            fprintf(stderr, "使い方: %s get-inbox [folder]\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        if (argc == 3)
+        {
+            bm_json_array_append(params, bm_json_new_string(argv[2]));
+        }
+        return call_rpc(&env, "getInboxMessages", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);
