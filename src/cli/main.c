@@ -54,8 +54,8 @@ static void print_usage(const char *prog)
             "  list-subscriptions\n"
             "  get-socks-proxy\n"
             "  set-socks-proxy <enabled:0|1> <host> <port>\n"
-            "      outbound接続用SOCKS5プロキシ(Tor等)の設定。config.dbへ永続化されるが、\n"
-            "      稼働中のbitmessagedには反映されない(再起動が必要)\n",
+            "      outbound接続用SOCKS5プロキシ(Tor等)の設定。config.dbへ永続化され、稼働中の\n"
+            "      bitmessagedにも次の再接続サイクル(既定30秒以内)で反映される(再起動不要)\n",
             prog);
 }
 

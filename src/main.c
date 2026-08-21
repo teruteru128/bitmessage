@@ -109,8 +109,10 @@ int main(void)
     }
     fprintf(stderr, "DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
 
-    /* §11 outbound接続用SOCKS5プロキシ設定。CLIのset-socks-proxyで永続化された値を起動時に
-     * 読み込む(実行中の変更はこの起動には反映されない、次回起動から有効)。 */
+    /* §11 outbound接続用SOCKS5プロキシ設定。起動時ログ用に一度読むだけで、実際に
+     * peer_connector_threadが使う値は再接続サイクルのたびconfig_dbから読み直される
+     * (§11設定変更の動的リロード、peer_connector.c参照)。CLIのset-socks-proxyでの変更は
+     * daemon再起動なしで次の再接続サイクル(既定30秒間隔)から反映される。 */
     struct bm_socks_proxy_config socks_proxy_config;
     bm_config_store_get_socks_proxy(config_db, &socks_proxy_config);
     fprintf(stderr, "[config] socks proxy: %s (%s:%d)\n",
@@ -240,7 +242,7 @@ int main(void)
         pc_args->config.max_outbound = BM_MAX_OUTBOUND;
         pc_args->config.user_agent = BM_USER_AGENT;
         pc_args->config.registry = &peer_registry;
-        pc_args->config.socks_proxy = &socks_proxy_config;
+        pc_args->config.config_db = config_db;
         pc_args->stop_flag = &peer_connector_stop;
         pthread_create(&th_peer_connector, NULL, bm_peer_connector_thread, pc_args);
         peer_connector_started = 1;

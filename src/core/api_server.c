@@ -687,8 +687,9 @@ static bm_json_value_t *h_getSocksProxy(const struct bm_api_server_config *confi
 
 /*
  * setSocksProxy: [enabled, host, port]
- * 変更はconfig.dbへ永続化されるが、稼働中のpeer_connector_threadには反映されない(起動時に
- * 読み込んだ値を使い続ける設計、DESIGN.md §11)。反映にはbitmessagedの再起動が必要。
+ * 変更はconfig.dbへ即座に永続化される。稼働中のpeer_connector_threadは再接続サイクルの
+ * たびconfig.dbを読み直すため(§11設定変更の動的リロード)、daemon再起動なしで次の
+ * 再接続サイクル(既定30秒以内)から反映される。
  */
 static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *config,
                                          const bm_json_value_t *params, char **out_error)

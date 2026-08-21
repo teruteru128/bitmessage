@@ -24,7 +24,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
   参加(`joinChan`)、自分自身宛のsendMessageで投稿、他メンバーはtrial_decryptで自動復号
 - **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
 - **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
-  mainnetシード全滅時の代替経路確保が主な動機
+  mainnetシード全滅時の代替経路確保が主な動機。設定変更はdaemon再起動なしで次の再接続
+  サイクル(既定30秒以内)から反映される
 - **addrホストのフィルタリング**: 受信した`addr`情報からprivate/loopback/link-local等の
   アドレスを除外(内部ネットワークへの誤接続防止)
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を
@@ -36,8 +37,7 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 ### v1スコープ外(既知の制限、backlog)
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
-- 設定変更の動的リロード(SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、
-  手動peer追加(`addPeer`) —
+- 手動peer追加(`addPeer`) —
   詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド
@@ -98,7 +98,8 @@ CHAN=$($CLI join-chan "my chan passphrase" "my chan" "store passphrase" | tr -d 
 $CLI unlock "$CHAN" "store passphrase"
 $CLI send-message "$CHAN" "$CHAN" - "subject" "body" 3600 1
 
-# outbound接続をSOCKS5プロキシ(Tor等)経由にする。反映にはbitmessagedの再起動が必要
+# outbound接続をSOCKS5プロキシ(Tor等)経由にする。次の再接続サイクル(既定30秒以内)で
+# daemon再起動なしに反映される
 $CLI set-socks-proxy 1 127.0.0.1 9050
 $CLI get-socks-proxy
 

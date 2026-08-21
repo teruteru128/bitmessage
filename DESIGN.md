@@ -1226,11 +1226,36 @@ deterministic`を呼べば誰でも同一のアドレス・鍵ペアを導出で
   `unlock`→`send-message`(自分自身宛)の一連の流れが動作することを確認済み。
   ctest 18件全通過。
 
+### 設定変更の動的リロード(2026-08-21)
+
+backlog優先順位の6番目、これで洗い出していた項目は全て完了した。SOCKS5プロキシ設定
+(config.db)は永続化されていたが、`peer_connector_thread`が起動時に読んだ値の
+スナップショットを生存期間中ずっと使い続ける作りだったため、`setSocksProxy`での変更は
+daemon再起動まで反映されなかった。
+
+対応方針は「専用のreload機構(シグナルハンドラや別スレッド等)を新設する」のではなく、
+既存の再接続ポーリングループ(`peer_connector_thread`、既定30秒間隔で
+`bm_peer_connector_connect_initial`を呼び直す設計、§1.1参照)にただ乗りする形にした。
+`bm_peer_connector_config`の`socks_proxy`(固定スナップショットへのポインタ)フィールドを
+`config_db`(sqlite3ハンドル)に置き換え、`bm_peer_connector_connect_initial`が呼ばれる
+たびに`bm_config_store_get_socks_proxy`で都度読み直すようにした。これにより、
+`setSocksProxy`での変更はdaemon再起動なしで次の再接続サイクル(既定30秒以内)から
+反映されるようになった。`main.c`は起動時ログ表示用に1回読むだけで、実際に
+`peer_connector_thread`が使う値の受け渡しは`config_db`ハンドルそのものになった。
+
+`tests/test_config_store.c`のSOCKS5経由接続テストも、`struct`に直接値を詰める代わりに
+`bm_config_store_set_socks_proxy`でconfig.dbへ永続化してから`bm_peer_connector_config.
+config_db`経由で渡す形に変更し、実際の動的リロード経路そのものを検証するようにした。
+実daemon(testnet)でも、起動直後は直結で接続し、稼働中に`set-socks-proxy`した後
+(daemon再起動なし)、次の再接続サイクルで`(via SOCKS5)`表示に切り替わることをログで
+確認済み。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
-- **設定変更の動的リロード**: SOCKS5プロキシ設定は永続化したものの、稼働中プロセスへの
-  反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。優先度は低いが実運用に
-  近づくほど効いてくる。
+2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・
+直接pubkey送信の自動再送・DoS上限の見直し・chan仕様・設定変更の動的リロード)は全て完了した。
+残るのは以下の通り。
+
 - **手動peer追加(`addPeer`)**: mainnetシード全滅時、addr永続化(§11「addr受信のpeer_manager
   永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
   最後の手段として、ユーザーが個人的に(掲示板等ではなく実際に運用者と面識のある経路で)

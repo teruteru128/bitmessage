@@ -198,11 +198,16 @@ int main(void)
     struct bm_peer_registry registry;
     bm_peer_registry_init(&registry);
 
+    /* §11 設定変更の動的リロード: peer_connectorはstruct経由の固定スナップショットではなく、
+     * config_dbを渡してconnect_initialが呼ばれるたび読み直す設計になったため、ここでも
+     * config.dbへ永続化してから渡す(setSocksProxy APIでの変更が反映される経路そのもの) */
     struct bm_socks_proxy_config socks_proxy;
     memset(&socks_proxy, 0, sizeof(socks_proxy));
     socks_proxy.enabled = 1;
     strncpy(socks_proxy.host, "127.0.0.1", sizeof(socks_proxy.host) - 1);
     socks_proxy.port = mock_port;
+    CHECK(bm_config_store_set_socks_proxy(config_db, &socks_proxy) == 0,
+          "persist socks proxy config for peer_connector to read");
 
     struct bm_peer_connector_config pc_config;
     memset(&pc_config, 0, sizeof(pc_config));
@@ -212,7 +217,7 @@ int main(void)
     pc_config.max_outbound = 1;
     pc_config.user_agent = "/bitmessage-c-test:0.1.0/";
     pc_config.registry = &registry;
-    pc_config.socks_proxy = &socks_proxy;
+    pc_config.config_db = config_db;
 
     int connected = bm_peer_connector_connect_initial(&pc_config);
     CHECK(connected == 1, "should connect exactly 1 peer via the socks proxy");

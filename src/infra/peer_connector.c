@@ -274,6 +274,16 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
 {
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
 
+    /* §11 設定変更の動的リロード: 呼ばれるたびconfig.dbから読み直す(スナップショットを
+     * 保持しない)ことで、setSocksProxy APIでの変更がdaemon再起動なしで次回呼び出し
+     * (=次の再接続サイクル、既定30秒間隔)から反映されるようにする */
+    struct bm_socks_proxy_config socks_proxy;
+    memset(&socks_proxy, 0, sizeof(socks_proxy));
+    if (config->config_db != NULL)
+    {
+        bm_config_store_get_socks_proxy(config->config_db, &socks_proxy);
+    }
+
     size_t already_connected = config->registry != NULL ? bm_peer_registry_count(config->registry) : 0;
     if ((int)already_connected >= config->max_outbound)
     {
@@ -298,10 +308,9 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         }
 
         fprintf(stderr, "[peer_connector] connecting to %s:%d%s...\n",
-                candidates[i].ip_address, candidates[i].port,
-                (config->socks_proxy != NULL && config->socks_proxy->enabled) ? " (via SOCKS5)" : "");
+                candidates[i].ip_address, candidates[i].port, socks_proxy.enabled ? " (via SOCKS5)" : "");
         int sock = open_peer_connection(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC,
-                                         config->socks_proxy);
+                                         &socks_proxy);
         if (sock < 0)
         {
             fprintf(stderr, "[peer_connector] failed to connect to %s:%d\n",
