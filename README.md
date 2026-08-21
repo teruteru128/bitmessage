@@ -26,6 +26,9 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
   mainnetシード全滅時の代替経路確保が主な動機。設定変更はdaemon再起動なしで次の再接続
   サイクル(既定30秒以内)から反映される
+- **v3 onionピア探索**: PyBitmessage準拠の`OBJECT_ONIONPEER`(専用object type)を受信し、
+  ネットワーク上で生存しているv3 onionピアを`peers.db`へ自動登録(受信のみ、自身のonion
+  hidden serviceの運用・announceはinbound Tor同様スコープ外)
 - **addrホストのフィルタリング**: 受信した`addr`情報からprivate/loopback/link-local等の
   アドレスを除外(内部ネットワークへの誤接続防止)
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を

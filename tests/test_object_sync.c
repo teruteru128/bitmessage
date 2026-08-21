@@ -478,6 +478,108 @@ int main(void)
         sqlite3_finalize(private_stmt);
     }
 
+    /* --- 7. onionpeer object(BM_OBJECT_ONIONPEER)受信 -> v3 onionピアをpeers.dbへ登録(§11)
+     * PyBitmessageの実ワイヤーフォーマット(class_singleWorker.pyのsendOnionPeerObj)に合わせ、
+     * varint(port) || 0xfd87d87eeb43(OnionCat prefix) || 35byteのed25519鍵バイト列、という
+     * payloadを持つobjectを実PoW付きで組み立てて受信させる --- */
+    {
+        /* RFC4648 base32(小文字、大文字小文字を区別しない)デコード。実際に流通していた
+         * v3 onionアドレス文字列(56文字)を、ワイヤー上の生バイト列(35byte)へ変換するための
+         * テスト専用ヘルパー(本体側はbase32_encode_lowerのみ持つ、逆方向はテストにしか要らない) */
+        const char *onion_b32 = "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id";
+        unsigned char onion_key[35];
+        memset(onion_key, 0, sizeof(onion_key));
+        {
+            uint64_t buffer = 0;
+            int bits = 0;
+            size_t out_pos = 0;
+            for (size_t i = 0; onion_b32[i] != '\0'; i++)
+            {
+                char c = onion_b32[i];
+                int val = (c >= 'a' && c <= 'z') ? (c - 'a') : (c >= '2' && c <= '7') ? (c - '2' + 26) : -1;
+                CHECK(val >= 0, "test onion address should be valid lowercase base32");
+                buffer = (buffer << 5) | (unsigned)val;
+                bits += 5;
+                if (bits >= 8)
+                {
+                    bits -= 8;
+                    onion_key[out_pos++] = (unsigned char)((buffer >> bits) & 0xff);
+                }
+            }
+            CHECK(out_pos == sizeof(onion_key), "decoded onion key should be exactly 35 bytes");
+        }
+
+        unsigned char onion_payload_body[bm_varint_size(8444) + 6 + 35];
+        unsigned char *p = onion_payload_body;
+        bm_varint_encode(p, 8444); /* port */
+        p += bm_varint_size(8444);
+        static const unsigned char ONIONCAT_PREFIX[6] = {0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43};
+        memcpy(p, ONIONCAT_PREFIX, sizeof(ONIONCAT_PREFIX));
+        p += sizeof(ONIONCAT_PREFIX);
+        memcpy(p, onion_key, sizeof(onion_key));
+        p += sizeof(onion_key);
+        size_t onion_payload_body_len = (size_t)(p - onion_payload_body);
+
+        uint64_t onion_ttl = 3600;
+        uint64_t onion_expires = (uint64_t)time(NULL) + onion_ttl;
+        unsigned char onion_prefix[8 + 4 + bm_varint_size(3) + bm_varint_size(1)];
+        unsigned char *op = onion_prefix;
+        for (int i = 0; i < 8; i++)
+        {
+            op[i] = (unsigned char)((onion_expires >> (56 - 8 * i)) & 0xff);
+        }
+        op += 8;
+        uint32_t onion_type = BM_OBJECT_ONIONPEER;
+        for (int i = 0; i < 4; i++)
+        {
+            op[i] = (unsigned char)((onion_type >> (24 - 8 * i)) & 0xff);
+        }
+        op += 4;
+        bm_varint_encode(op, 3); /* object version = 3 (v3 onion, PyBitmessage準拠) */
+        op += bm_varint_size(3);
+        bm_varint_encode(op, 1); /* stream */
+        op += bm_varint_size(1);
+        size_t onion_prefix_len = (size_t)(op - onion_prefix);
+
+        size_t onion_full_payload_len = onion_prefix_len + onion_payload_body_len;
+        unsigned char *onion_full_payload = malloc(onion_full_payload_len);
+        memcpy(onion_full_payload, onion_prefix, onion_prefix_len);
+        memcpy(onion_full_payload + onion_prefix_len, onion_payload_body, onion_payload_body_len);
+
+        uint64_t onion_target = bm_pow_get_target(onion_full_payload_len, onion_ttl, 1000, 1000);
+        uint64_t onion_nonce = bm_pow_run(onion_full_payload, onion_full_payload_len, onion_target);
+
+        size_t onion_object_len = 8 + onion_full_payload_len;
+        unsigned char *onion_object = malloc(onion_object_len);
+        for (int i = 0; i < 8; i++)
+        {
+            onion_object[i] = (unsigned char)((onion_nonce >> (56 - 8 * i)) & 0xff);
+        }
+        memcpy(onion_object + 8, onion_full_payload, onion_full_payload_len);
+        free(onion_full_payload);
+
+        struct bm_message onion_msg;
+        memset(&onion_msg, 0, sizeof(onion_msg));
+        memcpy(onion_msg.command, "object", 6);
+        onion_msg.length = (uint32_t)onion_object_len;
+        onion_msg.payload = onion_object;
+        bm_object_sync_dispatch(conn, &onion_msg, &ctx);
+        free(onion_object);
+
+        sqlite3_stmt *onion_stmt = NULL;
+        sqlite3_prepare_v2(peers_db,
+                            "SELECT port, source FROM hosts WHERE ip_address = "
+                            "'f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion';",
+                            -1, &onion_stmt, NULL);
+        CHECK(sqlite3_step(onion_stmt) == SQLITE_ROW,
+              "v3 onion peer from onionpeer object should be registered into peers.db");
+        CHECK(sqlite3_column_int(onion_stmt, 0) == 8444, "registered onion peer port should match");
+        const char *onion_source = (const char *)sqlite3_column_text(onion_stmt, 1);
+        CHECK(onion_source != NULL && strcmp(onion_source, "onionpeer_obj") == 0,
+              "registered onion peer source should be 'onionpeer_obj'");
+        sqlite3_finalize(onion_stmt);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

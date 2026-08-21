@@ -18,6 +18,12 @@ enum bm_object_type
     BM_OBJECT_PUBKEY = 1,
     BM_OBJECT_MSG = 2,
     BM_OBJECT_BROADCAST = 3,
+    /* §11 outbound Tor経路の強化。PyBitmessage(class_singleWorker.pyのsendOnionPeerObj/
+     * class_objectProcessor.pyのprocessonion)準拠。ASCII "tor"の16進表現。addr/version
+     * メッセージの16byte固定node encoding(v2 onionの80bitしか収まらない)とは別経路で、
+     * objectペイロード末尾までを可変長のホストエンコードとして使うため、v3 onion(56文字
+     * →35byte)も正しく往復できる */
+    BM_OBJECT_ONIONPEER = 0x746f72,
 };
 
 /* §5.0: nonce(8)||expiresTime(8)||objectType(4)||varint(version)||varint(stream) */

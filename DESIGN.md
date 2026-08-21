@@ -1282,6 +1282,47 @@ REPコード(host unreachable/connection refused等)を人間可読な文字列�
 診断ログを出して次の候補へ継続すること)の両方を確認済み。ctest 18件全通過(既存挙動に
 変更なし、診断ログの追加のみ)。
 
+### v3 onionピア探索(OBJECT_ONIONPEER)の実装(2026-08-21)
+
+上記調査で「onion peer探索はaddr/versionメッセージ経由では原理的に無価値」と結論したが、
+ユーザーの指摘(自身の2020年当時のkeys.datに残っていた`onionhostname`設定を手がかりに
+`knownnodes.py`を辿るよう指示)を受けて再調査した結果、これは誤りだったと判明した。
+
+PyBitmessage実ソース(`class_singleWorker.py`の`sendOnionPeerObj`、`class_objectProcessor.py`
+の`processonion`、`protocol.py`)を精読すると、`OBJECT_ONIONPEER`(`0x746f72`、ASCII "tor")
+という**専用のobject type**が存在し、これはaddr/versionメッセージの16byte固定node encoding
+とは別経路であることが分かった。version messageのnode encodingだけが`encodeHost(host)[:16]`
+で明示的に16byteへ切り詰めているのに対し、onionpeer objectの`objectPayload = encodeVarint
+(peer.port) + protocol.encodeHost(peer.host)`にはこの切り詰めが無く、objectペイロードの
+残り全体を可変長のホストバイト列として使う。受信側`processonion`も`checkIPAddress`へ
+残りバイト全部を渡すため、v2(10byte→16文字)でもv3(35byte→56文字)でも、base32
+encode/decodeがそのまま正しく往復する。つまりこのobject typeは`getpubkey`/`pubkey`/`msg`/
+`broadcast`と同じ`inv`/`object`のPoW付き配信に乗る形で、実際に生きているv3 onionピアを
+ネットワークから発見できる設計だった。
+
+自分自身のonionピア情報をannounceする送信側(`sendOnionPeerObj`)は、inbound Tor
+(hidden service)自体がスコープ外のため今回は実装しない。**受信側のみ**実装した:
+
+- `infra/object.h`に`BM_OBJECT_ONIONPEER = 0x746f72`を追加。
+- `infra/object_sync.c`に`base32_encode_lower`(RFC4648小文字・パディング無し、v2=10byte
+  →16文字/v3=35byte→56文字はどちらも5bit境界にきれいに乗るため実装は単純)と
+  `handle_incoming_onionpeer`を追加。ワイヤーフォーマット(varint(port) ||
+  0xfd87d87eeb43[OnionCat prefix] || onion鍵バイト列)をパースし、prefix+35byte
+  (v3)の場合のみ`peers.db`へ登録する(v2の10byteはTorが2021年に廃止済みで無価値のため
+  無視)。`handle_object`の既存dispatch chain(PoW検証・重複排除・object_pool.db挿入・
+  inv再broadcastは全object type共通で既に適用済み)に新しいtype分岐を追加するだけで済んだ。
+- `infra/peer_manager.c/h`の`bm_peer_manager_upsert_from_addr`を`bm_peer_manager_upsert_
+  learned`に一般化し(`source`を引数化)、addrメッセージ由来(`'addr_msg'`)とonionpeer
+  object由来(`'onionpeer_obj'`)を両方この1関数で扱えるようにした。
+- `tests/test_object_sync.c`に、ユーザー自身の実在した(2020年当時の)v3 onionアドレス
+  `f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion`を使い、実際のワイヤー
+  フォーマット通りに組み立てた実PoW付きobjectを受信させ、`peers.db`へ`source=
+  'onionpeer_obj'`で正しく登録されることを確認するcaseを追加(base32エンコード/デコードの
+  往復も含めて実データで検証済み)。実daemon(testnet)でも60秒間の通常稼働(3peer接続・
+  version/addr処理)に新しいdispatch分岐が悪影響を与えないことを確認済み(この短時間の
+  試行では実際のonionpeer objectには遭遇しなかったが、実装自体は上記の実データテストで
+  検証済み)。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・

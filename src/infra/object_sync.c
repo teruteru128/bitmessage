@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "../common/hash.h"
+#include "../common/varint.h"
 #include "../core/address.h"
 #include "../core/broadcast_decrypt.h"
 #include "../core/message_builder.h"
@@ -369,6 +370,78 @@ static void handle_incoming_broadcast(struct bm_object_sync_ctx *ctx, const stru
     bm_subscription_list_free(subs);
 }
 
+/* RFC4648 base32(小文字、パディング無し)。§11 outbound Tor経路の強化: onionpeer objectの
+ * ホストバイト列(v2=10byte→16文字、v3=35byte→56文字、どちらも5bit境界にきれいに乗るため
+ * パディング不要)をonionアドレス文字列へ復元するために使う。out には len*8/5 バイト分の
+ * 領域が必要(呼び出し側でlenを10または35に限定して呼ぶため常に割り切れる) */
+static size_t base32_encode_lower(const unsigned char *data, size_t len, char *out)
+{
+    static const char ALPHABET[32] = "abcdefghijklmnopqrstuvwxyz234567";
+    size_t out_len = 0;
+    uint64_t buffer = 0;
+    int bits = 0;
+    for (size_t i = 0; i < len; i++)
+    {
+        buffer = (buffer << 8) | data[i];
+        bits += 8;
+        while (bits >= 5)
+        {
+            bits -= 5;
+            out[out_len++] = ALPHABET[(buffer >> bits) & 0x1f];
+        }
+    }
+    if (bits > 0)
+    {
+        out[out_len++] = ALPHABET[(buffer << (5 - bits)) & 0x1f];
+    }
+    return out_len;
+}
+
+/*
+ * §11 outbound Tor経路の強化: PyBitmessage(class_singleWorker.pyのsendOnionPeerObj/
+ * class_objectProcessor.pyのprocessonion)準拠のonionpeer object(BM_OBJECT_ONIONPEER)を
+ * 受信し、v3 onionピア(56文字、35byte ed25519鍵ベース)をpeers.dbへ登録する。addr/version
+ * メッセージの16byte固定node encodingとは異なりobjectペイロード末尾までを可変長のホスト
+ * バイト列として使うため、v3もそのまま運べる(ワイヤーフォーマット: varint(port) ||
+ * 0xfd87d87eeb43(OnionCat prefix) || onion鍵バイト列)。v2(10byte→16文字)はTorが2021年に
+ * 廃止済みで実害が無いため無視する。
+ */
+static void handle_incoming_onionpeer(struct bm_object_sync_ctx *ctx, const struct bm_object_header *hdr,
+                                       const struct bm_message *msg)
+{
+    static const unsigned char ONIONCAT_PREFIX[6] = {0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43};
+    static const size_t V3_ONION_KEY_LEN = 35; /* 32byte ed25519 pubkey + 2byte checksum + 1byte version */
+
+    const unsigned char *body = msg->payload + hdr->header_len;
+    size_t body_len = msg->length - hdr->header_len;
+
+    uint64_t port = 0;
+    size_t port_len = bm_varint_decode(body, body_len, &port);
+    if (port_len == 0 || port == 0 || port > 65535)
+    {
+        return;
+    }
+    const unsigned char *host = body + port_len;
+    size_t host_len = body_len - port_len;
+
+    if (host_len != sizeof(ONIONCAT_PREFIX) + V3_ONION_KEY_LEN
+        || memcmp(host, ONIONCAT_PREFIX, sizeof(ONIONCAT_PREFIX)) != 0)
+    {
+        return; /* v2(10byte)や不正な形式は無視 */
+    }
+
+    char onion_address[56 + 6 + 1]; /* 56文字 + ".onion" + NUL */
+    size_t b32_len = base32_encode_lower(host + sizeof(ONIONCAT_PREFIX), V3_ONION_KEY_LEN, onion_address);
+    memcpy(onion_address + b32_len, ".onion", 7); /* ".onion" + NUL */
+
+    if (ctx->peers_db != NULL
+        && bm_peer_manager_upsert_learned(ctx->peers_db, onion_address, (int)port, (int)hdr->stream, 1,
+                                           (int64_t)time(NULL), "onionpeer_obj") == 0)
+    {
+        fprintf(stderr, "[object_sync] discovered v3 onion peer: %s:%" PRIu64 "\n", onion_address, port);
+    }
+}
+
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
                            const struct bm_message *msg)
 {
@@ -481,6 +554,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     else if (hdr.object_type == BM_OBJECT_BROADCAST)
     {
         handle_incoming_broadcast(ctx, msg);
+    }
+    else if (hdr.object_type == BM_OBJECT_ONIONPEER)
+    {
+        handle_incoming_onionpeer(ctx, &hdr, msg);
     }
 }
 
@@ -687,8 +764,8 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     {
                         continue;
                     }
-                    if (bm_peer_manager_upsert_from_addr(ctx->peers_db, ip_str, e->port, (int)e->stream,
-                                                          e->services, (int64_t)e->time) == 0)
+                    if (bm_peer_manager_upsert_learned(ctx->peers_db, ip_str, e->port, (int)e->stream,
+                                                        e->services, (int64_t)e->time, "addr_msg") == 0)
                     {
                         registered++;
                     }

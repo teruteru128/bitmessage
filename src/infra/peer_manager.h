@@ -50,12 +50,12 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet);
 int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port, int stream, int success);
 
 /*
- * §1/§11: addrメッセージ(infra/object_sync.c)で教えられたホストを登録する。既存行があれば
- * services/last_seenのみ更新し、rating/sourceは変更しない(実際の接続実績で積み上げたrating
- * を、単なる伝聞情報で上書き・リセットしないため)。新規行ならrating=0.0, source='addr_msg'で
- * 挿入する。成功時0。
+ * §1/§11: addrメッセージ/onionpeer object(infra/object_sync.c)等、ネットワークからの
+ * 伝聞情報で教えられたホストを登録する。既存行があればservices/last_seenのみ更新し、
+ * rating/sourceは変更しない(実際の接続実績で積み上げたratingを、単なる伝聞情報で
+ * 上書き・リセットしないため)。新規行ならrating=0.0, source=sourceで挿入する。成功時0。
  */
-int bm_peer_manager_upsert_from_addr(sqlite3 *db, const char *ip_address, int port, int stream,
-                                      uint64_t services, int64_t last_seen);
+int bm_peer_manager_upsert_learned(sqlite3 *db, const char *ip_address, int port, int stream,
+                                    uint64_t services, int64_t last_seen, const char *source);
 
 #endif /* BM_INFRA_PEER_MANAGER_H */
