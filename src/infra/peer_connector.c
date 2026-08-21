@@ -10,6 +10,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../core/config_store.h"
@@ -312,6 +313,16 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
 
 int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *config)
 {
+    /* §11 peers.dbの低rating/古いノードのクリーンアップ。seed_bootstrapより前に呼ぶことで、
+     * クリーンアップの結果hostsテーブルが完全に空になった場合でも同じ呼び出し内で
+     * 既定シードが再投入される(bm_peer_manager_seed_bootstrapはテーブルが空の時のみ
+     * 動作するため) */
+    int cleaned = bm_peer_manager_cleanup(config->peers_db, (int64_t)time(NULL));
+    if (cleaned > 0)
+    {
+        fprintf(stderr, "[peer_connector] cleaned up %d stale/low-rating peer(s) from peers.db\n", cleaned);
+    }
+
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
 
     /* §11 設定変更の動的リロード: 呼ばれるたびconfig.dbから読み直す(スナップショットを

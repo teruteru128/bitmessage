@@ -1335,11 +1335,42 @@ BM_PROJECT_VERSION "/"`と組み立てるだけにした。以後はCMakeLists.t
 上げれば自動的に反映される。実バイナリに`/bitmessage-c:1.0.0/`が正しく埋め込まれること
 を`strings`で確認、実daemon(testnet)での動作にも影響が無いことを確認済み。ctest 18件全通過。
 
+### peers.dbの低rating/古いノードのクリーンアップ(2026-08-21)
+
+`bm_peer_manager_record_result`はratingを-1.0で下限クランプするだけで、`hosts`テーブルから
+行を削除する処理が無いことが判明した(ユーザー指摘、検索した限りDELETE文が1つも無いことを
+確認済み)。rating DESC順で候補を選ぶ設計上、死んだノードが新しい候補の選定を直接妨げることは
+無いが(常に一番下に沈む)、DB内に永久に残り続ける。
+
+PyBitmessage(`network/knownnodes.py`)の実装を参考にした: `singleCleaner`スレッドが5分間隔
+(`cycleLength=300`)で`cleanupKnownNodes`を呼び、(1) `lastseen`から28日(2419200秒)経過した
+ノードはrating問わず無条件削除、(2) `lastseen`から3時間(10800秒)経過かつ
+`rating <= knownNodesForgetRating`(定数`-0.5`)のノードを削除、(3) streamごとに最低1ノードは
+残す、という方式だった。
+
+この実装では同じ2条件(28日/3時間+rating<=-0.5)を`peer_manager.c`に
+`bm_peer_manager_cleanup(db, now)`として追加した。「streamごとに最低1ノードは残す」安全弁は
+実装していない: `bm_peer_manager_seed_bootstrap`が`hosts`テーブル完全空の場合のみ既定シードを
+再投入する既存の仕組みが、テーブル全体が空になった場合の実質的な安全弁として機能するため
+(そもそもv1スコープでは実質streamは1のみで、複数streamの共存自体を想定していない)。
+`bm_peer_manager_cleanup`は§11設定変更の動的リロードと同じパターンで
+`bm_peer_connector_connect_initial`(`bm_peer_manager_seed_bootstrap`の直前、テーブルが
+空になった場合に同じ呼び出し内で再シードされるように)から毎回(再接続サイクルの既定30秒
+間隔)呼ばれる。
+
+`tests/test_network_testnet.c`に、28日超・3時間超+rating<=-0.5・境界値未満・新しい低rating・
+新しい高rating、の5パターンを仕込んで削除対象が正確に2件だけになることを確認するcaseを
+追加。実daemonでも劇的な効果を確認できた: 稼働中のbootstrap daemon(4484件、うち9件の死んだ
+mainnetシード全てrating=-1.0・4422件のknownnodes_2020インポートの大半が組織的な再試行で
+既にrating<=-0.5まで減衰済み)を新バイナリで再起動したところ、起動直後の1サイクルで
+4431件が一括削除され、59件(生存確認済み3件+新鮮なaddr伝播56件)まで整理された。その後も
+生存ノードへの接続・addr受信が正常に継続することを確認済み。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・
-直接pubkey送信の自動再送・DoS上限の見直し・chan仕様・設定変更の動的リロード)は全て完了した。
-残るのは以下の通り。
+直接pubkey送信の自動再送・DoS上限の見直し・chan仕様・設定変更の動的リロード)、および
+その後追加で対応したpeers.dbクリーンアップは全て完了した。残るのは以下の通り。
 
 - **手動peer追加(`addPeer`)**: mainnetシード全滅時、addr永続化(§11「addr受信のpeer_manager
   永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
@@ -1354,19 +1385,6 @@ BM_PROJECT_VERSION "/"`と組み立てるだけにした。以後はCMakeLists.t
   (rating方式は接続実績で信用を積み上げる仕組みであり、bootstrap候補そのものには
   実績が無いためこの防御が機能しない)。あくまで人間が個別に保証したノードを手動で足す、
   という線引き。実装は未着手(v1.1で他backlogを優先するためスキップ、2026-08-21)。
-- **peers.dbの低rating/古いノードのクリーンアップ**: `bm_peer_manager_record_result`は
-  ratingを-1.0で下限クランプするだけで、`hosts`テーブルから行を削除する処理が無い
-  (2026-08-21、ユーザー指摘で発覚。検索した限りDELETE文が1つも無いことを確認済み)。
-  rating DESC順で候補を選ぶ設計上、死んだノードが新しい候補の選定を直接妨げることは
-  無いが(常に一番下に沈む)、DB内に永久に残り続ける。PyBitmessage(`network/knownnodes.py`)
-  の実装を参考として確認した: `singleCleaner`スレッドが5分間隔(`cycleLength=300`)で
-  `cleanupKnownNodes`を呼び、(1) `lastseen`から28日(2419200秒)経過したノードは
-  rating問わず無条件削除、(2) `lastseen`から3時間(10800秒)経過かつ
-  `rating <= knownNodesForgetRating`(定数`-0.5`)のノードを削除、(3) streamごとに
-  最低1ノードは残す、という方式だった。この実装でも同様の間引き(例えば
-  `bm_peer_manager_seed_bootstrap`と対になる`bm_peer_manager_cleanup`のような関数を
-  peer_connector_threadの再接続サイクルにただ乗りさせる、§11設定変更の動的リロードと
-  同じパターン)を追加するのが妥当と考えられる。実装は未着手。
 - inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
   §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 

@@ -6,6 +6,12 @@
 
 #include "../common/db_common.h"
 
+/* §11 peers.dbクリーンアップ。PyBitmessage network/knownnodes.pyのcleanupKnownNodes
+ * (28日/3時間/-0.5)準拠 */
+#define BM_PEER_CLEANUP_MAX_AGE_SECONDS (28 * 24 * 60 * 60)
+#define BM_PEER_CLEANUP_MIN_AGE_SECONDS (3 * 60 * 60)
+#define BM_PEER_CLEANUP_FORGET_RATING (-0.5)
+
 struct bootstrap_node
 {
     const char *ip;
@@ -188,6 +194,34 @@ int bm_peer_manager_upsert_learned(sqlite3 *db, const char *ip_address, int port
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_peer_manager_cleanup(sqlite3 *db, int64_t now)
+{
+    static const char *SQL =
+        "DELETE FROM hosts WHERE "
+        "(?1 - last_seen > ?2) OR "
+        "(?1 - last_seen > ?3 AND rating <= ?4);";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, now);
+    sqlite3_bind_int64(stmt, 2, BM_PEER_CLEANUP_MAX_AGE_SECONDS);
+    sqlite3_bind_int64(stmt, 3, BM_PEER_CLEANUP_MIN_AGE_SECONDS);
+    sqlite3_bind_double(stmt, 4, BM_PEER_CLEANUP_FORGET_RATING);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE)
+    {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int deleted = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    return deleted;
 }
 
 int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port, int stream, int success)

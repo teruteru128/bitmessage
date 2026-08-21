@@ -58,4 +58,16 @@ int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port,
 int bm_peer_manager_upsert_learned(sqlite3 *db, const char *ip_address, int port, int stream,
                                     uint64_t services, int64_t last_seen, const char *source);
 
+/*
+ * §11 peers.dbの低rating/古いノードのクリーンアップ。PyBitmessage(network/knownnodes.pyの
+ * cleanupKnownNodes)準拠の2条件で削除する: (1) last_seenからBM_PEER_CLEANUP_MAX_AGE_SECONDS
+ * (28日)以上経過したホストはratingを問わず削除、(2) last_seenからBM_PEER_CLEANUP_MIN_AGE_
+ * SECONDS(3時間)以上経過し、かつratingがBM_PEER_CLEANUP_FORGET_RATING(-0.5)以下のホストを
+ * 削除する。PyBitmessageと異なりstreamごとに最低1件残す安全弁は設けていない
+ * (bm_peer_manager_seed_bootstrapがhostsテーブル完全空の場合のみ既定シードを再投入する
+ * 既存の仕組みが、テーブル全体が空になった場合の実質的な安全弁として機能するため)。
+ * 削除件数を返す(エラー時-1)。
+ */
+int bm_peer_manager_cleanup(sqlite3 *db, int64_t now);
+
 #endif /* BM_INFRA_PEER_MANAGER_H */

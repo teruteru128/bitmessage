@@ -147,12 +147,76 @@ static void test_bootstrap_seeding(void)
     printf("OK: bootstrap seed node insertion\n");
 }
 
+static void seed_cleanup_test_peer(sqlite3 *db, const char *ip, int64_t last_seen, double rating)
+{
+    struct bm_peer_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.ip_address, ip, sizeof(entry.ip_address) - 1);
+    entry.port = 8444;
+    entry.stream = 1;
+    entry.services = 1;
+    entry.last_seen = last_seen;
+    entry.rating = rating;
+    strncpy(entry.source, "test", sizeof(entry.source) - 1);
+    CHECK(bm_peer_manager_upsert(db, &entry) == 0, "seed test peer for cleanup test");
+}
+
+static void test_peer_cleanup(void)
+{
+    const char *db_path = "test_network_testnet_cleanup_peers.db";
+    unlink(db_path);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK || bm_peer_manager_init_schema(db) != 0)
+    {
+        fprintf(stderr, "FATAL: could not open/init %s\n", db_path);
+        exit(EXIT_FAILURE);
+    }
+
+    /* §11 PyBitmessage(network/knownnodes.pyのcleanupKnownNodes)準拠の2条件:
+     * (1) 28日以上経過はratingを問わず削除、(2) 3時間以上経過かつrating<=-0.5を削除 */
+    int64_t now = 2000000000; /* 固定基準時刻(テストの決定性のため実時刻に依存しない) */
+    seed_cleanup_test_peer(db, "203.0.113.1", now - (29 * 24 * 60 * 60), 1.0);  /* 28日超、rating高 -> 削除 */
+    seed_cleanup_test_peer(db, "203.0.113.2", now - (4 * 60 * 60), -0.5);       /* 3時間超、rating<=-0.5 -> 削除 */
+    seed_cleanup_test_peer(db, "203.0.113.3", now - (4 * 60 * 60), -0.4);       /* 3時間超だがrating閾値内 -> 残る */
+    seed_cleanup_test_peer(db, "203.0.113.4", now - (2 * 60 * 60), -1.0);       /* rating低いがまだ3時間未満 -> 残る */
+    seed_cleanup_test_peer(db, "203.0.113.5", now - (1 * 60 * 60), 1.0);        /* 新しくrating高 -> 残る */
+
+    int deleted = bm_peer_manager_cleanup(db, now);
+    CHECK(deleted == 2, "cleanup should remove exactly the 2 stale/low-rating peers");
+
+    struct bm_peer_entry results[32];
+    int count = 0;
+    CHECK(bm_peer_manager_list_top(db, 1, results, 32, &count) == 0, "list peers after cleanup");
+    CHECK(count == 3, "3 peers should remain after cleanup");
+
+    int found1 = 0, found2 = 0, found3 = 0, found4 = 0, found5 = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (strcmp(results[i].ip_address, "203.0.113.1") == 0) found1 = 1;
+        if (strcmp(results[i].ip_address, "203.0.113.2") == 0) found2 = 1;
+        if (strcmp(results[i].ip_address, "203.0.113.3") == 0) found3 = 1;
+        if (strcmp(results[i].ip_address, "203.0.113.4") == 0) found4 = 1;
+        if (strcmp(results[i].ip_address, "203.0.113.5") == 0) found5 = 1;
+    }
+    CHECK(!found1, "28-day-old peer should have been deleted regardless of its high rating");
+    CHECK(!found2, "3-hour-old peer at the forget-rating threshold should have been deleted");
+    CHECK(found3, "3-hour-old peer just above the forget-rating threshold should survive");
+    CHECK(found4, "low-rating peer younger than 3 hours should survive");
+    CHECK(found5, "fresh high-rating peer should survive");
+
+    sqlite3_close(db);
+    unlink(db_path);
+
+    printf("OK: peers.db cleanup of stale/low-rating peers\n");
+}
+
 int main(void)
 {
     test_magic_bytes_switch();
     test_bad_magic_rejected();
     test_oversized_length_rejected();
     test_bootstrap_seeding();
+    test_peer_cleanup();
 
     if (failures == 0)
     {
