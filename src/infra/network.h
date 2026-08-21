@@ -20,8 +20,12 @@ struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前
 
 enum bm_fd_type
 {
-    BM_FD_CLIENT_SOCKET,
-    BM_FD_SERVER_SOCKET,
+    BM_FD_CLIENT_SOCKET, /* outbound: 自分からconnect()した接続 */
+    BM_FD_SERVER_SOCKET, /* inbound: BM_FD_LISTEN_SOCKETがaccept()した、相手からの接続
+                          * (§11 Tor hidden service対応) */
+    BM_FD_LISTEN_SOCKET, /* inbound接続を受け付けるlisten中のソケット自体。epoll_waitで
+                          * readable(=accept可能)になった際、bm_network_epoll_threadは
+                          * bm_network_handle_readableではなくaccept()ループを呼ぶ */
 };
 
 struct bm_fd_data
@@ -43,6 +47,14 @@ typedef void (*bm_command_handler_fn)(struct bm_fd_data *conn, const struct bm_m
 
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd);
 void bm_fd_data_free(struct bm_fd_data *data);
+
+/*
+ * §11 inbound接続(Tor hidden service)対応。bind_address:portでTCP listenする(SO_REUSEADDR、
+ * backlog 16、O_NONBLOCK)。bind_addressは通常"127.0.0.1"を渡す想定(公開IPへの直接listenは
+ * 意味が無い。到達可能にするのはTor hidden serviceの役目、DESIGN.md §8-10参照)。
+ * 成功時listen中のfd、失敗時-1。
+ */
+int bm_network_listen(const char *bind_address, int port);
 
 /*
  * §11 部分書き込み対策。fdへdataをlenバイト書き切るまで送る。peer_connector.cが

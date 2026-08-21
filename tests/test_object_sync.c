@@ -127,7 +127,7 @@ int main(void)
     bm_peer_registry_init(&registry);
 
     struct bm_object_sync_ctx ctx;
-    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, peers_db, &kr, &registry);
+    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, peers_db, &kr, &registry, NULL);
 
     int fds[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");

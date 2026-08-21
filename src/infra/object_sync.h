@@ -67,6 +67,11 @@ struct bm_object_sync_ctx
     sqlite3 *peers_db; /* NULL可(未使用ならaddr永続化をスキップ) */
     bm_keyring_t *keyring;
     struct bm_peer_registry *registry; /* NULL可(未使用ならinv broadcastをスキップ) */
+    /* §11 inbound接続(Tor hidden service)対応。inbound(BM_FD_SERVER_SOCKET)接続からversionを
+     * 受信した際、自分自身のversionを送り返すのに使う(outboundは接続直後にpeer_connector.cが
+     * 既に送信済みのため送り返さない、object_sync.cのversion処理参照)。NULL可(その場合は
+     * inbound接続でも自分のversionを送り返さない。テスト等outbound専用の用途向け)。 */
+    const char *user_agent;
     time_t last_gc; /* GC間引き用。network_epoll_threadという単一スレッドからのみ呼ばれる
                       * 前提で排他制御はしない */
     time_t last_resend_check; /* §11再送チェックの間引き用。last_gcと同じ理由で排他制御はしない */
@@ -74,7 +79,8 @@ struct bm_object_sync_ctx
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
                               sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,
-                              bm_keyring_t *keyring, struct bm_peer_registry *registry);
+                              bm_keyring_t *keyring, struct bm_peer_registry *registry,
+                              const char *user_agent);
 
 /* bm_command_handler_fn互換。user_dataにstruct bm_object_sync_ctx*を渡すこと */
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data);

@@ -48,7 +48,8 @@
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
                               sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,
-                              bm_keyring_t *keyring, struct bm_peer_registry *registry)
+                              bm_keyring_t *keyring, struct bm_peer_registry *registry,
+                              const char *user_agent)
 {
     ctx->object_pool_db = object_pool_db;
     ctx->identity_db = identity_db;
@@ -56,6 +57,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->peers_db = peers_db;
     ctx->keyring = keyring;
     ctx->registry = registry;
+    ctx->user_agent = user_agent;
     ctx->last_gc = 0;
     ctx->last_resend_check = 0;
 }
@@ -719,6 +721,18 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         if (bm_reply_verack(conn) != 0)
         {
             fprintf(stderr, "[object_sync] failed to reply verack\n");
+        }
+        /* §11 inbound接続(Tor hidden service)対応: outboundは接続直後に
+         * peer_connector.cが既に自分のversionを送信済みだが、inbound(BM_FD_SERVER_SOCKET、
+         * 相手が接続してきた側)はまだ送っていないため、相手のversionを受け取った
+         * このタイミングで送り返す(verack+versionの両方を返すのが正しいハンドシェイク、
+         * 実ネットワークの他ノードからの応答でも同じ挙動が観測されている) */
+        if (conn->type == BM_FD_SERVER_SOCKET && ctx->user_agent != NULL)
+        {
+            if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
+            {
+                fprintf(stderr, "[object_sync] failed to send version to inbound peer\n");
+            }
         }
     }
     else if (strncmp(msg->command, "verack", 12) == 0)

@@ -71,3 +71,7 @@ add_test(NAME config_store COMMAND test_config_store)
 add_executable(test_chan test_chan.c)
 target_link_libraries(test_chan PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME chan COMMAND test_chan)
+
+add_executable(test_inbound test_inbound.c)
+target_link_libraries(test_inbound PRIVATE bm_core bm_infra)
+add_test(NAME inbound COMMAND test_inbound)

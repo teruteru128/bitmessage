@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 
 #include "common/db_common.h"
 #include "common/queue.h"
@@ -211,7 +212,53 @@ int main(void)
      * より前に破棄されないことをそれで保証している。 */
     struct bm_object_sync_ctx object_sync_ctx;
     bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, peers_db, &keyring,
-                             &peer_registry);
+                             &peer_registry, BM_USER_AGENT);
+
+    /* §11 inbound接続(Tor hidden service)対応。BM_INBOUND_PORTが設定されていれば
+     * 127.0.0.1:<port>でTCP listenし、Tor hidden serviceからの転送を受け付ける準備をする
+     * (実際にTorのHiddenServicePortをこのポートへ向けて設定しないと外部からは到達しない、
+     * DESIGN.md §11参照)。既定は未設定=inbound無効(v1のoutbound専用設計を壊さないため)。
+     * listen_fd用のbm_fd_data(type=BM_FD_LISTEN_SOCKET)もmain()がsigwaitでブロックしている
+     * 間ずっと生存するスタック変数として持つ(他のctx類と同じ扱い)。 */
+    struct bm_fd_data *listen_conn = NULL;
+    const char *inbound_port_env = getenv("BM_INBOUND_PORT");
+    if (inbound_port_env != NULL)
+    {
+        int inbound_port = atoi(inbound_port_env);
+        int listen_fd = bm_network_listen("127.0.0.1", inbound_port);
+        if (listen_fd < 0)
+        {
+            fprintf(stderr, "[network] failed to listen on 127.0.0.1:%d for inbound connections\n",
+                    inbound_port);
+        }
+        else
+        {
+            listen_conn = bm_fd_data_new(BM_FD_LISTEN_SOCKET, listen_fd);
+            if (listen_conn == NULL)
+            {
+                fprintf(stderr, "[network] bm_fd_data_new failed for inbound listen socket\n");
+                close(listen_fd);
+            }
+            else
+            {
+                struct epoll_event listen_ev;
+                listen_ev.events = EPOLLIN;
+                listen_ev.data.ptr = listen_conn;
+                if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &listen_ev) != 0)
+                {
+                    perror("[network] epoll_ctl (listen socket)");
+                    bm_fd_data_free(listen_conn);
+                    close(listen_fd);
+                    listen_conn = NULL;
+                }
+                else
+                {
+                    fprintf(stderr, "[network] listening for inbound connections on 127.0.0.1:%d\n",
+                            inbound_port);
+                }
+            }
+        }
+    }
 
     struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));
     net_args->epfd = epfd;

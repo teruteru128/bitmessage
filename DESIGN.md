@@ -1459,13 +1459,85 @@ close()されfd番号が別の用途に再利用された場合に誤った相�
 修正前後を比較し、修正後は約85秒の稼働で新規の「failed to send」発生が0件だったことを
 確認した(修正前に累積していた27件は全て過去の実行分)。ctest 18件全通過。
 
+### inbound接続 Stage 1: 汎用TCP listen/accept + 双方向handshake(2026-08-21)
+
+inbound接続対応を2段階に分けて実装することにした。Stage 1は本項目、Tor非依存の
+一般的なTCP listen/accept + プロトコル上のhandshake。Stage 2(Tor ControlPortを使った
+hidden service自動作成・鍵永続化)は未着手で、次回以降に着手する。
+
+開発者の自宅回線がCGNAT相当でグローバルIPへの直接listenができないため、外部からの
+到達性は最終的にTor hidden serviceのフォワーディングに頼る前提(§8で最初にinbound見送りと
+決めた理由もこれ)。そのためStage 1は`bind_address`に常に`127.0.0.1`のみを渡す設計とし、
+グローバルIPへのbindは行わない(意味がないため)。Stage 1自体はTor固有のコードを一切含まず、
+プレーンなloopback TCPだけで決定的にテストできる。
+
+**実装した内容:**
+
+- `enum bm_fd_type`に`BM_FD_LISTEN_SOCKET`を追加(`network.h`)。既存の`BM_FD_SERVER_SOCKET`
+  (accept()された側、これまでコード中で未使用だった)を「相手からの接続」の意味で使うことにし、
+  `BM_FD_CLIENT_SOCKET`(自分からconnect()した接続)と役割を明確に分離した。
+- `bm_network_listen(bind_address, port)`(`network.c`)。`getaddrinfo`+`bind`+`listen`
+  (backlog 16)+`SO_REUSEADDR`+`O_NONBLOCK`、`peer_connector.c`の`connect_with_timeout`と
+  同じスタイル。
+- `bm_fd_data_new`の既存バグを修正: 無条件に`getpeername()`を呼んでいたため、listen中の
+  ソケット(相手がいないので`ENOTCONN`になる)を渡すと必ずNULLを返して失敗していた。
+  `type == BM_FD_LISTEN_SOCKET`の場合は`getpeername()`をスキップするよう修正。
+- `network.c`に`handle_accept`を追加。`accept()`をEAGAINになるまでループし、
+  (Linuxでは`accept()`されたfdはlistenソケットの`O_NONBLOCK`を継承しないため)各fdへ
+  個別に`O_NONBLOCK`を設定、`bm_fd_data_new(BM_FD_SERVER_SOCKET, ...)`でepollへ登録、
+  `bm_peer_registry_add`(registryがNULLでなければ)する。`bm_network_epoll_thread`は
+  readableになった接続の`type`が`BM_FD_LISTEN_SOCKET`ならこちらを呼ぶよう分岐した。
+- handshakeの非対称性を修正: outboundは接続確立直後に`peer_connector.c`が自分から
+  versionを送信済みなので、相手のversionを受け取った時点ではverackを返すだけでよい。
+  一方inboundは自分からversionを送っていないため、相手のversionを受け取ったらverackに
+  加えて自分自身のversionも送り返す必要がある(そうしないと相手が自分を認識できない)。
+  `bm_object_sync_ctx`に`user_agent`フィールドを追加し(`ctx_init`の8番目の引数)、
+  `object_sync.c`の`"version"`分岐で`conn->type == BM_FD_SERVER_SOCKET`かつ
+  `ctx->user_agent != NULL`の場合のみ`bm_post_version`を追加送信するようにした。
+- `main.c`: 環境変数`BM_INBOUND_PORT`が設定されている場合のみ`127.0.0.1:<port>`でlistenし
+  epollへ登録する。未設定時はinbound無効(v1のoutbound専用動作を変えないための既定)。
+
+**テスト:** `tests/test_inbound.c`を新規追加。実ソケット(loopback TCP)を使い、
+`bm_network_listen`→クライアントconnect→`bm_post_version`→`accept()`→
+`bm_object_sync_dispatch`→クライアント側でverack・versionの両方を受信、の一連を検証する。
+
+作成時に見つけたテストヘルパーのバグ: `read_one_message(fd)`は呼び出しごとに
+ローカル/スタックバッファを使い捨てる設計だったため、1回の`read()`にverack+versionの
+2メッセージがまとまって届くと2個目のバイト列を静かに読み捨ててしまい、2回目の
+`read_one_message`呼び出しが永遠にブロックする(`ctest`がハングし、手動で
+プロセスをkillして原因を特定した)。fdをまたいでバッファとoffsetを保持する
+`struct msg_reader`+`reader_next_message`を追加し、1回の受信に複数メッセージが
+含まれていても取りこぼさないようにして解消した。本番コードの
+`bm_network_handle_readable`は元々この問題を正しく扱っている(受信バッファに
+残った未消費バイトを次回に持ち越す設計)ため、production側に同種のバグはない。
+
+**実daemonでのスモークテスト:** 独立した一時ディレクトリで`BM_INBOUND_PORT`と
+`BM_NO_CONNECT=1`を指定して`bitmessaged`を起動し(バックグラウンドで動かし続けている
+bootstrap daemonのDB/ポートとは完全に分離)、単純なPythonスクリプトから生TCPで
+versionメッセージを送信。ログに`[network] accepted inbound connection`
+`[object_sync] version: ...`が出て、クライアント側にverack(24byte)とversion(103byte)の
+両方が返ってくることを確認した。
+
+Stage 2(Tor ControlPort経由のhidden service自動作成)は未着手。PyBitmessageの
+`proxyconfig_stem.py`(stemライブラリ経由でControlPortに接続し`ADD_ONION`する)と
+同様のアプローチを想定しており、初回は`NEW:BEST`で鍵生成、以後は生成したed25519鍵を
+config.db等へ永続化して`ADD_ONION`に渡すことで同じonionアドレスを再利用する設計とする
+予定(ユーザーとの合意事項)。
+
+**注記:** 開発者はこの実装の動作確認のため、自身の環境で実際のTor hidden service
+(静的torrc設定)を用意して`127.0.0.1:8444`へフォワーディングしているが、その
+onionアドレス自体はユーザーの明示的な指示によりこのファイル・コミットメッセージ・
+コード中を含め、一切の公開ドキュメントに記載しない。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。残るのは以下の通り。
 
-- inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
-  §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
+- inbound接続はStage 1(汎用TCP listen/accept、上記参照)まで完了。Stage 2
+  (Tor ControlPort自動化・onion鍵永続化)は引き続き未着手。
+- Dandelion++のstem機能、GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、
+  今回のv1完成の対象外(引き続き見送り)。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

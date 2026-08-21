@@ -5,11 +5,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,12 +42,17 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
         free(data);
         return NULL;
     }
-    data->peer_len = sizeof(data->peer_addr);
-    if (getpeername(fd, (struct sockaddr *)&data->peer_addr, &data->peer_len) == -1)
+    /* §11 listenソケット自体には相手(peer)が存在しないためgetpeername()は常に失敗する
+     * (ENOTCONN)。BM_FD_LISTEN_SOCKETの場合はpeer_addrを空のまま(未使用)にしてスキップする */
+    if (type != BM_FD_LISTEN_SOCKET)
     {
-        perror("getpeername");
-        free(data);
-        return NULL;
+        data->peer_len = sizeof(data->peer_addr);
+        if (getpeername(fd, (struct sockaddr *)&data->peer_addr, &data->peer_len) == -1)
+        {
+            perror("getpeername");
+            free(data);
+            return NULL;
+        }
     }
 
     data->recv_buffer = malloc(INIT_RECV_BUFFER_SIZE);
@@ -65,6 +72,51 @@ void bm_fd_data_free(struct bm_fd_data *data)
     }
     free(data->recv_buffer);
     free(data);
+}
+
+int bm_network_listen(const char *bind_address, int port)
+{
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(bind_address, port_str, &hints, &res) != 0)
+    {
+        return -1;
+    }
+
+    int sock = -1;
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next)
+    {
+        sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sock < 0)
+        {
+            continue;
+        }
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(sock, p->ai_addr, p->ai_addrlen) == 0 && listen(sock, 16) == 0)
+        {
+            break;
+        }
+        close(sock);
+        sock = -1;
+    }
+    freeaddrinfo(res);
+    if (sock < 0)
+    {
+        return -1;
+    }
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    return sock;
 }
 
 int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec)
@@ -286,6 +338,56 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
     return 0;
 }
 
+/*
+ * §11 inbound接続(Tor hidden service)対応。listenソケットがreadable(=accept可能)に
+ * なった際に呼ぶ。EAGAINになるまで(=溜まっている分を全部)accept()し、各接続を
+ * BM_FD_SERVER_SOCKETとしてepoll登録・registry登録する。inbound接続はこの時点では
+ * まだ相手のversionを受け取っていないため、自分からは何も送らずに待つ(相手からの
+ * versionを受けてobject_sync.cが自分のversionを送り返す、object_sync_dispatch参照)。
+ */
+static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *listener)
+{
+    for (;;)
+    {
+        int client_fd = accept(listener->fd, NULL, NULL);
+        if (client_fd < 0)
+        {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            {
+                perror("[network] accept");
+            }
+            break;
+        }
+
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK); /* accept()されたfdはlistenソケットの
+                                                          * O_NONBLOCKを継承しないため明示的に設定 */
+
+        struct bm_fd_data *conn = bm_fd_data_new(BM_FD_SERVER_SOCKET, client_fd);
+        if (conn == NULL)
+        {
+            close(client_fd);
+            continue;
+        }
+
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.ptr = conn;
+        if (epoll_ctl(args->epfd, EPOLL_CTL_ADD, client_fd, &ev) != 0)
+        {
+            perror("[network] epoll_ctl (inbound accept)");
+            bm_fd_data_free(conn);
+            close(client_fd);
+            continue;
+        }
+        if (args->registry != NULL)
+        {
+            bm_peer_registry_add(args->registry, conn);
+        }
+        fprintf(stderr, "[network] accepted inbound connection (fd=%d)\n", client_fd);
+    }
+}
+
 void *bm_network_epoll_thread(void *arg)
 {
     struct bm_epoll_thread_args *args = arg;
@@ -306,6 +408,11 @@ void *bm_network_epoll_thread(void *arg)
         for (int i = 0; i < nfds; i++)
         {
             struct bm_fd_data *conn = events[i].data.ptr;
+            if (conn->type == BM_FD_LISTEN_SOCKET)
+            {
+                handle_accept(args, conn);
+                continue;
+            }
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
             if (rc != 0)
             {
