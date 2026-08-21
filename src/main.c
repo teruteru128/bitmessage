@@ -29,7 +29,14 @@
 #include "infra/peer_manager.h"
 #include "infra/protocol.h"
 
-#define BM_USER_AGENT "/bitmessage-c:0.1.0/"
+/* BM_PROJECT_VERSIONはCMakeLists.txt(ルート)のproject(bitmessage VERSION ...)から
+ * target_compile_definitionsで注入される(src/CMakeLists.txt参照)。バージョン文字列を
+ * ここへ直接ハードコードすると更新を忘れやすいため(2026-08-21発覚: v1.0.0タグ後もずっと
+ * "0.1.0"のままだった)、単一の情報源から取るようにした。 */
+#ifndef BM_PROJECT_VERSION
+#define BM_PROJECT_VERSION "0.0.0"
+#endif
+#define BM_USER_AGENT "/bitmessage-c:" BM_PROJECT_VERSION "/"
 #define BM_MAX_OUTBOUND 3
 
 /* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */

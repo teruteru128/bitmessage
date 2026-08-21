@@ -1323,6 +1323,18 @@ encode/decodeがそのまま正しく往復する。つまりこのobject type�
   試行では実際のonionpeer objectには遭遇しなかったが、実装自体は上記の実データテストで
   検証済み)。ctest 18件全通過。
 
+### user agent文字列のバージョン化石化を修正(2026-08-21)
+
+`main.c`のP2P version messageに載せるuser agent文字列(`BM_USER_AGENT`)が
+`"/bitmessage-c:0.1.0/"`のままハードコードされており、v1.0.0タグ後もずっと更新されて
+いなかった(ユーザー指摘)。再発防止のため、ハードコード文字列を都度手で直す代わりに、
+`src/CMakeLists.txt`で`target_compile_definitions(bitmessaged PRIVATE
+BM_PROJECT_VERSION="${PROJECT_VERSION}")`によりルートの`project(bitmessage VERSION ...)`
+を単一の情報源として注入し、`main.c`側は`#define BM_USER_AGENT "/bitmessage-c:"
+BM_PROJECT_VERSION "/"`と組み立てるだけにした。以後はCMakeLists.txtのバージョンを
+上げれば自動的に反映される。実バイナリに`/bitmessage-c:1.0.0/`が正しく埋め込まれること
+を`strings`で確認、実daemon(testnet)での動作にも影響が無いことを確認済み。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・
