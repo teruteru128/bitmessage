@@ -18,7 +18,7 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **P2Pネットワーク層**: version/verack/addr/inv/getdata/objectのハンドシェイクと配線。実testnetノードとの
   相互運用を確認済み。接続の常駐維持・再接続、受信objectの他peerへの中継(inv flooding)に対応
 - **direct message送受信**: 送信時のPoW計算・ack機構、getpubkey要求の自動発行/自動応答、ack未着時の
-  自動再送(間隔を倍々に)
+  自動再送(間隔を倍々に、toPubEncryptionHexを直接指定した送信でも自動でpubkey_cacheへ登録され再送される)
 - **broadcast購読・送信**: 購読先アドレスからのbroadcastを自動復号してinboxへ、`sendBroadcast`での送信
 - **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
 - **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
@@ -32,9 +32,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 ### v1スコープ外(既知の制限、backlog)
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
-- 直接pubkey指定で送ったメッセージの自動再送、設定変更の動的リロード
-  (SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、DoS上限の見直し、chan仕様、
-  手動peer追加(`addPeer`) —
+- 設定変更の動的リロード(SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、
+  DoS上限の見直し、chan仕様、手動peer追加(`addPeer`) —
   詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド

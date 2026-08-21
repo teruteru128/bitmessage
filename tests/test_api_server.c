@@ -18,6 +18,7 @@
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/messages_store.h"
+#include "../src/core/pubkey_cache.h"
 
 #define TEST_PORT 18442
 #define TEST_IDENTITY_DB "test_api_server_identity.db"
@@ -311,8 +312,9 @@ int main(void)
         free(created_address);
     }
 
-    /* sendMessage: 送信者をAPI経由で作成・unlockし、受信者は(pubkey_cache未実装のため)
-     * テスト側でローカルに鍵を導出してpub_encryptionを直接渡す */
+    /* sendMessage: 送信者をAPI経由で作成・unlockし、受信者はテスト側でローカルに鍵を導出して
+     * toPubEncryptionHexを直接渡す(cachePubkeyは意図的に呼ばない。§11の直接pubkey送信の
+     * 自動再送を検証するため、pubkey_cacheが空の状態から始める) */
     resp = do_request(
         "{\"jsonrpc\":\"2.0\",\"method\":\"createDeterministicAddress\","
         "\"params\":[\"api_server sendMessage sender\",4,1,1,\"sender\",\"senderpass\"],\"id\":10}",
@@ -369,6 +371,21 @@ int main(void)
             }
             bm_json_free(v);
             free(resp);
+        }
+
+        /* §11 直接pubkeyを渡した送信の自動再送: 上のsendMessageがtoPubEncryptionHexを直接
+         * 渡しただけなのに、cachePubkeyを呼んでいないこの時点で既にpubkey_cacheへ
+         * 自動でupsertされているはず(再送はcache参照のみで行うため) */
+        {
+            uint64_t cv = 0, cs = 0;
+            unsigned char cripe[BM_RIPE_LEN];
+            CHECK(bm_address_decode(recv_address, &cv, &cs, cripe) == 0,
+                  "decode receiver address for pubkey_cache check");
+            struct bm_cached_pubkey cached;
+            CHECK(bm_pubkey_cache_lookup_by_ripe(identity_db, cripe, &cached) == 0,
+                  "sendMessage with a direct toPubEncryptionHex should auto-upsert pubkey_cache");
+            CHECK(memcmp(cached.encryption_pubkey, recv_gen.pub_encryption, 65) == 0,
+                  "auto-upserted pubkey_cache entry should have the encryption pubkey we sent with");
         }
 
         /* cachePubkey + sendMessage(toPubEncryptionHex=null): pubkey_cache経由の送信 */

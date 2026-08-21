@@ -156,10 +156,20 @@ int main(void)
     }
 
     /* pubkey_cacheフォールバック: to_pub_encryption=NULLで呼ぶと、cacheに無ければ失敗し、
-     * 事前にbm_pubkey_cache_upsertしておけば成功する(§2.3, core/pubkey_cache.c) */
+     * 事前にbm_pubkey_cache_upsertしておけば成功する(§2.3, core/pubkey_cache.c)。
+     * recv_addressは上のsendでtoPubEncryptionを直接渡して送信済みのため、§11の自動upsert
+     * (2026-08-23、bm_send_pipeline_send_message自身が直接pubkeyを渡された送信の成功時に
+     * cache未登録ならupsertする)で既にpubkey_cacheへ乗っている。「cacheが空の場合失敗する」
+     * ことを検証するには、まだ一度も送っていない別の宛先を使う必要がある。 */
+    struct bm_generated_address recv2_gen;
+    CHECK(bm_address_generate_deterministic("send_pipeline test receiver 2", 1, &recv2_gen) == 0,
+          "generate second receiver address");
+    char *recv2_address = bm_address_encode(4, 1, recv2_gen.ripe, BM_RIPE_LEN);
+    CHECK(recv2_address != NULL, "encode second receiver address");
+
     unsigned char *object_no_pubkey = NULL;
     size_t object_no_pubkey_len = 0;
-    int rc_no_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
+    int rc_no_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv2_address,
                                                      NULL, subject, body, 60, 1,
                                                      NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                                      &object_no_pubkey, &object_no_pubkey_len);
@@ -167,18 +177,18 @@ int main(void)
 
     struct bm_cached_pubkey cached;
     memset(&cached, 0, sizeof(cached));
-    memcpy(cached.ripe, recv_gen.ripe, BM_RIPE_LEN);
+    memcpy(cached.ripe, recv2_gen.ripe, BM_RIPE_LEN);
     cached.address_version = 4;
     cached.stream = 1;
-    memcpy(cached.signing_pubkey, recv_gen.pub_signing, 65);
-    memcpy(cached.encryption_pubkey, recv_gen.pub_encryption, 65);
+    memcpy(cached.signing_pubkey, recv2_gen.pub_signing, 65);
+    memcpy(cached.encryption_pubkey, recv2_gen.pub_encryption, 65);
     cached.nonce_trials_per_byte = 1000;
     cached.payload_length_extra_bytes = 1000;
     CHECK(bm_pubkey_cache_upsert(identity_db, &cached, 1234567890) == 0, "seed pubkey_cache for receiver");
 
     unsigned char *object_from_cache = NULL;
     size_t object_from_cache_len = 0;
-    int rc_from_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
+    int rc_from_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv2_address,
                                                        NULL, subject, body, 60, 1,
                                                        NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                                        &object_from_cache, &object_from_cache_len);
@@ -186,14 +196,24 @@ int main(void)
     CHECK(object_from_cache != NULL && object_from_cache_len > 0, "cache-derived object non-empty");
     free(object_from_cache);
 
+    /* §11 直接pubkeyを渡した送信の自動再送: recv_address(上で直接pubkeyを渡して送信済み)の
+     * pubkey_cacheが自動で埋まっていることを確認する */
+    struct bm_cached_pubkey auto_cached;
+    CHECK(bm_pubkey_cache_lookup_by_ripe(identity_db, recv_gen.ripe, &auto_cached) == 0,
+          "pubkey_cache should be auto-populated after a direct-pubkey send succeeds");
+    CHECK(memcmp(auto_cached.encryption_pubkey, recv_gen.pub_encryption, 65) == 0,
+          "auto-populated pubkey_cache entry should have the encryption pubkey we sent with");
+
     if (failures == 0)
     {
-        printf("OK: pubkey_cache fallback in send_pipeline (fails empty, succeeds once cached)\n");
+        printf("OK: pubkey_cache fallback in send_pipeline (fails empty, succeeds once cached, "
+               "auto-populated after a direct-pubkey send)\n");
     }
 
     free(object);
     free(sender_address);
     free(recv_address);
+    free(recv2_address);
     bm_keyring_destroy(&kr);
     sqlite3_close(identity_db);
     sqlite3_close(messages_db);

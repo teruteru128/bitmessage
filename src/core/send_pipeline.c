@@ -106,7 +106,13 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
         OPENSSL_cleanse(&from_id, sizeof(from_id));
         return -1;
     }
-    (void)to_version; /* msgの共通ヘッダstreamにはtoStreamだけが必要(§5.3) */
+    /* §11 直接pubkeyを渡した送信の自動再送: 再送(infra/object_sync.cの
+     * bm_object_sync_check_resends)はto_pub_encryption=NULL固定でこの関数を呼ぶ
+     * (pubkey_cacheのみ参照する設計)ため、呼び出し元がto_pub_encryptionを直接指定した
+     * 場合はcacheに乗らず再送できなかった(2026-08-23発覚)。送信成功時、まだcache未登録
+     * ならこのencryption_pubkeyを自動でupsertし、以後の再送でも使えるようにする
+     * (関数末尾で行う。ここでは「直接指定されたか」だけ憶えておく)。 */
+    int direct_pub_encryption_given = (to_pub_encryption != NULL);
 
     /* to_pub_encryptionが指定されなければpubkey_cacheから引く */
     unsigned char cached_pub_encryption[65];
@@ -223,6 +229,26 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     {
         free(object);
         return -1;
+    }
+
+    /* §11 直接pubkeyを渡した送信の自動再送(続き): まだcache未登録ならupsertする。
+     * signing_pubkey等toPubEncryptionHexだけでは分からない情報は既定値(全0)で埋める
+     * (現状これらは受信pubkeyの検証用途にのみ使われ送信経路では未使用のため実害は無い)。
+     * 既にcacheへ登録済み(=実物のpubkeyオブジェクトから得られた、より質の高い情報)なら
+     * 上書きしない。 */
+    if (direct_pub_encryption_given)
+    {
+        struct bm_cached_pubkey existing;
+        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &existing) != 0)
+        {
+            struct bm_cached_pubkey entry;
+            memset(&entry, 0, sizeof(entry));
+            memcpy(entry.ripe, to_ripe, BM_RIPE_LEN);
+            entry.address_version = to_version;
+            entry.stream = to_stream;
+            memcpy(entry.encryption_pubkey, to_pub_encryption, 65);
+            bm_pubkey_cache_upsert(identity_db, &entry, (int64_t)time(NULL));
+        }
     }
 
     *out_object = object;

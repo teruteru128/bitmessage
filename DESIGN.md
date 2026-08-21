@@ -1123,11 +1123,34 @@ backlog優先順位の2番目。同一宛先への短時間の連続getpubkey要
   (実ネットワーク難易度でのPoWタイミング確認は前回の28日TTL検証で既に実施済みのため、
   今回はキャッシュヒット時に新規PoWが走らないことのDB状態確認に留めた)。
 
+### 直接pubkeyを渡した送信の自動再送(2026-08-21)
+
+backlog優先順位の3番目。再送(`infra/object_sync.c`の`bm_object_sync_check_resends`)は
+`to_pub_encryption=NULL`固定で`bm_send_pipeline_send_message`を呼ぶ(pubkey_cacheのみ参照
+する設計)ため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
+という制約があった(2026-08-23発覚)。
+
+修正は`core/send_pipeline.c`の`bm_send_pipeline_send_message`自身に実装した(当初
+`api_server.c`のh_sendMessageだけに実装したが、`send_pipeline.c`を直接呼ぶ他の呼び出し元
+[テスト等]にも効くよう、より根本のレイヤーへ移した)。呼び出し元が`to_pub_encryption`を
+直接指定して送信に成功した時点で、pubkey_cacheにまだそのripeが登録されていなければ
+自動でupsertする。`signing_pubkey`等`toPubEncryptionHex`だけでは分からない情報は既定値
+(全0)で埋める(現状これらは受信pubkeyの検証用途にのみ使われ送信経路では未使用のため
+実害は無い、`nonce_trials_per_byte`/`payload_length_extra_bytes`も0のままなら「宛先固有の
+難易度は不明」として送信元自身の既定難易度にフォールバックする既存ロジックがそのまま働く)。
+既にcacheへ登録済み(=実物のpubkeyオブジェクトから得られた、より質の高い情報)なら上書き
+しない。
+
+`tests/test_send_pipeline.c`・`tests/test_api_server.c`に、直接pubkey送信後にpubkey_cache
+が自動で埋まっていることを確認するcaseを追加。`tests/test_resend.c`は元々あった「再送の
+ためにcacheを事前に手動seedする」workaroundを削除し、自動upsertだけで再送が成功することを
+確認する形に変更した。`test_send_pipeline.c`の既存の「cache空なら失敗する」検証は、
+既に直接送信済みの宛先だとこの修正で自動的にcacheへ乗ってしまうため、まだ一度も送っていない
+別の宛先を使うよう修正した。実daemon・CLI経由でも、送信前はpubkey_cache 0件・直接pubkey指定
+でsend-messageした後は1件登録されることを確認済み。ctest 17件全通過。
+
 ### v1.1以降のbacklog
 
-- **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
-  固定で行うため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
-  (2026-08-23発覚)。送信成功時にcache未登録なら自動的にupsertする、等の対応が考えられる。
 - **DoS上限の見直し・chan仕様・設定変更の動的リロード**: SOCKS5プロキシ設定は永続化した
   ものの、稼働中プロセスへの反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。
   優先度は低いが実運用に近づくほど効いてくる。
