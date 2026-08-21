@@ -164,6 +164,31 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
     return 0;
 }
 
+int bm_peer_manager_upsert_from_addr(sqlite3 *db, const char *ip_address, int port, int stream,
+                                      uint64_t services, int64_t last_seen)
+{
+    static const char *SQL =
+        "INSERT INTO hosts (ip_address, port, stream, services, last_seen, rating, source) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, 0.0, 'addr_msg') "
+        "ON CONFLICT(ip_address, port, stream) DO UPDATE SET "
+        "services=excluded.services, last_seen=excluded.last_seen;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, ip_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, port);
+    sqlite3_bind_int(stmt, 3, stream);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)services);
+    sqlite3_bind_int64(stmt, 5, last_seen);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port, int stream, int success)
 {
     const char *sql = success

@@ -9,6 +9,7 @@
  * - 期限切れobjectのGC
  */
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,9 +24,11 @@
 #include "../src/core/message_builder.h"
 #include "../src/core/messages_store.h"
 #include "../src/core/send_pipeline.h"
+#include "../src/common/varint.h"
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
 #include "../src/infra/object_sync.h"
+#include "../src/infra/peer_manager.h"
 #include "../src/infra/peer_registry.h"
 #include "../src/infra/protocol.h"
 #include "../src/pow/pow_engine.h"
@@ -33,6 +36,7 @@
 #define TEST_OBJECT_POOL_DB "test_object_sync_pool.db"
 #define TEST_IDENTITY_DB "test_object_sync_identity.db"
 #define TEST_MESSAGES_DB "test_object_sync_messages.db"
+#define TEST_PEERS_DB "test_object_sync_peers.db"
 
 static int failures = 0;
 
@@ -114,6 +118,7 @@ int main(void)
     sqlite3 *object_pool_db = open_fresh_db(TEST_OBJECT_POOL_DB, bm_object_store_init_schema);
     sqlite3 *identity_db = open_fresh_db(TEST_IDENTITY_DB, bm_identity_store_init_schema);
     sqlite3 *messages_db = open_fresh_db(TEST_MESSAGES_DB, bm_messages_store_init_schema);
+    sqlite3 *peers_db = open_fresh_db(TEST_PEERS_DB, bm_peer_manager_init_schema);
 
     bm_keyring_t kr;
     bm_keyring_init(&kr);
@@ -122,7 +127,7 @@ int main(void)
     bm_peer_registry_init(&registry);
 
     struct bm_object_sync_ctx ctx;
-    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, &kr, &registry);
+    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, peers_db, &kr, &registry);
 
     int fds[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
@@ -402,6 +407,62 @@ int main(void)
     CHECK(deleted >= 1, "gc should remove at least the expired dummy object");
     CHECK(bm_object_store_has(object_pool_db, expired_hash) == 0, "expired object should be gone after gc");
 
+    /* --- 6. addr受信 -> peers.dbへ登録(§11) --- */
+    {
+        unsigned char ipv4_mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 203, 0, 113, 42};
+        unsigned char entry[38];
+        unsigned char *p = entry;
+        uint64_t addr_time = (uint64_t)time(NULL);
+        for (int i = 0; i < 8; i++)
+        {
+            p[i] = (unsigned char)((addr_time >> (56 - 8 * i)) & 0xff);
+        }
+        p += 8;
+        uint32_t stream = 1;
+        for (int i = 0; i < 4; i++)
+        {
+            p[i] = (unsigned char)((stream >> (24 - 8 * i)) & 0xff);
+        }
+        p += 4;
+        uint64_t services = 1;
+        for (int i = 0; i < 8; i++)
+        {
+            p[i] = (unsigned char)((services >> (56 - 8 * i)) & 0xff);
+        }
+        p += 8;
+        memcpy(p, ipv4_mapped, 16);
+        p += 16;
+        uint16_t port = htons(8444);
+        memcpy(p, &port, 2);
+
+        unsigned char addr_payload[1 + sizeof(entry)];
+        bm_varint_encode(addr_payload, 1);
+        memcpy(addr_payload + bm_varint_size(1), entry, sizeof(entry));
+        size_t addr_payload_len = bm_varint_size(1) + sizeof(entry);
+
+        size_t addr_packet_len = 0;
+        unsigned char *addr_packet = bm_create_packet("addr", addr_payload, addr_payload_len, &addr_packet_len);
+        struct bm_message *addr_wire_msg = NULL;
+        size_t addr_consumed = 0;
+        CHECK(bm_parse_message(addr_packet, addr_packet_len, &addr_wire_msg, &addr_consumed) == BM_PARSE_OK,
+              "parse addr wire packet");
+        free(addr_packet);
+
+        bm_object_sync_dispatch(conn, addr_wire_msg, &ctx);
+        bm_free_message(addr_wire_msg);
+
+        sqlite3_stmt *addr_stmt = NULL;
+        sqlite3_prepare_v2(peers_db,
+                            "SELECT port, source FROM hosts WHERE ip_address = '203.0.113.42';", -1,
+                            &addr_stmt, NULL);
+        CHECK(sqlite3_step(addr_stmt) == SQLITE_ROW, "addr entry should be registered into peers.db");
+        CHECK(sqlite3_column_int(addr_stmt, 0) == 8444, "registered port should match addr entry");
+        const char *addr_source = (const char *)sqlite3_column_text(addr_stmt, 1);
+        CHECK(addr_source != NULL && strcmp(addr_source, "addr_msg") == 0,
+              "registered source should be 'addr_msg'");
+        sqlite3_finalize(addr_stmt);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);
@@ -413,9 +474,11 @@ int main(void)
     sqlite3_close(object_pool_db);
     sqlite3_close(identity_db);
     sqlite3_close(messages_db);
+    sqlite3_close(peers_db);
     unlink(TEST_OBJECT_POOL_DB);
     unlink(TEST_IDENTITY_DB);
     unlink(TEST_MESSAGES_DB);
+    unlink(TEST_PEERS_DB);
 
     if (failures == 0)
     {

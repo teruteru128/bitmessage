@@ -27,7 +27,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
 - 直接pubkey指定で送ったメッセージの自動再送、getpubkey応答のスロットリング、設定の永続化、
-  DoS上限の見直し、chan仕様、addrのpeer_manager永続化 — 詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
+  DoS上限の見直し、chan仕様、addrで教えられたホストのフィルタリング(private/loopback除外) —
+  詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド
 

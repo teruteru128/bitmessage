@@ -177,7 +177,7 @@ int main(void)
      * スタック変数(api_configと同じ扱い)。network_epoll_threadはdetach済みなのでpthread_join
      * より前に破棄されないことをそれで保証している。 */
     struct bm_object_sync_ctx object_sync_ctx;
-    bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, &keyring,
+    bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, peers_db, &keyring,
                              &peer_registry);
 
     struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));

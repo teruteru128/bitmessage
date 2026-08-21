@@ -1008,6 +1008,37 @@ testnet接続中にgetpubkey要求の自動broadcastが実際に動くこと・�
 (外部に公開する前提の最低限のセキュリティ)の2点を満たした時点をv1完成とする。
 それ以外の既知のギャップ(下記)はv1.1以降のbacklogとして残す。
 
+### addr受信のpeer_manager永続化(2026-08-21)
+
+v1完成後、ユーザーが実際にmainnetへ接続したところ全く繋がらないという報告を受けて調査した
+結果、PyBitmessage `knownnodes.py`のハードコードされたmainnetシード9件が2026-08-21時点で
+全て(TCP接続自体が)到達不能になっていることを`/dev/tcp`での直接確認で特定した(testnet
+シード・一般的なインターネットホストへの接続は正常に成功することと対比して切り分け済み)。
+これはこの実装のバグではなく実際のネットワーク状況だが、それ以前から「シードが全滅したら
+詰む」という設計上の弱点があった: 受信した`addr`メッセージが`bm_object_sync_dispatch`で
+ログ出力されるだけで`peers.db`へ反映されておらず、シード以外の経路でpeerを発見する手段が
+無かったため。この弱点を解消する目的で、addr受信を`peers.db`へ実際に永続化するよう実装した。
+
+`peer_manager.c`に`bm_peer_manager_upsert_from_addr`を追加(既存の`bm_peer_manager_upsert`
+とは別関数): `ip_address, port, stream`の複合PKで`ON CONFLICT DO UPDATE`するが、
+`services`/`last_seen`のみ更新し`rating`/`source`は変更しない。これは「実際の接続実績で
+積み上げたratingを、単なる伝聞情報(相手が`addr`メッセージで自己申告してきただけの情報)で
+リセットしない」ため。新規行は`rating=0.0, source='addr_msg'`で挿入する。
+
+`object_sync.c`側は`bm_object_sync_ctx`に`peers_db`フィールド(NULL可、未設定ならaddr
+永続化を単にスキップ)を追加し、`addr`ディスパッチ分岐で`bm_parse_addr_message`の結果を
+`inv`/`getdata`と同じ`BM_MAX_INVENTORY_ITEMS`(50000件)でキャップした上で全件について
+`bm_peer_manager_upsert_from_addr`を呼ぶ。ワイヤー上の`ip[16]`(IPv4-mapped IPv6形式、
+先頭12byte`00*10,FF,FF`+IPv4の4byte、またはIPv6そのもの)は`inet_ntop`でテキストIPへ
+変換する(先頭12byteのプレフィックス一致で判定)。private/loopbackアドレス等のフィルタリングは
+未実装のまま(下記backlog参照)。
+
+実daemonでのtestnet接続による動作確認: `bitmessaged`起動後、testnetシードから受信した
+`addr`メッセージ(2件)が実際に`peers.db`へ`source='addr_msg', rating=0.0`で挿入され、
+既存のseed行(`source='seed'`)のratingは接続成功/失敗に応じて更新される一方
+addr由来の新規行のratingは触られないことを確認済み。ctest 16件(新規のaddr受信テストを
+`test_object_sync.c`へ追加)全通過。
+
 ### v1.1以降のbacklog
 
 - **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
@@ -1018,8 +1049,9 @@ testnet接続中にgetpubkey要求の自動broadcastが実際に動くこと・�
   防げるようになったが、正規のPoWを払われた場合の対策は無い)。
 - **設定の永続化・DoS上限の見直し・chan仕様**: 2026-08-21のギャップ洗い出しで指摘した残り3項目
   (日次振り返りの会話参照)。優先度は低いが実運用に近づくほど効いてくる。
-- **addrのpeer_manager永続化**: 受信した`addr`メッセージの内容がログ出力のみで`peers.db`へ
-  反映されない(§1参照)。
+- **addrで教えられたホストのフィルタリング**: private/loopbackアドレス等の除外は未実装
+  (2026-08-21、addr永続化の実装時に発覚)。不正確な情報が紛れ込んでもconnect失敗時に
+  ratingが下がるだけなので実害は小さいと判断し見送り。
 - inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
   §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 

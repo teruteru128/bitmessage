@@ -3,8 +3,11 @@
 
 /*
  * DESIGN.md §1.1 object_sync_thread(実質的にはcommand_worker_threadの本体も兼ねる)。
- * network_epoll_threadのbm_command_handler_fnとして使う。version/verack/addr/pingは
- * infra/network.cのdefault_dispatchと同等の最小応答、inv/getdata/objectを実際に処理する:
+ * network_epoll_threadのbm_command_handler_fnとして使う。version/pingはinfra/network.cの
+ * default_dispatchと同等の最小応答、addr/inv/getdata/objectを実際に処理する:
+ *   - addr受信: 教えられたホストをpeers.db(peer_manager.c)へ登録する(§11)。既存行は
+ *     services/last_seenのみ更新しratingは変更しない(接続実績で積み上げたratingを、
+ *     単なる伝聞情報で上書きしないため)。DoS対策としてinv同様1メッセージ50000件を上限とする
  *   - inv受信: 未所持hashについてgetdataを送り返す
  *   - getdata受信: object_pool.dbにあれば同じ接続へobjectを返す
  *   - object受信: 期限切れ・ネットワーク既定の最低難易度(1000,1000)未満のPoWを即座に
@@ -39,9 +42,10 @@
  * 受け渡す設計、DESIGN.md §1.2参照)。
  *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
- *   - addrのpeer_manager永続化
  *   - getpubkey応答のスパム対策(同じ宛先への短時間の連続要求に対する応答側スロットリング。
  *     PoW検証自体はあるので無償のspamは防げるが、正規のPoWを払われた場合の対策は無い)
+ *   - addrで教えられたホストのフィルタリング(private/loopbackアドレス除外等)は未実装。
+ *     不正確な情報が紛れ込んでもconnect失敗時にratingが下がるだけなので実害は小さい
  */
 
 #include <sqlite3.h>
@@ -60,6 +64,7 @@ struct bm_object_sync_ctx
     sqlite3 *object_pool_db;
     sqlite3 *identity_db;
     sqlite3 *messages_db;
+    sqlite3 *peers_db; /* NULL可(未使用ならaddr永続化をスキップ) */
     bm_keyring_t *keyring;
     struct bm_peer_registry *registry; /* NULL可(未使用ならinv broadcastをスキップ) */
     time_t last_gc; /* GC間引き用。network_epoll_threadという単一スレッドからのみ呼ばれる
@@ -68,8 +73,8 @@ struct bm_object_sync_ctx
 };
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
-                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring,
-                              struct bm_peer_registry *registry);
+                              sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,
+                              bm_keyring_t *keyring, struct bm_peer_registry *registry);
 
 /* bm_command_handler_fn互換。user_dataにstruct bm_object_sync_ctx*を渡すこと */
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data);

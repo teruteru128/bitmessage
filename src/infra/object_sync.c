@@ -1,6 +1,8 @@
 #include "object_sync.h"
 
+#include <arpa/inet.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,7 @@
 #include "../pow/pow_engine.h"
 #include "object.h"
 #include "object_store.h"
+#include "peer_manager.h"
 
 /* DoS対策の上限値(DESIGN.md §5.0、PyBitmessage protocol.py準拠) */
 #define BM_MAX_INVENTORY_ITEMS 50000
@@ -43,12 +46,13 @@
 #define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
-                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring,
-                              struct bm_peer_registry *registry)
+                              sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,
+                              bm_keyring_t *keyring, struct bm_peer_registry *registry)
 {
     ctx->object_pool_db = object_pool_db;
     ctx->identity_db = identity_db;
     ctx->messages_db = messages_db;
+    ctx->peers_db = peers_db;
     ctx->keyring = keyring;
     ctx->registry = registry;
     ctx->last_gc = 0;
@@ -569,8 +573,41 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_addr_message addr_msg;
         if (bm_parse_addr_message(msg->payload, msg->length, &addr_msg) == 0)
         {
-            fprintf(stderr, "[object_sync] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n",
-                    addr_msg.count);
+            uint64_t n = addr_msg.count;
+            if (n > BM_MAX_INVENTORY_ITEMS)
+            {
+                n = BM_MAX_INVENTORY_ITEMS;
+            }
+            int registered = 0;
+            if (ctx->peers_db != NULL)
+            {
+                static const unsigned char IPV4_MAPPED_PREFIX[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+                for (uint64_t i = 0; i < n; i++)
+                {
+                    const struct bm_address_info *e = &addr_msg.addresses[i];
+                    char ip_str[INET6_ADDRSTRLEN];
+                    const char *ok;
+                    if (memcmp(e->ip, IPV4_MAPPED_PREFIX, sizeof(IPV4_MAPPED_PREFIX)) == 0)
+                    {
+                        ok = inet_ntop(AF_INET, e->ip + 12, ip_str, sizeof(ip_str));
+                    }
+                    else
+                    {
+                        ok = inet_ntop(AF_INET6, e->ip, ip_str, sizeof(ip_str));
+                    }
+                    if (ok == NULL)
+                    {
+                        continue;
+                    }
+                    if (bm_peer_manager_upsert_from_addr(ctx->peers_db, ip_str, e->port, (int)e->stream,
+                                                          e->services, (int64_t)e->time) == 0)
+                    {
+                        registered++;
+                    }
+                }
+            }
+            fprintf(stderr, "[object_sync] addr: %" PRIu64 " entries (%d registered to peers.db)\n",
+                    addr_msg.count, registered);
             bm_free_addr_message(&addr_msg);
         }
     }
