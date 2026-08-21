@@ -84,6 +84,37 @@ cp bitmessage.conf.example bitmessage.conf
 ./build-Debug/src/bitmessaged
 ```
 
+### 環境変数一覧
+
+`bitmessaged`向け(`bitmessage.conf`の値をこの起動限りで上書きする。優先順位: 環境変数 >
+`bitmessage.conf` > 既定値):
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `BM_CONFIG_FILE` | `bitmessage.conf` | 起動時設定ファイルの場所 |
+| `BM_TESTNET` | (mainnet) | `1`でtestnetへ切り替え |
+| `BM_NO_CONNECT` | (接続する) | `1`で実際のP2P接続を一切行わない(主にテスト用) |
+| `BM_MAX_OUTBOUND` | `3` | 同時に確立する最大outbound接続数 |
+| `BM_API_PORT` | `8442` | JSON-RPC APIのlisten port |
+| `BM_INBOUND_PORT` | (無効) | Tor hidden service等からのinbound接続を受け付けるport。0または未設定で無効 |
+| `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | 新規アドレス作成時の既定PoW難易度(nonce trials/byte) |
+| `BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES` | `1000` | 同上(payload length extra bytes) |
+| `BM_TOR_CONTROL` | (無効) | `1`でTor ControlPort経由のhidden service自動作成を試みる(`BM_INBOUND_PORT`が前提) |
+| `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | ControlPortのUnixドメインソケットパス |
+| `BM_TOR_CONTROL_HOST` | `127.0.0.1` | 上記に接続できない場合のTCPフォールバック先ホスト |
+| `BM_TOR_CONTROL_PORT` | `9051` | 同上ポート |
+| `BM_TOR_VIRTUAL_PORT` | `8444` | 他peerが自分のonionアドレスへ接続してくるポート番号 |
+| `BM_ONION_ADDRESS` | (未設定) | 静的torrc設定を使う場合、自分のonionアドレスを直接指定(`BM_TOR_CONTROL`より優先) |
+
+`bitmessage-cli`向け:
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `BM_API_HOST` | `127.0.0.1` | 接続先daemonのホスト |
+| `BM_API_PORT` | `8442` | 接続先daemonのポート(daemon起動時と揃えること) |
+| `BM_API_USER` | (必須) | JSON-RPC APIのユーザー名(daemon起動時の表示に合わせる) |
+| `BM_API_PASS` | (必須) | 同パスワード |
+
 別ターミナルから `bitmessage-cli` で操作する(`BM_API_USER`/`BM_API_PASS` は daemon 起動時の表示に合わせる)。
 
 ```sh
