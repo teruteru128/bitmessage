@@ -657,7 +657,7 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
         unsigned char *packet = bm_create_inventory_message("getdata", missing, missing_count, &packet_len);
         if (packet != NULL)
         {
-            if (write(conn->fd, packet, packet_len) != (ssize_t)packet_len)
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
             {
                 fprintf(stderr, "[object_sync] failed to send getdata\n");
             }
@@ -695,7 +695,7 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         free(payload);
         if (packet != NULL)
         {
-            if (write(conn->fd, packet, packet_len) != (ssize_t)packet_len)
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
             {
                 fprintf(stderr, "[object_sync] failed to send object for getdata\n");
             }

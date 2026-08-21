@@ -1420,6 +1420,45 @@ OBJECT_ONIONPEER発見も「既に1本繋がっていること」が前提の仕
 という当初の目的を実証)。`add-peer` CLIコマンドの実daemonでの動作、不正な値の拒否も
 確認済み。ctest 18件全通過。
 
+### 「failed to send getdata」の原因調査・修正(2026-08-21)
+
+バックグラウンドで動かし続けていたbootstrap daemonのログに`[object_sync] failed to send
+getdata`が繰り返し出ていることにユーザーが気づき、調査した。
+
+原因は非blockingソケットへの部分書き込み(short write)を考慮していなかったこと。
+`peer_connector.c`の`connect_with_timeout`は接続確立後もソケットをO_NONBLOCKのまま
+epollへ渡す設計(§1参照)だが、`infra/object_sync.c`のgetdata送信・object応答送信、
+`infra/peer_registry.c`のinv broadcast、`infra/network.c`のverack/pong返信・version送信は
+いずれも単発の`write()`を呼び、戻り値が要求バイト数と一致しなければ即座に「失敗」として
+扱い黙ってデータを捨てていた。非blockingソケットのwrite()は、送信バッファが一時的に
+埋まっていると短い書き込みや`EAGAIN`を返すのが正常な挙動であり、1回のwrite()で全部
+送れることを仮定してはいけない(単発の`write()`呼び出しはその前提に反していた)。
+
+`infra/network.c`に`bm_network_write_all(fd, data, len, timeout_sec)`を追加し、
+EAGAIN/EWOULDBLOCK時は`select()`で書き込み可能になるのを待ちながらループする実装にした
+(peer_connector.cのSOCKS5クライアント実装で既に使っていた`socks5_send_all`と同じパターン)。
+タイムアウトは呼び出し元のスレッド文脈によって使い分ける: `network_epoll_thread`
+(単一の共有スレッドが全接続のディスパッチを直列に処理する設計)上で呼ばれるもの
+(verack/pong返信・object_sync.cのgetdata/object応答・peer_registry.cのinv broadcast)は
+`BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS`(2秒、詰まったpeer1本が他の全接続の処理を
+長時間ブロックしないため)、`peer_connector_thread`自身のスレッド上で呼ばれる
+`bm_post_version`は`BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS`(5秒、他接続を巻き込まないため)。
+
+`peer_registry.c`のinv broadcastは元々`reg->lock`を持ったまま全peerへ順にwrite()していたが、
+ブロッキング呼び出しに変えるとロック保持時間が長くなり他スレッドのregistry操作を止めて
+しまう。単純にfdだけコピーしてロックを解放する案は、書き込み前に元の接続がepoll thread側で
+close()されfd番号が別の用途に再利用された場合に誤った相手へ書き込む競合を生むため、
+ロックを持っている間に`dup()`した複製fdを使うことでこの競合を避けつつロックを早期解放
+できるようにした。
+
+`tests/test_network_testnet.c`に`bm_network_write_all`専用のテストを追加した:
+1MiBペイロードをnon-blocking socketpairへ送り、受信側をわざと間欠的に(2msずつ待ちながら)
+読ませることで実際に複数回のEAGAINを経験させ、最終的にバイト単位で欠落・破損なく
+送り切れることを確認するcase、および受信側が全く読まない場合に短いタイムアウトで
+ちゃんと諦める(無限に待たない)ことを確認するcaseの2つ。実daemon(bootstrap daemon)で
+修正前後を比較し、修正後は約85秒の稼働で新規の「failed to send」発生が0件だったことを
+確認した(修正前に累積していた27件は全て過去の実行分)。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -37,7 +37,7 @@ add_test(NAME cli_integration
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
 
 add_executable(test_network_testnet test_network_testnet.c)
-target_link_libraries(test_network_testnet PRIVATE bm_infra bm_common)
+target_link_libraries(test_network_testnet PRIVATE bm_infra bm_common Threads::Threads)
 add_test(NAME network_testnet COMMAND test_network_testnet)
 
 add_executable(test_pubkey_cache test_pubkey_cache.c)

@@ -44,6 +44,27 @@ typedef void (*bm_command_handler_fn)(struct bm_fd_data *conn, const struct bm_m
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd);
 void bm_fd_data_free(struct bm_fd_data *data);
 
+/*
+ * §11 部分書き込み対策。fdへdataをlenバイト書き切るまで送る。peer_connector.cが
+ * 接続確立後もO_NONBLOCKのままepollへ渡す設計のため、この接続へのwrite()は常に短い
+ * 書き込み・EAGAINで返る可能性がある(1回のwrite()で全部送れることを仮定してはいけない)。
+ * EAGAIN/EWOULDBLOCK時はtimeout_secを上限にselect()で書き込み可能になるのを待つ。
+ * 成功時0、失敗時(相手の切断・タイムアウト・その他エラー)-1。
+ *
+ * 呼び出し元は2種類あり、要求するタイムアウトの長さが異なる:
+ *   - network_epoll_thread(単一の共有スレッド、全接続のディスパッチを直列に処理する)上で
+ *     呼ばれるもの(verack/pong返信、infra/object_sync.cのgetdata要求・object応答・
+ *     infra/peer_registry.cのinv broadcast)は、ここでブロックすると他の全接続の処理も
+ *     止まってしまうため、BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDSを渡すこと(詰まったpeer
+ *     1本あたり最大でもこの秒数しか他接続をブロックしない)
+ *   - peer_connector_thread自身のスレッド上で呼ばれるもの(bm_post_version)は、他接続の
+ *     処理を巻き込まないため、BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS(接続確立自体の
+ *     タイムアウト、CONNECT_TIMEOUT_SEC@peer_connector.cと同程度)を渡してよい
+ */
+#define BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS 2
+#define BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS 5
+int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec);
+
 int bm_reply_verack(struct bm_fd_data *conn);
 int bm_reply_pong(struct bm_fd_data *conn);
 int bm_post_version(int sock, const char *user_agent_str, int version,

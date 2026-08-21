@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,13 +67,47 @@ void bm_fd_data_free(struct bm_fd_data *data)
     free(data);
 }
 
+int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec)
+{
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = write(fd, data + sent, len - sent);
+        if (n > 0)
+        {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv;
+            tv.tv_sec = timeout_sec;
+            tv.tv_usec = 0;
+            if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0)
+            {
+                return -1; /* タイムアウトまたはselect()自体のエラー */
+            }
+            continue;
+        }
+        return -1; /* 相手が切断した(n==0)、またはその他のエラー */
+    }
+    return 0;
+}
+
 static int send_header_only(int fd, const char *command)
 {
     size_t len = 0;
     unsigned char *packet = bm_create_packet(command, NULL, 0, &len);
-    ssize_t w = write(fd, packet, len);
+    int rc = bm_network_write_all(fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
     free(packet);
-    return (w == (ssize_t)len) ? 0 : -1;
+    return rc;
 }
 
 int bm_reply_verack(struct bm_fd_data *conn)
@@ -91,9 +126,9 @@ int bm_post_version(int sock, const char *user_agent_str, int version,
 {
     size_t len = 0;
     unsigned char *msg = bm_new_version_message(user_agent_str, version, peer_addr, local_addr, &len);
-    ssize_t w = write(sock, msg, len);
+    int rc = bm_network_write_all(sock, msg, len, BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS);
     free(msg);
-    return (w == (ssize_t)len) ? 0 : -1;
+    return rc;
 }
 
 /* 既定のコマンドディスパッチ。DESIGN.md §1.1 command_worker_thread の初版実装。

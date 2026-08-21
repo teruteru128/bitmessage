@@ -124,6 +124,17 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         return;
     }
 
+    /* §11 部分書き込み対策: bm_network_write_all は書き込み可能になるまで(最大
+     * BM_NETWORK_WRITE_TIMEOUT_SECONDS)select()で待つことがあるため、reg->lock を
+     * 持ったまま呼ぶと1本の詰まったpeerが他スレッドのregistry操作を長時間ブロック
+     * しかねない。かといってfd番号だけコピーしてロックを解放すると、書き込み前に
+     * 元の接続がepoll thread側でclose()されfd番号が別の用途に再利用された場合に
+     * 誤った相手へ書き込んでしまう恐れがある。dup()した複製fdはclose(conn->fd)されても
+     * 無効化されず同じsocketを指し続けるため、ロックを持っている間にdup()するだけで
+     * この競合を避けつつロックを早期に解放できる */
+    int *fds = reg->count > 0 ? malloc(sizeof(int) * reg->count) : NULL;
+    size_t fd_count = 0;
+
     pthread_mutex_lock(&reg->lock);
     for (size_t i = 0; i < reg->count; i++)
     {
@@ -132,12 +143,23 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         {
             continue;
         }
-        if (write(conn->fd, packet, packet_len) != (ssize_t)packet_len)
+        int dup_fd = dup(conn->fd);
+        if (dup_fd >= 0)
         {
-            fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", conn->fd);
+            fds[fd_count++] = dup_fd;
         }
     }
     pthread_mutex_unlock(&reg->lock);
+
+    for (size_t i = 0; i < fd_count; i++)
+    {
+        if (bm_network_write_all(fds[i], packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
+        {
+            fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", fds[i]);
+        }
+        close(fds[i]);
+    }
+    free(fds);
 
     free(packet);
 }

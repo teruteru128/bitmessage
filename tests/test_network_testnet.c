@@ -5,12 +5,16 @@
  * 実機での実testnetノードとのハンドシェイク確認は手動で実施済み(DESIGN.md参照)。
  */
 
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "../src/core/peer_manager.h"
+#include "../src/infra/network.h"
 #include "../src/infra/protocol.h"
 
 static int failures = 0;
@@ -105,6 +109,95 @@ static void test_oversized_length_rejected(void)
     CHECK(result == BM_PARSE_INCOMPLETE, "a declared length exactly at the limit should not be rejected");
 
     printf("OK: oversized declared message length rejected before buffering payload data\n");
+}
+
+struct drain_thread_args
+{
+    int fd;
+    unsigned char *received; /* 呼び出し側でmalloc、受信データを書き込む */
+    size_t expected_len;
+    size_t received_len; /* out */
+};
+
+/* 受信側を模す: 少しずつ・間隔を空けて読むことで、送信側(bm_network_write_all)が
+ * 複数回のEAGAINを経て初めて送り切れる状況を作る */
+static void *drain_thread_fn(void *arg)
+{
+    struct drain_thread_args *a = arg;
+    while (a->received_len < a->expected_len)
+    {
+        size_t chunk = 4096;
+        if (chunk > a->expected_len - a->received_len)
+        {
+            chunk = a->expected_len - a->received_len;
+        }
+        ssize_t n = read(a->fd, a->received + a->received_len, chunk);
+        if (n <= 0)
+        {
+            break;
+        }
+        a->received_len += (size_t)n;
+        usleep(2000); /* 送信側に複数回EAGAINを経験させるため、読み取りペースを意図的に落とす */
+    }
+    return NULL;
+}
+
+static void test_network_write_all(void)
+{
+    /* §11 部分書き込み対策: bm_network_write_allが非blockingソケットへの
+     * 短い書き込み/EAGAINを正しくループして処理し、最終的にペイロード全体を
+     * バイト単位で欠落なく送り切れることを確認する */
+    int fds[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair for write_all test");
+
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    fcntl(fds[0], F_SETFL, flags | O_NONBLOCK); /* peer_connector.cが接続後もO_NONBLOCKのまま
+                                                   * epollへ渡す実運用と同じ状態を再現する */
+
+    const size_t payload_len = 1024 * 1024; /* 1MiB。ソケットバッファより確実に大きくし、
+                                              * 1回のwrite()では絶対に送り切れないようにする */
+    unsigned char *payload = malloc(payload_len);
+    for (size_t i = 0; i < payload_len; i++)
+    {
+        payload[i] = (unsigned char)(i % 256); /* 欠落・順序入れ替わりを検出しやすいパターン */
+    }
+
+    struct drain_thread_args drain_args;
+    drain_args.fd = fds[1];
+    drain_args.received = malloc(payload_len);
+    drain_args.expected_len = payload_len;
+    drain_args.received_len = 0;
+    pthread_t drain_thread;
+    CHECK(pthread_create(&drain_thread, NULL, drain_thread_fn, &drain_args) == 0, "start drain thread");
+
+    int rc = bm_network_write_all(fds[0], payload, payload_len, 30);
+    CHECK(rc == 0, "bm_network_write_all should eventually send the entire 1MiB payload");
+
+    pthread_join(drain_thread, NULL);
+    CHECK(drain_args.received_len == payload_len, "receiver should have gotten every byte");
+    CHECK(memcmp(payload, drain_args.received, payload_len) == 0,
+          "received payload should exactly match what was sent (no corruption/reordering across "
+          "the multiple partial writes)");
+
+    free(payload);
+    free(drain_args.received);
+    close(fds[0]);
+    close(fds[1]);
+
+    /* 対照実験: 受信側が全く読まない(相手が詰まっている)場合、短いタイムアウトで
+     * ちゃんと諦めて-1を返すこと(無限に待ち続けない) */
+    int fds2[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2) == 0, "socketpair for timeout test");
+    int flags2 = fcntl(fds2[0], F_GETFL, 0);
+    fcntl(fds2[0], F_SETFL, flags2 | O_NONBLOCK);
+    unsigned char big_payload[1024 * 1024];
+    memset(big_payload, 0, sizeof(big_payload));
+    int rc2 = bm_network_write_all(fds2[0], big_payload, sizeof(big_payload), 1);
+    CHECK(rc2 != 0, "bm_network_write_all should give up (not hang forever) when the peer never reads");
+    close(fds2[0]);
+    close(fds2[1]);
+
+    printf("OK: bm_network_write_all handles partial writes/EAGAIN correctly and times out when stuck\n");
 }
 
 static void test_bootstrap_seeding(void)
@@ -268,6 +361,7 @@ int main(void)
     test_magic_bytes_switch();
     test_bad_magic_rejected();
     test_oversized_length_rejected();
+    test_network_write_all();
     test_bootstrap_seeding();
     test_observed_nodes_file();
     test_peer_cleanup();
