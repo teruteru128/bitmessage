@@ -25,6 +25,9 @@ struct bm_api_server_config
      * 流さず、objectはinventoryHashの計算にのみ使われて破棄される。testやCLI単体動作用)。
      * infra/object_sync.cのbm_object_sync_broadcast_threadが消費する。 */
     bm_queue_t *broadcast_queue;
+    /* §11 config.db(core/config_store.c)。NULL可(その場合getSocksProxy/setSocksProxyは
+     * エラーを返す。testやCLI単体動作用)。 */
+    sqlite3 *config_db;
 };
 
 /* bind+listenする。成功時0、*out_listen_fdにfdを設定。失敗時(ポート使用中等)は非0 */

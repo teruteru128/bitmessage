@@ -18,6 +18,7 @@
 #include "../common/json.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
+#include "config_store.h"
 #include "identity_store.h"
 #include "message_builder.h"
 #include "messages_store.h"
@@ -598,6 +599,81 @@ static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *c
     return arr;
 }
 
+/*
+ * getSocksProxy: [] -> {enabled, host, port}
+ * §11 outbound接続用SOCKS5プロキシ設定(config.db、core/config_store.c)の参照。
+ */
+static bm_json_value_t *h_getSocksProxy(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    if (config->config_db == NULL)
+    {
+        *out_error = dup_cstr("config store is not available");
+        return NULL;
+    }
+
+    struct bm_socks_proxy_config proxy;
+    if (bm_config_store_get_socks_proxy(config->config_db, &proxy) != 0)
+    {
+        *out_error = dup_cstr("failed to read socks proxy config");
+        return NULL;
+    }
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "enabled", bm_json_new_bool(proxy.enabled));
+    bm_json_object_set(result, "host", bm_json_new_string(proxy.host));
+    bm_json_object_set(result, "port", bm_json_new_number((double)proxy.port));
+    return result;
+}
+
+/*
+ * setSocksProxy: [enabled, host, port]
+ * 変更はconfig.dbへ永続化されるが、稼働中のpeer_connector_threadには反映されない(起動時に
+ * 読み込んだ値を使い続ける設計、DESIGN.md §11)。反映にはbitmessagedの再起動が必要。
+ */
+static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    if (config->config_db == NULL)
+    {
+        *out_error = dup_cstr("config store is not available");
+        return NULL;
+    }
+
+    const bm_json_value_t *enabled_v = bm_json_array_get(params, 0);
+    const char *host = param_str(params, 1);
+    const bm_json_value_t *port_v = bm_json_array_get(params, 2);
+    if (enabled_v == NULL || host == NULL || port_v == NULL)
+    {
+        *out_error = dup_cstr("setSocksProxy requires [enabled, host, port]");
+        return NULL;
+    }
+
+    struct bm_socks_proxy_config proxy;
+    memset(&proxy, 0, sizeof(proxy));
+    proxy.enabled = (bm_json_as_number(enabled_v) != 0.0) ? 1 : 0;
+    if (strlen(host) == 0 || strlen(host) >= sizeof(proxy.host))
+    {
+        *out_error = dup_cstr("host must be non-empty and shorter than 256 bytes");
+        return NULL;
+    }
+    strncpy(proxy.host, host, sizeof(proxy.host) - 1);
+    proxy.port = (int)bm_json_as_number(port_v);
+    if (proxy.port <= 0 || proxy.port > 65535)
+    {
+        *out_error = dup_cstr("port must be between 1 and 65535");
+        return NULL;
+    }
+
+    if (bm_config_store_set_socks_proxy(config->config_db, &proxy) != 0)
+    {
+        *out_error = dup_cstr("failed to store socks proxy config");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
 static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
                                             const bm_json_value_t *params, char **out_error)
 {
@@ -646,6 +722,8 @@ static const struct bm_api_method METHODS[] = {
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
     {"listSubscriptions", h_listSubscriptions},
+    {"getSocksProxy", h_getSocksProxy},
+    {"setSocksProxy", h_setSocksProxy},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

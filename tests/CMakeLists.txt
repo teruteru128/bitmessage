@@ -63,3 +63,7 @@ add_test(NAME resend COMMAND test_resend)
 add_executable(test_broadcast test_broadcast.c)
 target_link_libraries(test_broadcast PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME broadcast COMMAND test_broadcast)
+
+add_executable(test_config_store test_config_store.c)
+target_link_libraries(test_config_store PRIVATE bm_core bm_infra Threads::Threads)
+add_test(NAME config_store COMMAND test_config_store)

@@ -9,6 +9,7 @@ add_library(bm_core STATIC
     trial_decrypt.c
     broadcast_decrypt.c
     send_pipeline.c
+    config_store.c
     api_server.c
 )
 

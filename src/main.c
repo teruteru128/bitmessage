@@ -15,6 +15,7 @@
 #include "common/db_common.h"
 #include "common/queue.h"
 #include "core/api_server.h"
+#include "core/config_store.h"
 #include "core/identity_store.h"
 #include "core/keyring.h"
 #include "core/messages_store.h"
@@ -98,13 +99,23 @@ int main(void)
     sqlite3 *object_pool_db = open_and_init("object_pool.db", bm_object_store_init_schema);
     sqlite3 *identity_db = open_and_init("identity.db", bm_identity_store_init_schema);
     sqlite3 *messages_db = open_and_init("messages.db", bm_messages_store_init_schema);
+    sqlite3 *config_db = open_and_init("config.db", bm_config_store_init_schema);
 
-    if (peers_db == NULL || object_pool_db == NULL || identity_db == NULL || messages_db == NULL)
+    if (peers_db == NULL || object_pool_db == NULL || identity_db == NULL || messages_db == NULL
+        || config_db == NULL)
     {
         fprintf(stderr, "DB初期化に失敗しました\n");
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "DB初期化完了: peers.db, object_pool.db, identity.db, messages.db\n");
+    fprintf(stderr, "DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
+
+    /* §11 outbound接続用SOCKS5プロキシ設定。CLIのset-socks-proxyで永続化された値を起動時に
+     * 読み込む(実行中の変更はこの起動には反映されない、次回起動から有効)。 */
+    struct bm_socks_proxy_config socks_proxy_config;
+    bm_config_store_get_socks_proxy(config_db, &socks_proxy_config);
+    fprintf(stderr, "[config] socks proxy: %s (%s:%d)\n",
+            socks_proxy_config.enabled ? "enabled" : "disabled",
+            socks_proxy_config.host, socks_proxy_config.port);
 
     struct bm_queues queues;
     queues_init(&queues);
@@ -133,6 +144,7 @@ int main(void)
     api_config.identity_db = identity_db;
     api_config.messages_db = messages_db;
     api_config.broadcast_queue = &queues.broadcast_queue;
+    api_config.config_db = config_db;
     fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s (この起動でのみ有効、設定ファイル未実装)\n",
             api_password);
 
@@ -217,6 +229,7 @@ int main(void)
         pc_args->config.max_outbound = BM_MAX_OUTBOUND;
         pc_args->config.user_agent = BM_USER_AGENT;
         pc_args->config.registry = &peer_registry;
+        pc_args->config.socks_proxy = &socks_proxy_config;
         pc_args->stop_flag = &peer_connector_stop;
         pthread_create(&th_peer_connector, NULL, bm_peer_connector_thread, pc_args);
         peer_connector_started = 1;
@@ -253,6 +266,7 @@ int main(void)
     sqlite3_close(object_pool_db);
     sqlite3_close(identity_db);
     sqlite3_close(messages_db);
+    sqlite3_close(config_db);
 
     return EXIT_SUCCESS;
 }

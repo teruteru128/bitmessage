@@ -47,7 +47,11 @@ static void print_usage(const char *prog)
             "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
             "      受信したらinboxへ保存する\n"
             "  remove-subscription <address>\n"
-            "  list-subscriptions\n",
+            "  list-subscriptions\n"
+            "  get-socks-proxy\n"
+            "  set-socks-proxy <enabled:0|1> <host> <port>\n"
+            "      outbound接続用SOCKS5プロキシ(Tor等)の設定。config.dbへ永続化されるが、\n"
+            "      稼働中のbitmessagedには反映されない(再起動が必要)\n",
             prog);
 }
 
@@ -302,6 +306,25 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "list-subscriptions") == 0)
     {
         return call_rpc(&env, "listSubscriptions", params);
+    }
+
+    if (strcmp(cmd, "get-socks-proxy") == 0)
+    {
+        return call_rpc(&env, "getSocksProxy", params);
+    }
+
+    if (strcmp(cmd, "set-socks-proxy") == 0)
+    {
+        if (argc != 5)
+        {
+            fprintf(stderr, "使い方: %s set-socks-proxy <enabled:0|1> <host> <port>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_number(atof(argv[2])));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
+        return call_rpc(&env, "setSocksProxy", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);

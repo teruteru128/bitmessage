@@ -1039,6 +1039,44 @@ v1完成後、ユーザーが実際にmainnetへ接続したところ全く繋�
 addr由来の新規行のratingは触られないことを確認済み。ctest 16件(新規のaddr受信テストを
 `test_object_sync.c`へ追加)全通過。
 
+### SOCKS5プロキシ(Tor outbound)対応(2026-08-21)
+
+addr永続化に続く対策として、outbound接続をSOCKS5プロキシ(典型的にはTorのSocksPort)経由に
+できるようにした。動機は2つ: (1) mainnetシード全滅のような状況でも、Tor経由なら別経路で
+到達できる可能性がある、(2) 直接TCP接続がISP/ネットワーク事情で塞がれている環境でも
+迂回できる。inbound(Tor hidden serviceでの着信待受)は引き続き§9の通りスコープ外。
+
+設定の永続化そのものが未実装だった(§8/§9執筆時点のTODO)ため、今回は「設定の永続化」を
+汎用のkey-valueストアとしてではなく、まずSOCKS5プロキシ設定1項目に絞って実装した
+(汎用化は将来必要になった時点で改めて検討する、YAGNI)。
+
+- `core/config_store.c/h`(新規)を追加。`config.db`に`socks_proxy`テーブル(id=1固定の
+  単一行、`enabled`/`host`/`port`)を持つ。core層に置いたのは、core(api_server.c)・
+  infra(peer_connector.c)の両方から参照する必要があり、infra→coreの片方向依存という
+  既存の方針(DESIGN.md §1.2)に合わせるため。既定値はTorのSocksPort既定値に合わせ
+  `host=127.0.0.1, port=9050, enabled=0`とした。
+- `core/api_server.c`に`getSocksProxy`/`setSocksProxy(enabled, host, port)`を追加。
+  `bm_api_server_config`に`config_db`フィールド(NULL可)を追加。設定変更は`config.db`へ
+  即座に永続化されるが、**稼働中のpeer_connector_threadには反映されない**(起動時に
+  読み込んだ値をスレッド生存期間中ずっと使い続ける設計。動的リロードはv1.1のスコープ外、
+  反映にはbitmessadedの再起動が必要)。
+- `infra/peer_connector.c`にSOCKS5(RFC1928)のno-auth CONNECTハンドシェイクを実装
+  (`socks5_connect`ほか)。`bm_peer_connector_config`に`socks_proxy`フィールド(NULL可、
+  またはenabled=0なら従来通り直結)を追加。宛先は常にATYP=domain name(0x03)で送る
+  (`peers.db`の`ip_address`はIPv4/IPv6のテキスト表現だが、数字IP文字列であってもTor等の
+  SOCKS5サーバーは正しく扱う。将来onionアドレスに対応する際もこの経路がそのまま使える
+  設計)。プロキシ自体へのTCP接続は既存の`CONNECT_TIMEOUT_SEC`(5秒)、SOCKS5ハンドシェイク
+  自体(特にCONNECT応答待ち、Tor circuit構築で数秒~十数秒かかりうる)は別途
+  `SOCKS5_HANDSHAKE_TIMEOUT_SEC`(20秒)を設けた。
+- `cli/main.c`に`get-socks-proxy`/`set-socks-proxy <enabled> <host> <port>`を追加。
+- `tests/test_config_store.c`(新規)で、config_storeのget/set roundtrip・upsert確認に加え、
+  ローカルに立てたモックSOCKS5サーバーへ`bm_peer_connector_connect_initial`から実際に
+  CONNECTハンドシェイクさせて検証(実プロトコルバイト列のやり取りまで確認、宛先を実際に
+  中継する必要は無いためモックで十分)。
+- 実daemon・実Tor(ローカルの`tor`パッケージ、127.0.0.1:9050)での動作確認: CLIで
+  `set-socks-proxy`した後にbitmessagedを再起動し、testnetの実ピアへ`(via SOCKS5)`経由で
+  接続・version送信・addr受信までできることをログで確認済み。ctest 17件全通過。
+
 ### v1.1以降のbacklog
 
 - **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
@@ -1047,8 +1085,9 @@ addr由来の新規行のratingは触られないことを確認済み。ctest 1
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続getpubkey要求に対し、応答側が
   毎回PoWを計算し直してしまう(2026-08-23発覚。受信object全般のPoW検証により無償のspamは
   防げるようになったが、正規のPoWを払われた場合の対策は無い)。
-- **設定の永続化・DoS上限の見直し・chan仕様**: 2026-08-21のギャップ洗い出しで指摘した残り3項目
-  (日次振り返りの会話参照)。優先度は低いが実運用に近づくほど効いてくる。
+- **設定変更の動的リロード・DoS上限の見直し・chan仕様**: SOCKS5プロキシ設定は永続化した
+  ものの、稼働中プロセスへの反映は次回起動時のみ(上記参照)。汎用設定ストア化も含め今後の
+  検討課題。優先度は低いが実運用に近づくほど効いてくる。
 - **addrで教えられたホストのフィルタリング**: private/loopbackアドレス等の除外は未実装
   (2026-08-21、addr永続化の実装時に発覚)。不正確な情報が紛れ込んでもconnect失敗時に
   ratingが下がるだけなので実害は小さいと判断し見送り。

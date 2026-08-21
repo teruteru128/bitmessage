@@ -9,7 +9,8 @@
 #include <signal.h>
 #include <sqlite3.h>
 
-struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
+struct bm_peer_registry;       /* peer_registry.h、循環includeを避けるため前方宣言のみ */
+struct bm_socks_proxy_config; /* core/config_store.h、同上 */
 
 struct bm_peer_connector_config
 {
@@ -19,6 +20,10 @@ struct bm_peer_connector_config
     int max_outbound;
     const char *user_agent;
     struct bm_peer_registry *registry; /* NULL可(未使用ならレジストリ登録・重複接続チェックをスキップ) */
+    /* §11 outbound接続用SOCKS5プロキシ(Tor等)。NULL可、またはenabled=0なら直結する。
+     * 有効な場合、宛先へは直接connect()せずproxy host:portへ接続した上でSOCKS5(RFC1928)の
+     * no-auth CONNECTハンドシェイクで中継させる(peer_connector.c参照)。 */
+    const struct bm_socks_proxy_config *socks_proxy;
 };
 
 /*

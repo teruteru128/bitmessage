@@ -12,12 +12,16 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "../core/config_store.h"
 #include "network.h"
 #include "peer_manager.h"
 #include "peer_registry.h"
 
 #define MAX_CANDIDATES 32
 #define CONNECT_TIMEOUT_SEC 5
+/* SOCKS5ハンドシェイク(特にCONNECT応答待ち)は、宛先がTor等の場合に回線構築で数秒〜十数秒
+ * かかることがあるため、ローカルのプロキシ自体へのTCP接続(CONNECT_TIMEOUT_SEC)より長めに取る */
+#define SOCKS5_HANDSHAKE_TIMEOUT_SEC 20
 
 /* 非ブロッキングconnect + selectでタイムアウト付き接続を行う。成功時fd、失敗時-1 */
 static int connect_with_timeout(const char *ip, int port, int timeout_sec)
@@ -91,6 +95,181 @@ static int connect_with_timeout(const char *ip, int port, int timeout_sec)
     return sock;
 }
 
+/* O_NONBLOCKなsockに対しEAGAIN/EWOULDBLOCKをselect()で待ちながらlenバイト送り切る。成功時0 */
+static int socks5_send_all(int sock, const unsigned char *buf, size_t len, int timeout_sec)
+{
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = send(sock, buf + sent, len - sent, 0);
+        if (n > 0)
+        {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv;
+            tv.tv_sec = timeout_sec;
+            tv.tv_usec = 0;
+            if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* 同上の受信版。lenバイト読み切るまでselect()で待つ。相手がcloseしたら失敗として扱う */
+static int socks5_recv_all(int sock, unsigned char *buf, size_t len, int timeout_sec)
+{
+    size_t got = 0;
+    while (got < len)
+    {
+        ssize_t n = recv(sock, buf + got, len - got, 0);
+        if (n > 0)
+        {
+            got += (size_t)n;
+            continue;
+        }
+        if (n == 0)
+        {
+            return -1;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(sock, &rfds);
+            struct timeval tv;
+            tv.tv_sec = timeout_sec;
+            tv.tv_usec = 0;
+            if (select(sock + 1, &rfds, NULL, NULL, &tv) <= 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * SOCKS5(RFC1928)のno-auth CONNECTハンドシェイク。sockは既にproxyへ接続済み(O_NONBLOCK)で
+ * あること。宛先は常にドメイン名形式(ATYP=0x03)で送る: dest_hostが数字IPの文字列であっても
+ * Tor等のSOCKS5サーバーは正しく扱う(ローカルでDNS解決せずそのままCONNECT先として使うため、
+ * 将来onionアドレスに対応する際もこの経路がそのまま使える)。成功時0
+ */
+static int socks5_connect(int sock, const char *dest_host, int dest_port, int timeout_sec)
+{
+    size_t host_len = strlen(dest_host);
+    if (host_len == 0 || host_len > 255)
+    {
+        return -1;
+    }
+
+    unsigned char greeting[3] = {0x05, 0x01, 0x00}; /* version=5, 1 method, no-auth */
+    if (socks5_send_all(sock, greeting, sizeof(greeting), timeout_sec) != 0)
+    {
+        return -1;
+    }
+    unsigned char method_resp[2];
+    if (socks5_recv_all(sock, method_resp, sizeof(method_resp), timeout_sec) != 0)
+    {
+        return -1;
+    }
+    if (method_resp[0] != 0x05 || method_resp[1] != 0x00)
+    {
+        return -1; /* no-auth非対応、または想定外バージョン */
+    }
+
+    unsigned char req[4 + 1 + 255 + 2];
+    size_t req_len = 0;
+    req[req_len++] = 0x05;
+    req[req_len++] = 0x01; /* CMD=CONNECT */
+    req[req_len++] = 0x00; /* RSV */
+    req[req_len++] = 0x03; /* ATYP=domain name */
+    req[req_len++] = (unsigned char)host_len;
+    memcpy(req + req_len, dest_host, host_len);
+    req_len += host_len;
+    req[req_len++] = (unsigned char)((dest_port >> 8) & 0xff);
+    req[req_len++] = (unsigned char)(dest_port & 0xff);
+    if (socks5_send_all(sock, req, req_len, timeout_sec) != 0)
+    {
+        return -1;
+    }
+
+    unsigned char reply_head[4];
+    if (socks5_recv_all(sock, reply_head, sizeof(reply_head), timeout_sec) != 0)
+    {
+        return -1;
+    }
+    if (reply_head[0] != 0x05 || reply_head[1] != 0x00)
+    {
+        return -1; /* REPが成功(0x00)以外 */
+    }
+
+    size_t bnd_addr_len;
+    switch (reply_head[3])
+    {
+        case 0x01:
+            bnd_addr_len = 4;
+            break;
+        case 0x04:
+            bnd_addr_len = 16;
+            break;
+        case 0x03:
+        {
+            unsigned char len_byte;
+            if (socks5_recv_all(sock, &len_byte, 1, timeout_sec) != 0)
+            {
+                return -1;
+            }
+            bnd_addr_len = len_byte;
+            break;
+        }
+        default:
+            return -1;
+    }
+    unsigned char discard[256];
+    if (socks5_recv_all(sock, discard, bnd_addr_len + 2, timeout_sec) != 0)
+    {
+        return -1; /* BND.ADDR + BND.PORT。値自体は使わない */
+    }
+    return 0;
+}
+
+/*
+ * socks_proxyが有効ならproxy経由でSOCKS5 CONNECTして接続し、そうでなければ従来通り直結する。
+ * 戻り値はconnect_with_timeoutと同じ(成功時fd、失敗時-1)。
+ */
+static int open_peer_connection(const char *ip, int port, int timeout_sec,
+                                 const struct bm_socks_proxy_config *socks_proxy)
+{
+    if (socks_proxy != NULL && socks_proxy->enabled)
+    {
+        int sock = connect_with_timeout(socks_proxy->host, socks_proxy->port, timeout_sec);
+        if (sock < 0)
+        {
+            return -1;
+        }
+        if (socks5_connect(sock, ip, port, SOCKS5_HANDSHAKE_TIMEOUT_SEC) != 0)
+        {
+            close(sock);
+            return -1;
+        }
+        return sock;
+    }
+    return connect_with_timeout(ip, port, timeout_sec);
+}
+
 int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *config)
 {
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
@@ -118,9 +297,11 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             continue; /* 既に接続済みの相手には二重接続しない */
         }
 
-        fprintf(stderr, "[peer_connector] connecting to %s:%d...\n",
-                candidates[i].ip_address, candidates[i].port);
-        int sock = connect_with_timeout(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC);
+        fprintf(stderr, "[peer_connector] connecting to %s:%d%s...\n",
+                candidates[i].ip_address, candidates[i].port,
+                (config->socks_proxy != NULL && config->socks_proxy->enabled) ? " (via SOCKS5)" : "");
+        int sock = open_peer_connection(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC,
+                                         config->socks_proxy);
         if (sock < 0)
         {
             fprintf(stderr, "[peer_connector] failed to connect to %s:%d\n",
