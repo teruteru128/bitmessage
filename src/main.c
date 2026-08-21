@@ -192,21 +192,27 @@ int main(void)
 
     /* BM_NO_CONNECT=1で実接続を抑止できる(自動テスト用。cli_integration等が本物のネットワークへ
      * 接続しに行くとCI環境の到達性次第で数十秒単位で遅くなる/非決定的になるため)。 */
+    pthread_t th_peer_connector;
+    int peer_connector_started = 0;
+    volatile sig_atomic_t peer_connector_stop = 0;
     if (getenv("BM_NO_CONNECT") != NULL && strcmp(getenv("BM_NO_CONNECT"), "1") == 0)
     {
         fprintf(stderr, "[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
     }
     else
     {
-        struct bm_peer_connector_config pc_config;
-        pc_config.epfd = epfd;
-        pc_config.peers_db = peers_db;
-        pc_config.testnet = testnet;
-        pc_config.max_outbound = BM_MAX_OUTBOUND;
-        pc_config.user_agent = BM_USER_AGENT;
-        pc_config.registry = &peer_registry;
-        int connected = bm_peer_connector_connect_initial(&pc_config);
-        fprintf(stderr, "[peer_connector] %d outbound connection(s) established\n", connected);
+        /* §1.1 peer_connector_thread(常駐)。argはスレッド側でfreeされるためmallocする。
+         * peer_connector_stopはmain()がsigwaitでブロックしている間ずっと生存するスタック変数。 */
+        struct bm_peer_connector_thread_args *pc_args = malloc(sizeof(*pc_args));
+        pc_args->config.epfd = epfd;
+        pc_args->config.peers_db = peers_db;
+        pc_args->config.testnet = testnet;
+        pc_args->config.max_outbound = BM_MAX_OUTBOUND;
+        pc_args->config.user_agent = BM_USER_AGENT;
+        pc_args->config.registry = &peer_registry;
+        pc_args->stop_flag = &peer_connector_stop;
+        pthread_create(&th_peer_connector, NULL, bm_peer_connector_thread, pc_args);
+        peer_connector_started = 1;
     }
 
     /* SIGINT/SIGTERMをブロックしてsigwaitで待つ(全スレッドが実装されればここが本体のライフサイクルになる) */
@@ -220,10 +226,15 @@ int main(void)
     fprintf(stderr, "シグナル %d を受信、終了処理を開始します\n", sig);
 
     queues_shutdown(&queues);
+    peer_connector_stop = 1;
 
     pthread_join(th_trial_decrypt, NULL);
     pthread_join(th_send_pipeline, NULL);
     pthread_join(th_broadcast, NULL);
+    if (peer_connector_started)
+    {
+        pthread_join(th_peer_connector, NULL); /* 最大STOP_POLL_INTERVAL_SECONDS秒でポーリング検知して終了する */
+    }
     /* th_api_serverはdetach済み(上記コメント参照)。プロセス終了と共に破棄される */
 
     queues_destroy(&queues);

@@ -30,8 +30,18 @@
 verack受信→相手のversion受信、というプロトコルレベルのハンドシェイクが成立することを手動で確認済み
 (magic bytes・24byteヘッダ・checksum・varintエンコード・versionメッセージ構築が実ネットワークと
 バイト単位で相互運用可能であることの実証)。
-`peer_connector_thread`もv1は起動時1回のみの接続で、常駐しての再接続・維持ループは未実装(TODO、
-`src/infra/peer_connector.c`)。
+**`peer_connector_thread`の常駐化・再接続維持ループも実装済み(2026-08-23)。**
+`bm_peer_connector_thread`(`src/infra/peer_connector.c`)として、起動直後に
+`bm_peer_connector_connect_initial`相当を1回実行し、以後30秒間隔で接続数
+(`peer_registry`参照)を`max_outbound`まで補充し続ける。同じ相手への二重接続は
+`bm_peer_registry_has_peer`で回避する。接続試行の成否は`peer_manager.c`の新関数
+`bm_peer_manager_record_result`でrating(成功+0.1/失敗-0.1、上下限±1.0、PyBitmessageの
+rating更新方式を簡略化したもの)へ反映され、`list_top`(rating降順)の結果に効いてくる。
+シャットダウンは`volatile sig_atomic_t`のstop flagを1秒間隔でポーリングする方式にし、
+`main.c`からpthread_joinできるようにした(この時点でネットワーク関連スレッドの中で
+唯一グレースフルシャットダウンに対応している)。実testnetノードで65秒稼働させ、
+2回の再接続サイクル(生存中の相手は据え置き、接続できない相手のratingが-0.1ずつ
+減っていく)とSIGINT後0.5秒程度でのプロセス終了を実機で確認済み。
 
 **`object_sync_thread`実装済み(`src/infra/object_sync.c/h`、2026-08-22)。** `command_worker_thread`の
 役割も兼ねる形で1関数(`bm_object_sync_dispatch`)にまとめ、`network_epoll_thread`のハンドラとして
@@ -856,16 +866,13 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
-接続レジストリ(`peer_registry.c/h`)によるinv broadcastと、`api_server.c`からの能動的な
-broadcast(`broadcast_queue`結線)の両方が実装完了・push済み(2026-08-22)。これで受信object
-の中継(peer→peer)と自分が送信したmsgのネットワークへの実配信、両方が動く状態になった。
-ctest 12件全通過、実testnetノードとの通信で`sendMessage`→`object_pool.db`挿入→`inv`送出まで
-実機確認済み。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと
-(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
+`peer_connector`の常駐化・再接続維持ループが実装完了・push済み(2026-08-23)。ctest 12件全通過、
+実testnetノードで65秒稼働させて2回の再接続サイクルとrating更新、SIGINT後0.5秒程度での
+プロセス終了を実機確認済み。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
+確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから
+着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情でTor実装まで見送りの
+前提は継続(§8参照)。
 
-- **`peer_connector`の永続化**: 現在`bm_peer_connector_connect_initial()`は起動時一回きりのoutbound接続。
-  再接続・複数peer維持ループが未実装(自宅環境はCGNAT相当でinbound不可、Tor実装までoutbound-onlyの
-  前提は継続、§8参照)。
 - **`api_server`のgraceful shutdown**: `accept()`がブロッキングでSIGINT等に応答できないため現状は
   `pthread_detach`で逃げている(`main.c`)。self-pipeトリック等で正式に閉じられるようにする。
 - **PoW並列化**: `pow/pow_engine.c`は現状シングルスレッド。

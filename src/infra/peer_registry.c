@@ -1,10 +1,33 @@
 #include "peer_registry.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "protocol.h"
+
+/* peer_addr(sockaddr_storage)を"ip:port"文字列にする。DNS引きはせず数値表記のみ */
+static void format_peer_addr(const struct sockaddr_storage *addr, char *out, size_t out_len)
+{
+    char ip[INET6_ADDRSTRLEN] = {0};
+    int port = 0;
+    if (addr->ss_family == AF_INET)
+    {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+        port = ntohs(sin->sin_port);
+    }
+    else if (addr->ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
+        port = ntohs(sin6->sin6_port);
+    }
+    snprintf(out, out_len, "%s:%d", ip, port);
+}
 
 void bm_peer_registry_init(struct bm_peer_registry *reg)
 {
@@ -55,6 +78,35 @@ void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *co
         }
     }
     pthread_mutex_unlock(&reg->lock);
+}
+
+size_t bm_peer_registry_count(struct bm_peer_registry *reg)
+{
+    pthread_mutex_lock(&reg->lock);
+    size_t count = reg->count;
+    pthread_mutex_unlock(&reg->lock);
+    return count;
+}
+
+int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port)
+{
+    char target[INET6_ADDRSTRLEN + 8];
+    snprintf(target, sizeof(target), "%s:%d", ip, port);
+
+    pthread_mutex_lock(&reg->lock);
+    int found = 0;
+    for (size_t i = 0; i < reg->count; i++)
+    {
+        char current[INET6_ADDRSTRLEN + 8];
+        format_peer_addr(&reg->conns[i]->peer_addr, current, sizeof(current));
+        if (strcmp(current, target) == 0)
+        {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return found;
 }
 
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],

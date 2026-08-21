@@ -163,3 +163,29 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
             testnet ? "testnet" : "mainnet");
     return 0;
 }
+
+int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port, int stream, int success)
+{
+    const char *sql = success
+        ? "UPDATE hosts SET rating = MIN(1.0, rating + 0.1), last_seen = ?4 "
+          "WHERE ip_address = ?1 AND port = ?2 AND stream = ?3;"
+        : "UPDATE hosts SET rating = MAX(-1.0, rating - 0.1) "
+          "WHERE ip_address = ?1 AND port = ?2 AND stream = ?3;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, ip_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, port);
+    sqlite3_bind_int(stmt, 3, stream);
+    if (success)
+    {
+        sqlite3_bind_int64(stmt, 4, (sqlite3_int64)time(NULL));
+    }
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}

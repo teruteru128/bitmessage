@@ -28,6 +28,12 @@ void bm_peer_registry_add(struct bm_peer_registry *reg, struct bm_fd_data *conn)
 /* connが登録されていなくても何もしない(既に削除済み等) */
 void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *conn);
 
+/* 現在の登録数(peer_connectorが接続数維持の判断に使う) */
+size_t bm_peer_registry_count(struct bm_peer_registry *reg);
+
+/* ip:portが既に登録済みの接続の中にあるか(peer_connectorが同じ相手への二重接続を避けるため) */
+int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port);
+
 /*
  * 現在接続中の全peer(exceptが非NULLならそれを除く)へ、hashesをinvとして送る。
  * 個々のwrite失敗は無視する(接続の生死判定はnetwork_epoll_thread側のepoll_wait/readに任せ、

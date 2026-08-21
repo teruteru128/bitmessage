@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
@@ -94,6 +95,13 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
 {
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
 
+    size_t already_connected = config->registry != NULL ? bm_peer_registry_count(config->registry) : 0;
+    if ((int)already_connected >= config->max_outbound)
+    {
+        return 0;
+    }
+    int want = config->max_outbound - (int)already_connected;
+
     struct bm_peer_entry candidates[MAX_CANDIDATES];
     int candidate_count = 0;
     if (bm_peer_manager_list_top(config->peers_db, 1, candidates, MAX_CANDIDATES, &candidate_count) != 0)
@@ -102,8 +110,14 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     }
 
     int connected = 0;
-    for (int i = 0; i < candidate_count && connected < config->max_outbound; i++)
+    for (int i = 0; i < candidate_count && connected < want; i++)
     {
+        if (config->registry != NULL
+            && bm_peer_registry_has_peer(config->registry, candidates[i].ip_address, candidates[i].port))
+        {
+            continue; /* 既に接続済みの相手には二重接続しない */
+        }
+
         fprintf(stderr, "[peer_connector] connecting to %s:%d...\n",
                 candidates[i].ip_address, candidates[i].port);
         int sock = connect_with_timeout(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC);
@@ -111,6 +125,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         {
             fprintf(stderr, "[peer_connector] failed to connect to %s:%d\n",
                     candidates[i].ip_address, candidates[i].port);
+            bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
 
@@ -120,6 +135,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             fprintf(stderr, "[peer_connector] bm_fd_data_new failed for %s:%d\n",
                     candidates[i].ip_address, candidates[i].port);
             close(sock);
+            bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
 
@@ -131,6 +147,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             perror("[peer_connector] epoll_ctl");
             bm_fd_data_free(conn);
             close(sock);
+            bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
 
@@ -141,6 +158,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             epoll_ctl(config->epfd, EPOLL_CTL_DEL, sock, NULL);
             bm_fd_data_free(conn);
             close(sock);
+            bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
 
@@ -148,6 +166,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         {
             bm_peer_registry_add(config->registry, conn);
         }
+        bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 1);
 
         fprintf(stderr, "[peer_connector] connected to %s:%d, version sent\n",
                 candidates[i].ip_address, candidates[i].port);
@@ -155,4 +174,29 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     }
 
     return connected;
+}
+
+#define RECONNECT_INTERVAL_SECONDS 30
+#define STOP_POLL_INTERVAL_SECONDS 1
+
+void *bm_peer_connector_thread(void *arg)
+{
+    struct bm_peer_connector_thread_args *args = arg;
+
+    while (*args->stop_flag == 0)
+    {
+        int connected = bm_peer_connector_connect_initial(&args->config);
+        if (connected > 0)
+        {
+            fprintf(stderr, "[peer_connector] %d new outbound connection(s) established\n", connected);
+        }
+
+        for (int waited = 0; waited < RECONNECT_INTERVAL_SECONDS && *args->stop_flag == 0; waited++)
+        {
+            sleep(STOP_POLL_INTERVAL_SECONDS);
+        }
+    }
+
+    free(args);
+    return NULL;
 }
