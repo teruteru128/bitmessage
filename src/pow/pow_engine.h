@@ -17,8 +17,10 @@ uint64_t bm_pow_trial_value(uint64_t nonce, const unsigned char initial_hash[64]
 
 /*
  * §4.3: payload(nonce抜き)に対しPoWを計算し、見つかったnonceを返す。
- * TODO: 現状は単一スレッド探索(PyBitmessageの_doSafePoW相当)。
- * NumCPU本のワーカースレッドに割り当てる並列化は今後実装する。
+ * sysconf(_SC_NPROCESSORS_ONLN)本のワーカースレッドに探索空間をstride分割して割り当てる
+ * (PyBitmessageの_doSafePoW相当をさらに並列化したもの)。ワーカーiはnonce=i,i+N,i+2N,...を
+ * 担当し、いずれかが条件を満たすnonceを見つけたら他のワーカーへ通知して打ち切る。
+ * CPUコア数取得に失敗した場合は1スレッド(従来のシングルスレッド探索と同じ経路)にフォールバックする。
  */
 uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t target);
 

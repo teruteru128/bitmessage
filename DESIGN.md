@@ -435,6 +435,19 @@ nonceは0から順に(並列時はワーカー数刻みで)探索。見つかっ
 
 GPU/OpenCLは初版スコープ外(§8)。マルチスレッドCPU実装のみを対象とする。
 
+**マルチスレッド探索、実装済み(`src/pow/pow_engine.c`、2026-08-23)。** 上記の設計どおり
+`sysconf(_SC_NPROCESSORS_ONLN)`本のワーカースレッドに`nonce_start=worker_index`,
+`nonce_step=num_threads`で探索空間を割り当てる。ただし`pow_request_queue`/`pow_result_queue`
+経由ではなく、他の計算(`trial_decrypt`等)と同様に`bm_pow_run`を直接呼び出す設計に単純化して
+いる(§1「実装上の注記」と同じ方針)。`atomic_bool found`を各ワーカーが64反復に1回チェックし
+(メモリバリアの頻度を抑えつつ取りこぼしても正しさには影響しない)、見つけたワーカーが
+`atomic_compare_exchange_strong`で1回だけ`result_nonce`を書き込む。CPUコア数取得に失敗した
+場合(`num_cpus<1`)は従来のシングルスレッド探索にフォールバックする。
+`tests/test_pow_engine.c`で複数の乱数payload・難易度に対し返り値のnonceが実際にtargetを
+満たすことを検証(並行探索特有の競合バグを拾うため)、実daemonで実ネットワーク難易度
+(nonce_trials_per_byte=1000)のmsg送信PoWが16コア環境で約0.35秒(従来のシングルスレッドでは
+数秒〜十数秒)まで短縮されることを実機確認済み。
+
 ## 5. Object種別のワイヤーフォーマット
 
 **実装済み(`src/core/message_builder.c`)。getpubkey/pubkey v2・v3・v4/msg/broadcast/ack(stealth level 0/1/2)
@@ -872,17 +885,15 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
-`peer_connector`の常駐化・再接続維持ループ(2026-08-23)、`api_server`のgraceful shutdown
-(2026-08-23、poll()の1秒タイムアウトポーリング方式)が実装完了・push済み。これで
+`peer_connector`の常駐化・再接続維持ループ、`api_server`のgraceful shutdown、
+`pow_engine`のマルチスレッド並列化(いずれも2026-08-23)が実装完了・push済み。これで
 `network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
-ctest 12件全通過、実testnetノードで65秒稼働させて2回の再接続サイクルとrating更新、
-SIGINT後daemon全体で約1秒程度でのプロセス終了を実機確認済み。次に着手する項目は
-特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと(このセッションの
-一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
-inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情でTor実装まで見送りの
-前提は継続(§8参照)。
+ctest 13件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
+十数秒)になったことを確認済み(§4.3)。次に着手する項目は特に指定が無い限り、以下から
+都度ユーザーに確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を
+明示的に指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
+Tor実装まで見送りの前提は継続(§8参照)。
 
-- **PoW並列化**: `pow/pow_engine.c`は現状シングルスレッド。
 - **getpubkey要求の自動化**: `send_pipeline.c`は`pubkey_cache`未登録の宛先には送信失敗するのみで、
   能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。受信したgetpubkeyに自分のpubkeyで
   応答する処理も未実装。pubkey v4の自動キャッシュ(候補ripeが要る)もこれと合わせて検討。
