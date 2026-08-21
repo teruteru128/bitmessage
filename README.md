@@ -23,12 +23,16 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
 - **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
   mainnetシード全滅時の代替経路確保が主な動機
+- **addrホストのフィルタリング**: 受信した`addr`情報からprivate/loopback/link-local等の
+  アドレスを除外(内部ネットワークへの誤接続防止)
+- **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を
+  再利用しPoWを都度計算し直さない
 - **JSON-RPC 2.0 API + CLI**: 上記すべてを`bitmessage-cli`から操作可能
 
 ### v1スコープ外(既知の制限、backlog)
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
-- 直接pubkey指定で送ったメッセージの自動再送、getpubkey応答のスロットリング、設定変更の動的リロード
+- 直接pubkey指定で送ったメッセージの自動再送、設定変更の動的リロード
   (SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、DoS上限の見直し、chan仕様、
   手動peer追加(`addPeer`) —
   詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照

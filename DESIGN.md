@@ -1094,11 +1094,37 @@ addr受信テストへ、192.168.1.1宛のエントリを混ぜて「登録さ�
 追加。実daemon・testnetでの動作確認では、実際に受信した2件のaddrは両方とも公開IPで
 フィルタ対象0件だったこと(誤検知しないこと)をログで確認済み。ctest 17件全通過。
 
+### getpubkey応答のスロットリング(2026-08-21)
+
+backlog優先順位の2番目。同一宛先への短時間の連続getpubkey要求に対し、
+`handle_incoming_getpubkey`(object_sync.c)が毎回PoWを計算し直してしまう問題
+(正規のPoWを払われた場合の対策が無かった)への対応。
+
+方式は「応答を都度作り直す」のではなく「直近作った応答をキャッシュして使い回す」
+アプローチを取った。単純な時間ベースの拒否(冷却期間中は無視する)だと、別のノードが
+直前に問い合わせた直後に来た正規の要求まで無応答になってしまい本末転倒なため、代わりに
+「まだ有効期限内の応答objectがあればPoWを再計算せず、それをinv再broadcastするだけ」に
+した。これなら正規の要求には常に応じつつ、2回目以降は実質無料(DB参照のみ)になる。
+
+- `identity.db`に`self_pubkey_response_cache`テーブル(ripe BLOB PRIMARY KEY, object_hash
+  BLOB, expires_time INTEGER)を追加(identity_store.c)。
+- `core/pubkey_cache.c/h`に`bm_pubkey_cache_set_self_response`/
+  `bm_pubkey_cache_get_self_response`を追加(pubkey_requestsと同じ「getpubkey関連の
+  DB操作はpubkey_cache.cに置く」方針に合わせた)。
+- `infra/object_sync.c`の`handle_incoming_getpubkey`を変更: identityを見つけた直後に
+  必要なフィールド(ripe/pub_signing/pub_encryption/priv_signing等)をコピーして
+  `OPENSSL_cleanse`で秘密鍵material(`id`)を即座に消去するようにした(従来はPoW計算
+  ブロックの後で消去しており、鍵情報がPoW計算中も無駄にメモリ上に残っていた。副次的な
+  改善)。その直後にキャッシュを確認し、有効な応答があればinv再broadcastのみで返す。
+  無ければ従来通りbuild+PoW+object_pool.db挿入を行い、成功したらキャッシュへ記録する。
+- `tests/test_getpubkey_automation.c`に、同じ宛先へ2回目のgetpubkey要求を送っても
+  `object_pool.db`のpubkeyオブジェクト件数が増えない(=PoW再計算が発生しない)ことと、
+  `self_pubkey_response_cache`に該当行が作られることを確認するcaseを追加。ctest 17件全通過
+  (実ネットワーク難易度でのPoWタイミング確認は前回の28日TTL検証で既に実施済みのため、
+  今回はキャッシュヒット時に新規PoWが走らないことのDB状態確認に留めた)。
+
 ### v1.1以降のbacklog
 
-- **getpubkey応答のスロットリング**: 同一宛先への短時間の連続getpubkey要求に対し、応答側が
-  毎回PoWを計算し直してしまう(2026-08-23発覚。受信object全般のPoW検証により無償のspamは
-  防げるようになったが、正規のPoWを払われた場合の対策は無い)。
 - **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
   固定で行うため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
   (2026-08-23発覚)。送信成功時にcache未登録なら自動的にupsertする、等の対応が考えられる。
@@ -1109,7 +1135,10 @@ addr受信テストへ、192.168.1.1宛のエントリを混ぜて「登録さ�
   永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
   最後の手段として、ユーザーが個人的に(掲示板等ではなく実際に運用者と面識のある経路で)
   存在を確認したノードを手動でpeers.dbへ追加できるAPI/CLIがあるとよい(2026-08-21検討)。
-  PyBitmessageのGitHub issue #2310で「身元不明の匿名申告onionアドレスリスト」の採用が
+  ユーザーが2020年当時運用していたPyBitmessageの`knownnodes.dat`バックアップを発見した
+  (2026-08-21)ため、これを取り込む一時的な用途にも使える見込み(6年前のデータで大半は
+  既に停止している可能性が高いが、生きているものが混ざっていればaddr伝播の足がかりに
+  なる)。PyBitmessageのGitHub issue #2310で「身元不明の匿名申告onionアドレスリスト」の採用が
   「身元がわからないアドレスは信用できない」という理由で開発者に拒否された事例があり、
   それと同じ理由でこの実装でも匿名の公開リストを自動採用する設計は避ける方針とした
   (rating方式は接続実績で信用を積み上げる仕組みであり、bootstrap候補そのものには

@@ -43,6 +43,11 @@ static const char *SCHEMA_SQL =
     "address_version INTEGER NOT NULL, "
     "stream INTEGER NOT NULL, "
     "requested_time INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS self_pubkey_response_cache ("
+    "ripe BLOB PRIMARY KEY, "
+    "object_hash BLOB NOT NULL, "
+    "expires_time INTEGER NOT NULL"
     ");";
 
 int bm_identity_store_init_schema(sqlite3 *db)

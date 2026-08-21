@@ -240,6 +240,61 @@ int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20])
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
+                                       const unsigned char object_hash[32], int64_t expires_time)
+{
+    static const char *SQL =
+        "INSERT INTO self_pubkey_response_cache (ripe, object_hash, expires_time) VALUES (?1,?2,?3) "
+        "ON CONFLICT(ripe) DO UPDATE SET object_hash=excluded.object_hash, expires_time=excluded.expires_time;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, object_hash, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, expires_time);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], int64_t now,
+                                       unsigned char out_hash[32])
+{
+    static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache WHERE ripe = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+
+    int found = 0;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW)
+    {
+        int64_t expires_time = sqlite3_column_int64(stmt, 1);
+        if (expires_time > now)
+        {
+            const void *hash = sqlite3_column_blob(stmt, 0);
+            if (sqlite3_column_bytes(stmt, 0) == 32)
+            {
+                memcpy(out_hash, hash, 32);
+                found = 1;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+    {
+        return -1;
+    }
+    return found;
+}
+
 /* --- objectパース --- */
 
 int bm_parse_pubkey_v2(const unsigned char *object, size_t object_len, struct bm_cached_pubkey *out)

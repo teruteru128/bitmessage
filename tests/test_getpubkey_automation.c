@@ -327,6 +327,61 @@ int main(void)
         sqlite3_finalize(stmt);
     }
 
+    /* 2b. §11 getpubkey応答のスロットリング: 同じ宛先へ2回目のgetpubkeyを送っても、
+     * 新しいpubkey応答objectを作り直さず(=PoWを再計算せず)既存のものを再利用するはず */
+    {
+        sqlite3_stmt *count_stmt = NULL;
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects WHERE object_type = ?1;", -1,
+                            &count_stmt, NULL);
+        sqlite3_bind_int(count_stmt, 1, BM_OBJECT_PUBKEY);
+        CHECK(sqlite3_step(count_stmt) == SQLITE_ROW, "count pubkey objects before second request");
+        int count_before = sqlite3_column_int(count_stmt, 0);
+        sqlite3_finalize(count_stmt);
+        CHECK(count_before == 1, "exactly 1 self-issued pubkey response should exist so far");
+
+        uint64_t gp2_ttl = 3600;
+        size_t gp2_len = 0;
+        unsigned char *gp2_payload =
+            bm_build_getpubkey(4, 1, recv_gen.ripe, (uint64_t)time(NULL) + gp2_ttl, &gp2_len);
+        uint64_t gp2_target = bm_pow_get_target(gp2_len, gp2_ttl, 1000, 1000);
+        uint64_t gp2_nonce = bm_pow_run(gp2_payload, gp2_len, gp2_target);
+        size_t gp2_object_len = 8 + gp2_len;
+        unsigned char *gp2_object = malloc(gp2_object_len);
+        for (int i = 0; i < 8; i++)
+        {
+            gp2_object[i] = (unsigned char)((gp2_nonce >> (56 - 8 * i)) & 0xff);
+        }
+        memcpy(gp2_object + 8, gp2_payload, gp2_len);
+        free(gp2_payload);
+
+        struct bm_message gp2_msg;
+        memset(&gp2_msg, 0, sizeof(gp2_msg));
+        memcpy(gp2_msg.command, "object", 6);
+        gp2_msg.length = (uint32_t)gp2_object_len;
+        gp2_msg.payload = gp2_object;
+        bm_object_sync_dispatch(conn, &gp2_msg, &ctx);
+        free(gp2_object);
+
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects WHERE object_type = ?1;", -1,
+                            &count_stmt, NULL);
+        sqlite3_bind_int(count_stmt, 1, BM_OBJECT_PUBKEY);
+        CHECK(sqlite3_step(count_stmt) == SQLITE_ROW, "count pubkey objects after second request");
+        int count_after = sqlite3_column_int(count_stmt, 0);
+        sqlite3_finalize(count_stmt);
+        CHECK(count_after == count_before,
+              "a second getpubkey request for the same address should reuse the cached response, "
+              "not build (and PoW) a new one");
+
+        sqlite3_stmt *cache_stmt = NULL;
+        sqlite3_prepare_v2(identity_db,
+                            "SELECT expires_time FROM self_pubkey_response_cache WHERE ripe = ?1;", -1,
+                            &cache_stmt, NULL);
+        sqlite3_bind_blob(cache_stmt, 1, recv_gen.ripe, BM_RIPE_LEN, SQLITE_TRANSIENT);
+        CHECK(sqlite3_step(cache_stmt) == SQLITE_ROW,
+              "self_pubkey_response_cache should have a row for the receiver's ripe");
+        sqlite3_finalize(cache_stmt);
+    }
+
     /* 3. pubkey v4のpending照合: 第三者向けのpending要求を登録してから、実物のv4 pubkeyを
      * 受信させ、pubkey_cacheへ登録されpubkey_requestsから消えることを確認する */
     struct bm_generated_address third_party_gen;

@@ -251,6 +251,9 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         return; /* 自分宛てではない、またはロックされたままのアドレス宛 */
     }
 
+    unsigned char ripe[BM_RIPE_LEN];
+    memcpy(ripe, id.ripe, sizeof(ripe));
+
     struct bm_identity_info info;
     memset(&info, 0, sizeof(info));
     info.address_version = id.address_version;
@@ -260,23 +263,43 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     memcpy(info.priv_signing, id.priv_signing, 32);
     info.nonce_trials_per_byte = id.nonce_trials_per_byte;
     info.payload_length_extra_bytes = id.payload_length_extra_bytes;
+    uint64_t address_version = id.address_version;
+    uint64_t stream = id.stream;
+    OPENSSL_cleanse(&id, sizeof(id));
 
-    uint64_t expires_time = (uint64_t)time(NULL) + BM_PUBKEY_RESPONSE_TTL_SECONDS;
+    /* §11 getpubkey応答のスロットリング: 直近作った応答がまだ有効期限内ならPoWを計算し
+     * 直さず、既存objectのinvを再broadcastするだけにする(同じ宛先への短時間の連続要求に
+     * 対し、正規のPoWを払われた場合でも毎回計算し直させられないようにするため) */
+    int64_t now = (int64_t)time(NULL);
+    unsigned char cached_hash[32];
+    if (bm_pubkey_cache_get_self_response(ctx->identity_db, ripe, now, cached_hash) == 1
+        && bm_object_store_has(ctx->object_pool_db, cached_hash))
+    {
+        if (ctx->registry != NULL)
+        {
+            bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL);
+        }
+        fprintf(stderr,
+                "[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
+                address_version);
+        return;
+    }
+
+    uint64_t expires_time = (uint64_t)now + BM_PUBKEY_RESPONSE_TTL_SECONDS;
     size_t payload_len = 0;
     unsigned char *payload = NULL;
-    if (id.address_version == 2)
+    if (address_version == 2)
     {
         payload = bm_build_pubkey_v2(&info, expires_time, &payload_len);
     }
-    else if (id.address_version == 3)
+    else if (address_version == 3)
     {
         payload = bm_build_pubkey_v3(&info, expires_time, &payload_len);
     }
     else
     {
-        payload = bm_build_pubkey_v4(&info, id.ripe, expires_time, &payload_len);
+        payload = bm_build_pubkey_v4(&info, ripe, expires_time, &payload_len);
     }
-    OPENSSL_cleanse(&id, sizeof(id));
     if (payload == NULL)
     {
         return;
@@ -299,14 +322,15 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     bm_inventory_hash(object, object_len, hash);
     if (!bm_object_store_has(ctx->object_pool_db, hash))
     {
-        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)info.stream,
-                                object, object_len, (int64_t)expires_time, (int64_t)time(NULL));
+        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)stream,
+                                object, object_len, (int64_t)expires_time, now);
+        bm_pubkey_cache_set_self_response(ctx->identity_db, ripe, hash, (int64_t)expires_time);
         if (ctx->registry != NULL)
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
         }
         fprintf(stderr, "[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
-                info.address_version);
+                address_version);
     }
     free(object);
 }

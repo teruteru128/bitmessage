@@ -66,6 +66,25 @@ void bm_pubkey_request_list_free(struct bm_pubkey_request *list);
 /* 要求を完了扱いにする(pubkeyが手に入った場合等)。該当行が無くてもエラーにしない。成功時0 */
 int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20]);
 
+/*
+ * --- 自分宛getpubkey要求への応答スロットリング(identity.dbのself_pubkey_response_cache
+ * テーブル、§11)。infra/object_sync.cのhandle_incoming_getpubkeyが、同じripe宛の要求に
+ * 対して毎回PoWを計算し直さずに済むよう、直近組み立てたobjectのhashをキャッシュする
+ * (中身はaddress_version/pub_signing/pub_encryption/ripeが同じなら実質同一のため、
+ * まだ有効期限内ならinv再broadcastのみで新規PoWは不要)。
+ */
+
+/* ripe宛に直近組み立てた自己pubkey応答objectのhash/expires_timeを記録する(UPSERT)。成功時0 */
+int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
+                                       const unsigned char object_hash[32], int64_t expires_time);
+
+/*
+ * まだ有効(expires_time > now)なキャッシュがあればout_hashへコピーして1を返す。
+ * 無ければ0、DBエラー時は-1
+ */
+int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], int64_t now,
+                                       unsigned char out_hash[32]);
+
 /* --- objectパース(§5.2の逆方向) --- */
 
 /* type=pubkey, version=2の完全なobject(nonce込み)をパースする。署名が無いため構造検証のみ。成功時0 */
