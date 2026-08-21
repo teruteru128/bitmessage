@@ -1,5 +1,7 @@
 #include "network.h"
 
+#include "peer_registry.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -250,6 +252,10 @@ void *bm_network_epoll_thread(void *arg)
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
             if (rc != 0)
             {
+                if (args->registry != NULL)
+                {
+                    bm_peer_registry_remove(args->registry, conn);
+                }
                 epoll_ctl(args->epfd, EPOLL_CTL_DEL, conn->fd, NULL);
                 close(conn->fd);
                 bm_fd_data_free(conn);

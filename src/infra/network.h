@@ -16,6 +16,8 @@
 
 #include "protocol.h"
 
+struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
+
 enum bm_fd_type
 {
     BM_FD_CLIENT_SOCKET,
@@ -62,6 +64,7 @@ struct bm_epoll_thread_args
     int epfd;
     bm_command_handler_fn handler;
     void *user_data;
+    struct bm_peer_registry *registry; /* NULL可(未使用ならレジストリ更新をスキップ) */
 };
 
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。

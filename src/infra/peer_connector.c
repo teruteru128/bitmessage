@@ -13,6 +13,7 @@
 
 #include "network.h"
 #include "peer_manager.h"
+#include "peer_registry.h"
 
 #define MAX_CANDIDATES 32
 #define CONNECT_TIMEOUT_SEC 5
@@ -141,6 +142,11 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_fd_data_free(conn);
             close(sock);
             continue;
+        }
+
+        if (config->registry != NULL)
+        {
+            bm_peer_registry_add(config->registry, conn);
         }
 
         fprintf(stderr, "[peer_connector] connected to %s:%d, version sent\n",

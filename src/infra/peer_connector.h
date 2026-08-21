@@ -13,6 +13,8 @@
 
 #include <sqlite3.h>
 
+struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
+
 struct bm_peer_connector_config
 {
     int epfd;
@@ -20,6 +22,7 @@ struct bm_peer_connector_config
     int testnet;
     int max_outbound;
     const char *user_agent;
+    struct bm_peer_registry *registry; /* NULL可(未使用ならレジストリ登録をスキップ) */
 };
 
 /*

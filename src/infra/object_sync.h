@@ -13,10 +13,13 @@
  *       - type=pubkey(version 2/3)ならpubkey_cache(core/pubkey_cache.c)へ登録を試みる
  *         (version 4は「誰宛の候補か」が必要なため、getpubkey自動化と合わせて別途TODO)
  *       - どのtypeでもsent.ack_dataとの突合せ(§5.5のack検知)を試みる
+ *       - 新規に取り込んだobject(受信msgそのもの、埋め込みackの両方)はpeer_registry経由で
+ *         受信元コネクション以外の接続中peerへinv broadcastする
  *   期限切れobjectのGCも間引きながら実行する(bm_object_sync_gcで直接呼ぶことも可能)。
  *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
- *   - 受信objectを他の接続中peerへ能動的にinv broadcastする処理(接続レジストリが必要)
+ *   - api_server.c(自分が送信したmsg/ack)からの能動的なinv broadcast(こちらはcore層のため
+ *     直接peer_registryを呼べない、broadcast_queue経由の結線が別途必要)
  *   - addrのpeer_manager永続化
  *   - getpubkey受信時に自分のpubkeyで応答する処理
  *   - broadcast(type=3)の購読・復号
@@ -29,6 +32,7 @@
 
 #include "../core/keyring.h"
 #include "network.h"
+#include "peer_registry.h"
 
 struct bm_object_sync_ctx
 {
@@ -36,12 +40,14 @@ struct bm_object_sync_ctx
     sqlite3 *identity_db;
     sqlite3 *messages_db;
     bm_keyring_t *keyring;
+    struct bm_peer_registry *registry; /* NULL可(未使用ならinv broadcastをスキップ) */
     time_t last_gc; /* GC間引き用。network_epoll_threadという単一スレッドからのみ呼ばれる
                       * 前提で排他制御はしない */
 };
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
-                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring);
+                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring,
+                              struct bm_peer_registry *registry);
 
 /* bm_command_handler_fn互換。user_dataにstruct bm_object_sync_ctx*を渡すこと */
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data);

@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "../src/common/hash.h"
 #include "../src/core/address.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
@@ -25,6 +26,7 @@
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
 #include "../src/infra/object_sync.h"
+#include "../src/infra/peer_registry.h"
 #include "../src/infra/protocol.h"
 #include "../src/pow/pow_engine.h"
 
@@ -111,13 +113,24 @@ int main(void)
     bm_keyring_t kr;
     bm_keyring_init(&kr);
 
+    struct bm_peer_registry registry;
+    bm_peer_registry_init(&registry);
+
     struct bm_object_sync_ctx ctx;
-    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, &kr);
+    bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, &kr, &registry);
 
     int fds[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
     struct bm_fd_data *conn = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds[0]);
     CHECK(conn != NULL, "bm_fd_data_new");
+    bm_peer_registry_add(&registry, conn);
+
+    /* 接続レジストリ経由のinv broadcastを検証するための2本目の"peer" */
+    int fds2[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2) == 0, "socketpair for second peer");
+    struct bm_fd_data *conn2 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds2[0]);
+    CHECK(conn2 != NULL, "bm_fd_data_new for second peer");
+    bm_peer_registry_add(&registry, conn2);
 
     /* --- 1. inv受信 -> 未所持hashについてgetdataを送り返す --- */
     unsigned char unknown_hashes[2][32];
@@ -170,6 +183,28 @@ int main(void)
     object_msg.payload = object;
 
     bm_object_sync_dispatch(conn, &object_msg, &ctx);
+
+    /* --- 2a. 接続レジストリ経由のinv broadcast: conn(受信元)以外のpeer(conn2)へだけ届く --- */
+    unsigned char expected_hash[32];
+    bm_inventory_hash(object, object_len, expected_hash);
+
+    struct bm_message *broadcast_inv = read_one_message(fds2[1]);
+    CHECK(broadcast_inv != NULL, "conn2 should receive an inv broadcast for the newly received object");
+    if (broadcast_inv != NULL)
+    {
+        CHECK(strncmp(broadcast_inv->command, "inv", 12) == 0, "broadcast command should be inv");
+        struct bm_inventory_message parsed_broadcast;
+        CHECK(bm_parse_inventory_message(broadcast_inv->payload, broadcast_inv->length, &parsed_broadcast) == 0,
+              "parse broadcast inv payload");
+        CHECK(parsed_broadcast.count == 1, "broadcast inv should announce exactly the new object");
+        if (parsed_broadcast.count == 1)
+        {
+            CHECK(memcmp(parsed_broadcast.items[0], expected_hash, 32) == 0,
+                  "broadcast inv hash should match the received object's inventory hash");
+        }
+        bm_free_inventory_message(&parsed_broadcast);
+        bm_free_message(broadcast_inv);
+    }
 
     /* object_store経由の重複排除確認: 同じobjectをもう一度dispatchしても2重に保存されない
      * (=常に1件)ことをCOUNT(*)で見る */
@@ -328,6 +363,10 @@ int main(void)
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);
+    close(fds2[0]);
+    close(fds2[1]);
+    bm_fd_data_free(conn2);
+    bm_peer_registry_destroy(&registry);
     bm_keyring_destroy(&kr);
     sqlite3_close(object_pool_db);
     sqlite3_close(identity_db);

@@ -29,12 +29,14 @@
 #define BM_ACK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES 1000
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
-                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring)
+                              sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring,
+                              struct bm_peer_registry *registry)
 {
     ctx->object_pool_db = object_pool_db;
     ctx->identity_db = identity_db;
     ctx->messages_db = messages_db;
     ctx->keyring = keyring;
+    ctx->registry = registry;
     ctx->last_gc = 0;
 }
 
@@ -63,8 +65,8 @@ static void maybe_run_gc(struct bm_object_sync_ctx *ctx)
  * 取り込むだけでよい設計(以後getdataで配れる状態になる)。不正なpacket(実装バグ、または悪意ある
  * 相手が偽装した可能性もある)は無視する(msg受信自体の成否には影響させない、ベストエフォート)。
  */
-static void validate_and_store_ack(sqlite3 *object_pool_db, const unsigned char *ack_payload,
-                                    size_t ack_payload_len)
+static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *except,
+                                    const unsigned char *ack_payload, size_t ack_payload_len)
 {
     struct bm_message *msg = NULL;
     size_t consumed = 0;
@@ -105,12 +107,20 @@ static void validate_and_store_ack(sqlite3 *object_pool_db, const unsigned char 
 
     unsigned char hash[32];
     bm_inventory_hash(msg->payload, msg->length, hash);
-    bm_object_store_insert(object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
+    /* bm_object_store_insertはINSERT OR IGNOREのため既存行でも成功(0)を返す。新規挿入時のみ
+     * broadcastしたいので、事前にhas()で判定する(handle_objectの主object処理と同じ流儀) */
+    int already_known = bm_object_store_has(ctx->object_pool_db, hash);
+    bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
                             msg->payload, msg->length, (int64_t)hdr.expires_time, now);
+    if (!already_known && ctx->registry != NULL)
+    {
+        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, except);
+    }
     bm_free_message(msg);
 }
 
-static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_message *msg)
+static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
+                           const struct bm_message *msg)
 {
     if (msg->length > BM_MAX_OBJECT_PAYLOAD_SIZE)
     {
@@ -145,6 +155,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_messag
     int64_t now = (int64_t)time(NULL);
     bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
                             msg->payload, msg->length, (int64_t)hdr.expires_time, now);
+    if (ctx->registry != NULL)
+    {
+        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, conn);
+    }
 
     if (hdr.object_type == BM_OBJECT_MSG)
     {
@@ -156,7 +170,7 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_messag
             fprintf(stderr, "[object_sync] msg decrypted and stored to inbox\n");
             if (ack_payload_len > 0)
             {
-                validate_and_store_ack(ctx->object_pool_db, ack_payload, ack_payload_len);
+                validate_and_store_ack(ctx, conn, ack_payload, ack_payload_len);
             }
         }
         free(ack_payload);
@@ -311,7 +325,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "object", 12) == 0)
     {
-        handle_object(ctx, msg);
+        handle_object(ctx, conn, msg);
     }
     else
     {

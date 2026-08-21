@@ -24,6 +24,7 @@
 #include "infra/object_store.h"
 #include "infra/object_sync.h"
 #include "infra/peer_connector.h"
+#include "infra/peer_registry.h"
 #include "infra/peer_manager.h"
 #include "infra/protocol.h"
 
@@ -158,16 +159,24 @@ int main(void)
     pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
     pthread_detach(th_api_server);
 
+    /* §11 接続レジストリ。現在epollに登録中の接続一覧で、object_sync_threadが「新しく手に入れた
+     * objectを他の接続中peerへinv broadcastする」ために使う。registryもmain()がsigwaitで
+     * ブロックしている間ずっと生存するスタック変数。 */
+    struct bm_peer_registry peer_registry;
+    bm_peer_registry_init(&peer_registry);
+
     /* §1.1 object_sync_thread。ctxはmain()がsigwaitでブロックしている間ずっと生存する
      * スタック変数(api_configと同じ扱い)。network_epoll_threadはdetach済みなのでpthread_join
      * より前に破棄されないことをそれで保証している。 */
     struct bm_object_sync_ctx object_sync_ctx;
-    bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, &keyring);
+    bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, &keyring,
+                             &peer_registry);
 
     struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));
     net_args->epfd = epfd;
     net_args->handler = bm_object_sync_dispatch;
     net_args->user_data = &object_sync_ctx;
+    net_args->registry = &peer_registry;
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);
 
@@ -185,6 +194,7 @@ int main(void)
         pc_config.testnet = testnet;
         pc_config.max_outbound = BM_MAX_OUTBOUND;
         pc_config.user_agent = BM_USER_AGENT;
+        pc_config.registry = &peer_registry;
         int connected = bm_peer_connector_connect_initial(&pc_config);
         fprintf(stderr, "[peer_connector] %d outbound connection(s) established\n", connected);
     }
@@ -206,6 +216,7 @@ int main(void)
     /* th_api_serverはdetach済み(上記コメント参照)。プロセス終了と共に破棄される */
 
     queues_destroy(&queues);
+    bm_peer_registry_destroy(&peer_registry);
     bm_keyring_destroy(&keyring);
 
     sqlite3_close(peers_db);
