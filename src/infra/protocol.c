@@ -76,6 +76,10 @@ enum bm_parse_result bm_parse_message(const unsigned char *data, size_t data_len
     }
 
     uint32_t length = read_be32(data + 16);
+    if (length > BM_MAX_MESSAGE_LENGTH)
+    {
+        return BM_PARSE_MESSAGE_TOO_LARGE;
+    }
     size_t total = (size_t)BM_MESSAGE_HEADER_SIZE + length;
     if (data_len < total)
     {

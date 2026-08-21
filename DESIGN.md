@@ -1166,11 +1166,37 @@ ctestの`cli_integration`テストとポートが衝突する事態が発生し�
 起動したdaemonが8442の別daemonと同時にLISTENできることを確認済み。ctest 17件全通過
 (バックグラウンドdaemonを止めずに実行して確認)。
 
+### DoS上限の見直し(2026-08-21)
+
+backlog優先順位の4番目。既存のDoS対策(`BM_MAX_INVENTORY_ITEMS`=50000件、
+`BM_MAX_OBJECT_PAYLOAD_SIZE`=256KiB、JSON-RPCの`MAX_REQUEST_SIZE`=1MiB)を洗い出す中で、
+より根本的な穴を発見した: P2Pメッセージの共通ヘッダ(`infra/protocol.h`の`bm_message`)の
+`length`フィールドは32bit(理論上最大約4GiB)だが、`infra/network.c`の受信バッファは
+その値をそのまま信用してrealloc doublingで追いつこうとする作りだった。悪意あるpeerが
+巨大な`length`を申告するだけで、実データが1byteも届く前から受信側に無制限のメモリ確保を
+強制できる(既存の`BM_MAX_OBJECT_PAYLOAD_SIZE`チェックは`handle_object`内、つまり
+バッファ確保・full受信が終わった"後"にしか働かず、確保自体は防げていなかった)。
+
+対応: `infra/protocol.h`に`BM_MAX_MESSAGE_LENGTH`(4MiB。この実装で正当に流通しうる
+最大メッセージ[addr、`BM_MAX_INVENTORY_ITEMS`=50000件で約1.9MiB]に十分な余裕を持たせた値)
+を追加し、`bm_parse_message`がヘッダ受信直後(実データを待つ前)にlengthを検査、超過して
+いれば新設した`BM_PARSE_MESSAGE_TOO_LARGE`を返すようにした。呼び出し側
+(`bm_network_handle_readable`)はこれを検知したら resync を試みずに即座に接続を切断する
+(巨大な偽データを1byteずつresyncしようとすること自体もCPU消費のDoSになりうるため)。
+さらに`infra/network.c`の受信バッファのdoubling処理自体にも上限(`MAX_RECV_BUFFER_SIZE`
+=`2*(ヘッダ+BM_MAX_MESSAGE_LENGTH)`)を設け、二重に防御した。
+
+`tests/test_network_testnet.c`に、上限超過のlength申告(ヘッダ24byteのみ、payload未着の
+状態)が即座に`BM_PARSE_MESSAGE_TOO_LARGE`で拒否されること・ちょうど上限値なら
+`BM_PARSE_INCOMPLETE`(正常系)のままであることを確認するcaseを追加。実daemon・実testnet
+接続でも、version/verack/addr受信を含む通常のハンドシェイクが引き続き正常に動作すること
+(誤検知なし)を確認済み。ctest 17件全通過。
+
 ### v1.1以降のbacklog
 
-- **DoS上限の見直し・chan仕様・設定変更の動的リロード**: SOCKS5プロキシ設定は永続化した
-  ものの、稼働中プロセスへの反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。
-  優先度は低いが実運用に近づくほど効いてくる。
+- **chan仕様・設定変更の動的リロード**: SOCKS5プロキシ設定は永続化したものの、稼働中
+  プロセスへの反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。優先度は低いが
+  実運用に近づくほど効いてくる。chan(私設グループチャンネル)仕様は当初からv1スコープ外。
 - **手動peer追加(`addPeer`)**: mainnetシード全滅時、addr永続化(§11「addr受信のpeer_manager
   永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
   最後の手段として、ユーザーが個人的に(掲示板等ではなく実際に運用者と面識のある経路で)

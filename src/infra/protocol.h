@@ -18,6 +18,19 @@
 
 #define BM_MESSAGE_HEADER_SIZE 24
 
+/*
+ * §11 DoS上限の見直し。ヘッダのlengthフィールドは32bit(理論上最大約4GiB)だが、そのまま
+ * 信用すると悪意あるpeerが巨大な値を申告するだけで受信側に(実データが届く前から)無制限に
+ * バッファを確保させられてしまう(bm_parse_messageがBM_PARSE_INCOMPLETEを返し続け、
+ * infra/network.cの受信バッファがlengthに追いつくまでrealloc doublingし続けるため)。
+ * この実装で正当に流通しうる最大のメッセージ(addr/inv、BM_MAX_INVENTORY_ITEMS=50000件、
+ * object_sync.c参照)はaddrで約1.9MiBなので、十分な余裕を持たせて4MiBを上限とする。
+ * これを超える申告はbm_parse_messageの時点でBM_PARSE_MESSAGE_TOO_LARGEとして拒否し、
+ * 呼び出し側(infra/network.c)は該当接続を切断する(部分的に受信済みの巨大な偽データを
+ * 1byteずつresyncしようとするのもコスト増になるため、resyncはせず即切断する)。
+ */
+#define BM_MAX_MESSAGE_LENGTH (4u * 1024u * 1024u)
+
 /* 現在有効なmagic bytes(既定mainnet)。bm_protocol_set_testnetで切り替える。
  * mainnet=0xE9BEB4D9, testnet=0xFB110907(PyBitmessage protocol.py準拠)。 */
 extern unsigned char bm_magicbytes[4];
@@ -73,9 +86,10 @@ struct bm_inventory_message
 enum bm_parse_result
 {
     BM_PARSE_OK,
-    BM_PARSE_INCOMPLETE,     /* データ不足。追加受信を待つ */
-    BM_PARSE_BAD_CHECKSUM,   /* checksum不一致。このメッセージは破棄しresyncが必要 */
-    BM_PARSE_BAD_MAGIC,      /* magic bytes不一致(mainnet/testnet取り違え等)。1byteスキップしてresync */
+    BM_PARSE_INCOMPLETE,        /* データ不足。追加受信を待つ */
+    BM_PARSE_BAD_CHECKSUM,      /* checksum不一致。このメッセージは破棄しresyncが必要 */
+    BM_PARSE_BAD_MAGIC,         /* magic bytes不一致(mainnet/testnet取り違え等)。1byteスキップしてresync */
+    BM_PARSE_MESSAGE_TOO_LARGE, /* §11 lengthがBM_MAX_MESSAGE_LENGTHを超える。resyncせず即切断 */
 };
 
 /*
@@ -83,6 +97,7 @@ enum bm_parse_result
  * OK時: *out_msg にmalloc済みの構造体、*out_consumed に消費したバイト数(24+length)を設定
  * INCOMPLETE時: 何もしない(呼び出し側は追加受信を待つ)
  * BAD_CHECKSUM時: *out_consumed に 24+length(スキップすべきバイト数)を設定
+ * MESSAGE_TOO_LARGE時: *out_consumedは設定しない(呼び出し側は接続を切断すること、§11)
  */
 enum bm_parse_result bm_parse_message(const unsigned char *data, size_t data_len,
                                        struct bm_message **out_msg, size_t *out_consumed);

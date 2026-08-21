@@ -15,6 +15,11 @@
 #define INIT_RECV_BUFFER_SIZE 131072
 #define MAX_EPOLL_EVENTS 64
 
+/* §11 DoS上限の見直し。受信バッファのdoubling自体にも上限を設ける(bm_parse_messageの
+ * BM_MAX_MESSAGE_LENGTHチェックと二重の防御。複数メッセージがバッファ内に連続で溜まる
+ * ケースも考慮し、単一メッセージの上限より少し余裕を持たせる)。 */
+#define MAX_RECV_BUFFER_SIZE (2u * (BM_MESSAGE_HEADER_SIZE + BM_MAX_MESSAGE_LENGTH))
+
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
 {
     struct bm_fd_data *data = calloc(1, sizeof(struct bm_fd_data));
@@ -181,6 +186,15 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
             {
                 new_size *= 2;
             }
+            if (new_size > MAX_RECV_BUFFER_SIZE)
+            {
+                /* §11 単一メッセージの上限(BM_MAX_MESSAGE_LENGTH)は通常bm_parse_messageの
+                 * BM_PARSE_MESSAGE_TOO_LARGEで先に検知されるが、それより前にここへ到達する
+                 * ケース(単一read()で大量データが一度に届く等)に備えた二重の防御 */
+                fprintf(stderr, "[network] recv buffer would exceed %u bytes, dropping connection\n",
+                        MAX_RECV_BUFFER_SIZE);
+                return -1;
+            }
             unsigned char *grown = realloc(conn->recv_buffer, new_size);
             if (grown == NULL)
             {
@@ -217,6 +231,14 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
             memmove(conn->recv_buffer, conn->recv_buffer + consumed, conn->length - consumed);
             conn->length -= consumed;
             continue;
+        }
+        if (result == BM_PARSE_MESSAGE_TOO_LARGE)
+        {
+            /* §11 巨大なlengthを申告された。resyncを試みるコスト自体もDoSになりうるため、
+             * 即座に接続を切断する(呼び出し元でclose・registry除去される) */
+            fprintf(stderr, "[network] declared message length exceeds %u bytes, dropping connection\n",
+                    BM_MAX_MESSAGE_LENGTH);
+            return -1;
         }
 
         /* BM_PARSE_OK */

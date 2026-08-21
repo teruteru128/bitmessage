@@ -27,13 +27,15 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
   アドレスを除外(内部ネットワークへの誤接続防止)
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を
   再利用しPoWを都度計算し直さない
+- **DoS上限**: P2Pメッセージのlengthフィールド申告を実データ到着前に検査し、巨大な値を
+  申告するpeerを即座に切断(受信バッファの無制限確保を防止)
 - **JSON-RPC 2.0 API + CLI**: 上記すべてを`bitmessage-cli`から操作可能
 
 ### v1スコープ外(既知の制限、backlog)
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
 - 設定変更の動的リロード(SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、
-  DoS上限の見直し、chan仕様、手動peer追加(`addPeer`) —
+  chan仕様、手動peer追加(`addPeer`) —
   詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド

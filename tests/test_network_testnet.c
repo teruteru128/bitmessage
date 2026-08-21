@@ -72,6 +72,41 @@ static void test_bad_magic_rejected(void)
     printf("OK: magic byte validation in bm_parse_message\n");
 }
 
+static void test_oversized_length_rejected(void)
+{
+    bm_protocol_set_testnet(0); /* mainnetモード */
+
+    /* §11 DoS上限の見直し: lengthフィールドがBM_MAX_MESSAGE_LENGTHを超える申告は、
+     * 実データが揃うのを待たず(=ヘッダ24byteだけ届いた時点で)即座に拒否されるはず */
+    unsigned char header[BM_MESSAGE_HEADER_SIZE] = {0};
+    memcpy(header, bm_magicbytes, 4);
+    memcpy(header + 4, "object", 6);
+    uint32_t huge_length = BM_MAX_MESSAGE_LENGTH + 1;
+    header[16] = (unsigned char)((huge_length >> 24) & 0xff);
+    header[17] = (unsigned char)((huge_length >> 16) & 0xff);
+    header[18] = (unsigned char)((huge_length >> 8) & 0xff);
+    header[19] = (unsigned char)(huge_length & 0xff);
+    /* checksumは検証されない(lengthチェックの方が先に走るはず)ので適当な値のままでよい */
+
+    struct bm_message *msg = NULL;
+    size_t consumed = 0;
+    enum bm_parse_result result = bm_parse_message(header, sizeof(header), &msg, &consumed);
+    CHECK(result == BM_PARSE_MESSAGE_TOO_LARGE,
+          "a declared length exceeding BM_MAX_MESSAGE_LENGTH should be rejected immediately, "
+          "even though only the 24-byte header (no payload) has arrived");
+
+    /* 対照実験: ちょうど上限ならINCOMPLETE(データ不足)として正常に扱われる(拒否されない) */
+    uint32_t max_length = BM_MAX_MESSAGE_LENGTH;
+    header[16] = (unsigned char)((max_length >> 24) & 0xff);
+    header[17] = (unsigned char)((max_length >> 16) & 0xff);
+    header[18] = (unsigned char)((max_length >> 8) & 0xff);
+    header[19] = (unsigned char)(max_length & 0xff);
+    result = bm_parse_message(header, sizeof(header), &msg, &consumed);
+    CHECK(result == BM_PARSE_INCOMPLETE, "a declared length exactly at the limit should not be rejected");
+
+    printf("OK: oversized declared message length rejected before buffering payload data\n");
+}
+
 static void test_bootstrap_seeding(void)
 {
     const char *db_path = "test_network_testnet_peers.db";
@@ -116,6 +151,7 @@ int main(void)
 {
     test_magic_bytes_switch();
     test_bad_magic_rejected();
+    test_oversized_length_rejected();
     test_bootstrap_seeding();
 
     if (failures == 0)
