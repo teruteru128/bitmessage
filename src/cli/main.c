@@ -30,6 +30,10 @@ static void print_usage(const char *prog)
             "コマンド:\n"
             "  list-addresses\n"
             "  create-address <passphrase> <version:3|4> <stream> <ripeNullBytes> <label> <storePassphrase>\n"
+            "  join-chan <passphrase> <label> <storePassphrase>\n"
+            "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
+            "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
+            "      (自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める\n"
             "  unlock <address> <passphrase>\n"
             "  lock <address>\n"
             "  lock-all\n"
@@ -151,6 +155,20 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[6]));
         bm_json_array_append(params, bm_json_new_string(argv[7]));
         return call_rpc(&env, "createDeterministicAddress", params);
+    }
+
+    if (strcmp(cmd, "join-chan") == 0)
+    {
+        if (argc != 5)
+        {
+            fprintf(stderr, "使い方: %s join-chan <passphrase> <label> <storePassphrase>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_string(argv[4]));
+        return call_rpc(&env, "joinChan", params);
     }
 
     if (strcmp(cmd, "unlock") == 0)

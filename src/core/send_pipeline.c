@@ -114,19 +114,30 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
      * (関数末尾で行う。ここでは「直接指定されたか」だけ憶えておく)。 */
     int direct_pub_encryption_given = (to_pub_encryption != NULL);
 
-    /* to_pub_encryptionが指定されなければpubkey_cacheから引く */
+    /* to_pub_encryptionが指定されなければpubkey_cacheから引く。ただしto_address==from_address
+     * (自分自身宛、§11 chan仕様)の場合はcacheに無くてもfrom_id自身のpub_encryptionを使える
+     * (chanは共有passphraseから導出した同一の鍵を全メンバーが持つため、「自分宛に送る」ことが
+     * そのままchanへの投稿になる。他メンバーは同じ鍵を持つtrial_decryptで復号できる)。 */
     unsigned char cached_pub_encryption[65];
     if (to_pub_encryption == NULL)
     {
-        struct bm_cached_pubkey cached;
-        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &cached) != 0)
+        if (memcmp(to_ripe, from_id.ripe, BM_RIPE_LEN) == 0)
         {
-            OPENSSL_cleanse(&from_id, sizeof(from_id));
-            return -1; /* 宛先のpubkeyが分からない(getpubkey要求の自動化は未実装、TODO) */
+            memcpy(cached_pub_encryption, from_id.pub_encryption, 65);
+            to_pub_encryption = cached_pub_encryption;
         }
-        memcpy(cached_pub_encryption, cached.encryption_pubkey, 65);
-        to_pub_encryption = cached_pub_encryption;
-        bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
+        else
+        {
+            struct bm_cached_pubkey cached;
+            if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &cached) != 0)
+            {
+                OPENSSL_cleanse(&from_id, sizeof(from_id));
+                return -1; /* 宛先のpubkeyが分からない(getpubkey要求の自動化は未実装、TODO) */
+            }
+            memcpy(cached_pub_encryption, cached.encryption_pubkey, 65);
+            to_pub_encryption = cached_pub_encryption;
+            bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
+        }
     }
 
     struct bm_identity_info from_info;

@@ -192,9 +192,24 @@ int bm_identity_store_delete(sqlite3 *db, const char *address)
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+int bm_identity_store_set_is_chan(sqlite3 *db, const char *address, int is_chan)
+{
+    static const char *SQL = "UPDATE identities SET is_chan = ?1 WHERE address = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, is_chan);
+    sqlite3_bind_text(stmt, 2, address, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count)
 {
-    static const char *SQL = "SELECT address, label, enabled FROM identities ORDER BY created_time;";
+    static const char *SQL = "SELECT address, label, enabled, is_chan FROM identities ORDER BY created_time;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
     {
@@ -221,6 +236,7 @@ int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, s
             strncpy(list[count].label, (const char *)label, BM_IDENTITY_LABEL_MAX - 1);
         }
         list[count].enabled = sqlite3_column_int(stmt, 2);
+        list[count].is_chan = sqlite3_column_int(stmt, 3);
         count++;
     }
     sqlite3_finalize(stmt);

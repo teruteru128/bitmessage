@@ -232,6 +232,7 @@ static bm_json_value_t *h_listAddresses(const struct bm_api_server_config *confi
         bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
         bm_json_object_set(entry, "enabled", bm_json_new_bool(list[i].enabled));
         bm_json_object_set(entry, "unlocked", bm_json_new_bool(unlocked));
+        bm_json_object_set(entry, "isChan", bm_json_new_bool(list[i].is_chan));
         bm_json_array_append(arr, entry);
     }
     free(list);
@@ -287,6 +288,63 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
         *out_error = dup_cstr("failed to store identity (duplicate address?)");
         return NULL;
     }
+
+    bm_json_value_t *result = bm_json_new_string(address);
+    free(address);
+    return result;
+}
+
+/*
+ * §11 chan仕様: joinChan: [passphrase, label, storePassphrase]
+ *
+ * chanは暗号的には通常のdeterministic addressと全く同じもの(§5.1相当のaddress
+ * generation)で、共有passphraseから同じ鍵を導出したpeer全員が同じアドレス/鍵を持つことで
+ * 疑似グループチャットとして機能する(PyBitmessageのchan相当)。createDeterministicAddress
+ * を固定パラメータ(addressVersion=4, stream=1, ripeNullBytes=1)で呼んだ上でis_chan=1を
+ * 立てる薄いラッパー。同じpassphraseで複数のクライアントが呼べば全員が同じアドレスへ
+ * 「join」したことになる。chanへの投稿はsendMessage(fromAddress=chanAddress,
+ * toAddress=chanAddress, ...)で行う(自分自身宛の送信、§11のsend_pipeline.c参照。
+ * toPubEncryptionHexを省略してもfrom_id自身のpub_encryptionが自動的に使われる)。
+ * 受信側はtrial_decrypt(core/trial_decrypt.c)が既にkeyring中の全identityを試すため、
+ * chan用の鍵をunlockしてさえいれば新規の受信処理は不要で、他メンバーの投稿も自動的に
+ * inboxへ復号される。
+ */
+static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
+                                    const bm_json_value_t *params, char **out_error)
+{
+    const char *passphrase = param_str(params, 0);
+    const char *label = param_str(params, 1);
+    const char *store_passphrase = param_str(params, 2);
+
+    if (passphrase == NULL || store_passphrase == NULL)
+    {
+        *out_error = dup_cstr("joinChan requires [passphrase, label, storePassphrase]");
+        return NULL;
+    }
+
+    struct bm_generated_address gen;
+    if (bm_address_generate_deterministic(passphrase, 1, &gen) != 0)
+    {
+        *out_error = dup_cstr("address generation failed");
+        return NULL;
+    }
+    char *address = bm_address_encode(4, 1, gen.ripe, BM_RIPE_LEN);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("address encoding failed");
+        return NULL;
+    }
+
+    int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
+                                         4, 1, gen.pub_signing, gen.pub_encryption,
+                                         gen.priv_signing, gen.priv_encryption, store_passphrase, 1000, 1000);
+    if (rc != 0)
+    {
+        free(address);
+        *out_error = dup_cstr("failed to store chan identity (already joined this chan?)");
+        return NULL;
+    }
+    bm_keyring_mark_as_chan(config->identity_db, address);
 
     bm_json_value_t *result = bm_json_new_string(address);
     free(address);
@@ -715,6 +773,7 @@ static const struct bm_api_method METHODS[] = {
     {"deleteAddress", h_deleteAddress},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
+    {"joinChan", h_joinChan},
     {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},
     {"sendBroadcast", h_sendBroadcast},

@@ -1192,11 +1192,45 @@ backlog優先順位の4番目。既存のDoS対策(`BM_MAX_INVENTORY_ITEMS`=5000
 接続でも、version/verack/addr受信を含む通常のハンドシェイクが引き続き正常に動作すること
 (誤検知なし)を確認済み。ctest 17件全通過。
 
+### chan仕様(2026-08-21)
+
+backlog優先順位の5番目。chan(PyBitmessageの私設グループチャンネル相当)は、暗号的には
+通常のdeterministic addressと全く同じもの: 同じpassphraseから`bm_address_generate_
+deterministic`を呼べば誰でも同一のアドレス・鍵ペアを導出できる(§7.1参照)。「参加」とは
+ローカルでその鍵を導出してkeyringへ登録するだけの操作であり、新規のワイヤープロトコルは
+不要だと判明した。既に`identities`テーブルに`is_chan`列が存在したが(§7.1設計時点で
+先回りして用意されていた)、これを立てる経路が無く常に0固定だった。
+
+- `core/api_server.c`に`joinChan(passphrase, label, storePassphrase)`を追加。
+  `createDeterministicAddress`を固定パラメータ(addressVersion=4, stream=1,
+  ripeNullBytes=1)で呼んだ上で`is_chan=1`を立てる薄いラッパー。同じpassphraseで複数の
+  クライアントが呼べば全員が同じアドレスへ「join」したことになる。
+  `core/identity_store.c`に`bm_identity_store_set_is_chan`、`core/keyring.c`に
+  それを呼ぶ`bm_keyring_mark_as_chan`を追加(keyring.cは既存の方針通りidentity_store.c
+  経由でのみDBを触る)。`listAddresses`の応答にも`isChan`を追加した。
+- chanへの投稿は`sendMessage(fromAddress=chanAddress, toAddress=chanAddress, ...)`
+  (自分自身宛の送信)で行う設計とした。これを動かすため`core/send_pipeline.c`の
+  `bm_send_pipeline_send_message`に、`to_address`が`from_address`自身(=to_ripeが
+  from_idのripeと一致)かつ`to_pub_encryption`省略時、pubkey_cacheを参照せず
+  `from_id`自身の`pub_encryption`を直接使うfallbackを追加した(自分の鍵は既に手元にある
+  ため、cacheに登録されている必要が無い)。
+- 受信側は`core/trial_decrypt.c`が既にkeyring中の全identityを試す設計になっているため、
+  chan用の鍵をunlockしてさえいれば新規の受信処理は一切不要だった(他メンバーの投稿も
+  自動的に復号されinboxへ入る)。
+- `cli/main.c`に`join-chan <passphrase> <label> <storePassphrase>`を追加。
+- `tests/test_chan.c`(新規)で、独立した2回の`bm_address_generate_deterministic`呼び出し
+  (2つの別々のidentity.db/keyring、"メンバーA"「メンバーB"を模す)が同一アドレス・鍵に
+  なること、メンバーAが自分自身宛にtoPubEncryptionHex省略でsendMessageできること、
+  メンバーBがその投稿をtrial_decryptで復号できること(実際のグループチャット動作)を
+  end-to-endで確認。実daemon・CLI経由でも`join-chan`→`list-addresses`(isChan:true)→
+  `unlock`→`send-message`(自分自身宛)の一連の流れが動作することを確認済み。
+  ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
-- **chan仕様・設定変更の動的リロード**: SOCKS5プロキシ設定は永続化したものの、稼働中
-  プロセスへの反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。優先度は低いが
-  実運用に近づくほど効いてくる。chan(私設グループチャンネル)仕様は当初からv1スコープ外。
+- **設定変更の動的リロード**: SOCKS5プロキシ設定は永続化したものの、稼働中プロセスへの
+  反映は次回起動時のみ。汎用設定ストア化も含め今後の検討課題。優先度は低いが実運用に
+  近づくほど効いてくる。
 - **手動peer追加(`addPeer`)**: mainnetシード全滅時、addr永続化(§11「addr受信のpeer_manager
   永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
   最後の手段として、ユーザーが個人的に(掲示板等ではなく実際に運用者と面識のある経路で)

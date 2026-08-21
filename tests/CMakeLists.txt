@@ -67,3 +67,7 @@ add_test(NAME broadcast COMMAND test_broadcast)
 add_executable(test_config_store test_config_store.c)
 target_link_libraries(test_config_store PRIVATE bm_core bm_infra Threads::Threads)
 add_test(NAME config_store COMMAND test_config_store)
+
+add_executable(test_chan test_chan.c)
+target_link_libraries(test_chan PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME chan COMMAND test_chan)

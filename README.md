@@ -20,6 +20,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **direct message送受信**: 送信時のPoW計算・ack機構、getpubkey要求の自動発行/自動応答、ack未着時の
   自動再送(間隔を倍々に、toPubEncryptionHexを直接指定した送信でも自動でpubkey_cacheへ登録され再送される)
 - **broadcast購読・送信**: 購読先アドレスからのbroadcastを自動復号してinboxへ、`sendBroadcast`での送信
+- **chan(私設グループチャンネル)**: 共有passphraseから同じアドレス・鍵を導出して複数人が
+  参加(`joinChan`)、自分自身宛のsendMessageで投稿、他メンバーはtrial_decryptで自動復号
 - **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
 - **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
   mainnetシード全滅時の代替経路確保が主な動機
@@ -35,7 +37,7 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
 - 設定変更の動的リロード(SOCKS5プロキシ設定は永続化されるが反映は次回起動時のみ)、
-  chan仕様、手動peer追加(`addPeer`) —
+  手動peer追加(`addPeer`) —
   詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド
@@ -90,6 +92,11 @@ $CLI get-inbox
 # broadcast購読・送信
 $CLI add-subscription BM-someAddress "label"
 $CLI send-broadcast BM-fromAddress "subject" "body" 3600
+
+# chan(私設グループチャンネル): 同じpassphraseで呼んだ全員が同じアドレス・鍵を共有する
+CHAN=$($CLI join-chan "my chan passphrase" "my chan" "store passphrase" | tr -d '"')
+$CLI unlock "$CHAN" "store passphrase"
+$CLI send-message "$CHAN" "$CHAN" - "subject" "body" 3600 1
 
 # outbound接続をSOCKS5プロキシ(Tor等)経由にする。反映にはbitmessagedの再起動が必要
 $CLI set-socks-proxy 1 127.0.0.1 9050

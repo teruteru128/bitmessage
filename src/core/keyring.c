@@ -290,6 +290,11 @@ int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *addres
     return bm_identity_store_delete(db, address);
 }
 
+int bm_keyring_mark_as_chan(sqlite3 *db, const char *address)
+{
+    return bm_identity_store_set_is_chan(db, address, 1);
+}
+
 bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
                               struct bm_unlocked_identity *out)
 {

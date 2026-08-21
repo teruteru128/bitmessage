@@ -45,11 +45,15 @@ int bm_identity_store_load(sqlite3 *db, const char *address, struct bm_identity_
 
 int bm_identity_store_delete(sqlite3 *db, const char *address);
 
+/* §11 chan仕様: is_chanフラグを更新する。該当行が無くてもエラーにしない。成功時0 */
+int bm_identity_store_set_is_chan(sqlite3 *db, const char *address, int is_chan);
+
 struct bm_identity_summary
 {
     char address[BM_IDENTITY_ADDRESS_MAX];
     char label[BM_IDENTITY_LABEL_MAX];
     int enabled;
+    int is_chan;
 };
 
 /*

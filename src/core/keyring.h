@@ -69,6 +69,14 @@ void bm_keyring_lock_all(bm_keyring_t *kr);
 /* keyringからロック相当の消去をした上でidentity.dbから該当行を完全削除する(復元不可) */
 int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *address);
 
+/*
+ * §11 chan仕様: identities.is_chanを1に設定する(chan識別用のフラグ、暗号的には通常の
+ * deterministic addressと全く同じ扱い。共有passphraseから同じ鍵が導出されるpeer全員が
+ * 同じアドレス/鍵を持つことで疑似グループチャットとして機能する)。該当行が無ければ
+ * 何もしない。成功時0。
+ */
+int bm_keyring_mark_as_chan(sqlite3 *db, const char *address);
+
 /* ripeで検索する。見つかればtrueを返しoutにコピーする(呼び出し側が用意した領域へ) */
 bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
                               struct bm_unlocked_identity *out);
