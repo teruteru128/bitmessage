@@ -1582,14 +1582,52 @@ daemon自体は起動を続ける(SOCKS5プロキシ等、他の「あれば使�
 ログに出ること、`550 Onion address collision`等のエラーが出ないことを確認した。ctest
 20件(新規`tor_control`含む)全通過。
 
+### OBJECT_ONIONPEERの自己announce送信側(2026-08-22)
+
+Stage 2までで自分のonionアドレスは手に入るようになったので、それを`OBJECT_ONIONPEER`
+objectとしてネットワークへ告知する送信側(PyBitmessageの`sendOnionPeerObj`相当)を実装した。
+受信側(`handle_incoming_onionpeer`、peers.dbへ学習ピアとして登録)は既存実装済みだった。
+
+**`core/message_builder.c`に`bm_build_onionpeer`を追加:** 他のbuild関数(`bm_build_getpubkey`
+等)と同じ「PoW前のペイロードを返す」規約に揃えた。onion_addressは"xxxx.onion"(v3、56文字+
+".onion")形式の文字列で受け取り、base32部分をデコードして35byte(ed25519公開鍵32byte+
+チェックサム2byte+バージョン1byte)へ戻し、OnionCat prefix(`0xfd87d87eeb43`)を前置した
+ホストバイト列として埋め込む。これは`infra/object_sync.c`の受信側`handle_incoming_onionpeer`
+(base32エンコードで文字列へ戻す処理)のちょうど逆変換。base32デコーダはmessage_builder.c
+(core層)に新規実装した(object_sync.c、infra層のエンコーダとは層が違うため共有できず、
+element単体としては小さいので許容)。
+
+**`infra/object_sync.c`に`bm_object_sync_announce_onion_peer`を追加:** `handle_incoming_
+getpubkey`の自己pubkey応答生成と同じ「build→PoW→object_pool.dbへ挿入→peer_registry経由で
+inv broadcast(除外無し)」パターン。誰宛でもない匿名objectなのでPoW難易度はack objectと
+同じくネットワーク既定の最低値(1000,1000)を使う。TTLは当初pubkeyと同じ28日にしていたが、
+テストでPoW計算に非常に時間がかかった(28日という長いttlがそのままbm_pow_get_targetの
+難易度に跳ね返るため)ため、恒久的なアイデンティティ情報ではなく一時的なピア発見情報である
+ことを踏まえ、api_server.cのgetpubkey要求と同じ2日に短縮した(この方がdaemon起動時の
+PoW計算負荷も軽い)。
+
+**`main.c`への配線:** Stage 2のADD_ONION成功直後に1回呼ぶ。この時点ではpeer_connector_thread
+がまだ起動しておらずpeer_registryは空なので、inv broadcast自体は実質no-opになるが、
+object_pool.dbへは登録されるため以後getdataで配れる状態にはなる(新規接続時に全inv同期を
+行う仕組みはこの実装に無く、これは他の自己生成object種別と共通の既知の制約であり
+onionpeer固有の問題ではない)。
+
+**テスト:** `tests/test_object_sync.c`に検証を追加。(1)`bm_build_onionpeer`が生成する
+ペイロードが、既存の受信側テスト(同ファイル内、同じonionアドレス文字列を使用)が手組みした
+ワイヤーフォーマットとport・OnionCat prefix・鍵バイト列まで完全一致すること(相互運用性の
+直接証明)、(2)不正なonion文字列に対してNULLを返すこと、(3)`bm_object_sync_announce_onion_
+peer`が実際にobject_pool.dbへ`BM_OBJECT_ONIONPEER`型のobjectを挿入すること、を確認した。
+実daemon(独立した一時ディレクトリ)でも、Stage 2のhidden service作成に続けて
+`[object_sync] announced our onion peer: ...`が出て後続の起動処理(peer_connector等)を
+ブロックしないことを確認した。ctest 20件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。残るのは以下の通り。
 
 - inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
-  永続化)まで完了。残るのはOBJECT_ONIONPEERでの自己announce送信側
-  (`sendOnionPeerObj`相当、受信側は既存実装済み)。
+  永続化)・OBJECT_ONIONPEER自己announce送信側まで全て完了。
 - Dandelion++のstem機能、GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、
   今回のv1完成の対象外(引き続き見送り)。
 

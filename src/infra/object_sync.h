@@ -111,4 +111,14 @@ struct bm_broadcast_thread_args
 };
 void *bm_object_sync_broadcast_thread(void *arg);
 
+/*
+ * §11 outbound Tor経路の強化(送信側): 自分自身のonion hidden service情報をonionpeer object
+ * (BM_OBJECT_ONIONPEER)として組み立て・PoWし、object_pool.dbへ登録した上でpeer_registry経由で
+ * 全peer(除外無し、自分が新たに作った物なので他の自己生成object同様except=NULL)へbroadcast
+ * する。main.cがTor ControlPort連携(Stage 2)でhidden serviceを作成した直後に1回呼ぶ想定。
+ * onion_addressは"xxxx.onion"(v3、56文字+".onion")形式であること。stream=1(既定のmother
+ * stream)で告知する。成功時0、onion_addressの形式が不正な場合のみ-1(PoW自体は必ず成功する)。
+ */
+int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port);
+
 #endif /* BM_INFRA_OBJECT_SYNC_H */

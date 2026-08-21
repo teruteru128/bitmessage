@@ -322,6 +322,12 @@ int main(void)
                 }
                 fprintf(stderr, "[tor_control] hidden service ready: %s:%d -> 127.0.0.1:%d\n", onion_address,
                         virtual_port, inbound_port);
+
+                /* §11 onionpeer objectでの自己announce(送信側)。registryはこの時点では
+                 * まだ空(peer_connector_threadはこの後起動する)だが、object_pool.dbへ
+                 * 登録しておけば以後getdataで配れる状態になる(他の自己生成object、
+                 * getpubkey応答等と同じ扱い、object_sync.h参照)。 */
+                bm_object_sync_announce_onion_peer(&object_sync_ctx, onion_address, virtual_port);
             }
             free(onion_address);
             free(new_private_key);

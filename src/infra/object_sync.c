@@ -444,6 +444,58 @@ static void handle_incoming_onionpeer(struct bm_object_sync_ctx *ctx, const stru
     }
 }
 
+/* §11: pubkey(28日)ほど長生きさせる必要は無い(恒久的なアイデンティティ情報ではなく
+ * 「今どこに繋がるか」という一時的なピア発見情報のため)。api_server.cのgetpubkey要求
+ * (2日)と同程度の中程度の寿命にする。この値が短いほどPoW計算(bm_pow_get_targetの
+ * ttl引数)も軽くなり、daemon起動時にmain()を長時間ブロックしにくくなる副次効果もある */
+#define BM_ONIONPEER_ANNOUNCE_TTL_SECONDS (2 * 24 * 60 * 60)
+
+int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port)
+{
+    int64_t now = (int64_t)time(NULL);
+    uint64_t expires_time = (uint64_t)now + BM_ONIONPEER_ANNOUNCE_TTL_SECONDS;
+    uint64_t stream = 1;
+
+    size_t payload_len = 0;
+    unsigned char *payload = bm_build_onionpeer(onion_address, (uint16_t)port, stream, expires_time, &payload_len);
+    if (payload == NULL)
+    {
+        fprintf(stderr, "[object_sync] failed to build onionpeer object (malformed onion address?)\n");
+        return -1;
+    }
+
+    /* §11: 誰宛でもない匿名object(ack objectと同じ扱い)なのでネットワーク既定の最低難易度で
+     * PoWする(getpubkey応答のように特定アイデンティティのnonce_trials_per_byteは無い) */
+    uint64_t target = bm_pow_get_target(payload_len, BM_ONIONPEER_ANNOUNCE_TTL_SECONDS,
+                                         BM_NETWORK_MIN_NONCE_TRIALS_PER_BYTE,
+                                         BM_NETWORK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES);
+    uint64_t nonce = bm_pow_run(payload, payload_len, target);
+
+    size_t object_len = 8 + payload_len;
+    unsigned char *object = malloc(object_len);
+    for (int i = 0; i < 8; i++)
+    {
+        object[i] = (unsigned char)((nonce >> (56 - 8 * i)) & 0xff);
+    }
+    memcpy(object + 8, payload, payload_len);
+    free(payload);
+
+    unsigned char hash[32];
+    bm_inventory_hash(object, object_len, hash);
+    if (!bm_object_store_has(ctx->object_pool_db, hash))
+    {
+        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_ONIONPEER, (int)stream, object, object_len,
+                                (int64_t)expires_time, now);
+        if (ctx->registry != NULL)
+        {
+            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+        }
+        fprintf(stderr, "[object_sync] announced our onion peer: %s:%d\n", onion_address, port);
+    }
+    free(object);
+    return 0;
+}
+
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
                            const struct bm_message *msg)
 {

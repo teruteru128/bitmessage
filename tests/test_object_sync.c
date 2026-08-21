@@ -580,6 +580,76 @@ int main(void)
         sqlite3_finalize(onion_stmt);
     }
 
+    /* --- 8. onionpeer object送信側(bm_build_onionpeer/bm_object_sync_announce_onion_peer, §11)
+     * 上のテスト(7)と同じonionアドレス文字列を使い、bm_build_onionpeerが生成するペイロードが
+     * (7)の受信側テストが手組みしたワイヤーフォーマット(varint(port)||OnionCat prefix||
+     * 35byte鍵)と完全に一致すること(=受信側decodeとの相互運用性)を確認する。加えて
+     * bm_object_sync_announce_onion_peerがobject_pool.dbへ実際に登録することも確認する --- */
+    {
+        const char *send_onion = "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion";
+
+        /* (7)と同じbase32デコード(テスト専用ヘルパー、期待値算出のため) */
+        unsigned char expected_key[35];
+        {
+            uint64_t buffer = 0;
+            int bits = 0;
+            size_t out_pos = 0;
+            for (size_t i = 0; send_onion[i] != '.'; i++)
+            {
+                char c = send_onion[i];
+                int val = (c >= 'a' && c <= 'z') ? (c - 'a') : (c >= '2' && c <= '7') ? (c - '2' + 26) : -1;
+                buffer = (buffer << 5) | (unsigned)val;
+                bits += 5;
+                if (bits >= 8)
+                {
+                    bits -= 8;
+                    expected_key[out_pos++] = (unsigned char)((buffer >> bits) & 0xff);
+                }
+            }
+            CHECK(out_pos == sizeof(expected_key), "expected onion key should be exactly 35 bytes");
+        }
+
+        size_t built_len = 0;
+        unsigned char *built = bm_build_onionpeer(send_onion, 9999, 1, (uint64_t)time(NULL) + 3600, &built_len);
+        CHECK(built != NULL, "bm_build_onionpeer should succeed for a valid v3 onion address");
+        if (built != NULL)
+        {
+            size_t header_len = 8 + 4 + bm_varint_size(1) + bm_varint_size(1);
+            CHECK(built_len > header_len, "built onionpeer payload should have a body");
+            const unsigned char *body = built + header_len;
+            size_t body_len = built_len - header_len;
+
+            uint64_t decoded_port = 0;
+            size_t port_len = bm_varint_decode(body, body_len, &decoded_port);
+            CHECK(port_len > 0 && decoded_port == 9999, "built onionpeer body should encode the given port");
+
+            static const unsigned char ONIONCAT_PREFIX[6] = {0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43};
+            CHECK(port_len + sizeof(ONIONCAT_PREFIX) + sizeof(expected_key) == body_len,
+                  "built onionpeer body length should match varint(port)+prefix+35byte key exactly");
+            CHECK(memcmp(body + port_len, ONIONCAT_PREFIX, sizeof(ONIONCAT_PREFIX)) == 0,
+                  "built onionpeer body should carry the OnionCat prefix");
+            CHECK(memcmp(body + port_len + sizeof(ONIONCAT_PREFIX), expected_key, sizeof(expected_key)) == 0,
+                  "built onionpeer body should carry the exact same key bytes the receive side would decode "
+                  "back to the original onion address");
+            free(built);
+        }
+
+        CHECK(bm_build_onionpeer("not-a-valid-onion-address", 8444, 1, (uint64_t)time(NULL) + 3600, &built_len)
+                  == NULL,
+              "bm_build_onionpeer should reject a malformed onion address");
+
+        int announce_rc = bm_object_sync_announce_onion_peer(&ctx, send_onion, 7777);
+        CHECK(announce_rc == 0, "bm_object_sync_announce_onion_peer should succeed");
+
+        sqlite3_stmt *count_stmt = NULL;
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects WHERE object_type = ?1;", -1,
+                            &count_stmt, NULL);
+        sqlite3_bind_int(count_stmt, 1, (int)BM_OBJECT_ONIONPEER);
+        CHECK(sqlite3_step(count_stmt) == SQLITE_ROW && sqlite3_column_int(count_stmt, 0) >= 1,
+              "an onionpeer object should be stored in object_pool.db after announcing");
+        sqlite3_finalize(count_stmt);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

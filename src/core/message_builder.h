@@ -61,4 +61,15 @@ unsigned char *bm_build_broadcast(const struct bm_identity_info *from, const uns
  * send_pipeline.c側の責務、ここではackobjectの中身だけ作る)。 */
 unsigned char *bm_build_ack_object(int stealth_level, uint64_t stream, size_t *out_len);
 
+/*
+ * §11 outbound Tor経路の強化(送信側): 自分自身のonion hidden service情報をonionpeer object
+ * (BM_OBJECT_ONIONPEER)として組み立てる。onion_addressは"xxxx.onion"(v3、56文字+".onion")
+ * 形式であること。base32部分をデコードし、OnionCat prefix(0xfd87d87eeb43)を前置した
+ * ホストバイト列としてペイロードへ埋め込む(infra/object_sync.cのhandle_incoming_onionpeer、
+ * 受信側のちょうど逆変換)。形式が不正(56文字+".onion"でない、base32として不正な文字を含む)
+ * ならNULLを返す。
+ */
+unsigned char *bm_build_onionpeer(const char *onion_address, uint16_t port, uint64_t stream,
+                                   uint64_t expires_time, size_t *out_len);
+
 #endif /* BM_CORE_MESSAGE_BUILDER_H */

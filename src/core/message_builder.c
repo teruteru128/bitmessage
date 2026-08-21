@@ -508,3 +508,73 @@ unsigned char *bm_build_ack_object(int stealth_level, uint64_t stream, size_t *o
         return build_ack_level0(stream, out_len);
     }
 }
+
+/* --- §11 outbound Tor経路の強化: onionpeer(送信側) --- */
+
+/* RFC4648 base32(小文字、パディング無し)のデコード。onionアドレスの56文字部分を
+ * 35byte(=32byte ed25519公開鍵+2byteチェックサム+1byteバージョン)へ戻す。
+ * infra/object_sync.cのbase32_encode_lower(受信側、逆方向の変換)と対になる。
+ * 不正な文字(a-z, 2-7以外)を含む場合は0を返す。 */
+static size_t base32_decode_lower(const char *in, size_t in_len, unsigned char *out)
+{
+    uint64_t buffer = 0;
+    int bits = 0;
+    size_t out_len = 0;
+    for (size_t i = 0; i < in_len; i++)
+    {
+        char c = in[i];
+        int val;
+        if (c >= 'a' && c <= 'z')
+        {
+            val = c - 'a';
+        }
+        else if (c >= '2' && c <= '7')
+        {
+            val = c - '2' + 26;
+        }
+        else
+        {
+            return 0;
+        }
+        buffer = (buffer << 5) | (uint64_t)val;
+        bits += 5;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            out[out_len++] = (unsigned char)((buffer >> bits) & 0xff);
+        }
+    }
+    return out_len;
+}
+
+unsigned char *bm_build_onionpeer(const char *onion_address, uint16_t port, uint64_t stream,
+                                   uint64_t expires_time, size_t *out_len)
+{
+    static const unsigned char ONIONCAT_PREFIX[6] = {0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43};
+    static const size_t V3_ONION_ADDRESS_CHARS = 56;
+    static const size_t V3_ONION_KEY_LEN = 35;
+    static const char SUFFIX[] = ".onion";
+
+    size_t addr_len = strlen(onion_address);
+    size_t suffix_len = strlen(SUFFIX);
+    if (addr_len != V3_ONION_ADDRESS_CHARS + suffix_len
+        || strcmp(onion_address + V3_ONION_ADDRESS_CHARS, SUFFIX) != 0)
+    {
+        return NULL;
+    }
+
+    unsigned char key_bytes[V3_ONION_KEY_LEN];
+    if (base32_decode_lower(onion_address, V3_ONION_ADDRESS_CHARS, key_bytes) != V3_ONION_KEY_LEN)
+    {
+        return NULL;
+    }
+
+    struct bytebuf b;
+    bb_init(&b);
+    append_common_header(&b, expires_time, BM_OBJECT_ONIONPEER, 1, stream);
+    bb_append_varint(&b, port);
+    bb_append(&b, ONIONCAT_PREFIX, sizeof(ONIONCAT_PREFIX));
+    bb_append(&b, key_bytes, sizeof(key_bytes));
+
+    return bb_take(&b, out_len);
+}
