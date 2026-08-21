@@ -5,6 +5,8 @@
  * - コメント(# と ;)・空行が無視されること
  * - 不明なキー/"="の無い行があっても残りの行の解析が継続すること(1行の誤りで
  *   全体を止めない設計、config_file.h参照)
+ * - default_nonce_trials_per_byte/default_payload_length_extra_bytesに0を指定しても
+ *   拒否され既定値のまま維持されること(pow_engine.cが0除算するのを防ぐガード)
  */
 
 #include <stdio.h>
@@ -53,6 +55,10 @@ int main(void)
         CHECK(cfg.tor_control_port == 9051, "default tor_control_port should be 9051");
         CHECK(cfg.tor_virtual_port == 8444, "default tor_virtual_port should be 8444");
         CHECK(cfg.onion_address[0] == '\0', "default onion_address should be empty");
+        CHECK(cfg.max_outbound_connections == 3, "default max_outbound_connections should be 3");
+        CHECK(cfg.default_nonce_trials_per_byte == 1000, "default default_nonce_trials_per_byte should be 1000");
+        CHECK(cfg.default_payload_length_extra_bytes == 1000,
+              "default default_payload_length_extra_bytes should be 1000");
     }
 
     /* --- 2. 実際のINIファイル: 全セクション/キーが反映されること。コメント・空行・
@@ -64,6 +70,11 @@ int main(void)
                "[network]\n"
                "testnet = 1\n"
                "no_connect=1\n"
+               "max_outbound_connections = 8\n"
+               "\n"
+               "[identity]\n"
+               "default_nonce_trials_per_byte = 2000\n"
+               "default_payload_length_extra_bytes = 3000\n"
                "\n"
                "[api]\n"
                "  port = 9442  \n"
@@ -93,6 +104,32 @@ int main(void)
         CHECK(cfg.tor_virtual_port == 28444, "[tor] virtual_port should be parsed");
         CHECK(strcmp(cfg.onion_address, "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion") == 0,
               "[tor] onion_address should be parsed");
+        CHECK(cfg.max_outbound_connections == 8, "[network] max_outbound_connections should be parsed");
+        CHECK(cfg.default_nonce_trials_per_byte == 2000,
+              "[identity] default_nonce_trials_per_byte should be parsed");
+        CHECK(cfg.default_payload_length_extra_bytes == 3000,
+              "[identity] default_payload_length_extra_bytes should be parsed");
+    }
+
+    /* --- 3b. default_nonce_trials_per_byte/default_payload_length_extra_bytesに0や負の値を
+     * 指定しても拒否され、既定値(1000/1000)のまま維持されること --- */
+    write_file(TEST_CONFIG_PATH,
+               "[identity]\n"
+               "default_nonce_trials_per_byte = 0\n"
+               "default_payload_length_extra_bytes = -5\n"
+               "\n"
+               "[network]\n"
+               "max_outbound_connections = 0\n");
+    {
+        struct bm_config_file cfg;
+        int found = bm_config_file_load(TEST_CONFIG_PATH, &cfg);
+        CHECK(found == 1, "loading should still succeed despite rejected out-of-range values");
+        CHECK(cfg.default_nonce_trials_per_byte == 1000,
+              "default_nonce_trials_per_byte=0 should be rejected, keeping the default");
+        CHECK(cfg.default_payload_length_extra_bytes == 1000,
+              "default_payload_length_extra_bytes=-5 should be rejected, keeping the default");
+        CHECK(cfg.max_outbound_connections == 3,
+              "max_outbound_connections=0 should be rejected, keeping the default");
     }
 
     /* --- 3. 不明なキー/セクション、"="の無い行があっても他の行の解析は継続すること --- */

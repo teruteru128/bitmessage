@@ -282,7 +282,9 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
 
     int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
                                          (int)version, (int)stream, gen.pub_signing, gen.pub_encryption,
-                                         gen.priv_signing, gen.priv_encryption, store_passphrase, 1000, 1000);
+                                         gen.priv_signing, gen.priv_encryption, store_passphrase,
+                                         config->default_nonce_trials_per_byte,
+                                         config->default_payload_length_extra_bytes);
     if (rc != 0)
     {
         free(address);
@@ -338,7 +340,9 @@ static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
 
     int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
                                          4, 1, gen.pub_signing, gen.pub_encryption,
-                                         gen.priv_signing, gen.priv_encryption, store_passphrase, 1000, 1000);
+                                         gen.priv_signing, gen.priv_encryption, store_passphrase,
+                                         config->default_nonce_trials_per_byte,
+                                         config->default_payload_length_extra_bytes);
     if (rc != 0)
     {
         free(address);

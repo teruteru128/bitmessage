@@ -7,6 +7,7 @@
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,6 @@
 #define BM_PROJECT_VERSION "0.0.0"
 #endif
 #define BM_USER_AGENT "/bitmessage-c:" BM_PROJECT_VERSION "/"
-#define BM_MAX_OUTBOUND 3
 
 /* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */
 struct bm_queues
@@ -127,6 +127,12 @@ static const char *env_or_str(const char *env_name, const char *file_value)
     return (env_value != NULL) ? env_value : file_value;
 }
 
+static uint64_t env_or_u64(const char *env_name, uint64_t file_value)
+{
+    const char *env_value = getenv(env_name);
+    return (env_value != NULL) ? strtoull(env_value, NULL, 10) : file_value;
+}
+
 int main(void)
 {
     /* §1.3: DBはスレッドごとに個別接続を開く方針だが、v1では起動時のスキーマ初期化のみ行う */
@@ -204,6 +210,10 @@ int main(void)
     api_config.broadcast_queue = &queues.broadcast_queue;
     api_config.config_db = config_db;
     api_config.peers_db = peers_db;
+    api_config.default_nonce_trials_per_byte =
+        env_or_u64("BM_DEFAULT_NONCE_TRIALS_PER_BYTE", cfg.default_nonce_trials_per_byte);
+    api_config.default_payload_length_extra_bytes =
+        env_or_u64("BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES", cfg.default_payload_length_extra_bytes);
     fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
             api_password, api_port);
 
@@ -418,7 +428,7 @@ int main(void)
         pc_args->config.epfd = epfd;
         pc_args->config.peers_db = peers_db;
         pc_args->config.testnet = testnet;
-        pc_args->config.max_outbound = BM_MAX_OUTBOUND;
+        pc_args->config.max_outbound = env_or_int("BM_MAX_OUTBOUND", cfg.max_outbound_connections);
         pc_args->config.user_agent = BM_USER_AGENT;
         pc_args->config.registry = &peer_registry;
         pc_args->config.config_db = config_db;

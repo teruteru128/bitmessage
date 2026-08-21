@@ -1703,6 +1703,42 @@ tor_control_socket/host/port, tor_virtual_port, onion_address)を全て「設定
 (testnet/no_connect/api port/inbound port)だけが実際に反映されること、`BM_API_PORT`env
 varが設定ファイルの値を正しく上書きすることの両方を確認した。ctest 21件全通過。
 
+### PyBitmessage keys.dat由来の追加項目: maxoutboundconnections・PoW難易度既定値(2026-08-22)
+
+`bitmessage.conf`導入後、PyBitmessageのkeys.datにあってこちらに無い項目のうちGUI系を除いて
+洗い出し、価値がありそうな2つをユーザーと合意の上で追加した(SOCKS5認証・Namecoin連携・
+帯域制限・ブラックリスト等は別途大きな機能が必要、またはTorがSOCKS5認証を要求しないため
+実質価値が薄いと判断し見送った)。
+
+**`[network] max_outbound_connections`(PyBitmessageの`maxoutboundconnections`相当):**
+`main.c`にハードコードされていた`BM_MAX_OUTBOUND 3`を`bitmessage.conf`/`BM_MAX_OUTBOUND`
+env varから読むよう変更。既定値は変えず3のまま。
+
+**`[identity] default_nonce_trials_per_byte`/`default_payload_length_extra_bytes`
+(PyBitmessageの`defaultnoncetrialsperbyte`/`defaultpayloadlengthextrabytes`相当):**
+調べたところ、`api_server.c`の`h_createDeterministicAddress`/`h_joinChan`が新規identity
+作成のたびに`1000, 1000`を直接ハードコードしており、**ネットワーク最低難易度より高いPoWを
+自分宛のメッセージに要求する手段が(CLIにもAPIにも)一切無かった**。これはPyBitmessageに
+ある簡易的なスパム対策機能の欠落だったため、`struct bm_api_server_config`に
+`default_nonce_trials_per_byte`/`default_payload_length_extra_bytes`(共にuint64_t)を
+追加し、両ハンドラのハードコード値をこれに差し替えた。
+
+**0除算対策:** `pow_engine.c`の`bm_pow_get_target`は`nonce_trials_per_byte`で除算するため、
+この値が0だと即座にクラッシュする(未定義動作)。設定ファイル由来の値が万一0になる経路を
+断つため、`config_file.c`の`apply_kv`はこの2項目(および`max_outbound_connections`)に
+0以下の値が指定されたら警告を出して既定値を維持するガードを入れた。加えて、
+`bm_api_server_config`を直接組み立てている3つのテスト(`test_api_server.c`・
+`test_broadcast.c`・`test_getpubkey_automation.c`)は`memset`で0初期化した後に個別フィールドを
+設定する書き方だったため、この2つの新フィールドを明示的に`1000`で埋めるよう修正した
+(でなければテストがクラッシュしていた)。
+
+**テスト:** `tests/test_config_file.c`に新規セクション`[identity]`の値の反映、および
+`max_outbound_connections`/PoW難易度2項目への0や負の値が拒否され既定値のまま維持される
+ことの検証を追加。実daemon(独立した一時ディレクトリ)で`default_nonce_trials_per_byte=2000`
+`default_payload_length_extra_bytes=1500`を設定し、`bitmessage-cli create-address`で
+作成した実際のアドレスの`identity.db`の値が2000/1500になっていることを確認した。
+ctest 21件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

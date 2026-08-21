@@ -20,6 +20,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define BM_CONFIG_FILE_STR_MAX 256
 
@@ -27,6 +28,7 @@ struct bm_config_file
 {
     int testnet;
     int no_connect;
+    int max_outbound_connections; /* PyBitmessageのmaxoutboundconnections相当(既定3) */
     int api_port;
     int inbound_port; /* 0 = 未設定(inbound無効)。BM_INBOUND_PORTのenv var版と同じ意味 */
     int tor_control;
@@ -35,6 +37,12 @@ struct bm_config_file
     int tor_control_port;
     int tor_virtual_port;
     char onion_address[BM_CONFIG_FILE_STR_MAX]; /* 空文字列 = 未設定 */
+    /* PyBitmessageのdefaultnoncetrialsperbyte/defaultpayloadlengthextrabytes相当。新規
+     * identity作成時(createDeterministicAddress/joinChan)の既定PoW難易度。0にはできない
+     * (pow_engine.cのbm_pow_get_targetが0除算するため、bm_config_file_loadは0を指定されても
+     * 既定値1000を維持し警告するガードを持つ)。 */
+    uint64_t default_nonce_trials_per_byte;
+    uint64_t default_payload_length_extra_bytes;
 };
 
 /*

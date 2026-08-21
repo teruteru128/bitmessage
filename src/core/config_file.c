@@ -10,6 +10,7 @@ static void set_defaults(struct bm_config_file *out)
     memset(out, 0, sizeof(*out));
     out->testnet = 0;
     out->no_connect = 0;
+    out->max_outbound_connections = 3;
     out->api_port = 8442;
     out->inbound_port = 0;
     out->tor_control = 0;
@@ -18,6 +19,8 @@ static void set_defaults(struct bm_config_file *out)
     out->tor_control_port = 9051;
     out->tor_virtual_port = 8444;
     out->onion_address[0] = '\0';
+    out->default_nonce_trials_per_byte = 1000;
+    out->default_payload_length_extra_bytes = 1000;
 }
 
 /* 先頭・末尾の空白を取り除く(inを直接書き換えてポインタを返す、strdup等はしない) */
@@ -53,6 +56,51 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
         if (strcmp(key, "no_connect") == 0)
         {
             out->no_connect = atoi(value);
+            return;
+        }
+        if (strcmp(key, "max_outbound_connections") == 0)
+        {
+            int v = atoi(value);
+            if (v <= 0)
+            {
+                fprintf(stderr,
+                        "[config_file] %s:%d: max_outbound_connections must be positive, ignoring "
+                        "(keeping %d)\n",
+                        path, line_no, out->max_outbound_connections);
+                return;
+            }
+            out->max_outbound_connections = v;
+            return;
+        }
+    }
+    else if (strcmp(section, "identity") == 0)
+    {
+        if (strcmp(key, "default_nonce_trials_per_byte") == 0)
+        {
+            long long v = atoll(value);
+            if (v <= 0)
+            {
+                fprintf(stderr,
+                        "[config_file] %s:%d: default_nonce_trials_per_byte must be positive, ignoring "
+                        "(a value of 0 would make PoW target calculation divide by zero)\n",
+                        path, line_no);
+                return;
+            }
+            out->default_nonce_trials_per_byte = (uint64_t)v;
+            return;
+        }
+        if (strcmp(key, "default_payload_length_extra_bytes") == 0)
+        {
+            long long v = atoll(value);
+            if (v <= 0)
+            {
+                fprintf(stderr,
+                        "[config_file] %s:%d: default_payload_length_extra_bytes must be positive, "
+                        "ignoring\n",
+                        path, line_no);
+                return;
+            }
+            out->default_payload_length_extra_bytes = (uint64_t)v;
             return;
         }
     }

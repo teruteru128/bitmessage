@@ -21,10 +21,23 @@ testnet = 0
 # no_connect = 1 で実際のP2P接続を一切行いません(既定0、BM_NO_CONNECT。
 # 主にテスト用)
 no_connect = 0
+# 同時に確立する最大outbound接続数(既定3、BM_MAX_OUTBOUND。PyBitmessageの
+# maxoutboundconnections相当、PyBitmessage自体の既定値は8)
+max_outbound_connections = 3
 
 [api]
 # JSON-RPC APIのlisten port(既定8442、BM_API_PORT)
 port = 8442
+
+[identity]
+# 新規アドレス作成時(create-address/join-chan)に要求する既定のPoW難易度。
+# 値が大きいほど、自分宛にmsg/broadcastを送る側の計算負荷が増える(簡易的な
+# スパム対策。PyBitmessageのdefaultnoncetrialsperbyte/defaultpayloadlengthextrabytes
+# 相当)。0以下は無効(pow_engine.cが0除算するため拒否され既定値のまま維持される)。
+# 両方とも既定1000(ネットワークが受け入れる最低難易度と同じ値、BM_DEFAULT_NONCE_
+# TRIALS_PER_BYTE/BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES)
+default_nonce_trials_per_byte = 1000
+default_payload_length_extra_bytes = 1000
 
 [inbound]
 # Tor hidden service(またはその他のポートフォワーディング)経由のinbound接続を

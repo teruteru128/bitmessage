@@ -258,6 +258,8 @@ int main(void)
     config.keyring = &kr;
     config.identity_db = identity_db;
     config.messages_db = messages_db;
+    config.default_nonce_trials_per_byte = 1000;
+    config.default_payload_length_extra_bytes = 1000;
 
     bm_queue_t broadcast_queue;
     bm_queue_init(&broadcast_queue);

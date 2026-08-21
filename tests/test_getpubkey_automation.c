@@ -156,6 +156,8 @@ int main(void)
     config.identity_db = identity_db;
     config.messages_db = messages_db;
     config.broadcast_queue = &broadcast_queue;
+    config.default_nonce_trials_per_byte = 1000;
+    config.default_payload_length_extra_bytes = 1000;
 
     volatile sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
