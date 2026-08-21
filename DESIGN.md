@@ -1354,6 +1354,19 @@ BM_PROJECT_VERSION "/"`と組み立てるだけにした。以後はCMakeLists.t
   (rating方式は接続実績で信用を積み上げる仕組みであり、bootstrap候補そのものには
   実績が無いためこの防御が機能しない)。あくまで人間が個別に保証したノードを手動で足す、
   という線引き。実装は未着手(v1.1で他backlogを優先するためスキップ、2026-08-21)。
+- **peers.dbの低rating/古いノードのクリーンアップ**: `bm_peer_manager_record_result`は
+  ratingを-1.0で下限クランプするだけで、`hosts`テーブルから行を削除する処理が無い
+  (2026-08-21、ユーザー指摘で発覚。検索した限りDELETE文が1つも無いことを確認済み)。
+  rating DESC順で候補を選ぶ設計上、死んだノードが新しい候補の選定を直接妨げることは
+  無いが(常に一番下に沈む)、DB内に永久に残り続ける。PyBitmessage(`network/knownnodes.py`)
+  の実装を参考として確認した: `singleCleaner`スレッドが5分間隔(`cycleLength=300`)で
+  `cleanupKnownNodes`を呼び、(1) `lastseen`から28日(2419200秒)経過したノードは
+  rating問わず無条件削除、(2) `lastseen`から3時間(10800秒)経過かつ
+  `rating <= knownNodesForgetRating`(定数`-0.5`)のノードを削除、(3) streamごとに
+  最低1ノードは残す、という方式だった。この実装でも同様の間引き(例えば
+  `bm_peer_manager_seed_bootstrap`と対になる`bm_peer_manager_cleanup`のような関数を
+  peer_connector_threadの再接続サイクルにただ乗りさせる、§11設定変更の動的リロードと
+  同じパターン)を追加するのが妥当と考えられる。実装は未着手。
 - inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
   §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 
