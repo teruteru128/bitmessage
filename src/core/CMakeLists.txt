@@ -10,6 +10,7 @@ add_library(bm_core STATIC
     broadcast_decrypt.c
     send_pipeline.c
     config_store.c
+    config_file.c
     peer_manager.c
     api_server.c
 )

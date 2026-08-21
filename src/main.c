@@ -16,6 +16,7 @@
 #include "common/db_common.h"
 #include "common/queue.h"
 #include "core/api_server.h"
+#include "core/config_file.h"
 #include "core/config_store.h"
 #include "core/identity_store.h"
 #include "core/keyring.h"
@@ -101,6 +102,31 @@ static sqlite3 *open_and_init(const char *filename, int (*init_schema)(sqlite3 *
     return db;
 }
 
+/* §11 起動時設定: env var > 設定ファイル > 組み込みの既定値、という優先順位(core/config_file.h
+ * 参照)。env varが真偽フラグの場合は既存の"1"のみを真とみなす挙動(BM_TESTNET等)をそのまま
+ * 保つ(env_flag_or)。数値/文字列はatoi/そのまま採用する(env_or_int/env_or_str)。 */
+static int env_flag_or(const char *env_name, int file_value)
+{
+    const char *env_value = getenv(env_name);
+    if (env_value != NULL)
+    {
+        return strcmp(env_value, "1") == 0 ? 1 : 0;
+    }
+    return file_value;
+}
+
+static int env_or_int(const char *env_name, int file_value)
+{
+    const char *env_value = getenv(env_name);
+    return (env_value != NULL) ? atoi(env_value) : file_value;
+}
+
+static const char *env_or_str(const char *env_name, const char *file_value)
+{
+    const char *env_value = getenv(env_name);
+    return (env_value != NULL) ? env_value : file_value;
+}
+
 int main(void)
 {
     /* §1.3: DBはスレッドごとに個別接続を開く方針だが、v1では起動時のスキーマ初期化のみ行う */
@@ -118,6 +144,19 @@ int main(void)
     }
     fprintf(stderr, "DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
 
+    /* §11 起動時設定ファイル(既定"bitmessage.conf"、BM_CONFIG_FILEで別の場所を指定可能)。
+     * env var > 設定ファイル > 組み込みの既定値、という優先順位でこの後の各設定に使う
+     * (core/config_file.h参照)。ファイルが無くても正常に既定値で起動する。 */
+    const char *config_file_path = getenv("BM_CONFIG_FILE");
+    if (config_file_path == NULL)
+    {
+        config_file_path = "bitmessage.conf";
+    }
+    struct bm_config_file cfg;
+    int config_file_found = bm_config_file_load(config_file_path, &cfg);
+    fprintf(stderr, "[config] %s (%s)\n", config_file_path,
+            config_file_found ? "読み込み完了" : "見つからないため既定値を使用");
+
     /* §11 outbound接続用SOCKS5プロキシ設定。起動時ログ用に一度読むだけで、実際に
      * peer_connector_threadが使う値は再接続サイクルのたびconfig_dbから読み直される
      * (§11設定変更の動的リロード、peer_connector.c参照)。CLIのset-socks-proxyでの変更は
@@ -134,9 +173,11 @@ int main(void)
     bm_keyring_t keyring;
     bm_keyring_init(&keyring);
 
-    /* §6.1: apiusername/apipasswordはランダム生成し起動時に表示する(設定ファイル未実装のため)。
-     * bitmessagedプロセスが生きている間、mainのローカル変数としてこのconfigを保持し続ける
-     * (api_server_threadはmain終了までこのconfigを参照し続けるため)。 */
+    /* §6.1: apiusername/apipasswordはランダム生成し起動時に表示する。設定ファイルに平文の
+     * 固定認証情報を書き出す設計は意図的に採らなかった(core/config_file.h参照、セキュリティ
+     * 判断として起動毎の非永続を維持する)。bitmessagedプロセスが生きている間、mainの
+     * ローカル変数としてこのconfigを保持し続ける(api_server_threadはmain終了までこの
+     * configを参照し続けるため)。 */
     unsigned char api_password_raw[16];
     RAND_bytes(api_password_raw, sizeof(api_password_raw));
     char api_password[sizeof(api_password_raw) * 2 + 1];
@@ -149,12 +190,7 @@ int main(void)
      * daemon側にそれを上書きする手段が無く非対称だった(2026-08-21発覚: バックグラウンドで
      * peer bootstrap用に立てたdaemonと、テスト実行時にctestが自前で起動するdaemonがどちらも
      * 既定の8442を取り合って衝突した)。CLIと同じ環境変数名で揃える。 */
-    int api_port = 8442;
-    const char *api_port_env = getenv("BM_API_PORT");
-    if (api_port_env != NULL)
-    {
-        api_port = atoi(api_port_env);
-    }
+    int api_port = env_or_int("BM_API_PORT", cfg.api_port);
 
     struct bm_api_server_config api_config;
     memset(&api_config, 0, sizeof(api_config));
@@ -168,13 +204,12 @@ int main(void)
     api_config.broadcast_queue = &queues.broadcast_queue;
     api_config.config_db = config_db;
     api_config.peers_db = peers_db;
-    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、設定ファイル未実装)\n",
+    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
             api_password, api_port);
 
-    /* testnet切り替え。設定ファイル未実装のため環境変数BM_TESTNET=1で切り替える(既定mainnet)。
-     * inbound(サーバーソケットでの待ち受け)は自宅環境のISP事情でTor実装まで現実的でないため、
-     * v1はoutbound接続のみ(peer_connector参照)。 */
-    int testnet = getenv("BM_TESTNET") != NULL && strcmp(getenv("BM_TESTNET"), "1") == 0;
+    /* testnet切り替え。bitmessage.confの[network] testnet、またはBM_TESTNET=1で切り替える
+     * (既定mainnet)。 */
+    int testnet = env_flag_or("BM_TESTNET", cfg.testnet);
     bm_protocol_set_testnet(testnet);
     fprintf(stderr, "[network] mode=%s\n", testnet ? "testnet" : "mainnet");
 
@@ -222,11 +257,9 @@ int main(void)
      * listen_fd用のbm_fd_data(type=BM_FD_LISTEN_SOCKET)もmain()がsigwaitでブロックしている
      * 間ずっと生存するスタック変数として持つ(他のctx類と同じ扱い)。 */
     struct bm_fd_data *listen_conn = NULL;
-    int inbound_port = 0;
-    const char *inbound_port_env = getenv("BM_INBOUND_PORT");
-    if (inbound_port_env != NULL)
+    int inbound_port = env_or_int("BM_INBOUND_PORT", cfg.inbound_port);
+    if (inbound_port != 0)
     {
-        inbound_port = atoi(inbound_port_env);
         int listen_fd = bm_network_listen("127.0.0.1", inbound_port);
         if (listen_fd < 0)
         {
@@ -267,22 +300,18 @@ int main(void)
      * 先が無い)。外部から見えるポート番号はBM_TOR_VIRTUAL_PORT(既定8444)で、ControlPortの
      * ADD_ONIONでも静的torrc設定でも共通して使う(「他のpeerが自分のonionアドレスの
      * どのポートへ接続してくるか」という意味は経路によらず同じため)。 */
-    int virtual_port = 8444;
-    const char *virtual_port_env = getenv("BM_TOR_VIRTUAL_PORT");
-    if (virtual_port_env != NULL)
-    {
-        virtual_port = atoi(virtual_port_env);
-    }
+    int virtual_port = env_or_int("BM_TOR_VIRTUAL_PORT", cfg.tor_virtual_port);
 
     /* §11 静的torrc設定への対応(PyBitmessageのkeys.dat onionhostname相当)。ユーザーが
      * ControlPortを使わず自分でtorrcにHiddenServiceDir/HiddenServicePortを設定し、
      * BM_INBOUND_PORTへ転送するよう構成した場合、daemon自身はTorと一切やり取りしないため
-     * 自分のonionアドレスを知る手段が無い。BM_ONION_ADDRESSでユーザーが直接教えれば、
-     * ControlPort連携(下記)を完全にスキップして、そのアドレスをそのままonionpeer objectで
-     * 告知する。BM_TOR_CONTROLより優先する(PyBitmessageもonionhostname設定時はstemによる
-     * 自動作成を試みない、同じ優先順位)。 */
+     * 自分のonionアドレスを知る手段が無い。bitmessage.confの[tor] onion_address、または
+     * BM_ONION_ADDRESSでユーザーが直接教えれば、ControlPort連携(下記)を完全にスキップして、
+     * そのアドレスをそのままonionpeer objectで告知する。BM_TOR_CONTROLより優先する
+     * (PyBitmessageもonionhostname設定時はstemによる自動作成を試みない、同じ優先順位)。 */
     int tor_control_fd = -1;
-    const char *manual_onion_address = getenv("BM_ONION_ADDRESS");
+    const char *onion_address_from_file = (cfg.onion_address[0] != '\0') ? cfg.onion_address : NULL;
+    const char *manual_onion_address = env_or_str("BM_ONION_ADDRESS", onion_address_from_file);
     if (listen_conn != NULL && manual_onion_address != NULL)
     {
         if (bm_object_sync_announce_onion_peer(&object_sync_ctx, manual_onion_address, virtual_port) == 0)
@@ -304,16 +333,13 @@ int main(void)
      * のライフサイクルをプロセスの生存期間と一致させ、プロセス終了(正常終了・クラッシュ問わず)
      * でTor側が自動的にhidden serviceを片付けてくれるようにしている(そうしないと次回起動時に
      * 永続化した鍵での再作成が"550 Onion address collision"で失敗する、tor_control.h参照)。 */
-    else if (listen_conn != NULL && getenv("BM_TOR_CONTROL") != NULL && strcmp(getenv("BM_TOR_CONTROL"), "1") == 0)
+    else if (listen_conn != NULL && env_flag_or("BM_TOR_CONTROL", cfg.tor_control))
     {
         struct bm_tor_control_config tor_config;
         memset(&tor_config, 0, sizeof(tor_config));
-        const char *control_socket = getenv("BM_TOR_CONTROL_SOCKET");
-        tor_config.control_socket_path = (control_socket != NULL) ? control_socket : "/run/tor/control";
-        const char *control_host = getenv("BM_TOR_CONTROL_HOST");
-        tor_config.control_host = (control_host != NULL) ? control_host : "127.0.0.1";
-        const char *control_port_env = getenv("BM_TOR_CONTROL_PORT");
-        tor_config.control_port = (control_port_env != NULL) ? atoi(control_port_env) : 9051;
+        tor_config.control_socket_path = env_or_str("BM_TOR_CONTROL_SOCKET", cfg.tor_control_socket);
+        tor_config.control_host = env_or_str("BM_TOR_CONTROL_HOST", cfg.tor_control_host);
+        tor_config.control_port = env_or_int("BM_TOR_CONTROL_PORT", cfg.tor_control_port);
 
         tor_control_fd = bm_tor_control_connect_and_authenticate(&tor_config);
         if (tor_control_fd < 0)
@@ -374,12 +400,13 @@ int main(void)
     broadcast_args->queue = &queues.broadcast_queue;
     pthread_create(&th_broadcast, NULL, bm_object_sync_broadcast_thread, broadcast_args);
 
-    /* BM_NO_CONNECT=1で実接続を抑止できる(自動テスト用。cli_integration等が本物のネットワークへ
-     * 接続しに行くとCI環境の到達性次第で数十秒単位で遅くなる/非決定的になるため)。 */
+    /* bitmessage.confの[network] no_connect、またはBM_NO_CONNECT=1で実接続を抑止できる
+     * (自動テスト用。cli_integration等が本物のネットワークへ接続しに行くとCI環境の到達性
+     * 次第で数十秒単位で遅くなる/非決定的になるため)。 */
     pthread_t th_peer_connector;
     int peer_connector_started = 0;
     volatile sig_atomic_t peer_connector_stop = 0;
-    if (getenv("BM_NO_CONNECT") != NULL && strcmp(getenv("BM_NO_CONNECT"), "1") == 0)
+    if (env_flag_or("BM_NO_CONNECT", cfg.no_connect))
     {
         fprintf(stderr, "[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
     }

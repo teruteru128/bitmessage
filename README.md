@@ -68,10 +68,17 @@ ctest --test-dir build-Debug --output-on-failure
 ## 使い方
 
 daemon(`bitmessaged`)を起動すると、JSON-RPC APIの認証情報(ユーザー名は固定`bitmessage`、パスワードは
-起動毎にランダム生成)が標準エラー出力に表示される(設定ファイル未実装のため)。
+起動毎にランダム生成)が標準エラー出力に表示される(意図的に非永続。認証情報だけは設定ファイルに書けない)。
+
+起動時設定は`bitmessage.conf`(INI形式、`bitmessaged`のカレントディレクトリに置く。無ければ既定値で
+起動する)で行う。`bitmessage.conf.example`をコピーして使うと早い。各項目は環境変数でも指定でき、
+その場合は環境変数がファイルの値より優先される(優先順位: 環境変数 > `bitmessage.conf` > 既定値)。
 
 ```sh
-# 既定はmainnet。テストネットに繋ぎたい場合は BM_TESTNET=1 を指定
+cp bitmessage.conf.example bitmessage.conf
+# 必要な項目だけ編集する(testnet切り替え、APIポート、Tor hidden service連携等)
+
+# 環境変数での一時的な上書きも可能。例: 既定はmainnet、testnetに繋ぎたい場合は BM_TESTNET=1
 # JSON-RPC APIのポートは既定8442。他プロセスと衝突する場合は BM_API_PORT で変更可能
 # (bitmessage-cli側も同じ環境変数を読むので揃えること)
 ./build-Debug/src/bitmessaged

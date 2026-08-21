@@ -1,0 +1,50 @@
+# bitmessaged の起動時設定ファイル(INI形式)。
+#
+# 使い方: このファイルを "bitmessage.conf" という名前でコピーし(bitmessagedを起動する
+# カレントディレクトリに置く)、必要な項目だけ書き換えてください。ファイルが存在しない
+# 場合は全て既定値のまま起動します(必須ファイルではありません)。
+# BM_CONFIG_FILE環境変数で別の場所に置いたファイルを指定することもできます。
+#
+# 優先順位: 環境変数 > このファイル > 組み込みの既定値。
+# 各項目に対応する環境変数名をコメントに記載しています(テスト/CI用の一時的な上書きに
+# 使えます)。
+#
+# ここに書けるのは「起動時にしか意味を持たない設定」だけです。SOCKS5プロキシ等、
+# daemon稼働中にAPI経由で変更できる設定はconfig.db側で管理されるため、ここには
+# ありません(bitmessage-cliのset-socks-proxy等を使ってください)。
+# API認証情報(ユーザー名/パスワード)も意図的にここには含まれません。起動のたびに
+# ランダム生成され、標準エラー出力にのみ表示されます。
+
+[network]
+# testnet = 1 でmainnetの代わりにtestnetへ接続します(既定0、BM_TESTNET)
+testnet = 0
+# no_connect = 1 で実際のP2P接続を一切行いません(既定0、BM_NO_CONNECT。
+# 主にテスト用)
+no_connect = 0
+
+[api]
+# JSON-RPC APIのlisten port(既定8442、BM_API_PORT)
+port = 8442
+
+[inbound]
+# Tor hidden service(またはその他のポートフォワーディング)経由のinbound接続を
+# 受け付けるport。0または未設定でinbound無効(既定0、BM_INBOUND_PORT)
+port = 0
+
+[tor]
+# 1にするとTor ControlPort経由でhidden serviceを自動作成する(既定0、BM_TOR_CONTROL)。
+# [inbound] port が0のままだと転送先が無いため何もしない
+control = 0
+# ControlPortのUnixドメインソケットパス(既定/run/tor/control、Debian/Ubuntu系torの既定。
+# BM_TOR_CONTROL_SOCKET)
+control_socket = /run/tor/control
+# 上記ソケットに接続できない場合のTCPフォールバック先(既定127.0.0.1、BM_TOR_CONTROL_HOST/
+# BM_TOR_CONTROL_PORT)
+control_host = 127.0.0.1
+control_port = 9051
+# 他のpeerが自分のonionアドレスに接続してくる際のポート番号(既定8444、BM_TOR_VIRTUAL_PORT)
+virtual_port = 8444
+# 自分でtorrcにHiddenServiceDir/HiddenServicePortを静的設定し、[tor] controlを使わない
+# 場合はここに自分のonionアドレス("xxxx.onion")を書く(PyBitmessageのkeys.dat
+# onionhostname相当、BM_ONION_ADDRESS)。controlと両方設定した場合はこちらが優先される
+onion_address =

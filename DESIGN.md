@@ -1650,6 +1650,59 @@ HiddenServicePortを静的に設定し、Tor自体はdaemonと一切やり取り
 ため、このBM_ONION_ADDRESS配線自体に対する新規ctestは追加していない。main.cの環境変数
 分岐という薄い配線のみのため)。
 
+### 起動時設定ファイル bitmessage.conf(2026-08-22)
+
+env varがBM_TESTNET/BM_API_PORT/BM_INBOUND_PORT/BM_TOR_(CONTROL等)/BM_ONION_ADDRESS/
+BM_NO_CONNECTという6系統・計9個まで増え、実運用で毎回同じ設定を手打ちするのは非現実的に
+なったため、ユーザーとの合意でINI形式の起動時設定ファイルを導入した。
+
+**設計方針:** 「起動時にしか意味を持たない設定」はこのファイル、「実行時にAPI経由で変更
+できる設定」(SOCKS5プロキシ等)は引き続き`config.db`(`core/config_store.c`)を使う、と
+役割分担する。静的ファイルにAPI経由のホットリロードまで持たせると複雑になりすぎるための
+判断。優先順位は「環境変数 > 設定ファイル > 組み込みの既定値」とし、env var自体は削除せず
+テスト/CI用の上書き手段として残した(既存の`BM_NO_CONNECT`等の使われ方をそのまま活かす
+ため。実際`tests/`配下のシェルスクリプト・Cテストは全てenv var経由でdaemonを制御しており、
+env varを優先させることでカレントディレクトリにたまたま`bitmessage.conf`があっても
+テストの決定性が壊れない)。
+
+**形式選定(YAML vs INI):** ユーザーと検討し、外部依存無しで安全に自前パーサを書ける・
+今回の設定がフラットなkey-valueの集まりでネスト/リストが不要・PyBitmessageの`keys.dat`
+(Pythonの`configparser`、INI形式)と同じ伝統に乗れる、という理由でINIを選んだ。
+
+**実装:** `core/config_file.h`/`.c`(`bm_config_file_load(path, &cfg)`)。`[section]`・
+`key = value`・`#`/`;`行コメントのみの最小限のパーサ(約150行)。ファイルが存在しない場合は
+既定値のまま0を返す(必須ファイルではない)。認識できないキー/`=`の無い行は1行ごとに
+警告を出すだけで処理を継続する(1行の誤りで起動全体を止めないため)。
+
+セクション構成: `[network]`(testnet, no_connect)・`[api]`(port)・`[inbound]`(port、0=無効)・
+`[tor]`(control, control_socket, control_host, control_port, virtual_port, onion_address)。
+API認証情報(ユーザー名/パスワード)は意図的に含めない: 起動毎のランダム生成・非永続という
+既存の設計はセキュリティ上の判断であり、平文設定ファイルへ持ち出す変更は別途の判断が必要な
+ため今回のスコープでは行わなかった。
+
+`main.c`に`env_flag_or`/`env_or_int`/`env_or_str`という3つの小さなヘルパーを追加し、
+既存の9箇所のenv var読み取り(testnet, no_connect, api_port, inbound_port, tor_control,
+tor_control_socket/host/port, tor_virtual_port, onion_address)を全て「設定ファイルの値を
+既定にしつつenv varで上書き」という形に置き換えた。`BM_INBOUND_PORT`は挙動を少し変更した:
+従来は「env varが設定されていること」自体で判定していたが(値が0でも listen を試みた)、
+設定ファイルとの共存のため「値が0以外」で判定するよう統一した(0=無効という約束を両方の
+入力元で共通化するため。既存のctest/シェルスクリプトはどちらも`BM_INBOUND_PORT=0`を
+使っていないことをgrepで確認済みで、後方互換上の実害は無い)。
+
+ファイルの置き場所は`BM_CONFIG_FILE`環境変数で変更でき、既定は`bitmessaged`のカレント
+ディレクトリの`bitmessage.conf`(他の全てのDBファイルと同じくカレントディレクトリ基準、
+という既存の一貫性に合わせた。XDG設定ディレクトリ等、他のファイルが使っていない新しい
+置き場所の慣習は導入していない)。テンプレートとして`bitmessage.conf.example`をリポジトリ
+直下に追加し、実際に使う`bitmessage.conf`自体は`.gitignore`へ追加した(ユーザーが実onion
+アドレス等の個別設定を誤ってcommitしないため)。
+
+**テスト:** `tests/test_config_file.c`を追加。存在しないパスで既定値のまま0を返すこと、
+実際のINIファイルの全セクション/キーが正しく反映されること(コメント・空行・前後の空白の
+無視も含む)、不明なキーや`=`の無い行があっても残りの行の解析が継続することを確認した。
+実daemon(独立した一時ディレクトリ)でも、env var無しで設定ファイルの値
+(testnet/no_connect/api port/inbound port)だけが実際に反映されること、`BM_API_PORT`env
+varが設定ファイルの値を正しく上書きすることの両方を確認した。ctest 21件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
