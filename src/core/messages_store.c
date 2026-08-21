@@ -18,14 +18,18 @@ static const char *SCHEMA_SQL =
     "folder TEXT NOT NULL DEFAULT 'inbox'"
     ");"
     "CREATE TABLE IF NOT EXISTS sent ("
-    "ack_data BLOB PRIMARY KEY, "
+    "msg_id BLOB PRIMARY KEY, " /* 送信試行を安定して指す32byteランダムID(再送でも不変) */
+    "ack_data BLOB NOT NULL, "  /* 再送のたびに新しいobjectと共に上書きされる */
     "to_address TEXT NOT NULL, "
     "from_address TEXT NOT NULL, "
     "subject BLOB NOT NULL, "
     "body BLOB NOT NULL, "
     "status TEXT NOT NULL, "
+    "ack_stealth_level INTEGER NOT NULL DEFAULT 1, "
     "sent_time INTEGER NOT NULL, "
-    "ttl INTEGER NOT NULL"
+    "ttl INTEGER NOT NULL, "
+    "resend_count INTEGER NOT NULL DEFAULT 0, "
+    "next_resend_time INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS address_book ("
     "address TEXT PRIMARY KEY, "
@@ -146,28 +150,38 @@ void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count)
     free(list);
 }
 
-int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char *ack_data, size_t ack_data_len,
+int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char msg_id[32],
+                                   const unsigned char *ack_data, size_t ack_data_len,
                                    const char *to_address, const char *from_address,
                                    const char *subject, const char *body,
-                                   const char *status, int64_t sent_time, int64_t ttl)
+                                   const char *status, int ack_stealth_level,
+                                   int64_t sent_time, int64_t ttl, int64_t next_resend_time)
 {
     static const char *SQL =
-        "INSERT INTO sent (ack_data, to_address, from_address, subject, body, status, sent_time, ttl) "
-        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8);";
+        "INSERT INTO sent (msg_id, ack_data, to_address, from_address, subject, body, status, "
+        "ack_stealth_level, sent_time, ttl, resend_count, next_resend_time) "
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11) "
+        "ON CONFLICT(msg_id) DO UPDATE SET "
+        "ack_data=excluded.ack_data, status=excluded.status, sent_time=excluded.sent_time, "
+        "ttl=excluded.ttl, resend_count=sent.resend_count + 1, "
+        "next_resend_time=excluded.next_resend_time;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
     {
         return -1;
     }
-    sqlite3_bind_blob(stmt, 1, ack_data, (int)ack_data_len, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, to_address, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, from_address, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 4, subject, (int)strlen(subject), SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 5, body, (int)strlen(body), SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, status, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 7, sent_time);
-    sqlite3_bind_int64(stmt, 8, ttl);
+    sqlite3_bind_blob(stmt, 1, msg_id, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, ack_data, (int)ack_data_len, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, to_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, from_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 5, subject, (int)strlen(subject), SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 6, body, (int)strlen(body), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, status, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 8, ack_stealth_level);
+    sqlite3_bind_int64(stmt, 9, sent_time);
+    sqlite3_bind_int64(stmt, 10, ttl);
+    sqlite3_bind_int64(stmt, 11, next_resend_time);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -209,4 +223,76 @@ int bm_messages_store_try_mark_ack_received(sqlite3 *db, const unsigned char rec
     }
     sqlite3_finalize(stmt);
     return found ? 0 : -1;
+}
+
+int bm_messages_store_list_resend_candidates(sqlite3 *db, int64_t now, int max_attempts,
+                                              struct bm_sent_resend_candidate **out_list, size_t *out_count)
+{
+    static const char *SQL =
+        "SELECT msg_id, to_address, from_address, subject, body, ack_stealth_level, ttl, resend_count "
+        "FROM sent WHERE status != 'ackreceived' AND next_resend_time <= ?1 AND resend_count < ?2;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, now);
+    sqlite3_bind_int(stmt, 2, max_attempts);
+
+    size_t cap = 4;
+    size_t count = 0;
+    struct bm_sent_resend_candidate *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (sqlite3_column_bytes(stmt, 0) != 32)
+        {
+            continue;
+        }
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        struct bm_sent_resend_candidate *c = &list[count];
+        memset(c, 0, sizeof(*c));
+        memcpy(c->msg_id, sqlite3_column_blob(stmt, 0), 32);
+
+        const unsigned char *to_address = sqlite3_column_text(stmt, 1);
+        strncpy(c->to_address, (const char *)to_address, sizeof(c->to_address) - 1);
+        const unsigned char *from_address = sqlite3_column_text(stmt, 2);
+        strncpy(c->from_address, (const char *)from_address, sizeof(c->from_address) - 1);
+
+        int subject_len = sqlite3_column_bytes(stmt, 3);
+        c->subject = malloc((size_t)subject_len + 1);
+        memcpy(c->subject, sqlite3_column_blob(stmt, 3), (size_t)subject_len);
+        c->subject[subject_len] = '\0';
+
+        int body_len = sqlite3_column_bytes(stmt, 4);
+        c->body = malloc((size_t)body_len + 1);
+        memcpy(c->body, sqlite3_column_blob(stmt, 4), (size_t)body_len);
+        c->body[body_len] = '\0';
+
+        c->ack_stealth_level = sqlite3_column_int(stmt, 5);
+        c->ttl = sqlite3_column_int64(stmt, 6);
+        c->resend_count = sqlite3_column_int(stmt, 7);
+
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+void bm_sent_resend_candidate_list_free(struct bm_sent_resend_candidate *list, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        free(list[i].subject);
+        free(list[i].body);
+    }
+    free(list);
 }

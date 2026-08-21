@@ -13,6 +13,7 @@
 #include "../core/message_builder.h"
 #include "../core/messages_store.h"
 #include "../core/pubkey_cache.h"
+#include "../core/send_pipeline.h"
 #include "../core/trial_decrypt.h"
 #include "../pow/pow_engine.h"
 #include "object.h"
@@ -25,6 +26,10 @@
 /* 期限切れobject GCの間引き間隔。dispatchが呼ばれるたびに毎回DELETEを試みるのは無駄なので、
  * このくらいの間隔を置く(厳密である必要はない) */
 #define BM_OBJECT_SYNC_GC_INTERVAL_SECONDS 300
+
+/* 再送チェックの間引き間隔(§11)。next_resend_time自体は分単位以上の粒度なので、
+ * これくらいの頻度で十分 */
+#define BM_OBJECT_SYNC_RESEND_CHECK_INTERVAL_SECONDS 300
 
 /* ackobject自体の受け入れ基準。send_pipeline.cのBM_ACK_NONCE_TRIALS_PER_BYTE等と対になる
  * ネットワーク既定値(誰宛でもない匿名objectのため、宛先固有の難易度は使えない) */
@@ -45,6 +50,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->keyring = keyring;
     ctx->registry = registry;
     ctx->last_gc = 0;
+    ctx->last_resend_check = 0;
 }
 
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now)
@@ -63,6 +69,72 @@ static void maybe_run_gc(struct bm_object_sync_ctx *ctx)
         {
             fprintf(stderr, "[object_sync] GC: removed %d expired object(s)\n", deleted);
         }
+    }
+}
+
+int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
+{
+    ctx->last_resend_check = (time_t)now;
+
+    struct bm_sent_resend_candidate *candidates = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_resend_candidates(ctx->messages_db, now, BM_RESEND_MAX_ATTEMPTS,
+                                                  &candidates, &count) != 0)
+    {
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        struct bm_sent_resend_candidate *c = &candidates[i];
+        int new_resend_count = c->resend_count + 1;
+        int64_t next_resend_time = now + (int64_t)BM_RESEND_INITIAL_INTERVAL_SECONDS * (1LL << new_resend_count);
+
+        unsigned char *object = NULL;
+        size_t object_len = 0;
+        int rc = bm_send_pipeline_send_message(ctx->keyring, ctx->identity_db, ctx->messages_db,
+                                                c->from_address, c->to_address, NULL,
+                                                c->subject, c->body, (uint64_t)c->ttl, c->ack_stealth_level,
+                                                c->msg_id, next_resend_time, &object, &object_len);
+        if (rc == 0)
+        {
+            struct bm_object_header hdr;
+            if (bm_object_parse_header(object, object_len, &hdr) == 0)
+            {
+                unsigned char hash[32];
+                bm_inventory_hash(object, object_len, hash);
+                if (!bm_object_store_has(ctx->object_pool_db, hash))
+                {
+                    bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
+                                            object, object_len, (int64_t)hdr.expires_time, now);
+                    if (ctx->registry != NULL)
+                    {
+                        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+                    }
+                }
+            }
+            fprintf(stderr, "[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
+            free(object);
+        }
+        else
+        {
+            fprintf(stderr,
+                    "[object_sync] resend attempt skipped for %s (fromAddress not unlocked or "
+                    "recipient pubkey not cached?)\n",
+                    c->to_address);
+        }
+    }
+
+    bm_sent_resend_candidate_list_free(candidates, count);
+    return (int)count;
+}
+
+static void maybe_run_resend_check(struct bm_object_sync_ctx *ctx)
+{
+    time_t now = time(NULL);
+    if (now - ctx->last_resend_check >= BM_OBJECT_SYNC_RESEND_CHECK_INTERVAL_SECONDS)
+    {
+        bm_object_sync_check_resends(ctx, (int64_t)now);
     }
 }
 
@@ -458,6 +530,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
 
     maybe_run_gc(ctx);
+    maybe_run_resend_check(ctx);
 }
 
 void *bm_object_sync_broadcast_thread(void *arg)

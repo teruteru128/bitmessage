@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../src/core/address.h"
@@ -85,6 +86,7 @@ int main(void)
     int rc = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
                                             recv_gen.pub_encryption, subject, body,
                                             /*ttl_seconds=*/60, /*ack_stealth_level=*/1,
+                                            NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                             &object, &object_len);
     CHECK(rc == 0, "bm_send_pipeline_send_message");
     CHECK(object != NULL && object_len > 0, "produced object should be non-empty");
@@ -159,6 +161,7 @@ int main(void)
     size_t object_no_pubkey_len = 0;
     int rc_no_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
                                                      NULL, subject, body, 60, 1,
+                                                     NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                                      &object_no_pubkey, &object_no_pubkey_len);
     CHECK(rc_no_cache != 0, "sendMessage with NULL pubkey should fail when cache is empty");
 
@@ -177,6 +180,7 @@ int main(void)
     size_t object_from_cache_len = 0;
     int rc_from_cache = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
                                                        NULL, subject, body, 60, 1,
+                                                       NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                                        &object_from_cache, &object_from_cache_len);
     CHECK(rc_from_cache == 0, "sendMessage with NULL pubkey should succeed once cached");
     CHECK(object_from_cache != NULL && object_from_cache_len > 0, "cache-derived object non-empty");

@@ -280,7 +280,8 @@ int main(void)
     size_t msg_object_len = 0;
     CHECK(bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
                                          recv_gen.pub_encryption, "ack test subject", "ack test body",
-                                         3600, 1, &msg_object, &msg_object_len) == 0,
+                                         3600, 1, NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
+                                         &msg_object, &msg_object_len) == 0,
           "send_pipeline_send_message for ack round-trip test");
 
     struct bm_message incoming_msg;

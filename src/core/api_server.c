@@ -441,9 +441,11 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
 
     unsigned char *object = NULL;
     size_t object_len = 0;
+    int64_t next_resend_time = (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS;
     int rc = bm_send_pipeline_send_message(config->keyring, config->identity_db, config->messages_db,
                                             from_address, to_address, to_pub_encryption_ptr,
                                             subject, body, ttl_seconds, ack_stealth_level,
+                                            NULL, next_resend_time,
                                             &object, &object_len);
     if (rc != 0)
     {

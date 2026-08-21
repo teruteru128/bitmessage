@@ -663,9 +663,29 @@ msgへの埋め込みには`CreatePacket`で包んだ完成P2Pパケット(受�
 それぞれ格納する(両者は別物である点に注意、`bm_build_msg`のドキュメントコメント参照)。
 受信側の「そのまま書き込む」に対応する実装は`trial_decrypt.c`の`out_ack_payload`出力→
 `object_sync.c`の`validate_and_store_ack`(§1参照、object header・PoW・期限を検証してから
-自分のobject_pool.dbへ挿入。他peerへの能動的な再送出=inv broadcastは接続レジストリ未実装のため
-TODO)。送達確認(`ackreceived`遷移)は`messages_store.c`の`bm_messages_store_try_mark_ack_received`
+自分のobject_pool.dbへ挿入し、`peer_registry`経由で全peerへinv broadcastする)。送達確認
+(`ackreceived`遷移)は`messages_store.c`の`bm_messages_store_try_mark_ack_received`
 (§1のobject_sync_thread参照)。
+
+**再送(resend)ロジック、実装済み(2026-08-23)。** `sent`テーブルの主キーを`ack_data`から
+`msg_id`(32byteランダムID、送信試行を安定して指す。再送しても不変)へ変更し、`ack_data`/
+`status`/`resend_count`/`next_resend_time`は再送のたびに上書きされるようにした
+(`bm_messages_store_insert_sent`は`msg_id`でUPSERTし、UPDATE時は`resend_count`をDB側で
+`+1`する)。`bm_send_pipeline_send_message`は`reuse_msg_id`(NULL=新規送信、非NULL=既存行を
+再利用)と`next_resend_time`を新たに受け取る。`object_sync.c`の`bm_object_sync_check_resends`
+(GCと同様300秒間引きで`bm_object_sync_dispatch`から呼ばれる、`bm_object_sync_gc`と同じ手動
+呼び出しも可)が、ack未着かつ`next_resend_time`経過・`resend_count`が
+`BM_RESEND_MAX_ATTEMPTS`(既定5回)未満の行を`bm_messages_store_list_resend_candidates`で
+列挙し、同じ`msg_id`で`bm_send_pipeline_send_message`を呼び直す(`to_pub_encryption=NULL`固定、
+=pubkey_cache参照。**直接pubkeyを渡して送った場合はcacheに乗らないため自動再送できない**、
+既知の制限)。初回間隔`BM_RESEND_INITIAL_INTERVAL_SECONDS`(既定4時間)から2^resend_count倍で
+間隔が伸びていく。再送で生成された新しいobjectはobject_pool.dbへ挿入しpeer_registryで
+全peer(除外無し)へbroadcastする。`tests/test_resend.c`で、再送によりmsg_idが不変のまま
+ack_data/resend_count/next_resend_timeが更新されること、上限到達・ackreceived済みの行が
+対象から外れること、broadcastされること(inv)をend-to-endで検証済み。実daemonでも
+sendMessage→sentテーブルへの正しい記録までは実機確認したが、5分間引きの実発火タイミングは
+testnetの実イベント到達間隔と噛み合わず今回は個別確認できていない(GCと同じ間引き方式で
+機構自体は共通のため、信頼性は同等と判断)。
 
 ## 6. API層(フロント⇄コア暗号層)方針決定
 
@@ -923,17 +943,18 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 `peer_connector`の常駐化・再接続維持ループ、`api_server`のgraceful shutdown、
 `pow_engine`のマルチスレッド並列化、getpubkey要求の自動化(送信側の自動発行+受信側の
-自応答+v4の候補照合、いずれも2026-08-23)が実装完了・push済み。これで
-`network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
-ctest 14件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
+自応答+v4の候補照合)、再送(resend)ロジック(いずれも2026-08-23)が実装完了・push済み。
+これで`network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
+ctest 15件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
 十数秒)になったこと・testnet接続中にgetpubkey要求の自動broadcastが実際に動くことを
 確認済み(§4.3, §5.1)。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
 確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に
 指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
 Tor実装まで見送りの前提は継続(§8参照)。
 
-- **再送(resend)ロジック**: ack未着のまま一定時間経過した`sent`行を間隔を倍々にして再送する処理
-  (今回スコープ外と決めた分、§1参照)。
+- **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
+  固定で行うため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
+  (2026-08-23発覚)。送信成功時にcache未登録なら自動的にupsertする、等の対応が考えられる。
 - **broadcast(type=3)の購読・復号**: 「誰の配信を受信対象にするか」を持つテーブルが無い
   (`address_book`はラベル帳のみ)。
 - **受信object全般のPoW検証**: `validate_and_store_ack`(§5.5)はackobjectのPoWを検証しているが、

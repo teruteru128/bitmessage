@@ -55,3 +55,7 @@ add_test(NAME pow_engine COMMAND test_pow_engine)
 add_executable(test_getpubkey_automation test_getpubkey_automation.c)
 target_link_libraries(test_getpubkey_automation PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)
+
+add_executable(test_resend test_resend.c)
+target_link_libraries(test_resend PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME resend COMMAND test_resend)

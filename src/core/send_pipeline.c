@@ -1,6 +1,7 @@
 #include "send_pipeline.h"
 
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -88,6 +89,7 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
                                    const unsigned char to_pub_encryption[65],
                                    const char *subject, const char *body,
                                    uint64_t ttl_seconds, int ack_stealth_level,
+                                   const unsigned char reuse_msg_id[32], int64_t next_resend_time,
                                    unsigned char **out_object, size_t *out_object_len)
 {
     struct bm_unlocked_identity from_id;
@@ -198,9 +200,22 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     free(payload);
     free(ack_packet);
 
-    int rc = bm_messages_store_insert_sent(messages_db, ack_data, ack_data_len, to_address, from_address,
-                                            subject, body, "sent", (int64_t)time(NULL),
-                                            (int64_t)ttl_seconds);
+    unsigned char msg_id[32];
+    if (reuse_msg_id != NULL)
+    {
+        memcpy(msg_id, reuse_msg_id, 32);
+    }
+    else if (RAND_bytes(msg_id, sizeof(msg_id)) != 1)
+    {
+        free(object);
+        free(ack_data);
+        OPENSSL_cleanse(&from_id, sizeof(from_id));
+        return -1;
+    }
+
+    int rc = bm_messages_store_insert_sent(messages_db, msg_id, ack_data, ack_data_len, to_address, from_address,
+                                            subject, body, "sent", ack_stealth_level, (int64_t)time(NULL),
+                                            (int64_t)ttl_seconds, next_resend_time);
     free(ack_data);
     OPENSSL_cleanse(&from_id, sizeof(from_id));
 

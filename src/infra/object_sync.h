@@ -21,6 +21,12 @@
  *         受信元コネクション以外の接続中peerへinv broadcastする。自分が新たに作った
  *         object(getpubkeyへの自応答)は除外無しで全peerへbroadcastする
  *   期限切れobjectのGCも間引きながら実行する(bm_object_sync_gcで直接呼ぶことも可能)。
+ *   再送(resend)チェックも間引きながら実行する(§11、bm_object_sync_check_resendsで直接
+ *   呼ぶことも可能): messages.dbのsentテーブルでack未着かつnext_resend_time経過・
+ *   resend_count上限未満の行をbm_send_pipeline_send_message(core/send_pipeline.c)で
+ *   再送する(reuse_msg_idに既存msg_idを渡すことで同じsent行を更新、ack_dataは新しく
+ *   生成し直される)。生成されたobjectはobject_pool.dbへ挿入しpeer_registryで全peerへ
+ *   broadcastする(自分が新たに作ったobjectなのでgetpubkey自応答等と同じ扱い)。
  *
  * また、core/api_server.cのsendMessageが生成したobject(自分が送信したmsg)、およびpubkey_cache
  * 未登録の宛先へ送ろうとした際に自動発行するgetpubkey要求は、bm_object_sync_broadcast_thread
@@ -56,6 +62,7 @@ struct bm_object_sync_ctx
     struct bm_peer_registry *registry; /* NULL可(未使用ならinv broadcastをスキップ) */
     time_t last_gc; /* GC間引き用。network_epoll_threadという単一スレッドからのみ呼ばれる
                       * 前提で排他制御はしない */
+    time_t last_resend_check; /* §11再送チェックの間引き用。last_gcと同じ理由で排他制御はしない */
 };
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
@@ -68,6 +75,14 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
 /* 期限切れobjectを削除する(object_store.cのdelete_expiredを呼ぶだけ)。削除件数を返す。
  * dispatch内部でも間引きながら呼ばれるが、テストや明示的なメンテナンス用に直接呼べる */
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now);
+
+/*
+ * §11再送ロジック: ack未着のままnext_resend_timeを過ぎ、resend_count上限未満のsent行を
+ * bm_send_pipeline_send_message(既存msg_idを再利用)で再送し、object_pool.dbへ挿入・
+ * peer_registryでbroadcastする。dispatch内部でも間引きながら呼ばれるが、テストや
+ * 明示的なメンテナンス用に直接呼べる。処理した(再送を試みた)件数を返す。
+ */
+int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now);
 
 /*
  * broadcast_queueの消費ループ(pthread_createのarg用にmallocして渡す想定、main.c参照)。
