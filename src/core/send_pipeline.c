@@ -230,6 +230,58 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     return 0;
 }
 
+int bm_send_pipeline_send_broadcast(bm_keyring_t *kr, const char *from_address,
+                                     const char *subject, const char *body, uint64_t ttl_seconds,
+                                     unsigned char **out_object, size_t *out_object_len)
+{
+    struct bm_unlocked_identity from_id;
+    if (!bm_keyring_find_by_address(kr, from_address, &from_id))
+    {
+        return -1; /* fromアドレスがunlockされていない */
+    }
+
+    struct bm_identity_info from_info;
+    memset(&from_info, 0, sizeof(from_info));
+    from_info.address_version = from_id.address_version;
+    from_info.stream = from_id.stream;
+    memcpy(from_info.pub_signing, from_id.pub_signing, 65);
+    memcpy(from_info.pub_encryption, from_id.pub_encryption, 65);
+    memcpy(from_info.priv_signing, from_id.priv_signing, 32);
+    from_info.nonce_trials_per_byte = from_id.nonce_trials_per_byte;
+    from_info.payload_length_extra_bytes = from_id.payload_length_extra_bytes;
+
+    uint64_t expires_time = (uint64_t)time(NULL) + ttl_seconds;
+
+    size_t payload_len = 0;
+    unsigned char *payload = bm_build_broadcast(&from_info, from_id.ripe, subject, body, expires_time, &payload_len);
+    if (payload == NULL)
+    {
+        OPENSSL_cleanse(&from_id, sizeof(from_id));
+        return -1;
+    }
+
+    uint64_t target = bm_pow_get_target(payload_len, ttl_seconds, from_id.nonce_trials_per_byte,
+                                         from_id.payload_length_extra_bytes);
+    uint64_t nonce = bm_pow_run(payload, payload_len, target);
+
+    size_t object_len = 8 + payload_len;
+    unsigned char *object = malloc(object_len);
+    if (object == NULL)
+    {
+        free(payload);
+        OPENSSL_cleanse(&from_id, sizeof(from_id));
+        return -1;
+    }
+    pack_be64(object, nonce);
+    memcpy(object + 8, payload, payload_len);
+    free(payload);
+    OPENSSL_cleanse(&from_id, sizeof(from_id));
+
+    *out_object = object;
+    *out_object_len = object_len;
+    return 0;
+}
+
 void *bm_send_pipeline_thread(void *arg)
 {
     (void)arg;

@@ -4,7 +4,8 @@
  *   objectVersion、つまりaddressVersion<=3と>=4の両方)
  * - 購読していないアドレスからのbroadcastは復号されないこと
  * - remove-subscription後は復号されなくなること
- * - addSubscription/listSubscriptions APIが実HTTPリクエスト経由で動作すること
+ * - addSubscription/listSubscriptions/sendBroadcast APIが実HTTPリクエスト経由で
+ *   動作すること
  */
 
 #include <arpa/inet.h>
@@ -17,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../src/common/broadcast_item.h"
 #include "../src/common/json.h"
 #include "../src/core/address.h"
 #include "../src/core/api_server.h"
@@ -82,16 +84,20 @@ static void make_identity(const char *passphrase, uint64_t version, struct bm_id
 }
 
 /* subjectのbroadcastを実PoW付きで組み立てて"object"メッセージとして返す(呼び出し側でfree) */
+/* §11のPoW検証(受信側)はexpires_time-nowからttlを再計算しネットワーク既定の最低難易度
+ * (1000,1000)を満たすか確認するため、expires_timeは固定の遠い未来ではなくnow+ttlにし、
+ * PoW計算時のttl・難易度と一致させる必要がある */
 static unsigned char *build_broadcast_object(const struct bm_identity_info *id, const unsigned char ripe[20],
                                               const char *subject, const char *body, size_t *out_len)
 {
+    uint64_t ttl = 3600;
     size_t payload_len = 0;
-    unsigned char *payload = bm_build_broadcast(id, ripe, subject, body, 2000000000, &payload_len);
+    unsigned char *payload = bm_build_broadcast(id, ripe, subject, body, (uint64_t)time(NULL) + ttl, &payload_len);
     if (payload == NULL)
     {
         return NULL;
     }
-    uint64_t target = bm_pow_get_target(payload_len, 60, 50, 50);
+    uint64_t target = bm_pow_get_target(payload_len, ttl, 1000, 1000);
     uint64_t nonce = bm_pow_run(payload, payload_len, target);
 
     size_t object_len = 8 + payload_len;
@@ -253,6 +259,23 @@ int main(void)
     config.identity_db = identity_db;
     config.messages_db = messages_db;
 
+    bm_queue_t broadcast_queue;
+    bm_queue_init(&broadcast_queue);
+    config.broadcast_queue = &broadcast_queue;
+
+    /* sendBroadcast HTTPテスト用のidentity(keyringでunlock済みである必要がある) */
+    struct bm_generated_address sender_for_http_gen;
+    CHECK(bm_address_generate_deterministic("broadcast test sendBroadcast sender", 1, &sender_for_http_gen) == 0,
+          "generate sendBroadcast sender address");
+    char *sender_for_http_address = bm_address_encode(4, 1, sender_for_http_gen.ripe, BM_RIPE_LEN);
+    CHECK(bm_keyring_create_identity(identity_db, sender_for_http_address, "http sender", 4, 1,
+                                      sender_for_http_gen.pub_signing, sender_for_http_gen.pub_encryption,
+                                      sender_for_http_gen.priv_signing, sender_for_http_gen.priv_encryption,
+                                      "http sender pass", 1000, 1000) == 0,
+          "create sendBroadcast sender identity");
+    CHECK(bm_keyring_unlock(&kr, identity_db, sender_for_http_address, "http sender pass") == 0,
+          "unlock sendBroadcast sender");
+
     volatile sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
     server_args->config = &config;
@@ -319,8 +342,55 @@ int main(void)
     resp_buf[total] = '\0';
     CHECK(strstr(resp_buf, "true") != NULL, "addSubscription HTTP request should return true");
 
+    /* --- 6. sendBroadcast APIが実HTTPリクエスト経由でobjectを組み立てbroadcast_queueへ
+     * 投入すること --- */
+    int sock2 = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(sock2, (struct sockaddr *)&addr, sizeof(addr)) == 0, "connect to api_server for sendBroadcast");
+
+    char broadcast_body[512];
+    snprintf(broadcast_body, sizeof(broadcast_body),
+             "{\"jsonrpc\":\"2.0\",\"method\":\"sendBroadcast\",\"params\":[\"%s\",\"http broadcast subject\","
+             "\"http broadcast body\"],\"id\":2}",
+             sender_for_http_address);
+    char broadcast_request[2048];
+    int broadcast_req_len =
+        snprintf(broadcast_request, sizeof(broadcast_request),
+                 "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                 auth_b64, strlen(broadcast_body), broadcast_body);
+    write(sock2, broadcast_request, (size_t)broadcast_req_len);
+    char broadcast_resp[8192];
+    ssize_t broadcast_total = 0;
+    ssize_t bn;
+    while ((bn = read(sock2, broadcast_resp + broadcast_total, sizeof(broadcast_resp) - 1 - (size_t)broadcast_total))
+           > 0)
+    {
+        broadcast_total += bn;
+    }
+    close(sock2);
+    broadcast_resp[broadcast_total] = '\0';
+    CHECK(strstr(broadcast_resp, "objectLength") != NULL, "sendBroadcast HTTP request should return objectLength");
+    CHECK(strstr(broadcast_resp, "inventoryHash") != NULL, "sendBroadcast HTTP request should return inventoryHash");
+
+    void *raw = NULL;
+    CHECK(bm_queue_pop(&broadcast_queue, &raw) == true, "sendBroadcast should push an item to broadcast_queue");
+    if (raw != NULL)
+    {
+        struct bm_broadcast_item *item = raw;
+        struct bm_object_header hdr;
+        CHECK(bm_object_parse_header(item->object, item->object_len, &hdr) == 0,
+              "sendBroadcast object header parses");
+        CHECK(hdr.object_type == BM_OBJECT_BROADCAST, "sendBroadcast should push a type=broadcast object");
+        free(item->object);
+        free(item);
+    }
+    bm_queue_shutdown(&broadcast_queue);
+
+    free(sender_for_http_address);
+
     server_stop = 1;
     pthread_join(server_thread, NULL);
+    bm_queue_destroy(&broadcast_queue);
 
     bm_keyring_destroy(&kr);
     sqlite3_close(identity_db);

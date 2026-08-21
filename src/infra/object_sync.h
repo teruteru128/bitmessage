@@ -7,7 +7,8 @@
  * infra/network.cのdefault_dispatchと同等の最小応答、inv/getdata/objectを実際に処理する:
  *   - inv受信: 未所持hashについてgetdataを送り返す
  *   - getdata受信: object_pool.dbにあれば同じ接続へobjectを返す
- *   - object受信: 重複排除してobject_pool.dbへ保存し、
+ *   - object受信: 期限切れ・ネットワーク既定の最低難易度(1000,1000)未満のPoWを即座に
+ *     拒否した上で、重複排除してobject_pool.dbへ保存し、
  *       - type=msgならtrial_decrypt(core/trial_decrypt.c)を試み、成功したらinboxへ、
  *         埋め込みack_payloadがあれば検証してobject_pool.dbへ登録する(§5.5)
  *       - type=pubkey(version 2/3)ならpubkey_cache(core/pubkey_cache.c)へ登録を試みる。
@@ -39,11 +40,8 @@
  *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
  *   - addrのpeer_manager永続化
- *   - 受信object全般のPoW検証(§5.5のack検証では行っているが、object全般の受け入れ時には
- *     まだ行っていない、既知のギャップ)
- *   - getpubkey応答のスパム対策(同じ宛先への短時間の連続要求に対する応答側スロットリング)
- *   - broadcast送信側(sendBroadcast API)は未実装。message_builder.cのbm_build_broadcastは
- *     存在するが、api_server.cから呼ぶ経路が無い(既知のギャップ)
+ *   - getpubkey応答のスパム対策(同じ宛先への短時間の連続要求に対する応答側スロットリング。
+ *     PoW検証自体はあるので無償のspamは防げるが、正規のPoWを払われた場合の対策は無い)
  */
 
 #include <sqlite3.h>

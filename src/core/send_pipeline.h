@@ -43,6 +43,19 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
                                    const unsigned char reuse_msg_id[32], int64_t next_resend_time,
                                    unsigned char **out_object, size_t *out_object_len);
 
+/*
+ * §5.4/§11: from_address(keyring内でunlocked済みであること)からbroadcastを送る。
+ * broadcastには単一の宛先もack機構も無いため、send_messageと異なりsentテーブルへの
+ * 記録・再送の対象にはしない(v1の単純化。送りっぱなし)。
+ * 成功時0。*out_objectに完成object(nonce込み、malloc)、*out_object_lenにその長さを設定する
+ * (呼び出し側でfreeすること)。ネットワークへの実際のブロードキャストは呼び出し側の責務
+ * (broadcast_queue経由、§1.2)。失敗する場合: from_addressがunlockedでない、
+ * message_builder/pow_engineでのエラー。
+ */
+int bm_send_pipeline_send_broadcast(bm_keyring_t *kr, const char *from_address,
+                                     const char *subject, const char *body, uint64_t ttl_seconds,
+                                     unsigned char **out_object, size_t *out_object_len);
+
 void *bm_send_pipeline_thread(void *arg);
 
 #endif /* BM_CORE_SEND_PIPELINE_H */

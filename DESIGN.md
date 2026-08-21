@@ -65,6 +65,17 @@ rating更新方式を簡略化したもの)へ反映され、`list_top`(rating�
 DoS対策としてinv/getdataの要素数上限(50000)とobject payloadサイズ上限(256KiB、§5.0)を
 このディスパッチ内で強制する。
 
+**受信object全般のPoW検証、実装済み(2026-08-23)。** それまで`validate_and_store_ack`(§5.5)の
+みが行っていたPoW検証を`handle_object`(`object`受信の共通経路)にも適用した。共有の静的関数
+`object_pow_is_valid`が、期限切れ(`expires_time<=now`)と、ネットワーク既定の最低難易度
+(`BM_NETWORK_MIN_NONCE_TRIALS_PER_BYTE`/`_PAYLOAD_LENGTH_EXTRA_BYTES`、いずれも1000)を
+満たさないobjectを即座に(重複排除やtype別処理の前に)拒否する。宛先固有の難易度は
+受信時点では分からない(pubkey_cache未登録の相手からも受信しうる)ため、常にネットワーク
+既定値で判定する。自分自身が生成したobject(`validate_and_store_ack`・
+`handle_incoming_getpubkey`の自応答・`bm_object_sync_broadcast_thread`・再送)はこの経路を
+通らないため影響を受けない(自分のPoWは信頼する)。`tests/test_object_sync.c`で意図的に
+低難易度(50,50)でPoWしたobjectが拒否される(`object_pool.db`に入らない)ことを検証済み。
+
 **`api_server.c`からの能動的なinv broadcastも実装済み(2026-08-22)。** core層(`api_server.c`)は
 infra層の`peer_registry`を直接呼べない(§1参照)ため、common層の`struct bm_broadcast_item`
 (`src/common/broadcast_item.h`)を介して`broadcast_queue`(§1.2、これまで骨格のみで未配線
@@ -552,9 +563,10 @@ broadcast_queueへ投入すること・pubkey_requestsへ登録すること・co
 かかる(16コア環境)。実際のBitmessageクライアントでもアドレス作成時のpubkey告知に同程度の
 時間がかかることが知られており設計としては妥当だが、その間`network_epoll_thread`(単一スレッド)
 がブロックされる点は既存のsend_pipeline PoW(APIスレッドをブロック)と同じ性質のトレードオフ。
-(b) 同一宛先への短時間repeated getpubkeyに対する応答側スロットリングは無い(受信object全般の
-PoW検証が無いこととあわせて、悪意ある相手にPoW計算をさせられる余地が残る、既知のギャップ)。
-(c) getpubkey要求自体の定期再送(初回broadcastが届かなかった場合の再試行)は無い。
+(b) 同一宛先への短時間repeated getpubkeyに対する応答側スロットリングは無い。受信object全般の
+PoW検証(§1、2026-08-23実装)により無償のPoW無しobjectでの負荷はかけられなくなったが、
+相手が正規のPoWを払ってgetpubkeyを連投した場合の応答側スロットリングは依然として無い
+(既知のギャップ)。(c) getpubkey要求自体の定期再送(初回broadcastが届かなかった場合の再試行)は無い。
 
 ### 5.2 pubkey (type=1)、addressVersion(=objectVersion)ごとに構造が異なる
 
@@ -653,13 +665,19 @@ CLI(`add-subscription`/`remove-subscription`/`list-subscriptions`)から操作�
 通常少数なので線形探索で十分)。成功したらinboxへ保存する(`to_address=from_address`、broadcastには
 単一の宛先が無いためPyBitmessageに倣った慣習、通常のmsgと区別できる)。
 
+**broadcast送信(`sendBroadcast` API)も実装済み(2026-08-23)。** `send_pipeline.c`に
+`bm_send_pipeline_send_broadcast`を追加(`bm_build_broadcast`を呼びPoWして完成objectを返す。
+broadcastには単一の宛先もack機構も無いため、`sendMessage`と異なり`sent`テーブルへの記録・
+再送の対象にはしない設計、送りっぱなし)。`api_server.c`の`sendBroadcast`
+(`[fromAddress, subject, body, ttlSeconds?]`)が`sendMessage`と同じ`broadcast_queue`経由で
+`object_pool.db`への挿入・ネットワークへのbroadcastを行う。CLIの`send-broadcast`コマンドも
+追加。
+
 `tests/test_broadcast.c`でobjectVersion=4/5両方の実broadcastオブジェクトを購読先から受信して
 inboxへ保存されること、購読していない相手や購読解除後は復号されないこと、
-`addSubscription`/`listSubscriptions`が実HTTPリクエスト経由で動作することをend-to-endで検証済み。
-実daemonでも`add-subscription`/`list-subscriptions`/`remove-subscription`のCLI連携を確認済み。
-
-既知の制限: broadcast**送信**側(`sendBroadcast` API)は未実装。`message_builder.c`の
-`bm_build_broadcast`は存在するが、`api_server.c`から呼ぶ経路が無い(別タスクとして残す)。
+`addSubscription`/`listSubscriptions`/`sendBroadcast`が実HTTPリクエスト経由で動作することを
+end-to-endで検証済み。実daemonでも`add-subscription`/`list-subscriptions`/`remove-subscription`/
+`send-broadcast`のCLI連携を確認済み。
 
 ### 5.5 ack payload(msg内に埋め込まれる自己完結オブジェクト)
 
@@ -972,32 +990,38 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
+### v1完成(2026-08-23)
+
 `peer_connector`の常駐化・再接続維持ループ、`api_server`のgraceful shutdown、
 `pow_engine`のマルチスレッド並列化、getpubkey要求の自動化(送信側の自動発行+受信側の
-自応答+v4の候補照合)、再送(resend)ロジック、broadcast(type=3)の購読・復号(いずれも
-2026-08-23)が実装完了・push済み。これで`network_epoll_thread`以外の全スレッドが
-pthread_joinできる状態になった(§1参照)。ctest 16件全通過、実daemonで16コア環境の
-実ネットワーク難易度PoWが約0.35秒(従来数秒〜十数秒)になったこと・testnet接続中に
-getpubkey要求の自動broadcastが実際に動くこと・購読管理CLIが実daemonで動作することを
-確認済み(§4.3, §5.1, §5.4)。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
-確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に
-指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
-Tor実装まで見送りの前提は継続(§8参照)。
+自応答+v4の候補照合)、再送(resend)ロジック、broadcast(type=3)の購読・復号+送信
+(`sendBroadcast`)、受信object全般のPoW検証、が実装完了・push済み。これで
+`network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
+ctest 16件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒になったこと・
+testnet接続中にgetpubkey要求の自動broadcastが実際に動くこと・購読管理/broadcast送信CLIが
+実daemonで動作することを確認済み(§4.3, §5.1, §5.4)。
+
+「v1完成」の基準として、2026-08-23にユーザーと合意した内容: 当初のグランドデザイン
+(§0〜§10)で決めた機能一式(鍵ライフサイクル、全object種別の構築・解析、PoW、
+実ネットワークとの相互運用、direct message送受信、broadcast購読・送信、JSON-RPC API+CLI)
+に加え、`sendBroadcast`(受信側だけでは片手落ちなので)と受信object全般のPoW検証
+(外部に公開する前提の最低限のセキュリティ)の2点を満たした時点をv1完成とする。
+それ以外の既知のギャップ(下記)はv1.1以降のbacklogとして残す。
+
+### v1.1以降のbacklog
 
 - **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
   固定で行うため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
   (2026-08-23発覚)。送信成功時にcache未登録なら自動的にupsertする、等の対応が考えられる。
-- **broadcast送信(`sendBroadcast` API)**: `message_builder.c`の`bm_build_broadcast`は
-  存在するが、`api_server.c`から呼ぶ経路が無い(2026-08-23、購読・復号の実装中に発覚。
-  受信側だけ実装済みでも、実際にbroadcastできる相手がいなければ検証しづらい)。
-- **受信object全般のPoW検証**: `validate_and_store_ack`(§5.5)はackobjectのPoWを検証しているが、
-  `handle_object`(§1)が受信する通常のobjectはPoW未検証のまま`object_pool.db`へ受け入れている
-  (2026-08-23、getpubkey自応答の実装中に発覚)。悪意ある相手にPoW無しのobjectを大量に送りつけ
-  られる余地がある。
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続getpubkey要求に対し、応答側が
-  毎回PoWを計算し直してしまう(2026-08-23発覚、上記のPoW未検証と合わせて悪用されうる)。
+  毎回PoWを計算し直してしまう(2026-08-23発覚。受信object全般のPoW検証により無償のspamは
+  防げるようになったが、正規のPoWを払われた場合の対策は無い)。
 - **設定の永続化・DoS上限の見直し・chan仕様**: 2026-08-21のギャップ洗い出しで指摘した残り3項目
   (日次振り返りの会話参照)。優先度は低いが実運用に近づくほど効いてくる。
+- **addrのpeer_manager永続化**: 受信した`addr`メッセージの内容がログ出力のみで`peers.db`へ
+  反映されない(§1参照)。
+- inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
+  §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

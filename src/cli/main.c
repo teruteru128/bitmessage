@@ -42,6 +42,7 @@ static void print_usage(const char *prog)
             "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex)。\"-\"を指定するとcache-pubkeyで\n"
             "      登録済みの鍵を使う\n"
             "  get-inbox [folder]\n"
+            "  send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n"
             "  add-subscription <address> [label]\n"
             "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
             "      受信したらinboxへ保存する\n"
@@ -253,6 +254,24 @@ int main(int argc, char **argv)
             bm_json_array_append(params, bm_json_new_string(argv[2]));
         }
         return call_rpc(&env, "getInboxMessages", params);
+    }
+
+    if (strcmp(cmd, "send-broadcast") == 0)
+    {
+        if (argc < 5 || argc > 6)
+        {
+            fprintf(stderr, "使い方: %s send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_string(argv[4]));
+        if (argc == 6)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[5])));
+        }
+        return call_rpc(&env, "sendBroadcast", params);
     }
 
     if (strcmp(cmd, "add-subscription") == 0)

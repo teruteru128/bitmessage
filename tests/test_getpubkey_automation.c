@@ -271,9 +271,14 @@ int main(void)
           "create receiver identity");
     CHECK(bm_keyring_unlock(&kr, identity_db, recv_address, "receiver pass") == 0, "unlock receiver");
 
+    /* §11のPoW検証(受信側)はexpires_time-nowからttlを再計算し、ネットワーク既定の最低難易度
+     * (1000,1000)を満たすか確認するため、expires_timeはnow+ttlにしPoW計算時のttl・難易度と
+     * 一致させる必要がある */
+    uint64_t gp_ttl = 3600;
     size_t gp_len = 0;
-    unsigned char *gp_payload = bm_build_getpubkey(4, 1, recv_gen.ripe, 2000000000, &gp_len);
-    uint64_t gp_target = bm_pow_get_target(gp_len, 60, 50, 50);
+    unsigned char *gp_payload =
+        bm_build_getpubkey(4, 1, recv_gen.ripe, (uint64_t)time(NULL) + gp_ttl, &gp_len);
+    uint64_t gp_target = bm_pow_get_target(gp_len, gp_ttl, 1000, 1000);
     uint64_t gp_nonce = bm_pow_run(gp_payload, gp_len, gp_target);
     size_t gp_object_len = 8 + gp_len;
     unsigned char *gp_object = malloc(gp_object_len);
@@ -340,9 +345,14 @@ int main(void)
     third_party_id.nonce_trials_per_byte = 50;
     third_party_id.payload_length_extra_bytes = 50;
 
+    /* オブジェクト自体の転送PoWはネットワーク既定の最低難易度で計算する(third_party_idの
+     * nonce_trials_per_byte/payload_length_extra_bytesはpubkey payload内に埋め込まれる
+     * 「このアドレス宛に送る際の要求難易度」であり、object自体のPoWとは別概念) */
+    uint64_t tp_ttl = 3600;
     size_t tp_len = 0;
-    unsigned char *tp_payload = bm_build_pubkey_v4(&third_party_id, third_party_gen.ripe, 2000000000, &tp_len);
-    uint64_t tp_target = bm_pow_get_target(tp_len, 60, 50, 50);
+    unsigned char *tp_payload =
+        bm_build_pubkey_v4(&third_party_id, third_party_gen.ripe, (uint64_t)time(NULL) + tp_ttl, &tp_len);
+    uint64_t tp_target = bm_pow_get_target(tp_len, tp_ttl, 1000, 1000);
     uint64_t tp_nonce = bm_pow_run(tp_payload, tp_len, tp_target);
     size_t tp_object_len = 8 + tp_len;
     unsigned char *tp_object = malloc(tp_object_len);

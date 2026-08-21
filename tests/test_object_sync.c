@@ -58,14 +58,19 @@ static sqlite3 *open_fresh_db(const char *path, int (*init_schema)(sqlite3 *))
     return db;
 }
 
-/* 適当なgetpubkeyオブジェクトを実PoW付きで1個作る(inv/getdata/dedupテスト用) */
+/* 適当なgetpubkeyオブジェクトを実PoW付きで1個作る(inv/getdata/dedupテスト用)。
+ * §11のPoW検証(受信側)はexpires_time-nowからttlを再計算するため、expires_timeは
+ * 固定の遠い未来ではなくnow+ttlにし、PoW計算時のttlと一致させる必要がある。
+ * 難易度はネットワーク既定の最低値(1000,1000、object_pow_is_valid参照)を満たす必要がある */
 static unsigned char *build_test_object(size_t *out_len)
 {
     unsigned char ripe[20];
     memset(ripe, 0x42, sizeof(ripe));
+    uint64_t ttl = 3600;
+    uint64_t expires_time = (uint64_t)time(NULL) + ttl;
     size_t payload_len = 0;
-    unsigned char *payload = bm_build_getpubkey(4, 1, ripe, /*expires_time=*/2000000000, &payload_len);
-    uint64_t target = bm_pow_get_target(payload_len, 60, 50, 50);
+    unsigned char *payload = bm_build_getpubkey(4, 1, ripe, expires_time, &payload_len);
+    uint64_t target = bm_pow_get_target(payload_len, ttl, 1000, 1000);
     uint64_t nonce = bm_pow_run(payload, payload_len, target);
 
     size_t object_len = 8 + payload_len;
@@ -166,6 +171,42 @@ int main(void)
         }
         bm_free_inventory_message(&parsed_getdata);
         bm_free_message(getdata_reply);
+    }
+
+    /* --- 1b. §11: ネットワーク既定の最低難易度(1000,1000)を満たさないobjectは拒否される --- */
+    {
+        unsigned char weak_ripe[20];
+        memset(weak_ripe, 0x99, sizeof(weak_ripe));
+        uint64_t weak_ttl = 3600;
+        size_t weak_payload_len = 0;
+        unsigned char *weak_payload =
+            bm_build_getpubkey(4, 1, weak_ripe, (uint64_t)time(NULL) + weak_ttl, &weak_payload_len);
+        /* わざと最低難易度未満(50,50)でPoWする */
+        uint64_t weak_target = bm_pow_get_target(weak_payload_len, weak_ttl, 50, 50);
+        uint64_t weak_nonce = bm_pow_run(weak_payload, weak_payload_len, weak_target);
+        size_t weak_object_len = 8 + weak_payload_len;
+        unsigned char *weak_object = malloc(weak_object_len);
+        for (int i = 0; i < 8; i++)
+        {
+            weak_object[i] = (unsigned char)((weak_nonce >> (56 - 8 * i)) & 0xff);
+        }
+        memcpy(weak_object + 8, weak_payload, weak_payload_len);
+        free(weak_payload);
+
+        struct bm_message weak_msg;
+        memset(&weak_msg, 0, sizeof(weak_msg));
+        memcpy(weak_msg.command, "object", 6);
+        weak_msg.length = (uint32_t)weak_object_len;
+        weak_msg.payload = weak_object;
+        bm_object_sync_dispatch(conn, &weak_msg, &ctx);
+        free(weak_object);
+
+        sqlite3_stmt *weak_count_stmt = NULL;
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects;", -1, &weak_count_stmt, NULL);
+        sqlite3_step(weak_count_stmt);
+        int weak_count = sqlite3_column_int(weak_count_stmt, 0);
+        sqlite3_finalize(weak_count_stmt);
+        CHECK(weak_count == 0, "object with insufficient PoW should be rejected, not stored");
     }
 
     /* --- 2. object受信 -> object_pool.dbへ保存、重複排除 --- */

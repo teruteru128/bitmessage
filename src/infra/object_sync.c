@@ -32,10 +32,11 @@
  * これくらいの頻度で十分 */
 #define BM_OBJECT_SYNC_RESEND_CHECK_INTERVAL_SECONDS 300
 
-/* ackobject自体の受け入れ基準。send_pipeline.cのBM_ACK_NONCE_TRIALS_PER_BYTE等と対になる
- * ネットワーク既定値(誰宛でもない匿名objectのため、宛先固有の難易度は使えない) */
-#define BM_ACK_MIN_NONCE_TRIALS_PER_BYTE 1000
-#define BM_ACK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES 1000
+/* §11 受信object全般のPoW検証。宛先固有の難易度は分からない(pubkey_cacheに無い相手も
+ * 受信しうる)ため、ネットワーク既定の最低難易度を全objectで一律に要求する
+ * (send_pipeline.cのBM_ACK_NONCE_TRIALS_PER_BYTE等と同じ値)。 */
+#define BM_NETWORK_MIN_NONCE_TRIALS_PER_BYTE 1000
+#define BM_NETWORK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES 1000
 
 /* 自分のpubkeyで応答する際のobjectのTTL(§11 getpubkey要求の自動化)。PyBitmessageの
  * pubkey告知の目安(数週間)を参考にした固定値。 */
@@ -140,6 +141,24 @@ static void maybe_run_resend_check(struct bm_object_sync_ctx *ctx)
 }
 
 /*
+ * §11: object(nonce込み、全長object_len)のnonceがネットワーク既定の最低難易度を満たすかを
+ * 検証する。expires_timeが既にnowを過ぎている場合はtarget計算に使うttlを0とする
+ * (=最も厳しい、最速で見つかるはずのtargetになる。期限切れ自体の拒否は呼び出し側の責務)。
+ */
+static int object_pow_is_valid(const unsigned char *object, size_t object_len,
+                                const struct bm_object_header *hdr, int64_t now)
+{
+    const unsigned char *payload_no_nonce = object + 8;
+    size_t payload_no_nonce_len = object_len - 8;
+    uint64_t ttl = (hdr->expires_time > (uint64_t)now) ? (hdr->expires_time - (uint64_t)now) : 0;
+    uint64_t target = bm_pow_get_target(payload_no_nonce_len, ttl, BM_NETWORK_MIN_NONCE_TRIALS_PER_BYTE,
+                                         BM_NETWORK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES);
+    unsigned char initial_hash[64];
+    bm_sha512(payload_no_nonce, payload_no_nonce_len, initial_hash);
+    return bm_pow_trial_value(hdr->nonce, initial_hash) <= target;
+}
+
+/*
  * §5.5: msgに平文で埋め込まれていたfullAckPayload(P2P "object"パケット、送信者が既にPoW済み)を
  * 検証し、object_pool_dbへ挿入する。受信者は追加のPoWを行わずそのまま自分のobject_poolへ
  * 取り込むだけでよい設計(以後getdataで配れる状態になる)。不正なpacket(実装バグ、または悪意ある
@@ -172,14 +191,7 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
     }
 
     /* PoW検証: ネットワーク既定の最低難易度(誰宛でもない匿名objectのため宛先固有値は使えない) */
-    const unsigned char *payload_no_nonce = msg->payload + 8;
-    size_t payload_no_nonce_len = msg->length - 8;
-    uint64_t ttl = (hdr.expires_time > (uint64_t)now) ? (hdr.expires_time - (uint64_t)now) : 0;
-    uint64_t target = bm_pow_get_target(payload_no_nonce_len, ttl,
-                                         BM_ACK_MIN_NONCE_TRIALS_PER_BYTE, BM_ACK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES);
-    unsigned char initial_hash[64];
-    bm_sha512(payload_no_nonce, payload_no_nonce_len, initial_hash);
-    if (bm_pow_trial_value(hdr.nonce, initial_hash) > target)
+    if (!object_pow_is_valid(msg->payload, msg->length, &hdr, now))
     {
         bm_free_message(msg);
         return;
@@ -345,6 +357,20 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         return;
     }
 
+    int64_t now0 = (int64_t)time(NULL);
+    if ((int64_t)hdr.expires_time <= now0)
+    {
+        fprintf(stderr, "[object_sync] object already expired, ignoring\n");
+        return;
+    }
+    /* §11: ネットワーク既定の最低難易度を満たさないobjectは受け入れない(悪意ある相手に
+     * PoW無しのobjectで負荷をかけられるのを防ぐ、既知だった制限への対応) */
+    if (!object_pow_is_valid(msg->payload, msg->length, &hdr, now0))
+    {
+        fprintf(stderr, "[object_sync] insufficient PoW, ignoring\n");
+        return;
+    }
+
     unsigned char hash[32];
     bm_inventory_hash(msg->payload, msg->length, hash);
 
@@ -362,9 +388,8 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
                  * 重複受信するのは正常) */
     }
 
-    int64_t now = (int64_t)time(NULL);
     bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
-                            msg->payload, msg->length, (int64_t)hdr.expires_time, now);
+                            msg->payload, msg->length, (int64_t)hdr.expires_time, now0);
     if (ctx->registry != NULL)
     {
         bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, conn);
@@ -416,7 +441,7 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         }
         if (parsed == 0)
         {
-            bm_pubkey_cache_upsert(ctx->identity_db, &cached, now);
+            bm_pubkey_cache_upsert(ctx->identity_db, &cached, now0);
             bm_pubkey_cache_clear_request(ctx->identity_db, cached.ripe);
             fprintf(stderr, "[object_sync] pubkey (v%" PRIu64 ") cached\n", hdr.version);
         }

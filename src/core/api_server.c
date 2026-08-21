@@ -482,7 +482,56 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
     bm_json_value_t *result = bm_json_new_object();
     bm_json_object_set(result, "objectLength", bm_json_new_number((double)object_len));
     bm_json_object_set(result, "inventoryHash", bm_json_new_string(inv_hex));
-    /* TODO: ネットワーク層とのキュー結線後、broadcast_queueへの投入もここで行う */
+    return result;
+}
+
+/* sendBroadcast: [fromAddress, subject, body, ttlSeconds?]。§5.4/§11 */
+static bm_json_value_t *h_sendBroadcast(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    const char *from_address = param_str(params, 0);
+    const char *subject = param_str(params, 1);
+    const char *body = param_str(params, 2);
+    const bm_json_value_t *ttl_v = bm_json_array_get(params, 3);
+
+    if (from_address == NULL || subject == NULL || body == NULL)
+    {
+        *out_error = dup_cstr("sendBroadcast requires [fromAddress, subject, body, ttlSeconds?]");
+        return NULL;
+    }
+    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
+
+    unsigned char *object = NULL;
+    size_t object_len = 0;
+    int rc = bm_send_pipeline_send_broadcast(config->keyring, from_address, subject, body, ttl_seconds,
+                                              &object, &object_len);
+    if (rc != 0)
+    {
+        *out_error = dup_cstr("broadcast failed (is fromAddress unlocked?)");
+        return NULL;
+    }
+
+    unsigned char inv_hash[32];
+    bm_inventory_hash(object, object_len, inv_hash);
+
+    if (config->broadcast_queue != NULL)
+    {
+        struct bm_broadcast_item *item = malloc(sizeof(*item));
+        item->object = object;
+        item->object_len = object_len;
+        bm_queue_push(config->broadcast_queue, item);
+    }
+    else
+    {
+        free(object);
+    }
+
+    char inv_hex[65];
+    hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "objectLength", bm_json_new_number((double)object_len));
+    bm_json_object_set(result, "inventoryHash", bm_json_new_string(inv_hex));
     return result;
 }
 
@@ -592,6 +641,7 @@ static const struct bm_api_method METHODS[] = {
     {"createDeterministicAddress", h_createDeterministicAddress},
     {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},
+    {"sendBroadcast", h_sendBroadcast},
     {"getInboxMessages", h_getInboxMessages},
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
