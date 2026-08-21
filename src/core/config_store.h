@@ -12,6 +12,7 @@
  */
 
 #include <sqlite3.h>
+#include <stddef.h>
 
 struct bm_socks_proxy_config
 {
@@ -29,5 +30,20 @@ int bm_config_store_get_socks_proxy(sqlite3 *db, struct bm_socks_proxy_config *o
 
 /* upsert(常に1行のみ)。成功時0 */
 int bm_config_store_set_socks_proxy(sqlite3 *db, const struct bm_socks_proxy_config *cfg);
+
+/*
+ * §11 Stage 2: Tor hidden serviceのed25519秘密鍵("ED25519-V3:<base64>"、control-spec準拠の
+ * ADD_ONIONへそのまま渡せる形式)。一度ADD_ONIONで生成した鍵をここへ永続化し、再起動のたびに
+ * 同じ鍵を渡すことで同一のonionアドレスを再利用できるようにする(生成のたびにアドレスが
+ * 変わるのを防ぐため。infra/tor_control.c参照)。
+ */
+#define BM_TOR_ONION_KEY_MAX_LEN 160
+
+/* 未設定(行が無い/NULL)ならoutを空文字列にし0を返す。設定済みなら値を書き込み1を返す。
+ * DBエラー時のみ-1 */
+int bm_config_store_get_tor_onion_key(sqlite3 *db, char *out, size_t out_size);
+
+/* upsert(常に1行のみ)。成功時0 */
+int bm_config_store_set_tor_onion_key(sqlite3 *db, const char *private_key);
 
 #endif /* BM_CORE_CONFIG_STORE_H */

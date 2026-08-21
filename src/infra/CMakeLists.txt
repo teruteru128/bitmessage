@@ -6,6 +6,7 @@ add_library(bm_infra STATIC
     object_store.c
     object_sync.c
     peer_registry.c
+    tor_control.c
 )
 
 target_include_directories(bm_infra PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

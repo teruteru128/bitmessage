@@ -75,3 +75,7 @@ add_test(NAME chan COMMAND test_chan)
 add_executable(test_inbound test_inbound.c)
 target_link_libraries(test_inbound PRIVATE bm_core bm_infra)
 add_test(NAME inbound COMMAND test_inbound)
+
+add_executable(test_tor_control test_tor_control.c)
+target_link_libraries(test_tor_control PRIVATE bm_core bm_infra)
+add_test(NAME tor_control COMMAND test_tor_control)

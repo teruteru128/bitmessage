@@ -29,6 +29,7 @@
 #include "infra/peer_connector.h"
 #include "infra/peer_registry.h"
 #include "infra/protocol.h"
+#include "infra/tor_control.h"
 
 /* BM_PROJECT_VERSIONはCMakeLists.txt(ルート)のproject(bitmessage VERSION ...)から
  * target_compile_definitionsで注入される(src/CMakeLists.txt参照)。バージョン文字列を
@@ -221,10 +222,11 @@ int main(void)
      * listen_fd用のbm_fd_data(type=BM_FD_LISTEN_SOCKET)もmain()がsigwaitでブロックしている
      * 間ずっと生存するスタック変数として持つ(他のctx類と同じ扱い)。 */
     struct bm_fd_data *listen_conn = NULL;
+    int inbound_port = 0;
     const char *inbound_port_env = getenv("BM_INBOUND_PORT");
     if (inbound_port_env != NULL)
     {
-        int inbound_port = atoi(inbound_port_env);
+        inbound_port = atoi(inbound_port_env);
         int listen_fd = bm_network_listen("127.0.0.1", inbound_port);
         if (listen_fd < 0)
         {
@@ -257,6 +259,72 @@ int main(void)
                             inbound_port);
                 }
             }
+        }
+    }
+
+    /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
+     * Stage 1のlistenが成功している場合のみ試みる(listen_connが無ければADD_ONIONで転送する
+     * 先が無い)。ControlPortへの接続はUnixドメインソケット(既定/run/tor/control、Debian/
+     * Ubuntu系torパッケージの既定)を優先し、失敗すればTCP(既定127.0.0.1:9051)へ
+     * フォールバックする(infra/tor_control.h参照)。
+     * tor_control_fdはmain()がsigwaitでブロックしている間ずっと開いたままにする
+     * スタック変数(他のctx類と同じ扱い)。これはbm_tor_control_add_onionが意図的に
+     * Flags=Detachを使わない設計とペアであり、この接続を維持し続けることでhidden service
+     * のライフサイクルをプロセスの生存期間と一致させ、プロセス終了(正常終了・クラッシュ問わず)
+     * でTor側が自動的にhidden serviceを片付けてくれるようにしている(そうしないと次回起動時に
+     * 永続化した鍵での再作成が"550 Onion address collision"で失敗する、tor_control.h参照)。 */
+    int tor_control_fd = -1;
+    if (listen_conn != NULL && getenv("BM_TOR_CONTROL") != NULL && strcmp(getenv("BM_TOR_CONTROL"), "1") == 0)
+    {
+        struct bm_tor_control_config tor_config;
+        memset(&tor_config, 0, sizeof(tor_config));
+        const char *control_socket = getenv("BM_TOR_CONTROL_SOCKET");
+        tor_config.control_socket_path = (control_socket != NULL) ? control_socket : "/run/tor/control";
+        const char *control_host = getenv("BM_TOR_CONTROL_HOST");
+        tor_config.control_host = (control_host != NULL) ? control_host : "127.0.0.1";
+        const char *control_port_env = getenv("BM_TOR_CONTROL_PORT");
+        tor_config.control_port = (control_port_env != NULL) ? atoi(control_port_env) : 9051;
+
+        int virtual_port = 8444;
+        const char *virtual_port_env = getenv("BM_TOR_VIRTUAL_PORT");
+        if (virtual_port_env != NULL)
+        {
+            virtual_port = atoi(virtual_port_env);
+        }
+
+        tor_control_fd = bm_tor_control_connect_and_authenticate(&tor_config);
+        if (tor_control_fd < 0)
+        {
+            fprintf(stderr, "[tor_control] hidden serviceの自動作成をスキップします(ControlPortに"
+                            "接続できませんでした)\n");
+        }
+        else
+        {
+            char existing_key[BM_TOR_ONION_KEY_MAX_LEN];
+            int has_existing_key = bm_config_store_get_tor_onion_key(config_db, existing_key, sizeof(existing_key));
+
+            char *onion_address = NULL;
+            char *new_private_key = NULL;
+            int add_onion_rc = bm_tor_control_add_onion(tor_control_fd, has_existing_key == 1 ? existing_key : NULL,
+                                                          virtual_port, inbound_port, &onion_address,
+                                                          &new_private_key);
+            if (add_onion_rc != 0)
+            {
+                fprintf(stderr, "[tor_control] hidden serviceの作成に失敗しました\n");
+                close(tor_control_fd);
+                tor_control_fd = -1;
+            }
+            else
+            {
+                if (new_private_key != NULL)
+                {
+                    bm_config_store_set_tor_onion_key(config_db, new_private_key);
+                }
+                fprintf(stderr, "[tor_control] hidden service ready: %s:%d -> 127.0.0.1:%d\n", onion_address,
+                        virtual_port, inbound_port);
+            }
+            free(onion_address);
+            free(new_private_key);
         }
     }
 

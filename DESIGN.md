@@ -1518,24 +1518,78 @@ versionメッセージを送信。ログに`[network] accepted inbound connectio
 `[object_sync] version: ...`が出て、クライアント側にverack(24byte)とversion(103byte)の
 両方が返ってくることを確認した。
 
-Stage 2(Tor ControlPort経由のhidden service自動作成)は未着手。PyBitmessageの
-`proxyconfig_stem.py`(stemライブラリ経由でControlPortに接続し`ADD_ONION`する)と
-同様のアプローチを想定しており、初回は`NEW:BEST`で鍵生成、以後は生成したed25519鍵を
-config.db等へ永続化して`ADD_ONION`に渡すことで同じonionアドレスを再利用する設計とする
-予定(ユーザーとの合意事項)。
-
 **注記:** 開発者はこの実装の動作確認のため、自身の環境で実際のTor hidden service
 (静的torrc設定)を用意して`127.0.0.1:8444`へフォワーディングしているが、その
 onionアドレス自体はユーザーの明示的な指示によりこのファイル・コミットメッセージ・
 コード中を含め、一切の公開ドキュメントに記載しない。
+
+### inbound接続 Stage 2: Tor ControlPort連携によるhidden service自動作成(2026-08-22)
+
+Stage 1(上記)の上に、Tor Control Protocol(control-spec.txt)経由でhidden serviceを
+自動作成・再利用する層を実装した。`src/infra/tor_control.c`/`.h`。
+
+**ControlPortへの到達方法(TCP/Unixドメインソケット両対応):** ユーザーの環境で確認したところ、
+Debian/Ubuntu系のtorパッケージは既定でControlPortをUnixドメインソケット
+(`/run/tor/control`、Cookie認証ファイルは`/run/tor/control.authcookie`)としてのみ有効化しており、
+TCP(既定`127.0.0.1:9051`)は無効だった。一方Tor Browser Bundleや手動設定・他OS(特にWindows)では
+TCPが一般的なため、両対応にした: `bm_tor_control_connect_and_authenticate`はまずUnixソケット
+パス(既定`/run/tor/control`、`BM_TOR_CONTROL_SOCKET`で上書き可)への接続を試み、失敗したら
+TCP(既定`127.0.0.1:9051`、`BM_TOR_CONTROL_HOST`/`BM_TOR_CONTROL_PORT`で上書き可)へフォール
+バックする。認証はCookie認証のみ対応(`PROTOCOLINFO`で`COOKIEFILE`パスを取得し、その内容を
+16進数化して`AUTHENTICATE`する)。SAFECOOKIEのHMACチャレンジ/レスポンスは実装していない
+(ControlPortが同一ホスト上にあり、Cookieファイルを読めること自体が既にローカルの信頼された
+立場の証明になっているため、SAFECOOKIEが本来防ぎたい「ネットワーク越しの盗聴」はここでは
+当てはまらないと判断)。HASHEDPASSWORDのみの構成(Cookie認証が無効化された設定)は
+v1のスコープ外として非対応。
+
+ちなみにこの環境では`teruteru`ユーザーが既に`debian-tor`グループに所属していたため、
+sudoでの`/etc/tor/torrc`編集やtorサービス再起動をせずに、システムのTorデーモンへ実際に
+接続してテストできた。
+
+**ADD_ONIONの`Flags=Detach`は意図的に使わない:** 実装当初`Flags=Detach`を付けて実装したが、
+実Tor環境で検証したところ、「control接続を閉じてもhidden serviceは残り続ける」ため、
+永続化した鍵を使って次回起動時に再度`ADD_ONION`すると`550 Onion address collision`で
+失敗することが分かった(実際にこのエラーを再現させてから設計を修正した)。
+`Flags=Detach`を外し、代わりにTor ControlPortへの接続(fd)をbitmessagedプロセスの生存期間
+ずっと開いたままにする設計にした(`listen_conn`や`object_sync_ctx`と同じ、main()が
+sigwaitでブロックしている間ずっと生存するスタック変数`tor_control_fd`)。こうすると
+正常終了・クラッシュのどちらでもプロセス終了時にOSがfdを閉じ、Torがcontrol接続の切断を
+検知して自動的にhidden serviceを削除してくれるため、次回起動時に同じ永続化済みの鍵で
+`ADD_ONION`しても衝突しない。
+
+**鍵の永続化:** `core/config_store.c`に`tor_onion`テーブル(`private_key`列1つ、socks_proxy
+テーブルと同じ1行upsertパターン)を追加。`bm_config_store_get_tor_onion_key`/
+`bm_config_store_set_tor_onion_key`。初回起動時は`ADD_ONION NEW:ED25519-V3`で新規鍵生成し、
+返ってきた`PrivateKey=ED25519-V3:...`をconfig.dbへ保存する。2回目以降の起動では保存済みの
+鍵を`ADD_ONION`にそのまま渡すことで、Torが同じ鍵から決定的に同じonionアドレスを再現する
+(control-spec準拠。鍵を再利用する場合Torは`ServiceID`は返すが`PrivateKey`行は返さない)。
+
+**main.cへの配線:** `BM_TOR_CONTROL=1`(既存のBM_TESTNET/BM_NO_CONNECT等と同じ環境変数
+opt-inパターン)かつStage 1のinbound listenが成功している場合のみ試みる(転送先の
+ローカルポートが無ければADD_ONIONする意味が無いため)。外部から見えるポート番号は
+Bitmessageの慣習で`BM_TOR_VIRTUAL_PORT`(既定8444)。失敗時は診断ログを出すだけで
+daemon自体は起動を続ける(SOCKS5プロキシ等、他の「あれば使う」外部依存と同じ非fatal方針)。
+
+**テスト:** `tests/test_tor_control.c`を追加。実環境のTor ControlPortに接続できる場合のみ
+実際に`ADD_ONION`を発行して検証し(接続できない環境ではSKIP相当でEXIT_SUCCESSする)、
+このマシンでは実際にTorに接続して: (1)新規鍵での`ADD_ONION`が有効な`.onion`アドレスと
+`ED25519-V3:`形式の鍵を返すこと、(2)control接続を閉じてから別の接続で同じ鍵を渡すと
+同一のonionアドレスが決定的に再現されること、を確認した。
+
+**実daemonでのスモークテスト:** 独立した一時ディレクトリ(既存のbootstrap daemonとは
+完全に分離)で`BM_INBOUND_PORT`+`BM_TOR_CONTROL=1`を指定して`bitmessaged`を2回連続で
+起動し、1回目・2回目とも同一のonionアドレスが`[tor_control] hidden service ready: ...`
+ログに出ること、`550 Onion address collision`等のエラーが出ないことを確認した。ctest
+20件(新規`tor_control`含む)全通過。
 
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。残るのは以下の通り。
 
-- inbound接続はStage 1(汎用TCP listen/accept、上記参照)まで完了。Stage 2
-  (Tor ControlPort自動化・onion鍵永続化)は引き続き未着手。
+- inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
+  永続化)まで完了。残るのはOBJECT_ONIONPEERでの自己announce送信側
+  (`sendOnionPeerObj`相当、受信側は既存実装済み)。
 - Dandelion++のstem機能、GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、
   今回のv1完成の対象外(引き続き見送り)。
 
