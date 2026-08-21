@@ -487,6 +487,68 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
 }
 
 /* getInboxMessages: [folder?](省略時は全件、'inbox'/'trash'等で絞り込み可) */
+static bm_json_value_t *h_addSubscription(const struct bm_api_server_config *config,
+                                           const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *label = param_str(params, 1);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("addSubscription requires [address, label?]");
+        return NULL;
+    }
+
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char ripe[BM_RIPE_LEN];
+    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    {
+        *out_error = dup_cstr("invalid address");
+        return NULL;
+    }
+
+    int rc = bm_messages_store_add_subscription(config->messages_db, address, label != NULL ? label : "");
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_removeSubscription(const struct bm_api_server_config *config,
+                                              const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("removeSubscription requires [address]");
+        return NULL;
+    }
+    int rc = bm_messages_store_remove_subscription(config->messages_db, address);
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *config,
+                                             const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+
+    struct bm_subscription *list = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_subscriptions(config->messages_db, &list, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list subscriptions");
+        return NULL;
+    }
+
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
+        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
+        bm_json_array_append(arr, entry);
+    }
+    bm_subscription_list_free(list);
+    return arr;
+}
+
 static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
                                             const bm_json_value_t *params, char **out_error)
 {
@@ -531,6 +593,9 @@ static const struct bm_api_method METHODS[] = {
     {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},
     {"getInboxMessages", h_getInboxMessages},
+    {"addSubscription", h_addSubscription},
+    {"removeSubscription", h_removeSubscription},
+    {"listSubscriptions", h_listSubscriptions},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

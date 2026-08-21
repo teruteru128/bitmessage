@@ -16,6 +16,9 @@
  *       - type=getpubkeyなら、要求されているripe/tagがkeyringでunlock済みの自分のアドレス
  *         宛かどうか判定し、該当すれば自分のpubkeyオブジェクトを組み立てて応答する(§11、
  *         unlockされていないアドレスへの要求には応答できない)
+ *       - type=broadcastなら、messages.dbのsubscriptions(購読先、§5.4)に登録されている
+ *         アドレスを候補として順に復号を試み、成功したらinboxへ保存する
+ *         (core/broadcast_decrypt.c、成功した時点で打ち切る)
  *       - どのtypeでもsent.ack_dataとの突合せ(§5.5のack検知)を試みる
  *       - 新規に取り込んだobject(受信msgそのもの、埋め込みackの両方)はpeer_registry経由で
  *         受信元コネクション以外の接続中peerへinv broadcastする。自分が新たに作った
@@ -36,10 +39,11 @@
  *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
  *   - addrのpeer_manager永続化
- *   - broadcast(type=3)の購読・復号
  *   - 受信object全般のPoW検証(§5.5のack検証では行っているが、object全般の受け入れ時には
  *     まだ行っていない、既知のギャップ)
  *   - getpubkey応答のスパム対策(同じ宛先への短時間の連続要求に対する応答側スロットリング)
+ *   - broadcast送信側(sendBroadcast API)は未実装。message_builder.cのbm_build_broadcastは
+ *     存在するが、api_server.cから呼ぶ経路が無い(既知のギャップ)
  */
 
 #include <sqlite3.h>

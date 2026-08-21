@@ -93,4 +93,22 @@ int bm_messages_store_list_inbox(sqlite3 *db, const char *folder_filter,
                                   struct bm_inbox_message **out_list, size_t *out_count);
 void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count);
 
+/* --- §5.4 broadcast購読(subscriptions) --- */
+
+/* 既存行があればlabelのみ更新(UPSERT)。成功時0 */
+int bm_messages_store_add_subscription(sqlite3 *db, const char *address, const char *label);
+/* 該当行が無くてもエラーにしない。成功時0 */
+int bm_messages_store_remove_subscription(sqlite3 *db, const char *address);
+
+struct bm_subscription
+{
+    char address[BM_MESSAGES_ADDRESS_MAX];
+    char label[128];
+};
+
+/* enabled=1の購読を全件列挙する(malloc、呼び出し側でbm_subscription_list_freeすること)。
+ * 成功時0、*out_countに件数を設定する(0件でも成功) */
+int bm_messages_store_list_subscriptions(sqlite3 *db, struct bm_subscription **out_list, size_t *out_count);
+void bm_subscription_list_free(struct bm_subscription *list);
+
 #endif /* BM_CORE_MESSAGES_STORE_H */

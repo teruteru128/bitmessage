@@ -59,3 +59,7 @@ add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)
 add_executable(test_resend test_resend.c)
 target_link_libraries(test_resend PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME resend COMMAND test_resend)
+
+add_executable(test_broadcast test_broadcast.c)
+target_link_libraries(test_broadcast PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME broadcast COMMAND test_broadcast)

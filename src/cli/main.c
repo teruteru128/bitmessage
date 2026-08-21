@@ -41,7 +41,12 @@ static void print_usage(const char *prog)
             "[ttlSeconds] [ackStealthLevel]\n"
             "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex)。\"-\"を指定するとcache-pubkeyで\n"
             "      登録済みの鍵を使う\n"
-            "  get-inbox [folder]\n",
+            "  get-inbox [folder]\n"
+            "  add-subscription <address> [label]\n"
+            "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
+            "      受信したらinboxへ保存する\n"
+            "  remove-subscription <address>\n"
+            "  list-subscriptions\n",
             prog);
 }
 
@@ -248,6 +253,36 @@ int main(int argc, char **argv)
             bm_json_array_append(params, bm_json_new_string(argv[2]));
         }
         return call_rpc(&env, "getInboxMessages", params);
+    }
+
+    if (strcmp(cmd, "add-subscription") == 0)
+    {
+        if (argc < 3 || argc > 4)
+        {
+            fprintf(stderr, "使い方: %s add-subscription <address> [label]\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argc == 4 ? argv[3] : ""));
+        return call_rpc(&env, "addSubscription", params);
+    }
+
+    if (strcmp(cmd, "remove-subscription") == 0)
+    {
+        if (argc != 3)
+        {
+            fprintf(stderr, "使い方: %s remove-subscription <address>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        return call_rpc(&env, "removeSubscription", params);
+    }
+
+    if (strcmp(cmd, "list-subscriptions") == 0)
+    {
+        return call_rpc(&env, "listSubscriptions", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);

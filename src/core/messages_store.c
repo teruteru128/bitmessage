@@ -34,6 +34,11 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS address_book ("
     "address TEXT PRIMARY KEY, "
     "label TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS subscriptions ("
+    "address TEXT PRIMARY KEY, "
+    "label TEXT NOT NULL DEFAULT '', "
+    "enabled INTEGER NOT NULL DEFAULT 1"
     ");";
 
 int bm_messages_store_init_schema(sqlite3 *db)
@@ -294,5 +299,79 @@ void bm_sent_resend_candidate_list_free(struct bm_sent_resend_candidate *list, s
         free(list[i].subject);
         free(list[i].body);
     }
+    free(list);
+}
+
+int bm_messages_store_add_subscription(sqlite3 *db, const char *address, const char *label)
+{
+    static const char *SQL =
+        "INSERT INTO subscriptions (address, label, enabled) VALUES (?1,?2,1) "
+        "ON CONFLICT(address) DO UPDATE SET label=excluded.label, enabled=1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, label, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_remove_subscription(sqlite3 *db, const char *address)
+{
+    static const char *SQL = "DELETE FROM subscriptions WHERE address = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, address, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_list_subscriptions(sqlite3 *db, struct bm_subscription **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT address, label FROM subscriptions WHERE enabled = 1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+
+    size_t cap = 4;
+    size_t count = 0;
+    struct bm_subscription *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        struct bm_subscription *s = &list[count];
+        memset(s, 0, sizeof(*s));
+        const unsigned char *address = sqlite3_column_text(stmt, 0);
+        strncpy(s->address, (const char *)address, sizeof(s->address) - 1);
+        const unsigned char *label = sqlite3_column_text(stmt, 1);
+        if (label != NULL)
+        {
+            strncpy(s->label, (const char *)label, sizeof(s->label) - 1);
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+void bm_subscription_list_free(struct bm_subscription *list)
+{
     free(list);
 }

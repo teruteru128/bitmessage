@@ -10,6 +10,7 @@
 
 #include "../common/hash.h"
 #include "../core/address.h"
+#include "../core/broadcast_decrypt.h"
 #include "../core/message_builder.h"
 #include "../core/messages_store.h"
 #include "../core/pubkey_cache.h"
@@ -294,6 +295,40 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     free(object);
 }
 
+/*
+ * §5.4/§11: 受信したbroadcastを、messages.dbのsubscriptions(購読先)に登録されている
+ * アドレスそれぞれを候補として復号を試みる。成功した時点でinboxへ保存して打ち切る
+ * (同じbroadcastが複数の購読先の"ふり"をして一致することは実質無い)。
+ */
+static void handle_incoming_broadcast(struct bm_object_sync_ctx *ctx, const struct bm_message *msg)
+{
+    struct bm_subscription *subs = NULL;
+    size_t sub_count = 0;
+    if (bm_messages_store_list_subscriptions(ctx->messages_db, &subs, &sub_count) != 0)
+    {
+        return;
+    }
+
+    for (size_t i = 0; i < sub_count; i++)
+    {
+        uint64_t candidate_version = 0;
+        uint64_t candidate_stream = 0;
+        unsigned char candidate_ripe[BM_RIPE_LEN];
+        if (bm_address_decode(subs[i].address, &candidate_version, &candidate_stream, candidate_ripe) != 0)
+        {
+            continue;
+        }
+        if (bm_trial_decrypt_broadcast_and_store(ctx->messages_db, msg->payload, msg->length, candidate_version,
+                                                  candidate_stream, candidate_ripe) == 0)
+        {
+            fprintf(stderr, "[object_sync] broadcast decrypted (subscribed address %s)\n", subs[i].address);
+            break;
+        }
+    }
+
+    bm_subscription_list_free(subs);
+}
+
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
                            const struct bm_message *msg)
 {
@@ -389,6 +424,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     else if (hdr.object_type == BM_OBJECT_GETPUBKEY)
     {
         handle_incoming_getpubkey(ctx, &hdr, msg);
+    }
+    else if (hdr.object_type == BM_OBJECT_BROADCAST)
+    {
+        handle_incoming_broadcast(ctx, msg);
     }
 }
 

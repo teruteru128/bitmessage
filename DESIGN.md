@@ -76,9 +76,9 @@ join可能)がpopして`object_pool.db`への挿入と`peer_registry`経由のin
 `object_pool.db`に該当行が入ること・ログに`[object_sync] broadcasted locally-originated
 object to peers`が出ることを実機で確認済み。
 
-v1スコープ外(既知の制限、TODO): addrのpeer_manager永続化、getpubkey受信時の自応答、
-broadcast(type=3)の購読・復号、pubkey v4の自動キャッシュ(候補ripeが必要なため
-getpubkey自動化と合わせて要検討)。
+v1スコープ外(既知の制限、TODO): addrのpeer_manager永続化。getpubkey受信時の自応答・
+broadcast(type=3)の購読・復号・pubkey v4の自動キャッシュはいずれもこの後実装済み
+(§5.1, §5.4参照)。
 `tests/test_object_sync.c`でinv→getdata、object重複排除、getdata応答、GC、
 2本目のpeer接続を接続レジストリへ登録した上で「受信元以外にだけinv broadcastが届く」ことの
 検証、そしてsend_pipeline.cで実際に組み立てたmsgをdispatchに流し込み「trial_decrypt→
@@ -273,6 +273,12 @@ CREATE TABLE IF NOT EXISTS sent (
 CREATE TABLE IF NOT EXISTS address_book (
   address TEXT PRIMARY KEY,
   label TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions ( -- §5.4 broadcast購読先、実装済み(2026-08-23)
+  address TEXT PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1
 );
 ```
 
@@ -630,6 +636,31 @@ dataToEncrypt =
 購読者は既知の送信元アドレス全てについて`privEnc`を計算済みにしておき、`tag`(v5)またはtotal-scan(v4)で
 候補を絞ってから復号を試みる。
 
+**購読・復号、実装済み(2026-08-23)。** 新規`core/broadcast_decrypt.c/h`が`bm_build_broadcast`の
+逆方向を実装(`trial_decrypt.c`のmsg復号ロジックとほぼ同じ構造)。`bm_trial_decrypt_broadcast`は
+candidate(1件のアドレス、version/stream/ripe)を受け取り、objectVersion==5ならtagを先に比較して
+不一致なら復号を試みずに即座に失敗を返す(§5.4の「安価な絞り込み」)。objectVersion==4は
+tagが無いため常にECIES復号を試みる(total-scan)。署名検証、および復号できたpubkeyから
+計算したripeがcandidateと一致するかの整合性チェックまで行う(pubkey v4の検証と同じ設計)。
+
+購読先の管理は`messages.db`に新設した`subscriptions`テーブル(address/label/enabled)で行う。
+CRUD(`bm_messages_store_add_subscription`/`_remove_subscription`/`_list_subscriptions`)を
+`messages_store.c`に追加し、API(`addSubscription`/`removeSubscription`/`listSubscriptions`)と
+CLI(`add-subscription`/`remove-subscription`/`list-subscriptions`)から操作できる。
+
+受信側は`infra/object_sync.c`の`handle_incoming_broadcast`(`handle_object`のtype=broadcast分岐)で、
+`subscriptions`を全件列挙し候補として順に`bm_trial_decrypt_broadcast_and_store`を試す(購読数は
+通常少数なので線形探索で十分)。成功したらinboxへ保存する(`to_address=from_address`、broadcastには
+単一の宛先が無いためPyBitmessageに倣った慣習、通常のmsgと区別できる)。
+
+`tests/test_broadcast.c`でobjectVersion=4/5両方の実broadcastオブジェクトを購読先から受信して
+inboxへ保存されること、購読していない相手や購読解除後は復号されないこと、
+`addSubscription`/`listSubscriptions`が実HTTPリクエスト経由で動作することをend-to-endで検証済み。
+実daemonでも`add-subscription`/`list-subscriptions`/`remove-subscription`のCLI連携を確認済み。
+
+既知の制限: broadcast**送信**側(`sendBroadcast` API)は未実装。`message_builder.c`の
+`bm_build_broadcast`は存在するが、`api_server.c`から呼ぶ経路が無い(別タスクとして残す)。
+
 ### 5.5 ack payload(msg内に埋め込まれる自己完結オブジェクト)
 
 送信側は`sent`レコード作成時に`ackobject`を事前生成し、`ackdata`として保持する
@@ -943,11 +974,12 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 `peer_connector`の常駐化・再接続維持ループ、`api_server`のgraceful shutdown、
 `pow_engine`のマルチスレッド並列化、getpubkey要求の自動化(送信側の自動発行+受信側の
-自応答+v4の候補照合)、再送(resend)ロジック(いずれも2026-08-23)が実装完了・push済み。
-これで`network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
-ctest 15件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
-十数秒)になったこと・testnet接続中にgetpubkey要求の自動broadcastが実際に動くことを
-確認済み(§4.3, §5.1)。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
+自応答+v4の候補照合)、再送(resend)ロジック、broadcast(type=3)の購読・復号(いずれも
+2026-08-23)が実装完了・push済み。これで`network_epoll_thread`以外の全スレッドが
+pthread_joinできる状態になった(§1参照)。ctest 16件全通過、実daemonで16コア環境の
+実ネットワーク難易度PoWが約0.35秒(従来数秒〜十数秒)になったこと・testnet接続中に
+getpubkey要求の自動broadcastが実際に動くこと・購読管理CLIが実daemonで動作することを
+確認済み(§4.3, §5.1, §5.4)。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
 確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に
 指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
 Tor実装まで見送りの前提は継続(§8参照)。
@@ -955,8 +987,9 @@ Tor実装まで見送りの前提は継続(§8参照)。
 - **直接pubkeyを渡した送信の自動再送**: 再送は`to_pub_encryption=NULL`(pubkey_cache参照)
   固定で行うため、`toPubEncryptionHex`を直接指定して送った場合はcacheに乗らず再送できない
   (2026-08-23発覚)。送信成功時にcache未登録なら自動的にupsertする、等の対応が考えられる。
-- **broadcast(type=3)の購読・復号**: 「誰の配信を受信対象にするか」を持つテーブルが無い
-  (`address_book`はラベル帳のみ)。
+- **broadcast送信(`sendBroadcast` API)**: `message_builder.c`の`bm_build_broadcast`は
+  存在するが、`api_server.c`から呼ぶ経路が無い(2026-08-23、購読・復号の実装中に発覚。
+  受信側だけ実装済みでも、実際にbroadcastできる相手がいなければ検証しづらい)。
 - **受信object全般のPoW検証**: `validate_and_store_ack`(§5.5)はackobjectのPoWを検証しているが、
   `handle_object`(§1)が受信する通常のobjectはPoW未検証のまま`object_pool.db`へ受け入れている
   (2026-08-23、getpubkey自応答の実装中に発覚)。悪意ある相手にPoW無しのobjectを大量に送りつけ

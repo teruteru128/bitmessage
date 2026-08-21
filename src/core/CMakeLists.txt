@@ -7,6 +7,7 @@ add_library(bm_core STATIC
     message_builder.c
     pubkey_cache.c
     trial_decrypt.c
+    broadcast_decrypt.c
     send_pipeline.c
     api_server.c
 )
