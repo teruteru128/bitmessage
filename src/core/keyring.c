@@ -310,6 +310,33 @@ bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
     return false;
 }
 
+bool bm_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32],
+                             struct bm_unlocked_identity *out)
+{
+    pthread_rwlock_rdlock(&kr->lock);
+    struct bm_unlocked_identity *cur = kr->head;
+    while (cur != NULL)
+    {
+        if (cur->address_version >= 4)
+        {
+            unsigned char secret[32];
+            unsigned char computed_tag[32];
+            bm_address_derive_secret_and_tag(cur->address_version, cur->stream, cur->ripe, secret, computed_tag);
+            OPENSSL_cleanse(secret, sizeof(secret));
+            if (memcmp(computed_tag, tag, 32) == 0)
+            {
+                memcpy(out, cur, sizeof(*out));
+                out->next = NULL;
+                pthread_rwlock_unlock(&kr->lock);
+                return true;
+            }
+        }
+        cur = cur->next;
+    }
+    pthread_rwlock_unlock(&kr->lock);
+    return false;
+}
+
 bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
                                  struct bm_unlocked_identity *out)
 {

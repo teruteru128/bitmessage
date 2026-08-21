@@ -37,7 +37,13 @@ static const char *SCHEMA_SQL =
     "used_personally INTEGER NOT NULL DEFAULT 0, "
     "received_time INTEGER NOT NULL"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_pubkey_cache_tag ON pubkey_cache(tag);";
+    "CREATE INDEX IF NOT EXISTS idx_pubkey_cache_tag ON pubkey_cache(tag);"
+    "CREATE TABLE IF NOT EXISTS pubkey_requests ("
+    "ripe BLOB PRIMARY KEY, "
+    "address_version INTEGER NOT NULL, "
+    "stream INTEGER NOT NULL, "
+    "requested_time INTEGER NOT NULL"
+    ");";
 
 int bm_identity_store_init_schema(sqlite3 *db)
 {

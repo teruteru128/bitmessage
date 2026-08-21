@@ -139,6 +139,107 @@ int bm_pubkey_cache_mark_used_personally(sqlite3 *db, const unsigned char ripe[2
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+/* --- pending getpubkey要求 --- */
+
+int bm_pubkey_cache_record_request(sqlite3 *db, const unsigned char ripe[20],
+                                    uint64_t address_version, uint64_t stream, int64_t requested_time)
+{
+    static const char *SQL =
+        "INSERT INTO pubkey_requests (ripe, address_version, stream, requested_time) "
+        "VALUES (?1,?2,?3,?4) "
+        "ON CONFLICT(ripe) DO UPDATE SET requested_time=excluded.requested_time;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)address_version);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)stream);
+    sqlite3_bind_int64(stmt, 4, requested_time);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_pubkey_cache_has_recent_request(sqlite3 *db, const unsigned char ripe[20],
+                                        int64_t now, int64_t max_age_seconds)
+{
+    static const char *SQL = "SELECT requested_time FROM pubkey_requests WHERE ripe = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return 0;
+    }
+    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+
+    int recent = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        int64_t requested_time = sqlite3_column_int64(stmt, 0);
+        recent = (now - requested_time) < max_age_seconds;
+    }
+    sqlite3_finalize(stmt);
+    return recent;
+}
+
+int bm_pubkey_cache_list_pending_requests(sqlite3 *db, struct bm_pubkey_request **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT ripe, address_version, stream FROM pubkey_requests;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+
+    size_t cap = 8;
+    size_t count = 0;
+    struct bm_pubkey_request *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (sqlite3_column_bytes(stmt, 0) != 20)
+        {
+            continue;
+        }
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        memcpy(list[count].ripe, sqlite3_column_blob(stmt, 0), 20);
+        list[count].address_version = (uint64_t)sqlite3_column_int64(stmt, 1);
+        list[count].stream = (uint64_t)sqlite3_column_int64(stmt, 2);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+void bm_pubkey_request_list_free(struct bm_pubkey_request *list)
+{
+    free(list);
+}
+
+int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20])
+{
+    static const char *SQL = "DELETE FROM pubkey_requests WHERE ripe = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 /* --- objectパース --- */
 
 int bm_parse_pubkey_v2(const unsigned char *object, size_t object_len, struct bm_cached_pubkey *out)

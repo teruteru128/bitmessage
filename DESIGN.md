@@ -514,6 +514,42 @@ DoS対策の上限値(PyBitmessage `protocol.py`より): `inv`/`dinv`/`addr`等�
 `tag`(version>=4) = `SHA512( encodeVarint(version) || encodeVarint(stream) || ripe )[32:64]`(後半32byte)。
 署名なし、暗号化なし。
 
+**getpubkey要求の自動化、実装済み(2026-08-23)。** 送信側(`core/api_server.c`の`h_sendMessage`)は
+`toPubEncryptionHex`省略時に`pubkey_cache`未登録なら、上記フォーマットの`getpubkey`を
+`bm_build_getpubkey`(既存)+PoW(ネットワーク既定値1000/1000)で組み立て`broadcast_queue`へ
+投入する(実際のobject_pool.dbへの挿入・peer_registry経由のbroadcastは他のsendMessage生成object
+と同じく`bm_object_sync_broadcast_thread`が行う)。同時に`identity.db`の新規テーブル
+`pubkey_requests`(ripe/address_version/stream/requested_time)へpending登録し、10分以内の
+再要求はbroadcastしない(`bm_pubkey_cache_has_recent_request`)。この呼び出し自体は
+(その場でpubkeyを持っていないため)引き続き失敗を返す設計。
+
+受信側(`infra/object_sync.c`の`handle_incoming_getpubkey`)は、要求されているripe(version<=3)/
+tag(version>=4)がkeyringでunlock済みの自分のアドレスと一致するか`bm_keyring_find_by_ripe`/
+新設の`bm_keyring_find_by_tag`で判定し、該当すれば自分のpubkeyオブジェクトを
+`bm_build_pubkey_v2/v3/v4`で組み立ててPoW(自分のidentityのnonce_trials_per_byte/
+payload_length_extra_bytes、TTLは28日固定)し、object_pool.dbへ登録して全peer(除外無し)へ
+broadcastする。ロックされたままのアドレス宛の要求には応答できない(秘密鍵での署名が必要な
+ため、v1はkeyringにロードされているアドレスのみ対応)。
+
+pubkey v4の受信時キャッシュも同時に実装: 「誰宛の候補か」の判定に`pubkey_requests`の
+pending行を候補として順に試す(`bm_parse_pubkey_v4`は候補ripeを1件ずつ受け取る設計のため)。
+一致してキャッシュできたら該当のpending行を削除する(`bm_pubkey_cache_clear_request`)。
+
+`tests/test_getpubkey_automation.c`で(1)実HTTPリクエスト経由のsendMessageがgetpubkeyを
+broadcast_queueへ投入すること・pubkey_requestsへ登録すること・cooldown中は再投入しないこと、
+(2)自分のアドレス宛getpubkeyへの自応答がobject_pool.dbに正しいpubkeyとして登録されること、
+(3)pending登録した候補への実際のv4 pubkey受信でキャッシュ登録+pending解除、をend-to-endで
+検証済み。実daemonでもtestnet接続中に未キャッシュ宛先へsendMessageを呼び、getpubkeyの
+自動broadcastとpubkey_requestsへの登録を実機確認済み(2026-08-23)。
+
+既知の制限: (a) 28日TTL×実ネットワーク難易度(1000/1000)でのpubkey自応答PoWは実測20秒超
+かかる(16コア環境)。実際のBitmessageクライアントでもアドレス作成時のpubkey告知に同程度の
+時間がかかることが知られており設計としては妥当だが、その間`network_epoll_thread`(単一スレッド)
+がブロックされる点は既存のsend_pipeline PoW(APIスレッドをブロック)と同じ性質のトレードオフ。
+(b) 同一宛先への短時間repeated getpubkeyに対する応答側スロットリングは無い(受信object全般の
+PoW検証が無いこととあわせて、悪意ある相手にPoW計算をさせられる余地が残る、既知のギャップ)。
+(c) getpubkey要求自体の定期再送(初回broadcastが届かなかった場合の再試行)は無い。
+
 ### 5.2 pubkey (type=1)、addressVersion(=objectVersion)ごとに構造が異なる
 
 **version 2**(平文、署名なし):
@@ -886,21 +922,26 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
 `peer_connector`の常駐化・再接続維持ループ、`api_server`のgraceful shutdown、
-`pow_engine`のマルチスレッド並列化(いずれも2026-08-23)が実装完了・push済み。これで
+`pow_engine`のマルチスレッド並列化、getpubkey要求の自動化(送信側の自動発行+受信側の
+自応答+v4の候補照合、いずれも2026-08-23)が実装完了・push済み。これで
 `network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
-ctest 13件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
-十数秒)になったことを確認済み(§4.3)。次に着手する項目は特に指定が無い限り、以下から
-都度ユーザーに確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を
-明示的に指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
+ctest 14件全通過、実daemonで16コア環境の実ネットワーク難易度PoWが約0.35秒(従来数秒〜
+十数秒)になったこと・testnet接続中にgetpubkey要求の自動broadcastが実際に動くことを
+確認済み(§4.3, §5.1)。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
+確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に
+指名してから着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情で
 Tor実装まで見送りの前提は継続(§8参照)。
 
-- **getpubkey要求の自動化**: `send_pipeline.c`は`pubkey_cache`未登録の宛先には送信失敗するのみで、
-  能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。受信したgetpubkeyに自分のpubkeyで
-  応答する処理も未実装。pubkey v4の自動キャッシュ(候補ripeが要る)もこれと合わせて検討。
 - **再送(resend)ロジック**: ack未着のまま一定時間経過した`sent`行を間隔を倍々にして再送する処理
   (今回スコープ外と決めた分、§1参照)。
 - **broadcast(type=3)の購読・復号**: 「誰の配信を受信対象にするか」を持つテーブルが無い
   (`address_book`はラベル帳のみ)。
+- **受信object全般のPoW検証**: `validate_and_store_ack`(§5.5)はackobjectのPoWを検証しているが、
+  `handle_object`(§1)が受信する通常のobjectはPoW未検証のまま`object_pool.db`へ受け入れている
+  (2026-08-23、getpubkey自応答の実装中に発覚)。悪意ある相手にPoW無しのobjectを大量に送りつけ
+  られる余地がある。
+- **getpubkey応答のスロットリング**: 同一宛先への短時間の連続getpubkey要求に対し、応答側が
+  毎回PoWを計算し直してしまう(2026-08-23発覚、上記のPoW未検証と合わせて悪用されうる)。
 - **設定の永続化・DoS上限の見直し・chan仕様**: 2026-08-21のギャップ洗い出しで指摘した残り3項目
   (日次振り返りの会話参照)。優先度は低いが実運用に近づくほど効いてくる。
 

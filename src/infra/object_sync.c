@@ -1,6 +1,7 @@
 #include "object_sync.h"
 
 #include <inttypes.h>
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,8 @@
 #include <unistd.h>
 
 #include "../common/hash.h"
+#include "../core/address.h"
+#include "../core/message_builder.h"
 #include "../core/messages_store.h"
 #include "../core/pubkey_cache.h"
 #include "../core/trial_decrypt.h"
@@ -27,6 +30,10 @@
  * ネットワーク既定値(誰宛でもない匿名objectのため、宛先固有の難易度は使えない) */
 #define BM_ACK_MIN_NONCE_TRIALS_PER_BYTE 1000
 #define BM_ACK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES 1000
+
+/* 自分のpubkeyで応答する際のobjectのTTL(§11 getpubkey要求の自動化)。PyBitmessageの
+ * pubkey告知の目安(数週間)を参考にした固定値。 */
+#define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
                               sqlite3 *identity_db, sqlite3 *messages_db, bm_keyring_t *keyring,
@@ -119,6 +126,102 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
     bm_free_message(msg);
 }
 
+/*
+ * §5.1/§11: 受信したgetpubkeyが自分の(keyringでunlock済みの)アドレス宛かどうかを判定し、
+ * 該当すれば自分のpubkeyオブジェクトを組み立ててPoWし、object_pool.dbへ登録した上で
+ * 全peer(除外無し、自分が新たに作った物なので§1の他object同様except=NULL)へbroadcastする。
+ * unlockされていないアドレス宛の要求には応答できない(秘密鍵が必要な署名を作れないため、
+ * keyringにロードされているアドレスのみ対応する設計)。
+ */
+static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const struct bm_object_header *hdr,
+                                       const struct bm_message *msg)
+{
+    const unsigned char *body = msg->payload + hdr->header_len;
+    size_t body_len = msg->length - hdr->header_len;
+
+    struct bm_unlocked_identity id;
+    int found = 0;
+    if (hdr->version <= 3)
+    {
+        if (body_len < BM_RIPE_LEN)
+        {
+            return;
+        }
+        found = bm_keyring_find_by_ripe(ctx->keyring, body, &id) ? 1 : 0;
+    }
+    else
+    {
+        if (body_len < 32)
+        {
+            return;
+        }
+        found = bm_keyring_find_by_tag(ctx->keyring, body, &id) ? 1 : 0;
+    }
+    if (!found)
+    {
+        return; /* 自分宛てではない、またはロックされたままのアドレス宛 */
+    }
+
+    struct bm_identity_info info;
+    memset(&info, 0, sizeof(info));
+    info.address_version = id.address_version;
+    info.stream = id.stream;
+    memcpy(info.pub_signing, id.pub_signing, 65);
+    memcpy(info.pub_encryption, id.pub_encryption, 65);
+    memcpy(info.priv_signing, id.priv_signing, 32);
+    info.nonce_trials_per_byte = id.nonce_trials_per_byte;
+    info.payload_length_extra_bytes = id.payload_length_extra_bytes;
+
+    uint64_t expires_time = (uint64_t)time(NULL) + BM_PUBKEY_RESPONSE_TTL_SECONDS;
+    size_t payload_len = 0;
+    unsigned char *payload = NULL;
+    if (id.address_version == 2)
+    {
+        payload = bm_build_pubkey_v2(&info, expires_time, &payload_len);
+    }
+    else if (id.address_version == 3)
+    {
+        payload = bm_build_pubkey_v3(&info, expires_time, &payload_len);
+    }
+    else
+    {
+        payload = bm_build_pubkey_v4(&info, id.ripe, expires_time, &payload_len);
+    }
+    OPENSSL_cleanse(&id, sizeof(id));
+    if (payload == NULL)
+    {
+        return;
+    }
+
+    uint64_t target = bm_pow_get_target(payload_len, BM_PUBKEY_RESPONSE_TTL_SECONDS,
+                                         info.nonce_trials_per_byte, info.payload_length_extra_bytes);
+    uint64_t nonce = bm_pow_run(payload, payload_len, target);
+
+    size_t object_len = 8 + payload_len;
+    unsigned char *object = malloc(object_len);
+    for (int i = 0; i < 8; i++)
+    {
+        object[i] = (unsigned char)((nonce >> (56 - 8 * i)) & 0xff);
+    }
+    memcpy(object + 8, payload, payload_len);
+    free(payload);
+
+    unsigned char hash[32];
+    bm_inventory_hash(object, object_len, hash);
+    if (!bm_object_store_has(ctx->object_pool_db, hash))
+    {
+        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)info.stream,
+                                object, object_len, (int64_t)expires_time, (int64_t)time(NULL));
+        if (ctx->registry != NULL)
+        {
+            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+        }
+        fprintf(stderr, "[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
+                info.address_version);
+    }
+    free(object);
+}
+
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
                            const struct bm_message *msg)
 {
@@ -187,13 +290,33 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         {
             parsed = bm_parse_pubkey_v3(msg->payload, msg->length, &cached);
         }
-        /* version==4は「誰宛の候補か」というあて推量が要る(pubkey_cache.h参照)ため、
-         * getpubkey自動化と合わせたTODO(DESIGN.md §11) */
+        else if (hdr.version == 4)
+        {
+            /* 「誰宛の候補か」が必要(pubkey_cache.h参照)。自分がgetpubkeyを発行してpending
+             * 登録している宛先を候補として順に試す(§11)。候補数は通常少数(未解決の宛先分)
+             * なので線形に試して問題ない。 */
+            struct bm_pubkey_request *pending = NULL;
+            size_t pending_count = 0;
+            if (bm_pubkey_cache_list_pending_requests(ctx->identity_db, &pending, &pending_count) == 0)
+            {
+                for (size_t i = 0; i < pending_count && parsed != 0; i++)
+                {
+                    parsed = bm_parse_pubkey_v4(msg->payload, msg->length, pending[i].ripe,
+                                                 pending[i].address_version, pending[i].stream, &cached);
+                }
+                bm_pubkey_request_list_free(pending);
+            }
+        }
         if (parsed == 0)
         {
             bm_pubkey_cache_upsert(ctx->identity_db, &cached, now);
+            bm_pubkey_cache_clear_request(ctx->identity_db, cached.ripe);
             fprintf(stderr, "[object_sync] pubkey (v%" PRIu64 ") cached\n", hdr.version);
         }
+    }
+    else if (hdr.object_type == BM_OBJECT_GETPUBKEY)
+    {
+        handle_incoming_getpubkey(ctx, &hdr, msg);
     }
 }
 

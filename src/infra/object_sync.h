@@ -10,22 +10,30 @@
  *   - object受信: 重複排除してobject_pool.dbへ保存し、
  *       - type=msgならtrial_decrypt(core/trial_decrypt.c)を試み、成功したらinboxへ、
  *         埋め込みack_payloadがあれば検証してobject_pool.dbへ登録する(§5.5)
- *       - type=pubkey(version 2/3)ならpubkey_cache(core/pubkey_cache.c)へ登録を試みる
- *         (version 4は「誰宛の候補か」が必要なため、getpubkey自動化と合わせて別途TODO)
+ *       - type=pubkey(version 2/3)ならpubkey_cache(core/pubkey_cache.c)へ登録を試みる。
+ *         version 4は「誰宛の候補か」が必要なため、自分がgetpubkeyを発行してpending登録して
+ *         いる宛先(identity.dbのpubkey_requestsテーブル)を候補として順に試す(§11)
+ *       - type=getpubkeyなら、要求されているripe/tagがkeyringでunlock済みの自分のアドレス
+ *         宛かどうか判定し、該当すれば自分のpubkeyオブジェクトを組み立てて応答する(§11、
+ *         unlockされていないアドレスへの要求には応答できない)
  *       - どのtypeでもsent.ack_dataとの突合せ(§5.5のack検知)を試みる
  *       - 新規に取り込んだobject(受信msgそのもの、埋め込みackの両方)はpeer_registry経由で
- *         受信元コネクション以外の接続中peerへinv broadcastする
+ *         受信元コネクション以外の接続中peerへinv broadcastする。自分が新たに作った
+ *         object(getpubkeyへの自応答)は除外無しで全peerへbroadcastする
  *   期限切れobjectのGCも間引きながら実行する(bm_object_sync_gcで直接呼ぶことも可能)。
  *
- * また、core/api_server.cのsendMessageが生成したobject(自分が送信したmsg)は
- * bm_object_sync_broadcast_thread(下記)が別途broadcast_queueから受け取ってobject_pool.dbへ
- * 挿入・broadcastする(core層はinfra層のpeer_registryを直接呼べないため、common層の
- * bm_broadcast_item経由でqueue越しに受け渡す設計、DESIGN.md §1.2参照)。
+ * また、core/api_server.cのsendMessageが生成したobject(自分が送信したmsg)、およびpubkey_cache
+ * 未登録の宛先へ送ろうとした際に自動発行するgetpubkey要求は、bm_object_sync_broadcast_thread
+ * (下記)が別途broadcast_queueから受け取ってobject_pool.dbへ挿入・broadcastする(core層は
+ * infra層のpeer_registryを直接呼べないため、common層のbm_broadcast_item経由でqueue越しに
+ * 受け渡す設計、DESIGN.md §1.2参照)。
  *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
  *   - addrのpeer_manager永続化
- *   - getpubkey受信時に自分のpubkeyで応答する処理
  *   - broadcast(type=3)の購読・復号
+ *   - 受信object全般のPoW検証(§5.5のack検証では行っているが、object全般の受け入れ時には
+ *     まだ行っていない、既知のギャップ)
+ *   - getpubkey応答のスパム対策(同じ宛先への短時間の連続要求に対する応答側スロットリング)
  */
 
 #include <sqlite3.h>

@@ -73,6 +73,14 @@ int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *addres
 bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
                               struct bm_unlocked_identity *out);
 
+/*
+ * v4以降のgetpubkeyに含まれるtag(32byte)で検索する(§5.1)。address_version>=4の
+ * unlocked identityそれぞれについてtagを導出し比較する(通常identity数は少数なので
+ * 線形探索で十分)。見つかればtrueを返しoutにコピーする。
+ */
+bool bm_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32],
+                             struct bm_unlocked_identity *out);
+
 /* address文字列で検索する(send_pipeline.cがfromアドレスの鍵を引く際に使う) */
 bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
                                  struct bm_unlocked_identity *out);

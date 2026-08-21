@@ -39,6 +39,33 @@ int bm_pubkey_cache_lookup_by_tag(sqlite3 *db, const unsigned char tag[32], stru
 /* 自分がこのpubkeyを使って送信した(used_personally=1)ことを記録する。掃除対象から除外するため。成功時0 */
 int bm_pubkey_cache_mark_used_personally(sqlite3 *db, const unsigned char ripe[20]);
 
+/* --- pending getpubkey要求(identity.dbのpubkey_requestsテーブル、§11) --- */
+
+struct bm_pubkey_request
+{
+    unsigned char ripe[20];
+    uint64_t address_version;
+    uint64_t stream;
+};
+
+/* getpubkey要求を発行した(または再送すべき)ことを記録する。既存行があればrequested_timeのみ
+ * 更新する(UPSERT)。成功時0 */
+int bm_pubkey_cache_record_request(sqlite3 *db, const unsigned char ripe[20],
+                                    uint64_t address_version, uint64_t stream, int64_t requested_time);
+
+/* max_age_seconds以内にripe宛のgetpubkey要求を発行済みなら1、そうでなければ0を返す
+ * (短時間に同じ宛先へ何度もgetpubkeyをbroadcastするのを避けるため) */
+int bm_pubkey_cache_has_recent_request(sqlite3 *db, const unsigned char ripe[20],
+                                        int64_t now, int64_t max_age_seconds);
+
+/* 保留中のgetpubkey要求を全件列挙する(malloc、呼び出し側でbm_pubkey_request_list_freeすること)。
+ * 成功時0、*out_countに件数を設定する(0件でも成功) */
+int bm_pubkey_cache_list_pending_requests(sqlite3 *db, struct bm_pubkey_request **out_list, size_t *out_count);
+void bm_pubkey_request_list_free(struct bm_pubkey_request *list);
+
+/* 要求を完了扱いにする(pubkeyが手に入った場合等)。該当行が無くてもエラーにしない。成功時0 */
+int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20]);
+
 /* --- objectパース(§5.2の逆方向) --- */
 
 /* type=pubkey, version=2の完全なobject(nonce込み)をパースする。署名が無いため構造検証のみ。成功時0 */

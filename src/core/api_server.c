@@ -16,11 +16,22 @@
 #include "../common/broadcast_item.h"
 #include "../common/hash.h"
 #include "../common/json.h"
+#include "../pow/pow_engine.h"
 #include "address.h"
 #include "identity_store.h"
+#include "message_builder.h"
 #include "messages_store.h"
 #include "pubkey_cache.h"
 #include "send_pipeline.h"
+
+/* getpubkey要求自体のPoW難易度。誰が受け取るか分からない匿名objectのため、宛先固有の
+ * 難易度ではなくネットワーク既定値(send_pipeline.cのack生成と同じ考え方)を使う */
+#define BM_GETPUBKEY_NONCE_TRIALS_PER_BYTE 1000
+#define BM_GETPUBKEY_PAYLOAD_LENGTH_EXTRA_BYTES 1000
+#define BM_GETPUBKEY_REQUEST_TTL_SECONDS (2 * 24 * 60 * 60)
+/* 同じ宛先への再要求は最低でもこの間隔を空ける(短時間の連続sendMessage呼び出しでネットワークに
+ * getpubkeyをbroadcastし続けないため) */
+#define BM_GETPUBKEY_REQUEST_COOLDOWN_SECONDS (10 * 60)
 
 #define MAX_REQUEST_SIZE (1 * 1024 * 1024) /* 1MiB上限、DoS対策 */
 
@@ -371,6 +382,59 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
         }
         to_pub_encryption_ptr = to_pub_encryption;
     }
+    else
+    {
+        /* §11 getpubkey要求の自動化: pubkey_cacheに無ければ能動的にgetpubkeyオブジェクトを
+         * 発行してネットワークへ流す(この呼び出し自体はまだ送れないので、以下のsend_pipeline
+         * 呼び出しは従来通り失敗する。pubkeyが手に入り次第、改めてsendMessageを呼び直す運用を
+         * 想定。短時間の連続呼び出しでbroadcastし続けないようcooldownを設ける)。 */
+        uint64_t to_version = 0;
+        uint64_t to_stream = 0;
+        unsigned char to_ripe[BM_RIPE_LEN];
+        struct bm_cached_pubkey cached;
+        if (bm_address_decode(to_address, &to_version, &to_stream, to_ripe) == 0
+            && bm_pubkey_cache_lookup_by_ripe(config->identity_db, to_ripe, &cached) != 0)
+        {
+            int64_t now = (int64_t)time(NULL);
+            if (!bm_pubkey_cache_has_recent_request(config->identity_db, to_ripe, now,
+                                                      BM_GETPUBKEY_REQUEST_COOLDOWN_SECONDS))
+            {
+                size_t getpubkey_len = 0;
+                unsigned char *getpubkey_payload = bm_build_getpubkey(
+                    to_version, to_stream, to_ripe, (uint64_t)now + BM_GETPUBKEY_REQUEST_TTL_SECONDS,
+                    &getpubkey_len);
+                if (getpubkey_payload != NULL)
+                {
+                    uint64_t gp_target = bm_pow_get_target(getpubkey_len, BM_GETPUBKEY_REQUEST_TTL_SECONDS,
+                                                            BM_GETPUBKEY_NONCE_TRIALS_PER_BYTE,
+                                                            BM_GETPUBKEY_PAYLOAD_LENGTH_EXTRA_BYTES);
+                    uint64_t gp_nonce = bm_pow_run(getpubkey_payload, getpubkey_len, gp_target);
+
+                    size_t gp_object_len = 8 + getpubkey_len;
+                    unsigned char *gp_object = malloc(gp_object_len);
+                    for (int i = 0; i < 8; i++)
+                    {
+                        gp_object[i] = (unsigned char)((gp_nonce >> (56 - 8 * i)) & 0xff);
+                    }
+                    memcpy(gp_object + 8, getpubkey_payload, getpubkey_len);
+                    free(getpubkey_payload);
+
+                    if (config->broadcast_queue != NULL)
+                    {
+                        struct bm_broadcast_item *gp_item = malloc(sizeof(*gp_item));
+                        gp_item->object = gp_object;
+                        gp_item->object_len = gp_object_len;
+                        bm_queue_push(config->broadcast_queue, gp_item);
+                    }
+                    else
+                    {
+                        free(gp_object);
+                    }
+                    bm_pubkey_cache_record_request(config->identity_db, to_ripe, to_version, to_stream, now);
+                }
+            }
+        }
+    }
 
     uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
     int ack_stealth_level = stealth_v != NULL ? (int)bm_json_as_number(stealth_v) : 1;
@@ -384,8 +448,10 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
     if (rc != 0)
     {
         *out_error = dup_cstr("send failed (is fromAddress unlocked? is toAddress valid? if "
-                              "toPubEncryptionHex was omitted, is the recipient's key cached "
-                              "via cachePubkey?)");
+                              "toPubEncryptionHex was omitted and the recipient's key was not yet "
+                              "cached, a getpubkey request was broadcast automatically; retry "
+                              "sendMessage once it has been received, or supply toPubEncryptionHex "
+                              "directly / via cachePubkey)");
         return NULL;
     }
 

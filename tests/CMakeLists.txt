@@ -51,3 +51,7 @@ add_test(NAME object_sync COMMAND test_object_sync)
 add_executable(test_pow_engine test_pow_engine.c)
 target_link_libraries(test_pow_engine PRIVATE bm_pow bm_common OpenSSL::Crypto)
 add_test(NAME pow_engine COMMAND test_pow_engine)
+
+add_executable(test_getpubkey_automation test_getpubkey_automation.c)
+target_link_libraries(test_getpubkey_automation PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)
