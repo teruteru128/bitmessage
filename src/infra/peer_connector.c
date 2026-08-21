@@ -161,33 +161,60 @@ static int socks5_recv_all(int sock, unsigned char *buf, size_t len, int timeout
     return 0;
 }
 
+/* RFC1928のREPコードを人間が読めるメッセージへ変換する(§11 outbound Tor経路の検証:
+ * 実際にTorへ繋いだ際の失敗原因切り分けを容易にするため) */
+static const char *socks5_rep_to_string(unsigned char rep)
+{
+    switch (rep)
+    {
+        case 0x00: return "succeeded";
+        case 0x01: return "general SOCKS server failure";
+        case 0x02: return "connection not allowed by ruleset";
+        case 0x03: return "network unreachable";
+        case 0x04: return "host unreachable";
+        case 0x05: return "connection refused";
+        case 0x06: return "TTL expired";
+        case 0x07: return "command not supported";
+        case 0x08: return "address type not supported";
+        default: return "unknown REP code";
+    }
+}
+
 /*
  * SOCKS5(RFC1928)のno-auth CONNECTハンドシェイク。sockは既にproxyへ接続済み(O_NONBLOCK)で
  * あること。宛先は常にドメイン名形式(ATYP=0x03)で送る: dest_hostが数字IPの文字列であっても
  * Tor等のSOCKS5サーバーは正しく扱う(ローカルでDNS解決せずそのままCONNECT先として使うため、
- * 将来onionアドレスに対応する際もこの経路がそのまま使える)。成功時0
+ * 将来onionアドレスに対応する際もこの経路がそのまま使える)。成功時0。失敗時は原因を
+ * fprintf(stderr, "[peer_connector] socks5: ...")で診断ログに出す(§11、実際にTorへ繋いだ
+ * 際の切り分けを容易にするため)
  */
 static int socks5_connect(int sock, const char *dest_host, int dest_port, int timeout_sec)
 {
     size_t host_len = strlen(dest_host);
     if (host_len == 0 || host_len > 255)
     {
+        fprintf(stderr, "[peer_connector] socks5: destination host name too long (%zu bytes)\n", host_len);
         return -1;
     }
 
     unsigned char greeting[3] = {0x05, 0x01, 0x00}; /* version=5, 1 method, no-auth */
     if (socks5_send_all(sock, greeting, sizeof(greeting), timeout_sec) != 0)
     {
+        fprintf(stderr, "[peer_connector] socks5: failed to send greeting to proxy\n");
         return -1;
     }
     unsigned char method_resp[2];
     if (socks5_recv_all(sock, method_resp, sizeof(method_resp), timeout_sec) != 0)
     {
+        fprintf(stderr, "[peer_connector] socks5: no greeting response from proxy (unreachable/not a "
+                        "SOCKS5 server?)\n");
         return -1;
     }
     if (method_resp[0] != 0x05 || method_resp[1] != 0x00)
     {
-        return -1; /* no-auth非対応、または想定外バージョン */
+        fprintf(stderr, "[peer_connector] socks5: proxy rejected no-auth (version=0x%02x method=0x%02x)\n",
+                method_resp[0], method_resp[1]);
+        return -1;
     }
 
     unsigned char req[4 + 1 + 255 + 2];
@@ -203,17 +230,23 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
     req[req_len++] = (unsigned char)(dest_port & 0xff);
     if (socks5_send_all(sock, req, req_len, timeout_sec) != 0)
     {
+        fprintf(stderr, "[peer_connector] socks5: failed to send CONNECT request to proxy\n");
         return -1;
     }
 
     unsigned char reply_head[4];
     if (socks5_recv_all(sock, reply_head, sizeof(reply_head), timeout_sec) != 0)
     {
+        fprintf(stderr, "[peer_connector] socks5: no CONNECT reply from proxy (target %s:%d unreachable "
+                        "via Tor circuit, or proxy timed out)\n",
+                dest_host, dest_port);
         return -1;
     }
     if (reply_head[0] != 0x05 || reply_head[1] != 0x00)
     {
-        return -1; /* REPが成功(0x00)以外 */
+        fprintf(stderr, "[peer_connector] socks5: CONNECT to %s:%d failed: %s (REP=0x%02x)\n", dest_host,
+                dest_port, socks5_rep_to_string(reply_head[1]), reply_head[1]);
+        return -1;
     }
 
     size_t bnd_addr_len;
@@ -230,17 +263,21 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
             unsigned char len_byte;
             if (socks5_recv_all(sock, &len_byte, 1, timeout_sec) != 0)
             {
+                fprintf(stderr, "[peer_connector] socks5: failed to read BND.ADDR length\n");
                 return -1;
             }
             bnd_addr_len = len_byte;
             break;
         }
         default:
+            fprintf(stderr, "[peer_connector] socks5: unsupported BND.ADDR type 0x%02x in reply\n",
+                    reply_head[3]);
             return -1;
     }
     unsigned char discard[256];
     if (socks5_recv_all(sock, discard, bnd_addr_len + 2, timeout_sec) != 0)
     {
+        fprintf(stderr, "[peer_connector] socks5: failed to read BND.ADDR/BND.PORT\n");
         return -1; /* BND.ADDR + BND.PORT。値自体は使わない */
     }
     return 0;
@@ -258,6 +295,9 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
         int sock = connect_with_timeout(socks_proxy->host, socks_proxy->port, timeout_sec);
         if (sock < 0)
         {
+            fprintf(stderr, "[peer_connector] socks5: failed to reach proxy %s:%d (is Tor/the proxy "
+                            "running?)\n",
+                    socks_proxy->host, socks_proxy->port);
             return -1;
         }
         if (socks5_connect(sock, ip, port, SOCKS5_HANDSHAKE_TIMEOUT_SEC) != 0)

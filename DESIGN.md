@@ -1250,6 +1250,38 @@ config_db`経由で渡す形に変更し、実際の動的リロード経路そ�
 (daemon再起動なし)、次の再接続サイクルで`(via SOCKS5)`表示に切り替わることをログで
 確認済み。ctest 18件全通過。
 
+### outbound Tor経路の強化・検証(2026-08-21)
+
+backlog完了後、ユーザーからの追加要望。2点調査・対応した。
+
+**knownnodesフルスキャンの要否について**: `peer_connector_connect_initial`は「空いている
+スロット分だけ次の候補を試す」設計のため、`max_outbound`件の接続を維持できている間は
+新しい候補を試しに行かない。4400件超のknownnodes_2020_importを抱えていても全件を
+積極的に走査する仕組みは無いが、意図的にこの設計を維持する判断をした: 生きているpeerを
+見つける本来の仕組みは`addr`伝播であり、静的な過去データを総なめにすることではないため
+(gossip型ネットワークでは接続数もそこまで多く要らない)。フルスキャンが要る場面は
+「今すぐ4400件がどれだけ生きてるか知りたい」という一回限りの調査目的だけであり、
+それは常設コードではなく都度スクリプトで行う方が適切と判断し、実装しなかった。
+
+**onion peer探索の可否について**: PyBitmessageの実際のワイヤーフォーマット(`bmproto.py`
+の`decode_payload_node`、GitHub上のv0.6ソースで確認)を調べたところ、`addr`メッセージの
+16byte IPフィールドはOnionCat方式(`fd87:d87e:eb43::/48`プレフィックス + 残り80bit)で
+onionアドレスを表現できるが、これは80bit(10byte)しか余裕が無くv2 onion(80bit鍵)専用の
+仕組みで、v3 onion(2021年以降の標準、32byte ed25519鍵ベース)を表現する術が無いと判明した。
+Tor自体が2021年にv2 onion serviceを完全に廃止済みのため、`addr`経由でのonion peer探索は
+現在の実ネットワーク上では原理的に無価値(生きているv3 onion peerを表現する手段が
+プロトコルに存在しない)と結論し、実装を見送った。`knownnodes.py`にもonion bootstrap
+シードはハードコードされていない(自分自身のonionhostname申告機能のみ)ことも確認した。
+
+上記調査の副産物として、SOCKS5経由接続の失敗診断を強化した: `infra/peer_connector.c`の
+`socks5_connect`に、どの段階(proxy到達不能/greeting拒否/CONNECT失敗)で失敗したかを
+`[peer_connector] socks5: ...`のログとして出力するようにし、CONNECT失敗時はRFC1928の
+REPコード(host unreachable/connection refused等)を人間可読な文字列に変換して出力する
+ようにした。実daemon・実Torで、(1)正常系(実testnetノードへSOCKS5経由で成功、ログに
+ノイズ無し)、(2)異常系(プロキシ自体が到達不能なポートを指定、クラッシュ・ハングせず
+診断ログを出して次の候補へ継続すること)の両方を確認済み。ctest 18件全通過(既存挙動に
+変更なし、診断ログの追加のみ)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・
