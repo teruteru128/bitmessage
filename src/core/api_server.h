@@ -6,6 +6,7 @@
  * ハンドラ辞書(struct bm_api_method配列)とHTTPトランスポートを分離した設計(§6.0-6.1)。
  */
 
+#include <signal.h>
 #include <sqlite3.h>
 
 #include "../common/queue.h"
@@ -32,11 +33,25 @@ int bm_api_server_listen(const struct bm_api_server_config *config, int *out_lis
 /* accept済みの1コネクションに対して1リクエスト処理する(処理後closeする) */
 void bm_api_server_handle_connection(int client_fd, const struct bm_api_server_config *config);
 
-/* listen_fdに対してaccept loopを回し続ける(呼び出し元スレッドをブロックする) */
-void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config);
+/*
+ * listen_fdに対してaccept loopを回し続ける(呼び出し元スレッドをブロックする)。
+ * accept()を直接ブロッキングでは呼ばず、poll()に1秒のタイムアウトを与えて*stop_flagを
+ * 定期的に再チェックすることでグレースフルシャットダウンに対応する(peer_connector_thread
+ * と同じポーリング方式、§11)。*stop_flagが非0になれば次のタイムアウトで抜ける。
+ */
+void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config,
+                                  volatile sig_atomic_t *stop_flag);
 
-/* argは `const struct bm_api_server_config *` を期待する。ポート衝突時は§6.1のランダム
- * フォールバック(32767〜65535)を行う。 */
+/*
+ * pthread_createのarg用にmallocして渡す(スレッド側でfreeする、peer_connector_thread等と
+ * 同じ扱い)。configはスレッドの生存期間中ずっと有効な場所(呼び出し側のスタック変数等)を
+ * 指していること。
+ */
+struct bm_api_server_thread_args
+{
+    const struct bm_api_server_config *config;
+    volatile sig_atomic_t *stop_flag;
+};
 void *bm_api_server_thread(void *arg);
 
 #endif /* BM_CORE_API_SERVER_H */

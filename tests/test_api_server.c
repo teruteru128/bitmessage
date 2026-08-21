@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../src/common/json.h"
@@ -189,9 +190,13 @@ int main(void)
     config.identity_db = identity_db;
     config.messages_db = messages_db;
 
+    volatile sig_atomic_t server_stop = 0;
+    struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
+    server_args->config = &config;
+    server_args->stop_flag = &server_stop;
+
     pthread_t server_thread;
-    pthread_create(&server_thread, NULL, bm_api_server_thread, &config);
-    pthread_detach(server_thread);
+    pthread_create(&server_thread, NULL, bm_api_server_thread, server_args); /* server_argsはスレッド側でfreeされる */
     usleep(200000); /* サーバー起動待ち */
 
     /* 認証なしでは拒否されること */
@@ -457,6 +462,18 @@ int main(void)
         bm_json_free(v);
         free(resp);
     }
+
+    /* graceful shutdown: stop_flagを立ててから短時間(poll()の1秒タイムアウト程度)で
+     * スレッドが終了することを確認する(§11) */
+    struct timespec shutdown_start, shutdown_end;
+    clock_gettime(CLOCK_MONOTONIC, &shutdown_start);
+    server_stop = 1;
+    pthread_join(server_thread, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &shutdown_end);
+    double shutdown_seconds = (double)(shutdown_end.tv_sec - shutdown_start.tv_sec)
+        + (double)(shutdown_end.tv_nsec - shutdown_start.tv_nsec) / 1e9;
+    CHECK(shutdown_seconds < 3.0, "api_server should stop within a few seconds of stop_flag being set");
+    printf("api_server graceful shutdown took %.3f seconds\n", shutdown_seconds);
 
     bm_keyring_destroy(&kr);
     sqlite3_close(identity_db);

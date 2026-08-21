@@ -637,9 +637,15 @@ ttlSeconds?, ackStealthLevel?]`を取り、`toPubEncryptionHex`は130桁hexま�
 `send-message ... -`(cache利用の合図)で同じ経路を呼べる。`tests/test_cli_integration.sh`で
 引数検証・cache未登録時のエラー伝播まで確認済み(2026-08-21)。
 
-既知の制限: `bm_api_server_serve_forever`の`accept()`はブロッキングでシグナル等による
-グレースフルシャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。
-v1の`main.c`ではこのスレッドを`pthread_detach`し、プロセス終了時に道連れで終わらせている。
+**graceful shutdown実装済み(2026-08-23)。** `bm_api_server_serve_forever`は`accept()`を直接
+ブロッキングで呼ばず、`poll()`に1秒のタイムアウトを与えて`*stop_flag`を定期的に再チェックする
+方式に変更した(`peer_connector_thread`と同じポーリング設計、§1・§11参照)。`stop_flag`が
+非0になれば次のタイムアウト(最大1秒)で抜ける。`main.c`ではこのスレッドを
+`struct bm_api_server_thread_args`(config+stop_flagのポインタ、mallocしてスレッド側でfree)
+経由で起動し、以前は`pthread_detach`していたが今は`pthread_join`できる。
+`tests/test_api_server.c`でstop_flagを立ててから3秒以内に`pthread_join`が返ることを検証
+(実測1.005秒、poll()のタイムアウト分そのまま)。実daemonでもBM_NO_CONNECT=1構成で
+SIGINT送信から約1.04秒でプロセス全体が終了することを確認済み。
 
 出典: PyBitmessage `src/api.py`(モジュールdocstring, `singleAPI.run`, `CommandHandler`, `command`デコレータ)
 
@@ -866,15 +872,16 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
-`peer_connector`の常駐化・再接続維持ループが実装完了・push済み(2026-08-23)。ctest 12件全通過、
-実testnetノードで65秒稼働させて2回の再接続サイクルとrating更新、SIGINT後0.5秒程度での
-プロセス終了を実機確認済み。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに
-確認して選ぶこと(このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから
-着手する)。inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情でTor実装まで見送りの
+`peer_connector`の常駐化・再接続維持ループ(2026-08-23)、`api_server`のgraceful shutdown
+(2026-08-23、poll()の1秒タイムアウトポーリング方式)が実装完了・push済み。これで
+`network_epoll_thread`以外の全スレッドがpthread_joinできる状態になった(§1参照)。
+ctest 12件全通過、実testnetノードで65秒稼働させて2回の再接続サイクルとrating更新、
+SIGINT後daemon全体で約1秒程度でのプロセス終了を実機確認済み。次に着手する項目は
+特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと(このセッションの
+一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
+inbound(サーバーソケットでの待受)は自宅環境のCGNAT事情でTor実装まで見送りの
 前提は継続(§8参照)。
 
-- **`api_server`のgraceful shutdown**: `accept()`がブロッキングでSIGINT等に応答できないため現状は
-  `pthread_detach`で逃げている(`main.c`)。self-pipeトリック等で正式に閉じられるようにする。
 - **PoW並列化**: `pow/pow_engine.c`は現状シングルスレッド。
 - **getpubkey要求の自動化**: `send_pipeline.c`は`pubkey_cache`未登録の宛先には送信失敗するのみで、
   能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。受信したgetpubkeyに自分のpubkeyで

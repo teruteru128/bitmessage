@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -764,10 +765,29 @@ int bm_api_server_listen(const struct bm_api_server_config *config, int *out_lis
     return 0;
 }
 
-void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config)
+void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config,
+                                  volatile sig_atomic_t *stop_flag)
 {
-    for (;;)
+    struct pollfd pfd;
+    pfd.fd = listen_fd;
+    pfd.events = POLLIN;
+
+    while (*stop_flag == 0)
     {
+        int rc = poll(&pfd, 1, 1000); /* 1秒タイムアウトでstop_flagを再チェックする */
+        if (rc < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+        if (rc == 0)
+        {
+            continue; /* タイムアウト、stop_flagを再チェックするだけ */
+        }
+
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0)
         {
@@ -783,15 +803,20 @@ void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_confi
 
 void *bm_api_server_thread(void *arg)
 {
-    const struct bm_api_server_config *config = arg;
+    struct bm_api_server_thread_args *args = arg;
+    const struct bm_api_server_config *config = args->config;
+
     int listen_fd = -1;
     if (bm_api_server_listen(config, &listen_fd) != 0)
     {
         fprintf(stderr, "[api_server] failed to listen on %s:%d\n", config->bind_address, config->port);
+        free(args);
         return NULL;
     }
     fprintf(stderr, "[api_server] listening on %s:%d\n", config->bind_address, config->port);
-    bm_api_server_serve_forever(listen_fd, config);
+    bm_api_server_serve_forever(listen_fd, config, args->stop_flag);
     close(listen_fd);
+    fprintf(stderr, "[api_server] stopped\n");
+    free(args);
     return NULL;
 }

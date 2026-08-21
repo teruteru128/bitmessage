@@ -151,14 +151,21 @@ int main(void)
     }
 
     /* §1.1のスレッド一覧。trial_decrypt/send_pipelineは現状即returnするTODOスタブ。
-     * api_server/network_epollはブロッキング待受(accept()/epoll_wait())でグレースフル
-     * シャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。当面はdetachし、
-     * プロセス終了時に道連れで終わらせる(pthread_joinすると永久にブロックしてしまうため)。 */
+     * network_epoll_threadはepoll_wait()のブロッキング待受でグレースフルシャットダウンの
+     * 割り込み機構がない(self-pipe trick等が必要、TODO)。当面はdetachし、プロセス終了時に
+     * 道連れで終わらせる(pthread_joinすると永久にブロックしてしまうため)。 */
     pthread_t th_trial_decrypt, th_send_pipeline, th_api_server, th_network, th_broadcast;
     pthread_create(&th_trial_decrypt, NULL, bm_trial_decrypt_thread, NULL);
     pthread_create(&th_send_pipeline, NULL, bm_send_pipeline_thread, NULL);
-    pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
-    pthread_detach(th_api_server);
+
+    /* §11 api_serverのgraceful shutdown。peer_connector_threadと同じstop flagポーリング方式
+     * (poll()に1秒タイムアウトを与えてaccept()の代わりに使う、api_server.c参照)。
+     * api_server_stopもmain()がsigwaitでブロックしている間ずっと生存するスタック変数。 */
+    volatile sig_atomic_t api_server_stop = 0;
+    struct bm_api_server_thread_args *api_args = malloc(sizeof(*api_args));
+    api_args->config = &api_config;
+    api_args->stop_flag = &api_server_stop;
+    pthread_create(&th_api_server, NULL, bm_api_server_thread, api_args);
 
     /* §11 接続レジストリ。現在epollに登録中の接続一覧で、object_sync_threadが「新しく手に入れた
      * objectを他の接続中peerへinv broadcastする」ために使う。registryもmain()がsigwaitで
@@ -227,15 +234,16 @@ int main(void)
 
     queues_shutdown(&queues);
     peer_connector_stop = 1;
+    api_server_stop = 1;
 
     pthread_join(th_trial_decrypt, NULL);
     pthread_join(th_send_pipeline, NULL);
     pthread_join(th_broadcast, NULL);
+    pthread_join(th_api_server, NULL); /* 最大1秒でpoll()のタイムアウト検知して終了する */
     if (peer_connector_started)
     {
         pthread_join(th_peer_connector, NULL); /* 最大STOP_POLL_INTERVAL_SECONDS秒でポーリング検知して終了する */
     }
-    /* th_api_serverはdetach済み(上記コメント参照)。プロセス終了と共に破棄される */
 
     queues_destroy(&queues);
     bm_peer_registry_destroy(&peer_registry);
