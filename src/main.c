@@ -134,10 +134,21 @@ int main(void)
         snprintf(api_password + i * 2, 3, "%02x", api_password_raw[i]);
     }
 
+    /* §11 ポート衝突対策: bitmessage-cliは以前からBM_API_PORTで接続先ポートを変更できたが、
+     * daemon側にそれを上書きする手段が無く非対称だった(2026-08-21発覚: バックグラウンドで
+     * peer bootstrap用に立てたdaemonと、テスト実行時にctestが自前で起動するdaemonがどちらも
+     * 既定の8442を取り合って衝突した)。CLIと同じ環境変数名で揃える。 */
+    int api_port = 8442;
+    const char *api_port_env = getenv("BM_API_PORT");
+    if (api_port_env != NULL)
+    {
+        api_port = atoi(api_port_env);
+    }
+
     struct bm_api_server_config api_config;
     memset(&api_config, 0, sizeof(api_config));
     api_config.bind_address = "127.0.0.1";
-    api_config.port = 8442;
+    api_config.port = api_port;
     api_config.username = "bitmessage";
     api_config.password = api_password;
     api_config.keyring = &keyring;
@@ -145,8 +156,8 @@ int main(void)
     api_config.messages_db = messages_db;
     api_config.broadcast_queue = &queues.broadcast_queue;
     api_config.config_db = config_db;
-    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s (この起動でのみ有効、設定ファイル未実装)\n",
-            api_password);
+    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、設定ファイル未実装)\n",
+            api_password, api_port);
 
     /* testnet切り替え。設定ファイル未実装のため環境変数BM_TESTNET=1で切り替える(既定mainnet)。
      * inbound(サーバーソケットでの待ち受け)は自宅環境のISP事情でTor実装まで現実的でないため、

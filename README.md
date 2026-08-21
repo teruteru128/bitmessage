@@ -62,6 +62,8 @@ daemon(`bitmessaged`)を起動すると、JSON-RPC APIの認証情報(ユーザ�
 
 ```sh
 # 既定はmainnet。テストネットに繋ぎたい場合は BM_TESTNET=1 を指定
+# JSON-RPC APIのポートは既定8442。他プロセスと衝突する場合は BM_API_PORT で変更可能
+# (bitmessage-cli側も同じ環境変数を読むので揃えること)
 ./build-Debug/src/bitmessaged
 ```
 

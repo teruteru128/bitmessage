@@ -30,7 +30,10 @@ fail() {
     exit 1
 }
 
-BM_NO_CONNECT=1 "$BITMESSAGED" >bitmessaged.log 2>&1 &
+# §11 ポート衝突対策: 既定の8442は他の目的(手元でのpeer bootstrap用daemon等)で使われている
+# ことがあるため、ctest実行を邪魔しないようtest_api_server.c等と同じ流儀でscratchポートを使う
+# (BM_API_PORTはCLI・daemon双方が読む環境変数、main.c参照)。
+BM_NO_CONNECT=1 BM_API_PORT=18445 "$BITMESSAGED" >bitmessaged.log 2>&1 &
 PID=$!
 
 for _ in $(seq 1 50); do
@@ -41,7 +44,7 @@ for _ in $(seq 1 50); do
 done
 
 export BM_API_HOST=127.0.0.1
-export BM_API_PORT=8442
+export BM_API_PORT=18445
 export BM_API_USER=bitmessage
 export BM_API_PASS
 BM_API_PASS=$(grep -oP 'apipassword=\K[0-9a-f]+' bitmessaged.log || true)

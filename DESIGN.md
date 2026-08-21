@@ -1149,6 +1149,23 @@ backlog優先順位の3番目。再送(`infra/object_sync.c`の`bm_object_sync_c
 別の宛先を使うよう修正した。実daemon・CLI経由でも、送信前はpubkey_cache 0件・直接pubkey指定
 でsend-messageした後は1件登録されることを確認済み。ctest 17件全通過。
 
+### API portのBM_API_PORT対応(2026-08-21)
+
+backlog番号無し、運用上の実害から緊急対応。`bitmessage-cli`は以前から接続先ポートを
+`BM_API_PORT`環境変数で変更できたが、`bitmessaged`側にそれを上書きする手段が無く
+非対称だった。実際に、knownnodes.datインポート(§11参照)によるpeer bootstrapを
+バックグラウンドで動かし続けようとしたところ、両方とも既定の8442を使おうとして
+ctestの`cli_integration`テストとポートが衝突する事態が発生した(2026-08-21、ユーザー
+指摘により発覚)。
+
+`main.c`で起動時に`BM_API_PORT`環境変数を読み、設定されていればapi_config.portへ反映する
+ようにした(`BM_TESTNET`/`BM_NO_CONNECT`と同じ既存パターン)。起動時ログにもport番号を
+追加した。`tests/test_cli_integration.sh`が自前で起動する`bitmessaged`もscratchポート
+(18445、他のHTTPテストの18442-18444と同じ命名規則)を使うよう変更し、以後ctestが
+バックグラウンドの8442常駐daemonと衝突しないようにした。実際にBM_API_PORT=19999で
+起動したdaemonが8442の別daemonと同時にLISTENできることを確認済み。ctest 17件全通過
+(バックグラウンドdaemonを止めずに実行して確認)。
+
 ### v1.1以降のbacklog
 
 - **DoS上限の見直し・chan仕様・設定変更の動的リロード**: SOCKS5プロキシ設定は永続化した
