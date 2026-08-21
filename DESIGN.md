@@ -53,11 +53,22 @@ verack受信→相手のversion受信、というプロトコルレベルのハ�
   共有ポインタとして渡す
 
 DoS対策としてinv/getdataの要素数上限(50000)とobject payloadサイズ上限(256KiB、§5.0)を
-このディスパッチ内で強制する。v1スコープ外(既知の制限、TODO): `api_server.c`(自分が送信した
-msg/ack)からの能動的なinv broadcast(core層はinfra層のpeer_registryを直接呼べないため、
-`broadcast_queue`経由の結線が別途必要、§1.2参照)、addrのpeer_manager永続化、
-getpubkey受信時の自応答、broadcast(type=3)の購読・復号、pubkey v4の自動キャッシュ
-(候補ripeが必要なためgetpubkey自動化と合わせて要検討)。
+このディスパッチ内で強制する。
+
+**`api_server.c`からの能動的なinv broadcastも実装済み(2026-08-22)。** core層(`api_server.c`)は
+infra層の`peer_registry`を直接呼べない(§1参照)ため、common層の`struct bm_broadcast_item`
+(`src/common/broadcast_item.h`)を介して`broadcast_queue`(§1.2、これまで骨格のみで未配線
+だったキュー)経由で受け渡す。`h_sendMessage`は`bm_send_pipeline_send_message`が生成した
+objectを(即座にfreeするのではなく)`broadcast_queue`へpushし、`object_sync.c`の新スレッド
+`bm_object_sync_broadcast_thread`(`main.c`で起動、`queues_shutdown`で自然停止するので
+join可能)がpopして`object_pool.db`への挿入と`peer_registry`経由のinv broadcast(除外無し、
+全接続peerへ)を行う。実testnetノードに接続した状態で`sendMessage`を呼び、
+`object_pool.db`に該当行が入ること・ログに`[object_sync] broadcasted locally-originated
+object to peers`が出ることを実機で確認済み。
+
+v1スコープ外(既知の制限、TODO): addrのpeer_manager永続化、getpubkey受信時の自応答、
+broadcast(type=3)の購読・復号、pubkey v4の自動キャッシュ(候補ripeが必要なため
+getpubkey自動化と合わせて要検討)。
 `tests/test_object_sync.c`でinv→getdata、object重複排除、getdata応答、GC、
 2本目のpeer接続を接続レジストリへ登録した上で「受信元以外にだけinv broadcastが届く」ことの
 検証、そしてsend_pipeline.cで実際に組み立てたmsgをdispatchに流し込み「trial_decrypt→
@@ -119,6 +130,13 @@ dispatchに流す→sent.statusがackreceivedへ遷移」までのack往復をen
 | `pow_request_queue` | send_pipeline_thread → pow_worker_thread | `{unsigned char *payload_with_header, size_t len, uint64_t target}` |
 | `pow_result_queue` | pow_worker_thread → send_pipeline_thread | `{uint64_t nonce, unsigned char hash[32]}` |
 | `broadcast_queue` | send_pipeline_thread → network_epoll_thread(送信担当) | `{unsigned char *object_bytes, size_t len}` |
+
+**`broadcast_queue`のみ実際に配線済み(2026-08-22)**。他のキューは上記「実装上の注記」の通り
+未使用のまま。実際のproducerは`api_server.c`の`h_sendMessage`(send_pipeline_threadという
+独立スレッドは無いため)、consumerは`object_sync.c`の`bm_object_sync_broadcast_thread`
+(専用スレッド、`main.c`で起動)。要素の型は`struct bm_broadcast_item`(`src/common/
+broadcast_item.h`、core/infra両層から素朴に参照できるようcommon層に置く)。詳細は§1直下の
+`object_sync_thread`実装ノート参照。
 
 ### 1.3 DB接続方針
 
@@ -838,18 +856,13 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
-接続レジストリ(`peer_registry.c/h`)によるinv broadcast実装完了・push済み(2026-08-22)。
-ctest 12件全通過。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと
+接続レジストリ(`peer_registry.c/h`)によるinv broadcastと、`api_server.c`からの能動的な
+broadcast(`broadcast_queue`結線)の両方が実装完了・push済み(2026-08-22)。これで受信object
+の中継(peer→peer)と自分が送信したmsgのネットワークへの実配信、両方が動く状態になった。
+ctest 12件全通過、実testnetノードとの通信で`sendMessage`→`object_pool.db`挿入→`inv`送出まで
+実機確認済み。次に着手する項目は特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと
 (このセッションの一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
 
-- **`api_server.c`からの能動的なinv broadcast**: 受信objectの中継(peer→peer)は`peer_registry`で
-  実装済みだが、`api_server.c`の`h_sendMessage`(自分が送信したmsg)や送信側の`sendMessage`が
-  作るack objectを実際にネットワークへ流す経路がまだ無い(`h_sendMessage`に元々あった
-  「broadcast_queueへの投入」TODOそのもの)。`api_server.c`はcore層でinfra層の`peer_registry`を
-  直接呼べない(循環依存になる、§1参照)ため、`main.c`の`struct bm_queues`に既にある
-  `broadcast_queue`(common層、core→infra どちらからも触れる)を実際に使い、infra側に
-  `broadcast_queue`を消費して`object_pool.db`へ挿入+`peer_registry`でbroadcastする小さな
-  ループ(専用スレッド、または`object_sync_thread`への相乗り)を足す必要がある。
 - **`peer_connector`の永続化**: 現在`bm_peer_connector_connect_initial()`は起動時一回きりのoutbound接続。
   再接続・複数peer維持ループが未実装(自宅環境はCGNAT相当でinbound不可、Tor実装までoutbound-onlyの
   前提は継続、§8参照)。

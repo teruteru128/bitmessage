@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../common/broadcast_item.h"
 #include "../common/hash.h"
 #include "../common/json.h"
 #include "address.h"
@@ -389,7 +390,22 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
 
     unsigned char inv_hash[32];
     bm_inventory_hash(object, object_len, inv_hash);
-    free(object);
+
+    /* §1.2 broadcast_queueへ投入(infra/object_sync.cのbm_object_sync_broadcast_threadが
+     * object_pool.dbへの挿入とpeer_registry経由のネットワークへのinv broadcastを行う)。
+     * 所有権(object)はここでqueueへ渡す(popした側がfreeする)。queueが未設定(NULL)なら
+     * ネットワークへは流さずここでfreeする(test/CLI単体動作用)。 */
+    if (config->broadcast_queue != NULL)
+    {
+        struct bm_broadcast_item *item = malloc(sizeof(*item));
+        item->object = object;
+        item->object_len = object_len;
+        bm_queue_push(config->broadcast_queue, item);
+    }
+    else
+    {
+        free(object);
+    }
 
     char inv_hex[65];
     hex_encode(inv_hash, sizeof(inv_hash), inv_hex);

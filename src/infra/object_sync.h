@@ -17,9 +17,12 @@
  *         受信元コネクション以外の接続中peerへinv broadcastする
  *   期限切れobjectのGCも間引きながら実行する(bm_object_sync_gcで直接呼ぶことも可能)。
  *
+ * また、core/api_server.cのsendMessageが生成したobject(自分が送信したmsg)は
+ * bm_object_sync_broadcast_thread(下記)が別途broadcast_queueから受け取ってobject_pool.dbへ
+ * 挿入・broadcastする(core層はinfra層のpeer_registryを直接呼べないため、common層の
+ * bm_broadcast_item経由でqueue越しに受け渡す設計、DESIGN.md §1.2参照)。
+ *
  * v1スコープ外(既知のTODO、DESIGN.md §11参照):
- *   - api_server.c(自分が送信したmsg/ack)からの能動的なinv broadcast(こちらはcore層のため
- *     直接peer_registryを呼べない、broadcast_queue経由の結線が別途必要)
  *   - addrのpeer_manager永続化
  *   - getpubkey受信時に自分のpubkeyで応答する処理
  *   - broadcast(type=3)の購読・復号
@@ -30,6 +33,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "../common/broadcast_item.h"
+#include "../common/queue.h"
 #include "../core/keyring.h"
 #include "network.h"
 #include "peer_registry.h"
@@ -55,5 +60,19 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
 /* 期限切れobjectを削除する(object_store.cのdelete_expiredを呼ぶだけ)。削除件数を返す。
  * dispatch内部でも間引きながら呼ばれるが、テストや明示的なメンテナンス用に直接呼べる */
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now);
+
+/*
+ * broadcast_queueの消費ループ(pthread_createのarg用にmallocして渡す想定、main.c参照)。
+ * core/api_server.cのsendMessageがpushしたbm_broadcast_item(§1.2)をpopし、object_pool.dbへ
+ * 挿入した上でpeer_registry経由で全接続peer(除外無し)へinv broadcastする。既知object(重複)
+ * ならbroadcastしない。itemとitem->objectの所有権を受け取り、処理後に解放する。
+ * queueがbm_queue_shutdownされたら関数を抜ける(argも道連れで解放する)。
+ */
+struct bm_broadcast_thread_args
+{
+    struct bm_object_sync_ctx *ctx;
+    bm_queue_t *queue;
+};
+void *bm_object_sync_broadcast_thread(void *arg);
 
 #endif /* BM_INFRA_OBJECT_SYNC_H */

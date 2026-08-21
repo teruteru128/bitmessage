@@ -132,6 +132,7 @@ int main(void)
     api_config.keyring = &keyring;
     api_config.identity_db = identity_db;
     api_config.messages_db = messages_db;
+    api_config.broadcast_queue = &queues.broadcast_queue;
     fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s (この起動でのみ有効、設定ファイル未実装)\n",
             api_password);
 
@@ -153,7 +154,7 @@ int main(void)
      * api_server/network_epollはブロッキング待受(accept()/epoll_wait())でグレースフル
      * シャットダウンの割り込み機構がない(self-pipe trick等が必要、TODO)。当面はdetachし、
      * プロセス終了時に道連れで終わらせる(pthread_joinすると永久にブロックしてしまうため)。 */
-    pthread_t th_trial_decrypt, th_send_pipeline, th_api_server, th_network;
+    pthread_t th_trial_decrypt, th_send_pipeline, th_api_server, th_network, th_broadcast;
     pthread_create(&th_trial_decrypt, NULL, bm_trial_decrypt_thread, NULL);
     pthread_create(&th_send_pipeline, NULL, bm_send_pipeline_thread, NULL);
     pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
@@ -179,6 +180,15 @@ int main(void)
     net_args->registry = &peer_registry;
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);
+
+    /* broadcast_queueの消費スレッド(§1.2)。api_server.cのsendMessageが積んだobjectを
+     * object_pool.dbへ挿入し、peer_registry経由でネットワークへinv broadcastする。
+     * queues_shutdown()でbroadcast_queueがshutdownされると自然に抜けるのでjoinできる
+     * (th_trial_decrypt/th_send_pipelineと同じ扱い)。 */
+    struct bm_broadcast_thread_args *broadcast_args = malloc(sizeof(*broadcast_args));
+    broadcast_args->ctx = &object_sync_ctx;
+    broadcast_args->queue = &queues.broadcast_queue;
+    pthread_create(&th_broadcast, NULL, bm_object_sync_broadcast_thread, broadcast_args);
 
     /* BM_NO_CONNECT=1で実接続を抑止できる(自動テスト用。cli_integration等が本物のネットワークへ
      * 接続しに行くとCI環境の到達性次第で数十秒単位で遅くなる/非決定的になるため)。 */
@@ -213,6 +223,7 @@ int main(void)
 
     pthread_join(th_trial_decrypt, NULL);
     pthread_join(th_send_pipeline, NULL);
+    pthread_join(th_broadcast, NULL);
     /* th_api_serverはdetach済み(上記コメント参照)。プロセス終了と共に破棄される */
 
     queues_destroy(&queues);

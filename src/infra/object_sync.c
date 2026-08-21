@@ -336,3 +336,40 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
 
     maybe_run_gc(ctx);
 }
+
+void *bm_object_sync_broadcast_thread(void *arg)
+{
+    struct bm_broadcast_thread_args *args = arg;
+
+    void *raw = NULL;
+    while (bm_queue_pop(args->queue, &raw))
+    {
+        struct bm_broadcast_item *item = raw;
+
+        struct bm_object_header hdr;
+        if (bm_object_parse_header(item->object, item->object_len, &hdr) == 0)
+        {
+            unsigned char hash[32];
+            bm_inventory_hash(item->object, item->object_len, hash);
+            int already_known = bm_object_store_has(args->ctx->object_pool_db, hash);
+            int64_t now = (int64_t)time(NULL);
+            bm_object_store_insert(args->ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
+                                    item->object, item->object_len, (int64_t)hdr.expires_time, now);
+            if (!already_known && args->ctx->registry != NULL)
+            {
+                bm_peer_registry_broadcast_inv(args->ctx->registry, &hash, 1, NULL);
+                fprintf(stderr, "[object_sync] broadcasted locally-originated object to peers\n");
+            }
+        }
+        else
+        {
+            fprintf(stderr, "[object_sync] broadcast_queue item has a malformed object header, dropping\n");
+        }
+
+        free(item->object);
+        free(item);
+    }
+
+    free(args);
+    return NULL;
+}

@@ -8,6 +8,7 @@
 
 #include <sqlite3.h>
 
+#include "../common/queue.h"
 #include "keyring.h"
 
 struct bm_api_server_config
@@ -19,6 +20,10 @@ struct bm_api_server_config
     bm_keyring_t *keyring;
     sqlite3 *identity_db;
     sqlite3 *messages_db;
+    /* sendMessageが生成したobjectの投入先(DESIGN.md §1.2)。NULL可(その場合はネットワークへ
+     * 流さず、objectはinventoryHashの計算にのみ使われて破棄される。testやCLI単体動作用)。
+     * infra/object_sync.cのbm_object_sync_broadcast_threadが消費する。 */
+    bm_queue_t *broadcast_queue;
 };
 
 /* bind+listenする。成功時0、*out_listen_fdにfdを設定。失敗時(ポート使用中等)は非0 */
