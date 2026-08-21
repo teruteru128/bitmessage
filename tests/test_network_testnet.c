@@ -10,7 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../src/infra/peer_manager.h"
+#include "../src/core/peer_manager.h"
 #include "../src/infra/protocol.h"
 
 static int failures = 0;
@@ -147,6 +147,59 @@ static void test_bootstrap_seeding(void)
     printf("OK: bootstrap seed node insertion\n");
 }
 
+static void test_observed_nodes_file(void)
+{
+    /* §11「開発者が確認した身元不明のつながる可能性のあるノード」リスト
+     * (seeds/observed_nodes.txt)の読み込み確認。#コメント・空行・不正な行は無視し、
+     * 有効な行だけをsource='observed_seed'で登録することを確認する */
+    const char *db_path = "test_network_testnet_observed_peers.db";
+    unlink(db_path);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK || bm_peer_manager_init_schema(db) != 0)
+    {
+        fprintf(stderr, "FATAL: could not open/init %s\n", db_path);
+        exit(EXIT_FAILURE);
+    }
+
+    /* ファイル無しの場合は0を返すだけでエラーにならないこと */
+    CHECK(bm_peer_manager_load_observed_nodes(db, "test_observed_nodes_does_not_exist.txt") == 0,
+          "loading a nonexistent observed-nodes file should be a harmless no-op");
+
+    const char *list_path = "test_observed_nodes.txt";
+    FILE *f = fopen(list_path, "w");
+    CHECK(f != NULL, "create temporary observed-nodes file");
+    if (f != NULL)
+    {
+        fprintf(f, "# comment line, should be ignored\n");
+        fprintf(f, "\n"); /* 空行 */
+        fprintf(f, "203.0.113.10 8444\n");
+        fprintf(f, "  203.0.113.11 8445\n"); /* 先頭の空白も許容 */
+        fprintf(f, "not-a-valid-line\n");     /* portが無い不正な行 */
+        fprintf(f, "203.0.113.12 0\n");       /* port範囲外 */
+        fprintf(f, "203.0.113.13 8446\n");
+        fclose(f);
+    }
+
+    int loaded = bm_peer_manager_load_observed_nodes(db, list_path);
+    CHECK(loaded == 3, "should load exactly the 3 well-formed lines");
+
+    struct bm_peer_entry results[32];
+    int count = 0;
+    CHECK(bm_peer_manager_list_top(db, 1, results, 32, &count) == 0, "list observed peers");
+    CHECK(count == 3, "3 peers should be registered from the observed-nodes file");
+    for (int i = 0; i < count; i++)
+    {
+        CHECK(strcmp(results[i].source, "observed_seed") == 0,
+              "observed-nodes entries should use the 'observed_seed' source label");
+    }
+
+    unlink(list_path);
+    sqlite3_close(db);
+    unlink(db_path);
+
+    printf("OK: observed-nodes file loading\n");
+}
+
 static void seed_cleanup_test_peer(sqlite3 *db, const char *ip, int64_t last_seen, double rating)
 {
     struct bm_peer_entry entry;
@@ -216,6 +269,7 @@ int main(void)
     test_bad_magic_rejected();
     test_oversized_length_rejected();
     test_bootstrap_seeding();
+    test_observed_nodes_file();
     test_peer_cleanup();
 
     if (failures == 0)

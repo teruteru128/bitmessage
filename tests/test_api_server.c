@@ -18,11 +18,13 @@
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/messages_store.h"
+#include "../src/core/peer_manager.h"
 #include "../src/core/pubkey_cache.h"
 
 #define TEST_PORT 18442
 #define TEST_IDENTITY_DB "test_api_server_identity.db"
 #define TEST_MESSAGES_DB "test_api_server_messages.db"
+#define TEST_PEERS_DB "test_api_server_peers.db"
 
 static int failures = 0;
 
@@ -177,6 +179,7 @@ int main(void)
 {
     sqlite3 *identity_db = open_fresh_db(TEST_IDENTITY_DB, bm_identity_store_init_schema);
     sqlite3 *messages_db = open_fresh_db(TEST_MESSAGES_DB, bm_messages_store_init_schema);
+    sqlite3 *peers_db = open_fresh_db(TEST_PEERS_DB, bm_peer_manager_init_schema);
 
     bm_keyring_t kr;
     bm_keyring_init(&kr);
@@ -190,6 +193,7 @@ int main(void)
     config.keyring = &kr;
     config.identity_db = identity_db;
     config.messages_db = messages_db;
+    config.peers_db = peers_db;
 
     volatile sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
@@ -469,6 +473,42 @@ int main(void)
 
     free(sender_address);
 
+    /* §11 addPeer: [ipAddress, port, stream?]。手動でpeers.dbへ登録できることを確認する */
+    resp = do_request(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"addPeer\",\"params\":[\"203.0.113.99\",8444,1],\"id\":16}",
+        "testuser", "testpass");
+    CHECK(resp != NULL, "addPeer HTTP request");
+    if (resp != NULL)
+    {
+        bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+        bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+        CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1, "addPeer returns true");
+        bm_json_free(v);
+        free(resp);
+    }
+
+    sqlite3_stmt *peer_stmt = NULL;
+    sqlite3_prepare_v2(peers_db, "SELECT port, source, rating FROM hosts WHERE ip_address = '203.0.113.99';",
+                        -1, &peer_stmt, NULL);
+    CHECK(sqlite3_step(peer_stmt) == SQLITE_ROW, "addPeer should register the peer into peers.db");
+    CHECK(sqlite3_column_int(peer_stmt, 0) == 8444, "addPeer registered port matches");
+    const char *peer_source = (const char *)sqlite3_column_text(peer_stmt, 1);
+    CHECK(peer_source != NULL && strcmp(peer_source, "manual") == 0, "addPeer registered source should be 'manual'");
+    CHECK(sqlite3_column_double(peer_stmt, 2) == 0.0, "addPeer registered peer should start at rating 0.0");
+    sqlite3_finalize(peer_stmt);
+
+    /* 不正なportは拒否される */
+    resp = do_request(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"addPeer\",\"params\":[\"203.0.113.100\",0],\"id\":17}",
+        "testuser", "testpass");
+    if (resp != NULL)
+    {
+        bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+        CHECK(v != NULL && bm_json_object_get(v, "error") != NULL, "addPeer with invalid port returns an error");
+        bm_json_free(v);
+        free(resp);
+    }
+
     /* 存在しないメソッドはエラーを返す */
     resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"noSuchMethod\",\"params\":[],\"id\":7}",
                        "testuser", "testpass");
@@ -495,8 +535,10 @@ int main(void)
     bm_keyring_destroy(&kr);
     sqlite3_close(identity_db);
     sqlite3_close(messages_db);
+    sqlite3_close(peers_db);
     unlink(TEST_IDENTITY_DB);
     unlink(TEST_MESSAGES_DB);
+    unlink(TEST_PEERS_DB);
 
     if (failures == 0)
     {

@@ -29,6 +29,9 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **v3 onionピア探索**: PyBitmessage準拠の`OBJECT_ONIONPEER`(専用object type)を受信し、
   ネットワーク上で生存しているv3 onionピアを`peers.db`へ自動登録(受信のみ、自身のonion
   hidden serviceの運用・announceはinbound Tor同様スコープ外)
+- **手動peer追加・観測済みノードリスト**: 個人的に存在を確認したノードを`addPeer`で手動追加。
+  加えて`seeds/observed_nodes.txt`(出自・限界を明記した別ファイル、公式seedとは別枠)を
+  新規インストール時にmainnetシード全滅していても最初の1本を繋げるための足がかりとして同梱
 - **addrホストのフィルタリング**: 受信した`addr`情報からprivate/loopback/link-local等の
   アドレスを除外(内部ネットワークへの誤接続防止)
 - **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を
@@ -40,8 +43,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 ### v1スコープ外(既知の制限、backlog)
 
 - inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
-- 手動peer追加(`addPeer`) —
-  詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
+
+詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
 ## ビルド
 
@@ -106,6 +109,9 @@ $CLI send-message "$CHAN" "$CHAN" - "subject" "body" 3600 1
 $CLI set-socks-proxy 1 127.0.0.1 9050
 $CLI get-socks-proxy
 
+# 個人的に存在を確認したノードを手動で追加する(mainnetシード全滅時の最後の手段)
+$CLI add-peer 203.0.113.1 8444
+
 # その他
 $CLI cache-pubkey BM-address <signingPubkeyHex> <encryptionPubkeyHex>
 $CLI list-subscriptions
@@ -120,10 +126,11 @@ $CLI delete BM-address
 ```
 src/
   common/   共通ユーティリティ(varint、hash、JSON、キュー等)
-  core/     鍵管理・暗号・object構築/解析・送受信パイプライン・JSON-RPC API
-  infra/    P2Pネットワーク層(接続管理・object同期・peer管理)
+  core/     鍵管理・暗号・object構築/解析・送受信パイプライン・peer管理・JSON-RPC API
+  infra/    P2Pネットワーク層(接続管理・object同期)
   pow/      PoW計算エンジン
   cli/      CLIクライアント
 tests/      ctestベースのテストスイート
+seeds/      mainnetシード全滅時のフォールバック用ノードリスト(observed_nodes.txt)
 DESIGN.md   設計文書(グランドデザイン、随時更新される実装状況・決定事項)
 ```

@@ -1366,25 +1366,65 @@ mainnetシード全てrating=-1.0・4422件のknownnodes_2020インポートの�
 4431件が一括削除され、59件(生存確認済み3件+新鮮なaddr伝播56件)まで整理された。その後も
 生存ノードへの接続・addr受信が正常に継続することを確認済み。ctest 18件全通過。
 
+### 手動peer追加(`addPeer`)と「開発者が確認した身元不明のノード」リストの実装(2026-08-21)
+
+mainnetシード9件全滅への一連の対応(addr永続化・SOCKS5・knownnodes_2020インポート・
+OBJECT_ONIONPEER)を経て、実際に3件の生存ノードを発見できた。しかしこれは**このユーザーの
+2020年当時のバックアップという偶然のデータ**に依存した復旧であり、バックアップを持たない
+新規インストールでは全く再現できない(公式seedが全滅している以上、addr伝播も
+OBJECT_ONIONPEER発見も「既に1本繋がっていること」が前提の仕組みのため、最初の1本を
+繋ぐ手段自体が無い)ことが判明した。
+
+対策として2つを検討した:
+1. 発見した3件の生存ノードを`peer_manager.c`のハードコードされた公式seed一覧へ直接混ぜる
+2. `addPeer`(ユーザーが個別に保証したノードを手動追加するAPI/CLI)を実装する
+
+しかし1点、ユーザーから重要な指摘があった: 「発見した3件の運営者が誰なのか、いつまで
+稼働し続けるのかは全く分からない」という点で、これはPyBitmessageのGitHub issue #2310で
+「身元不明の匿名申告アドレスリストは信用できない」という理由により開発者が拒否した状況と
+本質的に同じ構造の問題だった(唯一の違いは、今回は実際に自分たちでP2Pハンドシェイクまで
+確認したという点だが、運営者の身元・永続性が不明という核心部分は変わらない)。
+
+この緊張関係を解決するため、「無条件にハードコードされた公式seedと同格として紛れ込ませる」
+のではなく、**出自と限界を明記した別ファイル(`seeds/observed_nodes.txt`)として同梱し、
+別のsource ('observed_seed')でpeers.dbへ登録する**という設計にした:
+
+- `seeds/observed_nodes.txt`(新規): 3件のIP:portと、冒頭に「2026-08-21にメンテナが直接
+  ハンドシェイクして生存確認しただけで、運営者の身元・永続性は保証しない」という注意書きを
+  記載した平文ファイル。`core/peer_manager.c`の`bm_peer_manager_load_observed_nodes(db, path)`
+  が読み込む(`#`コメント・空行を無視、1行「ip port」形式)。ファイルが無くても非致命的
+  (配布形態によっては同梱しない選択肢も残す)。`bm_peer_manager_seed_bootstrap`が
+  mainnet時のみ、公式seed投入と同じ「hostsテーブルが完全に空の場合だけ」というゲートで
+  自動的に読み込むようにした。
+- **peer_manager.c/hをinfra層からcore層へ移動した**: `addPeer`をAPI経由(`core/api_server.c`)
+  で提供するには、api_server.cがpeer_manager.cの機能を呼べる必要があるが、既存の
+  「infra→coreの片方向依存(circular importを避ける)」方針(§1.2)により、core層の
+  api_server.cがinfra層のpeer_manager.cを直接呼ぶことはできなかった。peer_manager.c自体は
+  実際にはsqlite3操作のみでinfra固有の依存(ソケット・P2Pメッセージパース等)が無かった
+  ため、config_store.cと同じ判断(§11「outbound Tor経路の強化」参照)でcore層へ移動する
+  のが正しい解決だった。`src/infra/peer_manager.c/h` → `src/core/peer_manager.c/h`、
+  `src/infra/CMakeLists.txt`から削除・`src/core/CMakeLists.txt`へ追加、6ファイルの
+  includeパスを更新。
+- `core/api_server.c`に`addPeer(ipAddress, port, stream?)`を追加。
+  `bm_peer_manager_upsert_learned`をsource='manual'で呼ぶ薄いラッパーで、rating=0.0
+  からスタートする(手動追加だからといって無条件に信用するわけではなく、他の候補と同じく
+  実際の接続実績でratingを積み上げていく設計を維持)。`bm_api_server_config`に
+  `peers_db`フィールド(NULL可)を追加。
+- `cli/main.c`に`add-peer <ipAddress> <port> [stream]`を追加。
+
+`tests/test_network_testnet.c`に`bm_peer_manager_load_observed_nodes`(コメント・空行・
+不正な行の無視、有効な行だけの登録)の、`tests/test_api_server.c`に`addPeer`(正常系・
+不正なport)のcaseを追加。実daemonで新規インストールを模した検証(空のpeers.db、
+`seeds/observed_nodes.txt`を同梱)を行い、公式seed9件は全滅する一方、observed_nodes.txt
+由来の3件全てに実際に接続できることを確認した(「新規インストールでもmainnetへ繋がれる」
+という当初の目的を実証)。`add-peer` CLIコマンドの実daemonでの動作、不正な値の拒否も
+確認済み。ctest 18件全通過。
+
 ### v1.1以降のbacklog
 
-2026-08-21に優先順位付けした6項目(addrホストフィルタリング・getpubkey応答のスロットリング・
-直接pubkey送信の自動再送・DoS上限の見直し・chan仕様・設定変更の動的リロード)、および
-その後追加で対応したpeers.dbクリーンアップは全て完了した。残るのは以下の通り。
+2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
+手動peer追加/observed_nodesリスト)は全て完了した。残るのは以下の通り。
 
-- **手動peer追加(`addPeer`)**: mainnetシード全滅時、addr永続化(§11「addr受信のpeer_manager
-  永続化」参照)は既知peerへ接続できて初めて機能する。「そもそも1件も接続できない」状況の
-  最後の手段として、ユーザーが個人的に(掲示板等ではなく実際に運用者と面識のある経路で)
-  存在を確認したノードを手動でpeers.dbへ追加できるAPI/CLIがあるとよい(2026-08-21検討)。
-  ユーザーが2020年当時運用していたPyBitmessageの`knownnodes.dat`バックアップを発見した
-  (2026-08-21)ため、これを取り込む一時的な用途にも使える見込み(6年前のデータで大半は
-  既に停止している可能性が高いが、生きているものが混ざっていればaddr伝播の足がかりに
-  なる)。PyBitmessageのGitHub issue #2310で「身元不明の匿名申告onionアドレスリスト」の採用が
-  「身元がわからないアドレスは信用できない」という理由で開発者に拒否された事例があり、
-  それと同じ理由でこの実装でも匿名の公開リストを自動採用する設計は避ける方針とした
-  (rating方式は接続実績で信用を積み上げる仕組みであり、bootstrap候補そのものには
-  実績が無いためこの防御が機能しない)。あくまで人間が個別に保証したノードを手動で足す、
-  という線引き。実装は未着手(v1.1で他backlogを優先するためスキップ、2026-08-21)。
 - inbound接続(Tor hidden service)、Dandelion++のstem機能、GPU/OpenCL PoWは
   §8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 

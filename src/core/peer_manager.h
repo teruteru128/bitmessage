@@ -42,6 +42,18 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
 int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet);
 
 /*
+ * §11「開発者が確認した身元不明のつながる可能性のあるノード」リスト(seeds/observed_nodes.txt、
+ * 既定でbm_peer_manager_seed_bootstrapがmainnet時のみ自動的に読み込む)を読み込みpeers.dbへ
+ * 登録する。1行に"ip_address port"、#で始まる行と空行は無視する。ファイルが無ければ何もせず
+ * 0を返す(非致命的、配布形態によっては同梱されない場合もあるため)。公式seed一覧とは別の
+ * source='observed_seed'で登録し、rating=0.0からのスタートとする(優先的に信用するわけでは
+ * なく、初回接続の足がかり候補が1つ増えるだけの位置づけ、ファイル冒頭のコメント参照)。
+ * 登録できた件数を返す(パース失敗行・DB書き込み失敗行はスキップしてカウントしない。
+ * ファイル無し・有効な行が0件でも0を返すだけでエラー扱いはしない)。
+ */
+int bm_peer_manager_load_observed_nodes(sqlite3 *db, const char *path);
+
+/*
  * peer_connectorの接続試行結果をratingへ反映する(PyBitmessageのrating更新方式を簡略化した
  * もの)。成功ならrating+0.1(上限1.0)とlast_seenを現在時刻に更新、失敗ならrating-0.1
  * (下限-1.0)のみ更新する。該当行が無ければ何もしない(候補は常にlist_topの結果から来るため

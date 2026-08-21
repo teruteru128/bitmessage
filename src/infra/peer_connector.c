@@ -14,8 +14,8 @@
 #include <unistd.h>
 
 #include "../core/config_store.h"
+#include "../core/peer_manager.h"
 #include "network.h"
-#include "peer_manager.h"
 #include "peer_registry.h"
 
 #define MAX_CANDIDATES 32

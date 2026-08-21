@@ -28,6 +28,9 @@ struct bm_api_server_config
     /* §11 config.db(core/config_store.c)。NULL可(その場合getSocksProxy/setSocksProxyは
      * エラーを返す。testやCLI単体動作用)。 */
     sqlite3 *config_db;
+    /* §11 peers.db(core/peer_manager.c)。NULL可(その場合addPeerはエラーを返す。testや
+     * CLI単体動作用)。addPeerで手動追加したpeerはsource='manual'で登録される。 */
+    sqlite3 *peers_db;
 };
 
 /* bind+listenする。成功時0、*out_listen_fdにfdを設定。失敗時(ポート使用中等)は非0 */

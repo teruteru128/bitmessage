@@ -16,13 +16,13 @@
 #include "../core/broadcast_decrypt.h"
 #include "../core/message_builder.h"
 #include "../core/messages_store.h"
+#include "../core/peer_manager.h"
 #include "../core/pubkey_cache.h"
 #include "../core/send_pipeline.h"
 #include "../core/trial_decrypt.h"
 #include "../pow/pow_engine.h"
 #include "object.h"
 #include "object_store.h"
-#include "peer_manager.h"
 
 /* DoS対策の上限値(DESIGN.md §5.0、PyBitmessage protocol.py準拠) */
 #define BM_MAX_INVENTORY_ITEMS 50000

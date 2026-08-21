@@ -10,8 +10,9 @@ add_library(bm_core STATIC
     broadcast_decrypt.c
     send_pipeline.c
     config_store.c
+    peer_manager.c
     api_server.c
 )
 
 target_include_directories(bm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(bm_core PUBLIC bm_common bm_pow OpenSSL::Crypto)
+target_link_libraries(bm_core PUBLIC bm_common bm_pow SQLite::SQLite3 OpenSSL::Crypto)

@@ -125,6 +125,53 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
     return 0;
 }
 
+int bm_peer_manager_load_observed_nodes(sqlite3 *db, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+    {
+        return 0;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+    int loaded = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        char ip[64];
+        int port = 0;
+        char *p = line;
+        while (*p == ' ' || *p == '\t')
+        {
+            p++;
+        }
+        if (*p == '#' || *p == '\n' || *p == '\0')
+        {
+            continue;
+        }
+        if (sscanf(p, "%63s %d", ip, &port) != 2 || port <= 0 || port > 65535)
+        {
+            continue;
+        }
+
+        struct bm_peer_entry entry;
+        memset(&entry, 0, sizeof(entry));
+        strncpy(entry.ip_address, ip, sizeof(entry.ip_address) - 1);
+        entry.port = port;
+        entry.stream = 1;
+        entry.services = 1;
+        entry.last_seen = now;
+        entry.rating = 0.0;
+        strncpy(entry.source, "observed_seed", sizeof(entry.source) - 1);
+        if (bm_peer_manager_upsert(db, &entry) == 0)
+        {
+            loaded++;
+        }
+    }
+    fclose(f);
+    return loaded;
+}
+
 int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
 {
     sqlite3_stmt *count_stmt = NULL;
@@ -167,6 +214,18 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
     }
     fprintf(stderr, "[peer_manager] seeded %zu bootstrap nodes (%s)\n", seed_count,
             testnet ? "testnet" : "mainnet");
+
+    if (!testnet)
+    {
+        int observed = bm_peer_manager_load_observed_nodes(db, "seeds/observed_nodes.txt");
+        if (observed > 0)
+        {
+            fprintf(stderr,
+                    "[peer_manager] seeded %d observed node(s) from seeds/observed_nodes.txt "
+                    "(unverified operators, see DESIGN.md §11)\n",
+                    observed);
+        }
+    }
     return 0;
 }
 

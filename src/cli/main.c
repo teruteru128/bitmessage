@@ -55,7 +55,10 @@ static void print_usage(const char *prog)
             "  get-socks-proxy\n"
             "  set-socks-proxy <enabled:0|1> <host> <port>\n"
             "      outbound接続用SOCKS5プロキシ(Tor等)の設定。config.dbへ永続化され、稼働中の\n"
-            "      bitmessagedにも次の再接続サイクル(既定30秒以内)で反映される(再起動不要)\n",
+            "      bitmessagedにも次の再接続サイクル(既定30秒以内)で反映される(再起動不要)\n"
+            "  add-peer <ipAddress> <port> [stream]\n"
+            "      個人的に存在を確認した(掲示板等の匿名リストではなく実際に運用者と面識のある\n"
+            "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n",
             prog);
 }
 
@@ -343,6 +346,23 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[3]));
         bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
         return call_rpc(&env, "setSocksProxy", params);
+    }
+
+    if (strcmp(cmd, "add-peer") == 0)
+    {
+        if (argc < 4 || argc > 5)
+        {
+            fprintf(stderr, "使い方: %s add-peer <ipAddress> <port> [stream]\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_number(atof(argv[3])));
+        if (argc == 5)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
+        }
+        return call_rpc(&env, "addPeer", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);

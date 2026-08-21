@@ -22,6 +22,7 @@
 #include "identity_store.h"
 #include "message_builder.h"
 #include "messages_store.h"
+#include "peer_manager.h"
 #include "pubkey_cache.h"
 #include "send_pipeline.h"
 
@@ -733,6 +734,62 @@ static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *confi
     return bm_json_new_bool(1);
 }
 
+/*
+ * §11 手動peer追加(`addPeer`): [ipAddress, port, stream?]
+ *
+ * mainnetシード全滅時、addr伝播やOBJECT_ONIONPEER発見は既に1本繋がっていることが前提の
+ * 仕組みのため、そもそも1件も接続できない状況では機能しない。その最後の手段として、
+ * ユーザーが個人的に(掲示板等の匿名リストではなく、実際に運用者と面識のある経路で)
+ * 存在を確認したノードを手動でpeers.dbへ追加する。PyBitmessageのGitHub issue #2310で
+ * 「身元不明の匿名申告アドレスリスト」の採用が拒否された事例を踏まえ、この実装でも
+ * 匿名の公開リストを自動採用する設計は避けている(DESIGN.md §11参照。同じ理由で
+ * seeds/observed_nodes.txtも「開発者が直接確認しただけ」という限定的な位置づけで
+ * peer_manager.c側に分離してある)。
+ *
+ * bm_peer_manager_upsert_learnedを使うため、rating=0.0(既存行があれば変更しない)から
+ * スタートする。手動追加だからといって無条件に信用するわけではなく、他の候補と同じく
+ * 実際の接続実績でratingを積み上げていく。
+ */
+static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
+                                   const bm_json_value_t *params, char **out_error)
+{
+    if (config->peers_db == NULL)
+    {
+        *out_error = dup_cstr("peer store is not available");
+        return NULL;
+    }
+
+    const char *ip_address = param_str(params, 0);
+    const bm_json_value_t *port_v = bm_json_array_get(params, 1);
+    const bm_json_value_t *stream_v = bm_json_array_get(params, 2);
+    if (ip_address == NULL || port_v == NULL)
+    {
+        *out_error = dup_cstr("addPeer requires [ipAddress, port, stream?]");
+        return NULL;
+    }
+    if (strlen(ip_address) == 0 || strlen(ip_address) >= 64)
+    {
+        *out_error = dup_cstr("ipAddress must be non-empty and shorter than 64 bytes");
+        return NULL;
+    }
+
+    int port = (int)bm_json_as_number(port_v);
+    if (port <= 0 || port > 65535)
+    {
+        *out_error = dup_cstr("port must be between 1 and 65535");
+        return NULL;
+    }
+    int stream = stream_v != NULL ? (int)bm_json_as_number(stream_v) : 1;
+
+    if (bm_peer_manager_upsert_learned(config->peers_db, ip_address, port, stream, 1,
+                                        (int64_t)time(NULL), "manual") != 0)
+    {
+        *out_error = dup_cstr("failed to store peer");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
 static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
                                             const bm_json_value_t *params, char **out_error)
 {
@@ -784,6 +841,7 @@ static const struct bm_api_method METHODS[] = {
     {"listSubscriptions", h_listSubscriptions},
     {"getSocksProxy", h_getSocksProxy},
     {"setSocksProxy", h_setSocksProxy},
+    {"addPeer", h_addPeer},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

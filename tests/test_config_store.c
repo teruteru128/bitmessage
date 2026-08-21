@@ -19,8 +19,8 @@
 #include <unistd.h>
 
 #include "../src/core/config_store.h"
+#include "../src/core/peer_manager.h"
 #include "../src/infra/peer_connector.h"
-#include "../src/infra/peer_manager.h"
 #include "../src/infra/peer_registry.h"
 
 #define TEST_PEERS_DB "test_config_store_peers.db"

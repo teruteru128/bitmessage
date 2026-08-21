@@ -19,6 +19,7 @@
 #include "core/identity_store.h"
 #include "core/keyring.h"
 #include "core/messages_store.h"
+#include "core/peer_manager.h"
 #include "core/send_pipeline.h"
 #include "core/trial_decrypt.h"
 #include "infra/network.h"
@@ -26,7 +27,6 @@
 #include "infra/object_sync.h"
 #include "infra/peer_connector.h"
 #include "infra/peer_registry.h"
-#include "infra/peer_manager.h"
 #include "infra/protocol.h"
 
 /* BM_PROJECT_VERSIONはCMakeLists.txt(ルート)のproject(bitmessage VERSION ...)から
@@ -165,6 +165,7 @@ int main(void)
     api_config.messages_db = messages_db;
     api_config.broadcast_queue = &queues.broadcast_queue;
     api_config.config_db = config_db;
+    api_config.peers_db = peers_db;
     fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、設定ファイル未実装)\n",
             api_password, api_port);
 

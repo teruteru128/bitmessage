@@ -28,7 +28,7 @@
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
 #include "../src/infra/object_sync.h"
-#include "../src/infra/peer_manager.h"
+#include "../src/core/peer_manager.h"
 #include "../src/infra/peer_registry.h"
 #include "../src/infra/protocol.h"
 #include "../src/pow/pow_engine.h"
