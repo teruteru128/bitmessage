@@ -1621,6 +1621,35 @@ peer`が実際にobject_pool.dbへ`BM_OBJECT_ONIONPEER`型のobjectを挿入す�
 `[object_sync] announced our onion peer: ...`が出て後続の起動処理(peer_connector等)を
 ブロックしないことを確認した。ctest 20件全通過。
 
+### 静的torrc設定への対応: BM_ONION_ADDRESS(2026-08-22)
+
+Stage 2(ControlPort自動化)を実装した後、「ユーザーが自分でtorrcにHiddenServiceDir/
+HiddenServicePortを静的に設定し、Tor自体はdaemonと一切やり取りしない」という運用
+(まさに開発者自身がこの一連の実装の動作確認のために最初からやっていた構成)についても
+確認された。この場合、Stage 1(`bm_network_listen`、Tor非依存)だけで接続受付自体は
+既に機能していたが、`OBJECT_ONIONPEER`の自己announce(前項)はStage 2のADD_ONION応答から
+得たonionアドレス文字列にしか発火しないため、静的torrc運用単体では自分のonionアドレスを
+ネットワークへ告知できないという抜けがあった。PyBitmessageの`keys.dat`の`onionhostname`
+設定(stemによる自動作成を使わず、ユーザーが直接教えたonionアドレスをそのまま使う)と
+同じ位置づけの機能が必要と分かり、`BM_ONION_ADDRESS`環境変数として追加した。
+
+**main.cでの優先順位:** `BM_ONION_ADDRESS`が設定されていれば、ControlPort連携(Stage 2)を
+完全にスキップし、そのアドレスをそのまま`bm_object_sync_announce_onion_peer`で告知する
+(`else if`でStage 2と排他)。PyBitmessageも`onionhostname`設定時はstemによる自動作成を
+試みないため、同じ優先順位に揃えた。外部から見えるポート番号(`BM_TOR_VIRTUAL_PORT`、
+既定8444)はStage 2と共通の変数をそのまま使う(「他のpeerが自分のonionアドレスのどの
+ポートへ接続してくるか」という意味は経路によらず同じであるため)。
+
+**検証:** 実daemon(独立した一時ディレクトリ)でテスト専用のダミーonionアドレス
+(実オニオンアドレスではなく、tests/test_object_sync.cで使っているのと同じテスト用文字列)を
+`BM_ONION_ADDRESS`に指定して起動し、ControlPortへは一切接続せずに
+`[tor_control] using statically configured onion address: ...`
+`[object_sync] announced our onion peer: ...`
+の両方が出て、後続の起動処理(peer_connector等)もブロックしないことを確認した。ctest
+20件全通過(既存のbm_object_sync_announce_onion_peer自体のテストで実質カバーされている
+ため、このBM_ONION_ADDRESS配線自体に対する新規ctestは追加していない。main.cの環境変数
+分岐という薄い配線のみのため)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

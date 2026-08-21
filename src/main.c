@@ -262,6 +262,37 @@ int main(void)
         }
     }
 
+    /* §11 inbound接続 Stage 2: Tor hidden service連携(ControlPort自動化 or 静的torrc設定)。
+     * どちらもStage 1のlistenが成功している場合のみ試みる(listen_connが無ければ転送する
+     * 先が無い)。外部から見えるポート番号はBM_TOR_VIRTUAL_PORT(既定8444)で、ControlPortの
+     * ADD_ONIONでも静的torrc設定でも共通して使う(「他のpeerが自分のonionアドレスの
+     * どのポートへ接続してくるか」という意味は経路によらず同じため)。 */
+    int virtual_port = 8444;
+    const char *virtual_port_env = getenv("BM_TOR_VIRTUAL_PORT");
+    if (virtual_port_env != NULL)
+    {
+        virtual_port = atoi(virtual_port_env);
+    }
+
+    /* §11 静的torrc設定への対応(PyBitmessageのkeys.dat onionhostname相当)。ユーザーが
+     * ControlPortを使わず自分でtorrcにHiddenServiceDir/HiddenServicePortを設定し、
+     * BM_INBOUND_PORTへ転送するよう構成した場合、daemon自身はTorと一切やり取りしないため
+     * 自分のonionアドレスを知る手段が無い。BM_ONION_ADDRESSでユーザーが直接教えれば、
+     * ControlPort連携(下記)を完全にスキップして、そのアドレスをそのままonionpeer objectで
+     * 告知する。BM_TOR_CONTROLより優先する(PyBitmessageもonionhostname設定時はstemによる
+     * 自動作成を試みない、同じ優先順位)。 */
+    int tor_control_fd = -1;
+    const char *manual_onion_address = getenv("BM_ONION_ADDRESS");
+    if (listen_conn != NULL && manual_onion_address != NULL)
+    {
+        if (bm_object_sync_announce_onion_peer(&object_sync_ctx, manual_onion_address, virtual_port) == 0)
+        {
+            fprintf(stderr,
+                    "[tor_control] using statically configured onion address: %s:%d -> 127.0.0.1:%d "
+                    "(BM_ONION_ADDRESS)\n",
+                    manual_onion_address, virtual_port, inbound_port);
+        }
+    }
     /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
      * Stage 1のlistenが成功している場合のみ試みる(listen_connが無ければADD_ONIONで転送する
      * 先が無い)。ControlPortへの接続はUnixドメインソケット(既定/run/tor/control、Debian/
@@ -273,8 +304,7 @@ int main(void)
      * のライフサイクルをプロセスの生存期間と一致させ、プロセス終了(正常終了・クラッシュ問わず)
      * でTor側が自動的にhidden serviceを片付けてくれるようにしている(そうしないと次回起動時に
      * 永続化した鍵での再作成が"550 Onion address collision"で失敗する、tor_control.h参照)。 */
-    int tor_control_fd = -1;
-    if (listen_conn != NULL && getenv("BM_TOR_CONTROL") != NULL && strcmp(getenv("BM_TOR_CONTROL"), "1") == 0)
+    else if (listen_conn != NULL && getenv("BM_TOR_CONTROL") != NULL && strcmp(getenv("BM_TOR_CONTROL"), "1") == 0)
     {
         struct bm_tor_control_config tor_config;
         memset(&tor_config, 0, sizeof(tor_config));
@@ -284,13 +314,6 @@ int main(void)
         tor_config.control_host = (control_host != NULL) ? control_host : "127.0.0.1";
         const char *control_port_env = getenv("BM_TOR_CONTROL_PORT");
         tor_config.control_port = (control_port_env != NULL) ? atoi(control_port_env) : 9051;
-
-        int virtual_port = 8444;
-        const char *virtual_port_env = getenv("BM_TOR_VIRTUAL_PORT");
-        if (virtual_port_env != NULL)
-        {
-            virtual_port = atoi(virtual_port_env);
-        }
 
         tor_control_fd = bm_tor_control_connect_and_authenticate(&tor_config);
         if (tor_control_fd < 0)
