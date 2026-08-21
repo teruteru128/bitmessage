@@ -407,38 +407,45 @@ int main(void)
     CHECK(deleted >= 1, "gc should remove at least the expired dummy object");
     CHECK(bm_object_store_has(object_pool_db, expired_hash) == 0, "expired object should be gone after gc");
 
-    /* --- 6. addr受信 -> peers.dbへ登録(§11) --- */
+    /* --- 6. addr受信 -> peers.dbへ登録(§11)。ルーティング可能なホストは登録され、
+     * private/loopback等はフィルタリングされて登録されないことを確認する --- */
     {
-        unsigned char ipv4_mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 203, 0, 113, 42};
-        unsigned char entry[38];
-        unsigned char *p = entry;
+        /* entryを1件分組み立てるヘルパー相当(ローカル配列に直接書き込む) */
+        unsigned char ipv4_routable[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 203, 0, 113, 42};
+        unsigned char ipv4_private[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 1, 1};
+        unsigned char entries[2][38];
+        const unsigned char *ips[2] = {ipv4_routable, ipv4_private};
         uint64_t addr_time = (uint64_t)time(NULL);
-        for (int i = 0; i < 8; i++)
+        for (int e = 0; e < 2; e++)
         {
-            p[i] = (unsigned char)((addr_time >> (56 - 8 * i)) & 0xff);
+            unsigned char *p = entries[e];
+            for (int i = 0; i < 8; i++)
+            {
+                p[i] = (unsigned char)((addr_time >> (56 - 8 * i)) & 0xff);
+            }
+            p += 8;
+            uint32_t stream = 1;
+            for (int i = 0; i < 4; i++)
+            {
+                p[i] = (unsigned char)((stream >> (24 - 8 * i)) & 0xff);
+            }
+            p += 4;
+            uint64_t services = 1;
+            for (int i = 0; i < 8; i++)
+            {
+                p[i] = (unsigned char)((services >> (56 - 8 * i)) & 0xff);
+            }
+            p += 8;
+            memcpy(p, ips[e], 16);
+            p += 16;
+            uint16_t port = htons(8444);
+            memcpy(p, &port, 2);
         }
-        p += 8;
-        uint32_t stream = 1;
-        for (int i = 0; i < 4; i++)
-        {
-            p[i] = (unsigned char)((stream >> (24 - 8 * i)) & 0xff);
-        }
-        p += 4;
-        uint64_t services = 1;
-        for (int i = 0; i < 8; i++)
-        {
-            p[i] = (unsigned char)((services >> (56 - 8 * i)) & 0xff);
-        }
-        p += 8;
-        memcpy(p, ipv4_mapped, 16);
-        p += 16;
-        uint16_t port = htons(8444);
-        memcpy(p, &port, 2);
 
-        unsigned char addr_payload[1 + sizeof(entry)];
-        bm_varint_encode(addr_payload, 1);
-        memcpy(addr_payload + bm_varint_size(1), entry, sizeof(entry));
-        size_t addr_payload_len = bm_varint_size(1) + sizeof(entry);
+        unsigned char addr_payload[1 + sizeof(entries)];
+        bm_varint_encode(addr_payload, 2);
+        memcpy(addr_payload + bm_varint_size(2), entries, sizeof(entries));
+        size_t addr_payload_len = bm_varint_size(2) + sizeof(entries);
 
         size_t addr_packet_len = 0;
         unsigned char *addr_packet = bm_create_packet("addr", addr_payload, addr_payload_len, &addr_packet_len);
@@ -455,12 +462,20 @@ int main(void)
         sqlite3_prepare_v2(peers_db,
                             "SELECT port, source FROM hosts WHERE ip_address = '203.0.113.42';", -1,
                             &addr_stmt, NULL);
-        CHECK(sqlite3_step(addr_stmt) == SQLITE_ROW, "addr entry should be registered into peers.db");
+        CHECK(sqlite3_step(addr_stmt) == SQLITE_ROW, "routable addr entry should be registered into peers.db");
         CHECK(sqlite3_column_int(addr_stmt, 0) == 8444, "registered port should match addr entry");
         const char *addr_source = (const char *)sqlite3_column_text(addr_stmt, 1);
         CHECK(addr_source != NULL && strcmp(addr_source, "addr_msg") == 0,
               "registered source should be 'addr_msg'");
         sqlite3_finalize(addr_stmt);
+
+        sqlite3_stmt *private_stmt = NULL;
+        sqlite3_prepare_v2(peers_db, "SELECT COUNT(*) FROM hosts WHERE ip_address = '192.168.1.1';", -1,
+                            &private_stmt, NULL);
+        CHECK(sqlite3_step(private_stmt) == SQLITE_ROW, "private addr count query should return a row");
+        CHECK(sqlite3_column_int(private_stmt, 0) == 0,
+              "private (192.168.0.0/16) addr entry should be filtered out, not registered");
+        sqlite3_finalize(private_stmt);
     }
 
     close(fds[0]);
