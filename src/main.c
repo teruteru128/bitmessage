@@ -22,6 +22,7 @@
 #include "core/trial_decrypt.h"
 #include "infra/network.h"
 #include "infra/object_store.h"
+#include "infra/object_sync.h"
 #include "infra/peer_connector.h"
 #include "infra/peer_manager.h"
 #include "infra/protocol.h"
@@ -157,10 +158,16 @@ int main(void)
     pthread_create(&th_api_server, NULL, bm_api_server_thread, &api_config);
     pthread_detach(th_api_server);
 
+    /* §1.1 object_sync_thread。ctxはmain()がsigwaitでブロックしている間ずっと生存する
+     * スタック変数(api_configと同じ扱い)。network_epoll_threadはdetach済みなのでpthread_join
+     * より前に破棄されないことをそれで保証している。 */
+    struct bm_object_sync_ctx object_sync_ctx;
+    bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, &keyring);
+
     struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));
     net_args->epfd = epfd;
-    net_args->handler = NULL; /* default_dispatch(version/verack/ping等の最小限の応答) */
-    net_args->user_data = NULL;
+    net_args->handler = bm_object_sync_dispatch;
+    net_args->user_data = &object_sync_ctx;
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);
 
