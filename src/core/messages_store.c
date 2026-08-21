@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "../common/db_common.h"
+#include "../common/hash.h"
 
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS inbox ("
@@ -171,4 +172,41 @@ int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char *ack_data, si
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_try_mark_ack_received(sqlite3 *db, const unsigned char received_hash[32])
+{
+    static const char *SELECT_SQL = "SELECT ack_data FROM sent WHERE status != 'ackreceived';";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SELECT_SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+
+    int found = 0;
+    while (!found && sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        const void *ack_data = sqlite3_column_blob(stmt, 0);
+        int ack_data_len = sqlite3_column_bytes(stmt, 0);
+        if (ack_data_len <= 0)
+        {
+            continue;
+        }
+        unsigned char computed[32];
+        bm_inventory_hash((const unsigned char *)ack_data, (size_t)ack_data_len, computed);
+        if (memcmp(computed, received_hash, 32) == 0)
+        {
+            static const char *UPDATE_SQL = "UPDATE sent SET status = 'ackreceived' WHERE ack_data = ?1;";
+            sqlite3_stmt *upd = NULL;
+            if (sqlite3_prepare_v2(db, UPDATE_SQL, -1, &upd, NULL) == SQLITE_OK)
+            {
+                sqlite3_bind_blob(upd, 1, ack_data, ack_data_len, SQLITE_TRANSIENT);
+                sqlite3_step(upd);
+                sqlite3_finalize(upd);
+                found = 1;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found ? 0 : -1;
 }

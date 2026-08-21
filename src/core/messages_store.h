@@ -27,6 +27,15 @@ int bm_messages_store_insert_sent(sqlite3 *db, const unsigned char *ack_data, si
                                    const char *subject, const char *body,
                                    const char *status, int64_t sent_time, int64_t ttl);
 
+/*
+ * §5.5: 受信したobjectのinventory hash(bm_inventory_hash)がsentテーブルのいずれかの行の
+ * ack_dataから計算したinventory hashと一致すれば、その行のstatusを'ackreceived'へ更新する
+ * (object_sync_thread から呼ばれる)。ack_dataは既にPoW nonce込みの完全なobjectバイト列
+ * (send_pipeline.cが格納する)なので、そのままhashを取り直して比較すればよい。
+ * 一致して更新できたら0、該当なし/既にackreceived済みなら非0を返す。
+ */
+int bm_messages_store_try_mark_ack_received(sqlite3 *db, const unsigned char received_hash[32]);
+
 #define BM_MESSAGES_ADDRESS_MAX 40
 #define BM_MESSAGES_FOLDER_MAX 16
 

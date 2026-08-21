@@ -43,3 +43,7 @@ add_test(NAME network_testnet COMMAND test_network_testnet)
 add_executable(test_pubkey_cache test_pubkey_cache.c)
 target_link_libraries(test_pubkey_cache PRIVATE bm_core bm_infra)
 add_test(NAME pubkey_cache COMMAND test_pubkey_cache)
+
+add_executable(test_object_sync test_object_sync.c)
+target_link_libraries(test_object_sync PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME object_sync COMMAND test_object_sync)

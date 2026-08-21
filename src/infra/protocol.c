@@ -372,3 +372,20 @@ unsigned char *bm_create_packet(const char *command, const unsigned char *payloa
     }
     return out;
 }
+
+unsigned char *bm_create_inventory_message(const char *command, const unsigned char (*hashes)[32],
+                                            size_t count, size_t *out_len)
+{
+    size_t payload_len = bm_varint_size(count) + count * 32;
+    unsigned char *payload = malloc(payload_len);
+    bm_varint_encode(payload, count);
+    unsigned char *p = payload + bm_varint_size(count); /* bm_varint_encodeはoutをそのまま返す(進めない) */
+    for (size_t i = 0; i < count; i++)
+    {
+        memcpy(p, hashes[i], 32);
+        p += 32;
+    }
+    unsigned char *packet = bm_create_packet(command, payload, payload_len, out_len);
+    free(payload);
+    return packet;
+}

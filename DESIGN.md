@@ -29,11 +29,32 @@
 追記。実際にtestnetの実ノード(`5.78.198.100:8444`, `/PyBitmessage:0.6.3.2/`)とTCP接続→version送信→
 verack受信→相手のversion受信、というプロトコルレベルのハンドシェイクが成立することを手動で確認済み
 (magic bytes・24byteヘッダ・checksum・varintエンコード・versionメッセージ構築が実ネットワークと
-バイト単位で相互運用可能であることの実証)。ただし`command_worker_thread`/`object_sync_thread`は
-まだ`network_epoll_thread`内の`default_dispatch`(version/verack/ping応答のみ、addr/inv/objectは
-ログ出力のみ)で代用しており、`peer_manager`/`object_store`への実際の保存やgetdata送信は未実装(TODO)。
+バイト単位で相互運用可能であることの実証)。
 `peer_connector_thread`もv1は起動時1回のみの接続で、常駐しての再接続・維持ループは未実装(TODO、
-`src/infra/peer_connector.c`)。**
+`src/infra/peer_connector.c`)。
+
+**`object_sync_thread`実装済み(`src/infra/object_sync.c/h`、2026-08-22)。** `command_worker_thread`の
+役割も兼ねる形で1関数(`bm_object_sync_dispatch`)にまとめ、`network_epoll_thread`のハンドラとして
+差し替える(`main.c`)。実装内容:
+- `inv`受信 → 未所持hashのみ`getdata`で要求(`bm_object_store_has`で既知判定)
+- `getdata`受信 → `object_pool.db`にあれば同じ接続へ`object`を返す(無ければ黙って無視)
+- `object`受信 → 重複排除して`object_pool.db`へ保存。type=msgなら`trial_decrypt`(§5.3)を試み
+  成功時inboxへ、type=pubkey(v2/v3)なら`pubkey_cache`(§2.3)へ登録。**ack突合せ
+  (`bm_messages_store_try_mark_ack_received`、§5.5)は既知/未知・type問わず毎回最初に試みる**
+  ようにしている点に注意(自分がack先回り登録した直後に同じackが"届く"ケースでも取りこぼさない
+  ため、既知object早期returnより前に置く設計)
+- 期限切れobjectのGC(`bm_object_sync_gc`、`object_store.c`の`delete_expired`を呼ぶだけ)を
+  300秒間隔で間引きながら実行
+
+DoS対策としてinv/getdataの要素数上限(50000)とobject payloadサイズ上限(256KiB、§5.0)を
+このディスパッチ内で強制する。v1スコープ外(既知の制限、TODO): 受信objectを他の接続中peerへ
+能動的にinv broadcastする処理(接続レジストリが未実装のため、複数peer間の中継はまだできない)、
+addrのpeer_manager永続化、getpubkey受信時の自応答、broadcast(type=3)の購読・復号、
+pubkey v4の自動キャッシュ(候補ripeが必要なためgetpubkey自動化と合わせて要検討)。
+`tests/test_object_sync.c`でinv→getdata、object重複排除、getdata応答、GC、そして
+send_pipeline.cで実際に組み立てたmsgをdispatchに流し込み「trial_decrypt→inbox保存→
+埋め込みfullAckPayloadのobject_pool.db取り込み→そのack自体を受信した体でdispatchに
+流す→sent.statusがackreceivedへ遷移」までのack往復をend-to-endで検証済み(2026-08-22)。
 
 ### 1.1 スレッド一覧
 
@@ -65,6 +86,14 @@ verack受信→相手のversion受信、というプロトコルレベルのハ�
 [pow_worker_thread] × NumCPU  pow_request_queueからjobを取り出しnonce探索、
                                見つかったらpow_result_queueへpush
 ```
+
+**実装上の注記(2026-08-22)**: 上記は初版設計時点の理想形。実装では`bm_queue.h`のキュー群
+(`main.c`の`struct bm_queues`)は骨格として確保したまま中身が未配線で、`command_worker_thread`/
+`decrypt_worker_thread`/`pow_worker_thread`はそれぞれ独立スレッドではなく、`object_sync_thread`
+(`network_epoll_thread`のハンドラとして動作)から`trial_decrypt`/`pow_engine`を直接関数呼び出しする
+形に単純化されている(1プロセス内スレッド分離という前提上、キュー越しの非同期化より直接呼び出しの
+方がシンプルで、v1では並列度より実装の見通しを優先した)。`pow_worker_thread`の並列化(NumCPU本)は
+§11のTODO。
 
 ### 1.2 層間キュー
 
@@ -541,6 +570,17 @@ msg送信時、受信側の`bitfield`が`BITFIELD_DOESACK`を要求していれ�
 送信側は自分が生成した`ackdata`と同じ`inventoryHash`を持つ`object`メッセージがネットワークに現れるのを
 監視し、見つかったら送達確認とする。
 
+**実装済み(2026-08-22)。** `send_pipeline.c`の`generate_full_ack`が上記`fullAckPayload`生成
+(PoW+`CreatePacket`包み)を担い、`bm_build_ack_object`(ackobject本体のみ)と対になる。
+`sent.ack_data`にはPoW済みnonce込みobject本体(P2Pヘッダ無し、`inventoryHash`計算用)を、
+msgへの埋め込みには`CreatePacket`で包んだ完成P2Pパケット(受信側がそのまま書き込める形)を
+それぞれ格納する(両者は別物である点に注意、`bm_build_msg`のドキュメントコメント参照)。
+受信側の「そのまま書き込む」に対応する実装は`trial_decrypt.c`の`out_ack_payload`出力→
+`object_sync.c`の`validate_and_store_ack`(§1参照、object header・PoW・期限を検証してから
+自分のobject_pool.dbへ挿入。他peerへの能動的な再送出=inv broadcastは接続レジストリ未実装のため
+TODO)。送達確認(`ackreceived`遷移)は`messages_store.c`の`bm_messages_store_try_mark_ack_received`
+(§1のobject_sync_thread参照)。
+
 ## 6. API層(フロント⇄コア暗号層)方針決定
 
 **実装済み(`src/core/api_server.c`)。自前JSON-RPC 2.0(`src/common/json.c`、外部JSONライブラリ非依存の
@@ -789,15 +829,16 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
 
 ## 11. 次にやること(引き継ぎメモ、随時更新)
 
-`pubkey_cache`実装完了・push済み(commit `d62a2ef`, 2026-08-21)。ctest 11件全通過。
+`object_sync_thread`実装完了・push済み(2026-08-22、コミット直前)。ctest 12件全通過。
 次に着手する項目は特に指定が無い限り、以下から都度ユーザーに確認して選ぶこと(このセッションの
 一貫した進め方: 毎回ユーザーが次の項目を明示的に指名してから着手する)。
 
-- **`object_sync_thread`本実装**: 現状`default_dispatch`(`src/infra/network.c`)はaddr/inv/objectを
-  受信してもログ出力するだけで、`peer_manager`/`object_store`への永続化配線が無い。実ネットワークから
-  受信した`pubkey`/`getpubkey`オブジェクトを`pubkey_cache.c`のパーサ(`bm_parse_pubkey_v2/v3/v4`)に
-  実際に渡す経路もここに含まれる(現状はmessage_builder.cで構築した自己生成オブジェクトのラウンド
-  トリップテストのみ)。
+- **他peerへのinv broadcast(接続レジストリ)**: 現状`object_sync.c`は受信したobjectを自分の
+  `object_pool.db`へ保存する・同じ接続からのgetdataに答えるところまでで、「新しく手に入れたobjectを
+  “今つながっている他のpeer”へ`inv`で積極的に知らせる」処理が無い(=複数peer間の中継・拡散が
+  まだできない)。これをやるには`network_epoll_thread`が管理している`bm_fd_data`の集合へ
+  外部からアクセスする手段(接続レジストリ)が要る。自分が送信したmsg/ack objectを実際にネットワークへ
+  流す(`api_server.c`の`h_sendMessage`に元々あった「broadcast_queueへの投入」TODOと同根)のもこれ待ち。
 - **`peer_connector`の永続化**: 現在`bm_peer_connector_connect_initial()`は起動時一回きりのoutbound接続。
   再接続・複数peer維持ループが未実装(自宅環境はCGNAT相当でinbound不可、Tor実装までoutbound-onlyの
   前提は継続、§8参照)。
@@ -805,7 +846,14 @@ CLIクライアント(`bitmessage-cli`)は「デーモン/UIクライアント�
   `pthread_detach`で逃げている(`main.c`)。self-pipeトリック等で正式に閉じられるようにする。
 - **PoW並列化**: `pow/pow_engine.c`は現状シングルスレッド。
 - **getpubkey要求の自動化**: `send_pipeline.c`は`pubkey_cache`未登録の宛先には送信失敗するのみで、
-  能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。
+  能動的に`getpubkey`オブジェクトを発行して取りに行く経路が無い。受信したgetpubkeyに自分のpubkeyで
+  応答する処理も未実装。pubkey v4の自動キャッシュ(候補ripeが要る)もこれと合わせて検討。
+- **再送(resend)ロジック**: ack未着のまま一定時間経過した`sent`行を間隔を倍々にして再送する処理
+  (今回スコープ外と決めた分、§1参照)。
+- **broadcast(type=3)の購読・復号**: 「誰の配信を受信対象にするか」を持つテーブルが無い
+  (`address_book`はラベル帳のみ)。
+- **設定の永続化・DoS上限の見直し・chan仕様**: 2026-08-21のギャップ洗い出しで指摘した残り3項目
+  (日次振り返りの会話参照)。優先度は低いが実運用に近づくほど効いてくる。
 
-出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipelineは§5末尾、
-api_serverは§6.1末尾)。
+出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
+§5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

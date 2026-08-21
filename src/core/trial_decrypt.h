@@ -33,9 +33,17 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
                           struct bm_decoded_msg *out);
 void bm_decoded_msg_free(struct bm_decoded_msg *msg);
 
-/* bm_trial_decrypt_msgを呼び、成功したらinboxへ保存する(msg_id=objectのinventory hash)。成功時0 */
+/*
+ * bm_trial_decrypt_msgを呼び、成功したらinboxへ保存する(msg_id=objectのinventory hash)。成功時0。
+ * out_ack_payload/out_ack_payload_lenが非NULLで、復号したmsgにack_payload(§5.5のfullAckPayload、
+ * P2P "object"パケット)が埋め込まれていれば、その所有権(malloc済みバッファ)を呼び出し側へ渡す
+ * (*out_ack_payload_len==0ならack無し、*out_ack_payloadはNULLのまま)。trial_decrypt.cはcore層で
+ * infra層(object_pool.dbへの検証・挿入)に依存しない方針のため、中身の検証・保存は呼び出し側
+ * (infra/object_sync.c)の責務とする。不要なら両方NULLを渡してよい(内部で解放する)。
+ */
 int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
-                                const unsigned char *object, size_t object_len);
+                                const unsigned char *object, size_t object_len,
+                                unsigned char **out_ack_payload, size_t *out_ack_payload_len);
 
 void *bm_trial_decrypt_thread(void *arg);
 

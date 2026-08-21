@@ -5,11 +5,83 @@
 #include <string.h>
 #include <time.h>
 
+#include "../infra/protocol.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
 #include "message_builder.h"
 #include "messages_store.h"
 #include "pubkey_cache.h"
+
+/* ackobject自体のPoW難易度。誰宛でもない匿名objectとして偽装するため、宛先固有の難易度
+ * ではなくネットワーク既定値(PyBitmessage networkDefaultProofOfWorkNonceTrialsPerByte等)を使う */
+#define BM_ACK_NONCE_TRIALS_PER_BYTE 1000
+#define BM_ACK_PAYLOAD_LENGTH_EXTRA_BYTES 1000
+
+static void pack_be64(unsigned char out[8], uint64_t v)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        out[i] = (unsigned char)((v >> (56 - 8 * i)) & 0xff);
+    }
+}
+
+/*
+ * §5.5 generateFullAckMessage相当。bm_build_ack_objectが作るackobject本体(type/version/
+ * stream/data)にexpiresTimeを付けてPoWし、nonce付きの完成object(*out_object、§5.0形式)と、
+ * それをさらにP2P "object"パケットとして包んだもの(*out_packet、msgのackPayloadへ平文埋め込み
+ * 用。受信側が復号後そのままソケットへ書き込める形)の両方を作る。
+ */
+static int generate_full_ack(int stealth_level, uint64_t stream, uint64_t expires_time, uint64_t ttl_seconds,
+                              unsigned char **out_object, size_t *out_object_len,
+                              unsigned char **out_packet, size_t *out_packet_len)
+{
+    size_t ack_body_len = 0;
+    unsigned char *ack_body = bm_build_ack_object(stealth_level, stream, &ack_body_len);
+    if (ack_body == NULL)
+    {
+        return -1;
+    }
+
+    size_t payload_len = 8 + ack_body_len;
+    unsigned char *payload = malloc(payload_len);
+    if (payload == NULL)
+    {
+        free(ack_body);
+        return -1;
+    }
+    pack_be64(payload, expires_time);
+    memcpy(payload + 8, ack_body, ack_body_len);
+    free(ack_body);
+
+    uint64_t target = bm_pow_get_target(payload_len, ttl_seconds,
+                                         BM_ACK_NONCE_TRIALS_PER_BYTE, BM_ACK_PAYLOAD_LENGTH_EXTRA_BYTES);
+    uint64_t nonce = bm_pow_run(payload, payload_len, target);
+
+    size_t object_len = 8 + payload_len;
+    unsigned char *object = malloc(object_len);
+    if (object == NULL)
+    {
+        free(payload);
+        return -1;
+    }
+    pack_be64(object, nonce);
+    memcpy(object + 8, payload, payload_len);
+    free(payload);
+
+    size_t packet_len = 0;
+    unsigned char *packet = bm_create_packet("object", object, object_len, &packet_len);
+    if (packet == NULL)
+    {
+        free(object);
+        return -1;
+    }
+
+    *out_object = object;
+    *out_object_len = object_len;
+    *out_packet = packet;
+    *out_packet_len = packet_len;
+    return 0;
+}
 
 int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite3 *messages_db,
                                    const char *from_address, const char *to_address,
@@ -63,9 +135,12 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
 
     uint64_t expires_time = (uint64_t)time(NULL) + ttl_seconds;
 
-    size_t ack_len = 0;
-    unsigned char *ack_object = bm_build_ack_object(ack_stealth_level, to_stream, &ack_len);
-    if (ack_object == NULL)
+    unsigned char *ack_data = NULL;    /* nonce付き完成object(§5.0形式)、sent.ack_dataとして保存 */
+    size_t ack_data_len = 0;
+    unsigned char *ack_packet = NULL;  /* P2P "object"パケット(24byteヘッダ込み)、msgへ平文埋め込み */
+    size_t ack_packet_len = 0;
+    if (generate_full_ack(ack_stealth_level, to_stream, expires_time, ttl_seconds,
+                           &ack_data, &ack_data_len, &ack_packet, &ack_packet_len) != 0)
     {
         OPENSSL_cleanse(&from_id, sizeof(from_id));
         return -1;
@@ -73,10 +148,11 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
 
     size_t payload_len = 0;
     unsigned char *payload = bm_build_msg(&from_info, to_stream, to_ripe, to_pub_encryption,
-                                           subject, body, ack_object, ack_len, expires_time, &payload_len);
+                                           subject, body, ack_packet, ack_packet_len, expires_time, &payload_len);
     if (payload == NULL)
     {
-        free(ack_object);
+        free(ack_data);
+        free(ack_packet);
         OPENSSL_cleanse(&from_id, sizeof(from_id));
         return -1;
     }
@@ -109,7 +185,8 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     if (object == NULL)
     {
         free(payload);
-        free(ack_object);
+        free(ack_data);
+        free(ack_packet);
         OPENSSL_cleanse(&from_id, sizeof(from_id));
         return -1;
     }
@@ -119,11 +196,12 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     }
     memcpy(object + 8, payload, payload_len);
     free(payload);
+    free(ack_packet);
 
-    int rc = bm_messages_store_insert_sent(messages_db, ack_object, ack_len, to_address, from_address,
+    int rc = bm_messages_store_insert_sent(messages_db, ack_data, ack_data_len, to_address, from_address,
                                             subject, body, "sent", (int64_t)time(NULL),
                                             (int64_t)ttl_seconds);
-    free(ack_object);
+    free(ack_data);
     OPENSSL_cleanse(&from_id, sizeof(from_id));
 
     if (rc != 0)

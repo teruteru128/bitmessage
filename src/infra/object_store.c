@@ -1,6 +1,8 @@
 #include "object_store.h"
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "../common/db_common.h"
 
@@ -60,6 +62,32 @@ int bm_object_store_has(sqlite3 *db, const unsigned char hash[32])
     int found = (sqlite3_step(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
     return found;
+}
+
+int bm_object_store_get(sqlite3 *db, const unsigned char hash[32],
+                         unsigned char **out_payload, size_t *out_len)
+{
+    static const char *SQL = "SELECT payload FROM objects WHERE hash = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, hash, 32, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW)
+    {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    const void *blob = sqlite3_column_blob(stmt, 0);
+    int blob_len = sqlite3_column_bytes(stmt, 0);
+    unsigned char *out = malloc((size_t)blob_len);
+    memcpy(out, blob, (size_t)blob_len);
+    sqlite3_finalize(stmt);
+
+    *out_payload = out;
+    *out_len = (size_t)blob_len;
+    return 0;
 }
 
 int bm_object_store_delete_expired(sqlite3 *db, int64_t now)

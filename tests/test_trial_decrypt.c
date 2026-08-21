@@ -147,7 +147,7 @@ int main(void)
     free(tampered);
 
     /* 7. inboxへ保存し、DB上に実際に行があることを確認 */
-    rc = bm_trial_decrypt_and_store(&kr, messages_db, object, object_len);
+    rc = bm_trial_decrypt_and_store(&kr, messages_db, object, object_len, NULL, NULL);
     CHECK(rc == 0, "bm_trial_decrypt_and_store");
 
     sqlite3_stmt *stmt = NULL;
@@ -165,7 +165,7 @@ int main(void)
     CHECK(row_count == 1, "inbox should have exactly 1 row");
 
     /* 重複投入しても行が増えないこと(msg_id = inventory hashでの重複排除) */
-    rc = bm_trial_decrypt_and_store(&kr, messages_db, object, object_len);
+    rc = bm_trial_decrypt_and_store(&kr, messages_db, object, object_len, NULL, NULL);
     CHECK(rc == 0, "duplicate insert should not error");
     sqlite3_prepare_v2(messages_db, "SELECT COUNT(*) FROM inbox;", -1, &stmt, NULL);
     sqlite3_step(stmt);

@@ -291,7 +291,8 @@ void bm_decoded_msg_free(struct bm_decoded_msg *msg)
 }
 
 int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
-                                const unsigned char *object, size_t object_len)
+                                const unsigned char *object, size_t object_len,
+                                unsigned char **out_ack_payload, size_t *out_ack_payload_len)
 {
     struct bm_decoded_msg decoded;
     if (bm_trial_decrypt_msg(kr, object, object_len, &decoded) != 0)
@@ -304,6 +305,21 @@ int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
 
     int rc = bm_messages_store_insert_inbox(db, msg_id, decoded.to_address, decoded.from_address,
                                              decoded.subject, decoded.body, (int64_t)time(NULL));
+
+    if (out_ack_payload != NULL && out_ack_payload_len != NULL && decoded.ack_payload_len > 0)
+    {
+        /* 所有権をdecodedからそのまま呼び出し側へ移す(bm_decoded_msg_freeで二重解放しないよう
+         * decoded側のポインタはNULLにしておく) */
+        *out_ack_payload = decoded.ack_payload;
+        *out_ack_payload_len = decoded.ack_payload_len;
+        decoded.ack_payload = NULL;
+        decoded.ack_payload_len = 0;
+    }
+    else if (out_ack_payload_len != NULL)
+    {
+        *out_ack_payload_len = 0;
+    }
+
     bm_decoded_msg_free(&decoded);
     return rc;
 }

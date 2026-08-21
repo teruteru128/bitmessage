@@ -118,4 +118,9 @@ void bm_free_inventory_message(struct bm_inventory_message *msg);
 unsigned char *bm_create_packet(const char *command, const unsigned char *payload,
                                  size_t payload_len, size_t *out_len);
 
+/* inv/getdata共通のペイロード(varint(count)||hash(32byte)*count)を持つメッセージを作る。
+ * commandには"inv"または"getdata"を渡す。完成メッセージ(24byteヘッダ込み)をmallocして返す */
+unsigned char *bm_create_inventory_message(const char *command, const unsigned char (*hashes)[32],
+                                            size_t count, size_t *out_len);
+
 #endif /* BM_INFRA_PROTOCOL_H */

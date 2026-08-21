@@ -19,6 +19,11 @@ int bm_object_store_insert(sqlite3 *db, const unsigned char hash[32], int object
 
 int bm_object_store_has(sqlite3 *db, const unsigned char hash[32]);
 
+/* hashからpayload(nonce込みの完全なobjectバイト列)を取得する。見つかれば0で*out_payloadをmalloc
+ * (呼び出し側でfree)、見つからない/エラー時は非0 */
+int bm_object_store_get(sqlite3 *db, const unsigned char hash[32],
+                         unsigned char **out_payload, size_t *out_len);
+
 /* 期限切れ(expires_time < now)のobjectを削除する。削除件数を返す(エラー時-1) */
 int bm_object_store_delete_expired(sqlite3 *db, int64_t now);
 

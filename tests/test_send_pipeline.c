@@ -16,6 +16,8 @@
 #include "../src/core/pubkey_cache.h"
 #include "../src/core/send_pipeline.h"
 #include "../src/core/trial_decrypt.h"
+#include "../src/infra/object.h"
+#include "../src/infra/protocol.h"
 
 #define TEST_IDENTITY_DB "test_send_pipeline_identity.db"
 #define TEST_MESSAGES_DB "test_send_pipeline_messages.db"
@@ -115,16 +117,37 @@ int main(void)
         CHECK(strcmp(decoded.subject, subject) == 0, "decoded.subject");
         CHECK(strcmp(decoded.body, body) == 0, "decoded.body");
 
-        /* ackPayloadがsentテーブルのack_dataと一致すること(§5.5) */
+        /* ackPayload(msgへ平文埋め込みされたfullAckPayload、§5.5)は完成したP2P "object"パケット
+         * (24byteヘッダ込み)であり、それをパースした中身(nonce付きobjectバイト列)がsentテーブルの
+         * ack_dataと一致するはず(sent.ack_dataはack_data、埋め込み側はack_dataをbm_create_packetで
+         * さらに包んだack_packet、send_pipeline.c参照)。 */
+        struct bm_message *ack_msg = NULL;
+        size_t ack_consumed = 0;
+        enum bm_parse_result ack_parse_rc =
+            bm_parse_message(decoded.ack_payload, decoded.ack_payload_len, &ack_msg, &ack_consumed);
+        CHECK(ack_parse_rc == BM_PARSE_OK, "ack_payload should parse as a complete P2P message");
+        CHECK(ack_consumed == decoded.ack_payload_len, "ack_payload should be exactly one P2P message");
+        CHECK(ack_msg != NULL && strncmp(ack_msg->command, "object", 12) == 0,
+              "ack_payload's P2P command should be \"object\"");
+
         sqlite3_prepare_v2(messages_db, "SELECT ack_data FROM sent WHERE to_address = ?1;", -1, &stmt, NULL);
         sqlite3_bind_text(stmt, 1, recv_address, -1, SQLITE_TRANSIENT);
         CHECK(sqlite3_step(stmt) == SQLITE_ROW, "fetch ack_data from sent");
         const void *ack_data = sqlite3_column_blob(stmt, 0);
         int ack_data_len = sqlite3_column_bytes(stmt, 0);
-        CHECK((size_t)ack_data_len == decoded.ack_payload_len, "ack_payload length matches sent.ack_data");
-        CHECK(ack_data_len > 0 && memcmp(ack_data, decoded.ack_payload, (size_t)ack_data_len) == 0,
-              "ack_payload content matches sent.ack_data");
+        if (ack_msg != NULL)
+        {
+            CHECK((size_t)ack_data_len == ack_msg->length, "sent.ack_data length matches ack_payload's inner object");
+            CHECK(ack_data_len > 0 && memcmp(ack_data, ack_msg->payload, (size_t)ack_data_len) == 0,
+                  "sent.ack_data content matches ack_payload's inner object");
+
+            /* sent.ack_data(nonce込み)の共通ヘッダも正しくパースできる(§5.0)ことを確認 */
+            struct bm_object_header ack_hdr;
+            CHECK(bm_object_parse_header(ack_msg->payload, ack_msg->length, &ack_hdr) == 0,
+                  "sent.ack_data should parse as a valid object header");
+        }
         sqlite3_finalize(stmt);
+        bm_free_message(ack_msg);
 
         printf("OK: send_pipeline -> trial_decrypt -> ack_data一致まで確認\n");
         bm_decoded_msg_free(&decoded);
