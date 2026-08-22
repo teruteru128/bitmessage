@@ -2169,6 +2169,14 @@ rating推移・Dandelion動作を確認できる。
 - SOCKS5クライアント認証(Tor自体がSocksPortに認証を要求しないため実質価値が薄い)
 - Namecoin RPC連携(`.bit`アドレス解決)・帯域制限・blacklist/whitelistフィルタリング
   (いずれも別途大きな機能が必要なため見送り)
+- `NODE_SSL`(接続全体を認証なしTLSで包む本家プロトコルのオプション、2026-08-23に
+  議論): 実装しない。認証なし(自己署名・cert pinningなし)TLSは受動的盗聴や
+  DPIフィンガープリンティングは防げても能動的MITMは防げず、しかもBitmessageの
+  payload自体は既にECIESでend-to-end暗号化済みのため、得られる効果は接続メタデータの
+  秘匿程度に限られる。それなら「メタデータも含めて隠したいなら、相手アドレス自体が
+  自己認証になるTorを使ってくれ」というスタンスの方が一貫しており、TLSハンドシェイク・
+  証明書生成まわりの実装/保守コストも避けられる。outbound SOCKS5・inbound onion対応が
+  既にあるため、この判断でも実用上のデメリットは小さい。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。
