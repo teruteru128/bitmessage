@@ -781,6 +781,73 @@ static void record_outbound_success(struct bm_object_sync_ctx *ctx, const struct
     }
 }
 
+/* §11 2026-08-23: version/verack handshake完了時(=verack受信時)に1回だけ、自分が知っている
+ * peer情報をその接続(conn)へ返す。PyBitmessage network/tcp.pyのset_connection_fully_
+ * established内のsendAddr呼び出しに相当するタイミング。接続中の周期的な再送や、新規学習
+ * したaddrのリアルタイム中継は行わない(PyBitmessage側もリアルタイム中継はflood/leak対策で
+ * 無効化されている)。BM_ADDR_SHARE_MAX_COUNTはPyBitmessageの既定maxaddrperstreamsend=500に
+ * 合わせた */
+#define BM_ADDR_SHARE_MAX_COUNT 500
+
+static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn)
+{
+    if (ctx->peers_db == NULL)
+    {
+        return;
+    }
+
+    struct bm_peer_entry candidates[BM_ADDR_SHARE_MAX_COUNT];
+    int candidate_count = 0;
+    if (bm_peer_manager_list_shareable(ctx->peers_db, 1, (int64_t)time(NULL), candidates,
+                                        BM_ADDR_SHARE_MAX_COUNT, &candidate_count)
+        != 0)
+    {
+        return;
+    }
+    if (candidate_count == 0)
+    {
+        return;
+    }
+
+    static const unsigned char IPV4_MAPPED_PREFIX[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+    struct bm_address_info *addresses = malloc(sizeof(struct bm_address_info) * (size_t)candidate_count);
+    int n = 0;
+    for (int i = 0; i < candidate_count; i++)
+    {
+        unsigned char v4[4];
+        if (inet_pton(AF_INET, candidates[i].ip_address, v4) != 1)
+        {
+            continue; /* 通常起こらない想定(shareable候補はIPv4限定のはず)、念のためskip */
+        }
+        memcpy(addresses[n].ip, IPV4_MAPPED_PREFIX, sizeof(IPV4_MAPPED_PREFIX));
+        memcpy(addresses[n].ip + 12, v4, 4);
+        addresses[n].time = (uint64_t)candidates[i].last_seen;
+        addresses[n].stream = (uint32_t)candidates[i].stream;
+        addresses[n].services = candidates[i].services;
+        addresses[n].port = (uint16_t)candidates[i].port;
+        n++;
+    }
+
+    if (n > 0)
+    {
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_addr_message(addresses, (size_t)n, &packet_len);
+        if (packet != NULL)
+        {
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
+            {
+                fprintf(stderr, "[object_sync] failed to send addr\n");
+            }
+            else
+            {
+                fprintf(stderr, "[object_sync] sent addr (%d entries)\n", n);
+            }
+            free(packet);
+        }
+    }
+    free(addresses);
+}
+
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
 {
     struct bm_object_sync_ctx *ctx = user_data;
@@ -817,6 +884,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         fprintf(stderr, "[object_sync] verack received\n");
         record_outbound_success(ctx, conn);
+        send_addr_reply(ctx, conn);
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {

@@ -130,6 +130,14 @@ int bm_parse_addr_message(const unsigned char *payload, size_t payload_len,
                            struct bm_addr_message *out_msg);
 void bm_free_addr_message(struct bm_addr_message *msg);
 
+/*
+ * §11 2026-08-23: bm_parse_addr_messageと対称のエンコーダ(varint(count) || entry(38byte)*count)。
+ * bm_create_inventory_messageと同じ流儀で、"addr"コマンドのヘッダまで含めた完成済みパケット
+ * (malloc済み、呼び出し側でfree)を返す。*out_lenへ全長を設定する。countが0の場合はNULLを
+ * 返す(空のaddrメッセージは送る意味が無いため、呼び出し側で判定)。
+ */
+unsigned char *bm_create_addr_message(const struct bm_address_info *addresses, size_t count, size_t *out_len);
+
 int bm_parse_inventory_message(const unsigned char *payload, size_t payload_len,
                                 struct bm_inventory_message *out_msg);
 void bm_free_inventory_message(struct bm_inventory_message *msg);

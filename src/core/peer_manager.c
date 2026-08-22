@@ -12,6 +12,10 @@
 #define BM_PEER_CLEANUP_MIN_AGE_SECONDS (3 * 60 * 60)
 #define BM_PEER_CLEANUP_FORGET_RATING (-0.5)
 
+/* §11 2026-08-23: outbound addr送信の候補フィルタ。PyBitmessage network/tcp.pyの
+ * maximumAgeOfNodesThatIAdvertiseToOthers(=10800秒、3時間)準拠 */
+#define BM_PEER_SHARE_MAX_AGE_SECONDS (3 * 60 * 60)
+
 struct bootstrap_node
 {
     const char *ip;
@@ -117,6 +121,51 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
     }
     sqlite3_bind_int(stmt, 1, stream);
     sqlite3_bind_int(stmt, 2, max_results);
+
+    int count = 0;
+    while (count < max_results && sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        struct bm_peer_entry *e = &results[count];
+        memset(e, 0, sizeof(*e));
+        const unsigned char *ip = sqlite3_column_text(stmt, 0);
+        strncpy(e->ip_address, (const char *)ip, sizeof(e->ip_address) - 1);
+        e->port = sqlite3_column_int(stmt, 1);
+        e->stream = sqlite3_column_int(stmt, 2);
+        e->services = (uint64_t)sqlite3_column_int64(stmt, 3);
+        e->last_seen = sqlite3_column_int64(stmt, 4);
+        e->rating = sqlite3_column_double(stmt, 5);
+        const unsigned char *source = sqlite3_column_text(stmt, 6);
+        if (source != NULL)
+        {
+            strncpy(e->source, (const char *)source, sizeof(e->source) - 1);
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    if (out_count)
+    {
+        *out_count = count;
+    }
+    return 0;
+}
+
+int bm_peer_manager_list_shareable(sqlite3 *db, int stream, int64_t now, struct bm_peer_entry *results,
+                                    int max_results, int *out_count)
+{
+    static const char *SQL =
+        "SELECT ip_address, port, stream, services, last_seen, rating, source "
+        "FROM hosts WHERE stream = ?1 AND is_self = 0 AND rating >= 0 AND last_seen > ?2 "
+        "AND ip_address NOT LIKE '%.onion' ORDER BY rating DESC LIMIT ?3;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, stream);
+    sqlite3_bind_int64(stmt, 2, now - BM_PEER_SHARE_MAX_AGE_SECONDS);
+    sqlite3_bind_int(stmt, 3, max_results);
 
     int count = 0;
     while (count < max_results && sqlite3_step(stmt) == SQLITE_ROW)

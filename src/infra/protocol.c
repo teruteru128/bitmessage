@@ -319,6 +319,36 @@ void bm_free_addr_message(struct bm_addr_message *msg)
     msg->addresses = NULL;
 }
 
+unsigned char *bm_create_addr_message(const struct bm_address_info *addresses, size_t count, size_t *out_len)
+{
+    if (count == 0)
+    {
+        return NULL;
+    }
+
+    size_t payload_len = bm_varint_size(count) + count * 38;
+    unsigned char *payload = malloc(payload_len);
+    bm_varint_encode(payload, count);
+    unsigned char *p = payload + bm_varint_size(count);
+    for (size_t i = 0; i < count; i++)
+    {
+        write_be64(p, addresses[i].time);
+        p += 8;
+        write_be32(p, addresses[i].stream);
+        p += 4;
+        write_be64(p, addresses[i].services);
+        p += 8;
+        memcpy(p, addresses[i].ip, 16);
+        p += 16;
+        uint16_t port = htons(addresses[i].port);
+        memcpy(p, &port, 2);
+        p += 2;
+    }
+    unsigned char *packet = bm_create_packet("addr", payload, payload_len, out_len);
+    free(payload);
+    return packet;
+}
+
 int bm_parse_inventory_message(const unsigned char *payload, size_t payload_len,
                                 struct bm_inventory_message *out_msg)
 {

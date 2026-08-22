@@ -2251,6 +2251,42 @@ optionalフィールドと同じ扱い)。`bm_peer_connector_thread`が自身の
 を新設(stop_flagを事前にセットした状態で呼ぶと、候補のratingが一切変化しない=1件も
 接続を試みていないことを確認)、ctest 29件全通過。
 
+### outbound addrメッセージ送信の実装(2026-08-23)
+
+`addr`メッセージは受信(→peers.db登録)のみ実装済みで、自分から送信する処理が無かった
+(受信専用)。onionpeer objectの中継について調べていた際に判明したギャップで、real
+Bitmessageネットワークとの相互運用性向上のため実装した。設計はPyBitmessage本家
+(`network/tcp.py`の`set_connection_fully_established`/`sendAddr`)に準拠。
+
+**送信タイミング**: version/verack handshake完了時(=`verack`受信時)に1回だけ、その接続へ
+返す(PyBitmessageの`set_connection_fully_established`と同じ)。周期的な再送や、新規学習した
+addrのリアルタイム中継は行わない(PyBitmessage側もリアルタイム中継はflood/leak対策で
+無効化されている)。
+
+**候補フィルタ**(PyBitmessageの`sendAddr`準拠): `is_self=0`・`rating>=0`・`last_seen`が
+直近3時間以内(`maximumAgeOfNodesThatIAdvertiseToOthers=10800`)・onionアドレス除外
+(addrワイヤーフォーマットは固定16byte IPフィールドしか持たずonionアドレスを表現できない。
+PyBitmessageも`not k.host.endswith('.onion')`で同様に除外)。rating降順で上限500件
+(PyBitmessageの`maxaddrperstreamsend`既定値)。
+
+**実装**: `core/peer_manager.c`に`bm_peer_manager_list_shareable`(既存の`list_top`に
+上記フィルタを追加した専用クエリ)、`infra/protocol.c`に`bm_create_addr_message`
+(`bm_parse_addr_message`と対称の、`bm_create_inventory_message`と同じ流儀のエンコーダ)、
+`infra/object_sync.c`に`send_addr_reply`(候補取得→IPv4-mapped形式へ変換→wire化→送信、
+`verack`受信ブランチから呼ぶ)を追加。`tests/test_object_sync.c`に回帰テストを追加
+(rating<0・3時間超過・onionの3種を除外し、条件を満たす1件だけが送信されることを確認)、
+ctest 29件全通過。
+
+**副次的な発見**: PyBitmessage本家の`sendOnionPeerObj`は必ず空引数(`''`)で呼ばれており、
+「knownnodesの他人のonion peerを代理でannounceし直す」機能は仕様上も実装上も無いことを
+確認した(`peer`引数を明示的に渡すコードパスは存在するが実際には未使用)。伝播はあくまで
+「各ノードが自分の分だけannounceし、それがobject floodingで中継される」方式のみ。うちの
+実装(`bm_object_sync_announce_onion_peer`)もこれと一致している。
+また、PyBitmessageは起動時1回に加え`class_singleCleaner.py`の約2時間おきの周期処理でも
+onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)、うちには無い定期再送が
+本家には存在することが分かった。これは今回のaddr送信とは別件のため、backlogへ追記した
+(次のセッションで別プランとして着手予定)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2295,8 +2331,13 @@ optionalフィールドと同じ扱い)。`bm_peer_connector_thread`が自身の
        フィールドだった。つまり「listConnections APIでノードごとの送受信バイト数を返す」
        のはPyBitmessage自体には無い機能で、今回追加するならPyBitmessageより一歩進んだ
        ものになる。実装はまだ着手していない。
-6. Dandelion++・inbound接続はどちらも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で
-   明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+6. **onionpeer自己announceの定期再送・TTL見直し**: 2026-08-23にPyBitmessage本家を調査して
+   判明。うちは起動時1回・TTL2日固定で、再起動しない限り2日でannounceが切れて誰からも
+   見つけられなくなる。本家は起動時1回に加え`class_singleCleaner.py`の約2時間おきの周期
+   処理でも再送しており、TTLも7日(±5分jitter)。addr送信とは別件のため次セッションで
+   別プランとして着手予定。
+7. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
+   GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **対応しないと決めたもの(参考、backlogではなく明示的な非対応判断):**
 - `bm_post_version`の`addr_recv`/`addr_from`がSOCKS5経由で不正確(検証・利用している

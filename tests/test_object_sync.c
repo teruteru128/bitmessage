@@ -732,6 +732,117 @@ int main(void)
         CHECK(1, "error message truncated right after 'fatal' should be ignored without crashing");
     }
 
+    /* --- 10. addr送信(§11 2026-08-23): verack受信時に、自分が知っているshareableなpeerを
+     * addrメッセージとして返す。rating<0・last_seenが3時間以上前・onionアドレスの候補は
+     * 除外され、条件を満たす1件だけが含まれることを確認する。専用のsocketpairを使う
+     * (既存のfds/connは(1)〜(9)のシナリオで送受信済みのバイト列が残っている可能性があり、
+     * 使い回すとstaleなバイト列を誤って読んでしまうため)。peers_dbも(6)で登録済みの行が
+     * 残っているため、事前にクリアしてこのシナリオ専用の候補だけにする --- */
+    {
+        sqlite3_exec(peers_db, "DELETE FROM hosts;", NULL, NULL, NULL);
+
+        int fds10[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds10) == 0, "socketpair for addr-send scenario");
+        struct bm_fd_data *conn10 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds10[0]);
+        CHECK(conn10 != NULL, "bm_fd_data_new for addr-send scenario");
+
+        struct bm_peer_entry shareable, low_rating, onion, stale;
+
+        memset(&shareable, 0, sizeof(shareable));
+        strncpy(shareable.ip_address, "198.51.100.7", sizeof(shareable.ip_address) - 1);
+        shareable.port = 8444;
+        shareable.stream = 1;
+        shareable.services = 1;
+        shareable.last_seen = (int64_t)time(NULL);
+        shareable.rating = 0.5;
+        strncpy(shareable.source, "test", sizeof(shareable.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &shareable) == 0, "seed shareable candidate");
+
+        memset(&low_rating, 0, sizeof(low_rating));
+        strncpy(low_rating.ip_address, "198.51.100.8", sizeof(low_rating.ip_address) - 1);
+        low_rating.port = 8444;
+        low_rating.stream = 1;
+        low_rating.services = 1;
+        low_rating.last_seen = (int64_t)time(NULL);
+        low_rating.rating = -0.3;
+        strncpy(low_rating.source, "test", sizeof(low_rating.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &low_rating) == 0, "seed negative-rating candidate");
+
+        memset(&onion, 0, sizeof(onion));
+        strncpy(onion.ip_address, "exampleonionaddressabcdefghijklmnopqrstuvwxyz234567.onion",
+                sizeof(onion.ip_address) - 1);
+        onion.port = 8444;
+        onion.stream = 1;
+        onion.services = 1;
+        onion.last_seen = (int64_t)time(NULL);
+        onion.rating = 0.5;
+        strncpy(onion.source, "test", sizeof(onion.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &onion) == 0, "seed onion candidate");
+
+        memset(&stale, 0, sizeof(stale));
+        strncpy(stale.ip_address, "198.51.100.9", sizeof(stale.ip_address) - 1);
+        stale.port = 8444;
+        stale.stream = 1;
+        stale.services = 1;
+        stale.last_seen = (int64_t)time(NULL) - 4 * 60 * 60;
+        stale.rating = 0.5;
+        strncpy(stale.source, "test", sizeof(stale.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &stale) == 0, "seed stale (>3h) candidate");
+
+        struct bm_message verack_msg;
+        memset(&verack_msg, 0, sizeof(verack_msg));
+        memcpy(verack_msg.command, "verack", 6);
+        verack_msg.length = 0;
+        verack_msg.payload = NULL;
+        bm_object_sync_dispatch(conn10, &verack_msg, &ctx);
+
+        unsigned char addr_buf[65536];
+        size_t addr_total = 0;
+        struct bm_message *addr_reply = NULL;
+        size_t addr_consumed = 0;
+        for (;;)
+        {
+            ssize_t n = read(fds10[1], addr_buf + addr_total, sizeof(addr_buf) - addr_total);
+            if (n <= 0)
+            {
+                break;
+            }
+            addr_total += (size_t)n;
+            if (bm_parse_message(addr_buf, addr_total, &addr_reply, &addr_consumed) == BM_PARSE_OK)
+            {
+                break;
+            }
+        }
+        CHECK(addr_reply != NULL, "an addr message should have been sent back after verack");
+        if (addr_reply != NULL)
+        {
+            CHECK(strncmp(addr_reply->command, "addr", 12) == 0, "the reply command should be 'addr'");
+
+            struct bm_addr_message parsed;
+            memset(&parsed, 0, sizeof(parsed));
+            int parse_rc = bm_parse_addr_message(addr_reply->payload, addr_reply->length, &parsed);
+            CHECK(parse_rc == 0, "the sent addr payload should parse back successfully");
+            if (parse_rc == 0)
+            {
+                CHECK(parsed.count == 1, "only the single shareable candidate should be included");
+                if (parsed.count == 1)
+                {
+                    char ip_str[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET, parsed.addresses[0].ip + 12, ip_str, sizeof(ip_str));
+                    CHECK(strcmp(ip_str, "198.51.100.7") == 0,
+                          "the included candidate should be the shareable one, not any of the excluded ones");
+                    CHECK(parsed.addresses[0].port == 8444, "the included candidate's port should match");
+                }
+                bm_free_addr_message(&parsed);
+            }
+            bm_free_message(addr_reply);
+        }
+
+        close(fds10[0]);
+        close(fds10[1]);
+        bm_fd_data_free(conn10);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

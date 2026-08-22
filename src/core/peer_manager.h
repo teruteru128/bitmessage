@@ -35,6 +35,18 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
                               int max_results, int *out_count);
 
 /*
+ * §11 2026-08-23: outbound addrメッセージ送信用に、他peerへ教えてよい候補を選ぶ
+ * (PyBitmessage network/tcp.py sendAddrのフィルタ基準に準拠)。list_topとの違い:
+ * rating>=0(negativeなpeerは教えない)、last_seenがnowからBM_PEER_SHARE_MAX_AGE_SECONDS
+ * (PyBitmessageのmaximumAgeOfNodesThatIAdvertiseToOthers=3時間相当)以内、かつonionアドレス
+ * (ip_addressが".onion"で終わる)を除外する。addrワイヤーフォーマットは固定16byte IP
+ * フィールドしか持たずonionアドレスを表現できないため(PyBitmessageも同様に除外している)。
+ * rating降順でmax_results件まで。成功時0。
+ */
+int bm_peer_manager_list_shareable(sqlite3 *db, int stream, int64_t now, struct bm_peer_entry *results,
+                                    int max_results, int *out_count);
+
+/*
  * hostsテーブルが空ならブートストラップシードノードを投入する(PyBitmessage
  * knownnodes.pyのDEFAULT_NODES/TESTNET_NODES準拠、2026-08-21確認)。既に1件でも
  * あれば何もしない(手動追加・既知情報を上書きしないため)。成功時0(0件挿入でも0)。
