@@ -2231,6 +2231,26 @@ IPv6 garbage(§参照)と違って**自然には消えない**、恒久的にDB�
 `DELETE FROM hosts WHERE last_seen > <now>;`で削除した(本物のpeerだった場合は今後の
 正常なaddr/onionpeer受信で自然に再登録される)。
 
+### バグ修正: SIGTERM後の終了処理が数分単位で長引く(2026-08-23)
+
+再起動のたびにSIGTERM送信後の終了までの時間が不安定(3分台のこともあれば11分かかった
+こともあった)だったのを、`infra/peer_connector.c`の`bm_peer_connector_connect_initial`を
+調査して特定。候補peerを順に試す`for`ループが`stop_flag`を一切見ておらず、SIGTERM後も
+「今回のバッチの残り候補全部」を試し終えるまで(1件あたりCONNECT_TIMEOUT_SEC(5秒)+
+SOCKS5_HANDSHAKE_TIMEOUT_SEC(20秒)=最大25秒)`bm_peer_connector_thread`が
+pthread_joinできない状態だった。`bitmessage.conf`で`max_outbound_connections = 8`と
+設定していたため、再起動直後(まだ0件も接続していない状態)にSIGTERMが来ると
+最大8×25秒=200秒(実測220秒のケースとほぼ一致)かかりうる計算になる。
+
+**修正**: `struct bm_peer_connector_config`に`stop_flag`フィールドを追加(NULL可、他の
+optionalフィールドと同じ扱い)。`bm_peer_connector_thread`が自身の`stop_flag`を
+`config.stop_flag`へ伝播し、`bm_peer_connector_connect_initial`の候補ループは各候補を
+試す前に`*stop_flag`を確認、非0なら残り候補を一切試さず即座にループを抜ける。ただし
+「今まさに接続/SOCKS5ハンドシェイク中の1件」だけは中断できないため、終了処理の残り時間は
+最大25秒程度に短縮される(ゼロにはならない)。回帰テスト`tests/test_peer_connector_shutdown.c`
+を新設(stop_flagを事前にセットした状態で呼ぶと、候補のratingが一切変化しない=1件も
+接続を試みていないことを確認)、ctest 29件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

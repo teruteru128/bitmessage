@@ -359,6 +359,11 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     int connected = 0;
     for (int i = 0; i < candidate_count && connected < want; i++)
     {
+        if (config->stop_flag != NULL && *config->stop_flag != 0)
+        {
+            break; /* §11 2026-08-23発覚のバグ修正: shutdown中は残り候補を試さず速やかに戻る */
+        }
+
         if (config->registry != NULL
             && bm_peer_registry_has_peer(config->registry, candidates[i].ip_address, candidates[i].port))
         {
@@ -443,6 +448,9 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
 void *bm_peer_connector_thread(void *arg)
 {
     struct bm_peer_connector_thread_args *args = arg;
+    /* §11 2026-08-23発覚のバグ修正: connect_initial自身の候補ループにshutdown中断を
+     * 効かせるため、自分のstop_flagをconfig側にも伝播しておく */
+    args->config.stop_flag = args->stop_flag;
 
     while (*args->stop_flag == 0)
     {
