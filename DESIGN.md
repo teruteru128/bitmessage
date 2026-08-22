@@ -2151,6 +2151,25 @@ host:portのログに埋め込むと、アドレス自体が含む`:`区切り�
 ため、ヘルパーを共有せず同等のロジックを1箇所だけインラインで複製した。
 ctest 27件全通過、クリーンなbuildディレクトリでの再ビルドも確認済み。
 
+### バグ修正: addr_msg由来の破損したように見えるIPv6がpeers.dbへ混入する(2026-08-23)
+
+運用テスト中のpeers.dbをユーザーが確認していて発見。`e001:1a00::ffff:aa54:3013`や
+`::ea:f035:c8c2:7d86`のような、明らかに正規のBitmessage peerとは思えないIPv6アドレスが
+`addr_msg`由来で登録されていた(実際に混入していたのは346件中7件)。`infra/object_sync.c`の
+`is_routable_peer_address`はloopback/ULA(fc00::/7)/link-local(fe80::/10)/multicast
+(ff00::/8)しか弾いておらず、たまたまそれ以外の範囲に収まったgarbageな16バイト値は
+素通りしてしまっていた。
+
+実ネットワーク上で本物のIPv6 peer(非IPv4-mapped)の利用実績が観測できていないこと
+(inbound listenは127.0.0.1固定、outboundもTor/SOCKS5前提)を踏まえ、`§9.6`の
+`NODE_SSL`非対応と同じ「実利用の裏付けが無いものは対応しない」方針で、`addr`受信時に
+素のIPv6エントリを一律filterするよう変更した(狭い許可範囲へ絞り込むのではなく、
+そもそも受け付けない)。`is_routable_peer_address`は`is_routable_ipv4_peer_address`に
+簡素化し、IPv4-mappedの判定と組み合わせて`is_ipv4_mapped`でない場合は即filterする。
+既に混入していた7件は既にratingが-0.1〜-0.2まで下がっており、既存のクリーンアップ処理で
+自然に消えるため手動削除はしていない。ctest 27件全通過(素のIPv6を一律filterする
+回帰テストを`test_object_sync.c`に追加)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

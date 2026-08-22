@@ -622,59 +622,39 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
  * 内部ネットワークへ接続を試みてしまう)アドレスを除外する。is_ipv4_mappedはipが
  * ::ffff:a.b.c.d形式かどうか(呼び出し側で判定済み)。ルーティング可能そうならreturn 1
  */
-static int is_routable_peer_address(const unsigned char ip[16], int is_ipv4_mapped)
+/* §11 2026-08-23: addr_msg由来の素のIPv6(非IPv4-mapped)は呼び出し側で一律filter済みのため、
+ * ここではIPv4の非routable範囲だけを見ればよい(実ネットワーク上で本物のIPv6 peerが
+ * 観測できておらず、garbageな16バイト値がfc00::/7等の除外範囲を運良く外れて素通りする
+ * 問題があったための方針転換。詳細はDESIGN.md参照)。 */
+static int is_routable_ipv4_peer_address(const unsigned char v4[4])
 {
-    if (is_ipv4_mapped)
+    if (v4[0] == 0)
     {
-        const unsigned char *v4 = ip + 12;
-        if (v4[0] == 0)
-        {
-            return 0; /* 0.0.0.0/8 */
-        }
-        if (v4[0] == 10)
-        {
-            return 0; /* 10.0.0.0/8 */
-        }
-        if (v4[0] == 127)
-        {
-            return 0; /* 127.0.0.0/8 loopback */
-        }
-        if (v4[0] == 169 && v4[1] == 254)
-        {
-            return 0; /* 169.254.0.0/16 link-local */
-        }
-        if (v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31)
-        {
-            return 0; /* 172.16.0.0/12 */
-        }
-        if (v4[0] == 192 && v4[1] == 168)
-        {
-            return 0; /* 192.168.0.0/16 */
-        }
-        if (v4[0] >= 224)
-        {
-            return 0; /* 224.0.0.0/4 multicast、240.0.0.0/4 reserved、255.255.255.255含む */
-        }
-        return 1;
+        return 0; /* 0.0.0.0/8 */
     }
-
-    static const unsigned char UNSPECIFIED[16] = {0};
-    static const unsigned char LOOPBACK[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-    if (memcmp(ip, UNSPECIFIED, 16) == 0 || memcmp(ip, LOOPBACK, 16) == 0)
+    if (v4[0] == 10)
     {
-        return 0;
+        return 0; /* 10.0.0.0/8 */
     }
-    if ((ip[0] & 0xfe) == 0xfc)
+    if (v4[0] == 127)
     {
-        return 0; /* fc00::/7 ユニークローカルアドレス */
+        return 0; /* 127.0.0.0/8 loopback */
     }
-    if (ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80)
+    if (v4[0] == 169 && v4[1] == 254)
     {
-        return 0; /* fe80::/10 リンクローカル */
+        return 0; /* 169.254.0.0/16 link-local */
     }
-    if (ip[0] == 0xff)
+    if (v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31)
     {
-        return 0; /* ff00::/8 マルチキャスト */
+        return 0; /* 172.16.0.0/12 */
+    }
+    if (v4[0] == 192 && v4[1] == 168)
+    {
+        return 0; /* 192.168.0.0/16 */
+    }
+    if (v4[0] >= 224)
+    {
+        return 0; /* 224.0.0.0/4 multicast、240.0.0.0/4 reserved、255.255.255.255含む */
     }
     return 1;
 }
@@ -864,15 +844,16 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                 {
                     const struct bm_address_info *e = &addr_msg.addresses[i];
                     int is_ipv4_mapped = (memcmp(e->ip, IPV4_MAPPED_PREFIX, sizeof(IPV4_MAPPED_PREFIX)) == 0);
-                    if (e->port == 0 || !is_routable_peer_address(e->ip, is_ipv4_mapped))
+                    if (e->port == 0 || !is_ipv4_mapped || !is_routable_ipv4_peer_address(e->ip + 12))
                     {
+                        /* §11 2026-08-23: 素のIPv6は一律filter。実ネットワーク上で本物のIPv6 peerの
+                         * 利用実績が無く、garbageな16バイト値をIPv6として誤登録してしまう問題が
+                         * 見つかったため(DESIGN.md参照)。 */
                         filtered++;
                         continue;
                     }
                     char ip_str[INET6_ADDRSTRLEN];
-                    const char *ok = is_ipv4_mapped
-                        ? inet_ntop(AF_INET, e->ip + 12, ip_str, sizeof(ip_str))
-                        : inet_ntop(AF_INET6, e->ip, ip_str, sizeof(ip_str));
+                    const char *ok = inet_ntop(AF_INET, e->ip + 12, ip_str, sizeof(ip_str));
                     if (ok == NULL)
                     {
                         continue;
