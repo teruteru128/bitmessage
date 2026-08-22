@@ -407,7 +407,15 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         {
             bm_peer_registry_add(config->registry, conn);
         }
-        bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 1);
+        /* §11 2026-08-22発覚のバグ修正: ここではsuccessを記録しない。以前はTCP接続+自分の
+         * version送信が成功しただけでrating+0.1していたが、これは相手が実際に応答したかとは
+         * 無関係な「自分側の送信が成功した」という弱い基準で、「繋がるが直後に相手から切断
+         * される」peerでも毎サイクル必ず成功扱いになってしまっていた。infra/network.cの
+         * bm_network_epoll_threadが切断時にfailure(-0.1)を記録するようになった今、この
+         * success(+0.1)が毎サイクル打ち消してしまい、ratingが永久に上限1.0へ張り付いたまま
+         * 抜け出せないバグを引き起こしていた(実際に9700行超のログ中3474回、同じ死んだpeerに
+         * 接続し続けていたのを確認済み)。successの記録はinfra/object_sync.cのversion/verack
+         * 受信時点(=相手が実際に応答した確かな証拠が得られた時点)へ移した。 */
 
         fprintf(stderr, "[peer_connector] connected to %s:%d, version sent\n",
                 candidates[i].ip_address, candidates[i].port);

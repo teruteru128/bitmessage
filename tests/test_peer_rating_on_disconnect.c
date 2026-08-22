@@ -2,15 +2,31 @@
  * §11 2026-08-22発覚のバグ修正のテスト。
  *
  * 実際のbootstrap daemonのログで、特定の1peerへの接続が9700行超のログ中3474回にわたって
- * 繰り返されていることが見つかった。原因はpeer_connector.cがconnect()+version送信の成功時点で
- * rating+0.1を記録するが、その直後にECONNRESET等で切断されてもそれをratingへフィードバック
- * する経路が無かったこと。「TCP接続とversion送信はできるが直後に切断される」peerのrating
- * だけが下がらないまま毎回の再接続サイクルで最上位候補に選ばれ続けてしまっていた。
+ * 繰り返されていることが見つかった。原因は2段階:
  *
+ * 1回目の修正(bm_network_epoll_threadが切断時にfailureを記録するようにした)だけでは
+ * 実は不十分だった。peer_connector.cが「TCP接続+自分のversion送信が成功」した時点で
+ * 無条件にsuccess(+0.1)を記録していたため、「繋がるが相手からは一切応答が無いまま
+ * 切断される」peerでも毎サイクル必ずsuccessが記録され、切断時のfailure(-0.1)を
+ * 毎回打ち消してratingが上限1.0に張り付いたまま抜け出せなかった(success/failureが
+ * ちょうど1回ずつ、同じサイクル内で相殺し合っていたため)。
+ *
+ * 2回目の修正でsuccessの記録場所をpeer_connector.cから infra/object_sync.c の
+ * version/verack受信時点(=相手が実際に応答した確かな証拠が得られた時点)へ移した。
+ * これにより「応答が一切無いまま切断される」peerは二度とsuccessを得られず、
+ * failureだけが積み重なってratingが実際に下がっていくようになった。
+ *
+ * --- シナリオ1: 応答なしで切断 ---
  * bm_network_epoll_threadの実スレッドを起動し、実TCP接続(BM_FD_CLIENT_SOCKET、outbound
- * 接続を模す)がpeer切断(EOF)で終了した際に、peers.dbの該当行のratingが実際に-0.1
- * されることを確認する(tests/test_inbound.cと同じ「実ソケット+実スレッドで決定的に
- * 検証する」方針)。
+ * 接続を模す)が(versionへの応答を一切受け取らないまま)peer切断(EOF)で終了した際に、
+ * peers.dbの該当行のratingが実際に-0.1されることを確認する。
+ *
+ * --- シナリオ2: 相手が実際にverackで応答する ---
+ * bm_object_sync_dispatchへ実際にverackメッセージを渡した場合、BM_FD_CLIENT_SOCKET
+ * (outbound、こちらが選んだ相手)ではratingが+0.1される一方、BM_FD_SERVER_SOCKET
+ * (inbound、相手が繋いできた側)では記録されないことを確認する。
+ *
+ * どちらもtests/test_inbound.cと同じ「実ソケット+実スレッドで決定的に検証する」方針。
  */
 
 #include <arpa/inet.h>
@@ -24,10 +40,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../src/core/identity_store.h"
+#include "../src/core/keyring.h"
+#include "../src/core/messages_store.h"
 #include "../src/core/peer_manager.h"
 #include "../src/infra/network.h"
+#include "../src/infra/object_store.h"
+#include "../src/infra/object_sync.h"
 
 #define TEST_PEERS_DB "test_peer_rating_peers.db"
+#define TEST_OBJECT_POOL_DB "test_peer_rating_pool.db"
+#define TEST_IDENTITY_DB "test_peer_rating_identity.db"
+#define TEST_MESSAGES_DB "test_peer_rating_messages.db"
 
 static int failures = 0;
 
@@ -139,6 +163,123 @@ int main(void)
           "rating should have decreased below 0.5 after the outbound connection was disconnected");
     CHECK(final_rating > 0.4 - 1e-9 && final_rating < 0.4 + 1e-9,
           "rating should have decreased by exactly 0.1 (0.5 -> 0.4)");
+
+    /* --- シナリオ2: verack受信でsuccessが記録されること(outboundのみ、inboundは対象外) --- */
+    {
+        sqlite3 *object_pool_db = NULL;
+        sqlite3 *identity_db = NULL;
+        sqlite3 *messages_db = NULL;
+        unlink(TEST_OBJECT_POOL_DB);
+        unlink(TEST_IDENTITY_DB);
+        unlink(TEST_MESSAGES_DB);
+        sqlite3_open(TEST_OBJECT_POOL_DB, &object_pool_db);
+        bm_object_store_init_schema(object_pool_db);
+        sqlite3_open(TEST_IDENTITY_DB, &identity_db);
+        bm_identity_store_init_schema(identity_db);
+        sqlite3_open(TEST_MESSAGES_DB, &messages_db);
+        bm_messages_store_init_schema(messages_db);
+
+        bm_keyring_t kr;
+        bm_keyring_init(&kr);
+
+        struct bm_object_sync_ctx ctx;
+        bm_object_sync_ctx_init(&ctx, object_pool_db, identity_db, messages_db, peers_db, &kr, NULL, NULL);
+
+        /* 2b-1: outbound(BM_FD_CLIENT_SOCKET)でverackを受け取るとsuccessが記録される */
+        struct bm_peer_entry entry2;
+        memset(&entry2, 0, sizeof(entry2));
+        strncpy(entry2.ip_address, "127.0.0.1", sizeof(entry2.ip_address) - 1);
+        entry2.port = 55501;
+        entry2.stream = 1;
+        entry2.rating = 0.3;
+        strncpy(entry2.source, "test", sizeof(entry2.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &entry2) == 0, "seeding the scenario2 outbound peer row");
+
+        struct sockaddr_storage fake_outbound_peer_addr;
+        memset(&fake_outbound_peer_addr, 0, sizeof(fake_outbound_peer_addr));
+        struct sockaddr_in *sin_out = (struct sockaddr_in *)&fake_outbound_peer_addr;
+        sin_out->sin_family = AF_INET;
+        sin_out->sin_port = htons(55501);
+        inet_pton(AF_INET, "127.0.0.1", &sin_out->sin_addr);
+
+        struct bm_fd_data outbound_conn;
+        memset(&outbound_conn, 0, sizeof(outbound_conn));
+        outbound_conn.type = BM_FD_CLIENT_SOCKET;
+        outbound_conn.fd = -1; /* verack受信処理自体はfdへ書き込まない(bm_reply_verack等を
+                                 * 呼ぶのはversion分岐のみ)ためこのテストでは未接続のままでよい */
+        outbound_conn.peer_addr = fake_outbound_peer_addr;
+
+        struct bm_message verack_msg;
+        memset(&verack_msg, 0, sizeof(verack_msg));
+        memcpy(verack_msg.command, "verack", 6);
+        bm_object_sync_dispatch(&outbound_conn, &verack_msg, &ctx);
+
+        struct bm_peer_entry after_outbound[16];
+        int count_out = 0;
+        CHECK(bm_peer_manager_list_top(peers_db, 1, after_outbound, 16, &count_out) == 0 && count_out >= 1,
+              "scenario2 outbound peer row lookup should succeed");
+        int found_out = 0;
+        for (int i = 0; i < count_out; i++)
+        {
+            if (after_outbound[i].port == 55501)
+            {
+                found_out = 1;
+                CHECK(after_outbound[i].rating > 0.4 - 1e-9 && after_outbound[i].rating < 0.4 + 1e-9,
+                      "outbound verack should credit success: rating should become 0.4 (0.3 + 0.1)");
+            }
+        }
+        CHECK(found_out, "scenario2 outbound peer row should be found");
+
+        /* 2b-2: inbound(BM_FD_SERVER_SOCKET)でverackを受け取ってもsuccessは記録されない
+         * (こちらが選んだ相手ではないため、network.cの切断時failure記録と対称) */
+        struct bm_peer_entry entry3;
+        memset(&entry3, 0, sizeof(entry3));
+        strncpy(entry3.ip_address, "127.0.0.1", sizeof(entry3.ip_address) - 1);
+        entry3.port = 55502;
+        entry3.stream = 1;
+        entry3.rating = 0.3;
+        strncpy(entry3.source, "test", sizeof(entry3.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &entry3) == 0, "seeding the scenario2 inbound peer row");
+
+        struct sockaddr_storage fake_inbound_peer_addr;
+        memset(&fake_inbound_peer_addr, 0, sizeof(fake_inbound_peer_addr));
+        struct sockaddr_in *sin_in = (struct sockaddr_in *)&fake_inbound_peer_addr;
+        sin_in->sin_family = AF_INET;
+        sin_in->sin_port = htons(55502);
+        inet_pton(AF_INET, "127.0.0.1", &sin_in->sin_addr);
+
+        struct bm_fd_data inbound_conn;
+        memset(&inbound_conn, 0, sizeof(inbound_conn));
+        inbound_conn.type = BM_FD_SERVER_SOCKET;
+        inbound_conn.fd = -1;
+        inbound_conn.peer_addr = fake_inbound_peer_addr;
+
+        bm_object_sync_dispatch(&inbound_conn, &verack_msg, &ctx);
+
+        struct bm_peer_entry after_inbound[16];
+        int count_in = 0;
+        CHECK(bm_peer_manager_list_top(peers_db, 1, after_inbound, 16, &count_in) == 0 && count_in >= 1,
+              "scenario2 inbound peer row lookup should succeed");
+        int found_in = 0;
+        for (int i = 0; i < count_in; i++)
+        {
+            if (after_inbound[i].port == 55502)
+            {
+                found_in = 1;
+                CHECK(after_inbound[i].rating > 0.3 - 1e-9 && after_inbound[i].rating < 0.3 + 1e-9,
+                      "inbound verack should NOT credit success: rating should stay 0.3");
+            }
+        }
+        CHECK(found_in, "scenario2 inbound peer row should be found");
+
+        bm_keyring_destroy(&kr);
+        sqlite3_close(object_pool_db);
+        sqlite3_close(identity_db);
+        sqlite3_close(messages_db);
+        unlink(TEST_OBJECT_POOL_DB);
+        unlink(TEST_IDENTITY_DB);
+        unlink(TEST_MESSAGES_DB);
+    }
 
     sqlite3_close(peers_db);
     unlink(TEST_PEERS_DB);

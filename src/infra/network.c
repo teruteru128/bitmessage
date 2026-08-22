@@ -392,10 +392,7 @@ static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *
     }
 }
 
-/* peer_addr(sockaddr_storage)からip文字列とportを取り出す。DNS引きはせず数値表記のみ
- * (peer_registry.cのformat_peer_addrと同じ考え方だが、bm_peer_manager_record_resultへ
- * ip/portを別々の引数で渡す必要があるためip:port結合済み文字列ではなく分けて返す) */
-static void extract_ip_port(const struct sockaddr_storage *addr, char *out_ip, size_t out_ip_len, int *out_port)
+void bm_network_extract_ip_port(const struct sockaddr_storage *addr, char *out_ip, size_t out_ip_len, int *out_port)
 {
     out_ip[0] = '\0';
     *out_port = 0;
@@ -454,7 +451,7 @@ void *bm_network_epoll_thread(void *arg)
                 {
                     char ip[INET6_ADDRSTRLEN];
                     int port = 0;
-                    extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
+                    bm_network_extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
                     if (ip[0] != '\0')
                     {
                         bm_peer_manager_record_result(args->peers_db, ip, port, 1, 0);

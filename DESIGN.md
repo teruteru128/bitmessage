@@ -1775,6 +1775,39 @@ outbound接続した直後に相手側がEOFで切断した場合、rating列が
 (前回誤って`pkill -f`で巻き込んで停止させてしまった経緯があるため、今回はPIDを
 明示的に指定してのみ操作する)。
 
+**追記: 上記修正だけでは不十分だった。** 実際にbootstrap daemonをこの修正版で再起動し、
+かつoutbound SOCKS5(Tor)プロキシも有効化して観察したところ、`179.191.207.222:8444`
+`95.49.240.98:8444`への接続が依然として1サイクルあたり最大回数近く繰り返されており、
+`peers.db`を直接確認するとratingが**1.0のまま**だった。
+
+**真因:** `peer_connector.c`が「TCP接続+自分のversion送信が成功」した時点で無条件に
+success(+0.1)を記録していた。これは相手が実際に応答したかとは無関係な弱い基準で、
+「繋がるが相手からは一切応答が無いまま切断される」peerでも毎サイクル必ずsuccessが
+記録される。この状態で上記1回目の修正(切断時にfailure -0.1)が効いても、
+success(+0.1)とfailure(-0.1)が**同じサイクル内で必ず1回ずつ発生して相殺**してしまい、
+ratingが上限1.0に張り付いたまま永久に下がらなかった。
+
+**2回目の修正:** successを記録する場所を`peer_connector.c`(自分の送信が成功した時点)から
+`infra/object_sync.c`の`bm_object_sync_dispatch`内、version/verackを実際に受信した時点
+(=相手が応答した確かな証拠が得られた時点)へ移した。`record_outbound_success`という
+静的関数を追加し、`conn->type == BM_FD_CLIENT_SOCKET`(outbound、こちらが選んだ相手。
+`BM_FD_SERVER_SOCKET`は対象外、1回目の修正の切断時failure記録と対称にした)かつ
+`ctx->peers_db != NULL`の場合のみ、version/verackどちらの受信でも(相手が最初にどちらを
+送ってくるかは実装依存のため両方で拾う)`bm_peer_manager_record_result(..., 1)`を呼ぶ。
+`ip:port`の取り出しには`network.c`の`extract_ip_port`を`bm_network_extract_ip_port`として
+公開し、`network.c`自身と`object_sync.c`の両方から共有した。
+
+これにより「応答が一切無いまま切断される」peerは二度とsuccessを得られず、failureだけが
+積み重なって実際にratingが下がっていくようになった(既存の1.0に張り付いた2peerも、
+今後は接続のたびにfailureのみが記録され続けるため、数サイクルかけて自然に下がっていく
+想定。DB上のratingを即座にリセットする対応はせず、修正の効果が実際の運用で自然に
+表れることを優先した)。
+
+**テスト:** `tests/test_peer_rating_on_disconnect.c`にシナリオ2を追加。
+`bm_object_sync_dispatch`へ実際にverackメッセージを渡し、outbound(`BM_FD_CLIENT_SOCKET`)
+では`rating`が+0.1(0.3→0.4)される一方、inbound(`BM_FD_SERVER_SOCKET`)では記録されない
+(0.3のまま)ことを確認した。ctest 22件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

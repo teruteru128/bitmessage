@@ -759,6 +759,30 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
     bm_free_inventory_message(&inv_msg);
 }
 
+/*
+ * §11 2026-08-22発覚のバグ修正: outbound接続(BM_FD_CLIENT_SOCKET)が相手から実際に
+ * version/verackを受け取った時点で初めてpeer_manager.cのratingへsuccessを記録する。
+ * 以前はpeer_connector.cがTCP接続+自分のversion送信の成功だけでsuccessを記録していたが、
+ * これは相手が実際に応答したかとは無関係な弱い基準で、「繋がるが直後に相手から切断される」
+ * peerでも毎サイクル必ず成功扱いになり、network.cが切断時に記録するfailure(-0.1)を毎回
+ * 打ち消してratingが上限1.0に張り付いたまま抜け出せないバグを引き起こしていた
+ * (peer_connector.c参照)。inbound(BM_FD_SERVER_SOCKET、相手が接続してきた側)は
+ * こちらが選んだ相手ではないため対象外(network.cの切断時failure記録と対称)。 */
+static void record_outbound_success(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn)
+{
+    if (conn->type != BM_FD_CLIENT_SOCKET || ctx->peers_db == NULL)
+    {
+        return;
+    }
+    char ip[INET6_ADDRSTRLEN];
+    int port = 0;
+    bm_network_extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
+    if (ip[0] != '\0')
+    {
+        bm_peer_manager_record_result(ctx->peers_db, ip, port, 1, 1);
+    }
+}
+
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
 {
     struct bm_object_sync_ctx *ctx = user_data;
@@ -770,6 +794,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         fprintf(stderr, "[object_sync] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
         bm_free_version_message(&ver);
+        record_outbound_success(ctx, conn);
         if (bm_reply_verack(conn) != 0)
         {
             fprintf(stderr, "[object_sync] failed to reply verack\n");
@@ -790,6 +815,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
         fprintf(stderr, "[object_sync] verack received\n");
+        record_outbound_success(ctx, conn);
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {

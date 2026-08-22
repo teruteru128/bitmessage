@@ -49,6 +49,14 @@ typedef void (*bm_command_handler_fn)(struct bm_fd_data *conn, const struct bm_m
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd);
 void bm_fd_data_free(struct bm_fd_data *data);
 
+/* addr(sockaddr_storage)からip文字列とportを取り出す(DNS引きはせず数値表記のみ)。
+ * bm_peer_manager_record_resultにip/portを別々の引数で渡す必要がある呼び出し元
+ * (network.c自身のbm_network_epoll_thread、object_sync.cのverack/version受信時の
+ * success記録)で共有するために公開している。out_ipはINET6_ADDRSTRLEN以上のバッファを渡すこと。
+ * addr->ss_familyがAF_INET/AF_INET6のいずれでもなければout_ip[0]='\0'、*out_port=0のまま。 */
+void bm_network_extract_ip_port(const struct sockaddr_storage *addr, char *out_ip, size_t out_ip_len,
+                                 int *out_port);
+
 /*
  * §11 inbound接続(Tor hidden service)対応。bind_address:portでTCP listenする(SO_REUSEADDR、
  * backlog 16、O_NONBLOCK)。bind_addressは通常"127.0.0.1"を渡す想定(公開IPへの直接listenは
