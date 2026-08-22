@@ -2206,6 +2206,31 @@ DBに残らないため、当時パースし損ねていたとしても今から
 source = 'onionpeer_obj';`で一括修正(swap16は自己逆写像なので同じ操作を再適用するだけで
 正しい値に戻る)。修正後は8444(14件)/2967(2件)/18444(1件)に復元された。
 
+### バグ修正: addr_msgのlast_seenが未来の値でも無検証で登録されていた(2026-08-23)
+
+ユーザーが`peers.db`で`last_seen`が2^31(2147483648)を超える行が70件あるのを発見。中身を
+見ると、3つのIP(82.10.174.236等)に対してport 8444〜65535近辺までの隣接する
+ephemeralポートを19〜21個ずつ生成し、かつ全entryに同一の巨大な(一部は2^63近くまである)
+last_seenを仕込んだgossip spamと判明した(ユーザーが「addr_msgスパムでは」と即座に
+見抜いた)。
+
+**実害**: `bm_peer_manager_cleanup`の年齢判定は`now - last_seen > max_age`で、
+last_seenが未来(=nowより大きい)だとこの差が常に負になり、ratingがどれだけ下がっても
+年齢起因のクリーンアップに一切引っかからなくなる。つまりこの種のspam entryは通常の
+IPv6 garbage(§参照)と違って**自然には消えない**、恒久的にDBへ居座る性質だった。
+
+**原因**: `addr`受信ハンドラ(`infra/object_sync.c`)がpeer申告の`time`フィールドを
+無条件に信用して`last_seen`へ書き込んでいた。PyBitmessage本家の`bmproto.py`
+`bm_command_addr`を確認したところ、`time.time() - seenTime > 0`(=未来なら弾く)という
+検証が入っていた。うちにはこれが無かった。
+
+**修正**: addr受信時、`e->time`が現在時刻より未来のentryを他のfilter条件
+(IPv4-mapped判定・routable判定)と同列に扱い、一律filterするようにした。
+回帰テストを`test_object_sync.c`に追加(未来1年のtimeを持つentryが登録されないことを
+確認)、ctest 28件全通過。既存の壊れた70件はspamであり正しい値を逆算する手段も無いため、
+`DELETE FROM hosts WHERE last_seen > <now>;`で削除した(本物のpeerだった場合は今後の
+正常なaddr/onionpeer受信で自然に再登録される)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -840,12 +840,20 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             if (ctx->peers_db != NULL)
             {
                 static const unsigned char IPV4_MAPPED_PREFIX[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+                int64_t addr_now = (int64_t)time(NULL);
                 for (uint64_t i = 0; i < n; i++)
                 {
                     const struct bm_address_info *e = &addr_msg.addresses[i];
                     int is_ipv4_mapped = (memcmp(e->ip, IPV4_MAPPED_PREFIX, sizeof(IPV4_MAPPED_PREFIX)) == 0);
-                    if (e->port == 0 || !is_ipv4_mapped || !is_routable_ipv4_peer_address(e->ip + 12))
+                    if (e->port == 0 || !is_ipv4_mapped || !is_routable_ipv4_peer_address(e->ip + 12)
+                        || (int64_t)e->time > addr_now)
                     {
+                        /* §11 2026-08-23: last_seen(peer申告のtime)が未来の値になっている
+                         * garbage/悪意あるentryをfilterする(PyBitmessageのbm_command_addrの
+                         * `time.time() - seenTime > 0`検証に相当)。無検証だと
+                         * bm_peer_manager_cleanupの`now - last_seen > max_age`が常に負に
+                         * なり、そのhostが永久にクリーンアップ対象から外れてしまう
+                         * (実際にpeers.dbで2^31を超えるlast_seenが70件見つかって発覚)。 */
                         /* §11 2026-08-23: 素のIPv6は一律filter。実ネットワーク上で本物のIPv6 peerの
                          * 利用実績が無く、garbageな16バイト値をIPv6として誤登録してしまう問題が
                          * 見つかったため(DESIGN.md参照)。 */

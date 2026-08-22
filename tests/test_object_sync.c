@@ -419,15 +419,22 @@ int main(void)
          * ことを確認する(実際にpeers.dbへ混入していたgarbageな値もこの範囲を運良く
          * すり抜けていた)。 */
         unsigned char ipv6_global_unicast[16] = {0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88};
-        unsigned char entries[3][38];
-        const unsigned char *ips[3] = {ipv4_routable, ipv4_private, ipv6_global_unicast};
+        /* §11 2026-08-23: last_seen(peer申告のtime)が未来の値のentryは一律filterするように
+         * した。実際にpeers.dbで2^31を超えるlast_seenが70件見つかり、bm_peer_manager_cleanup
+         * の年齢判定(now - last_seen)が常に負になって永久にクリーンアップされなくなる問題が
+         * 発覚したため。 */
+        unsigned char ipv4_future[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 203, 0, 113, 99};
+        unsigned char entries[4][38];
+        const unsigned char *ips[4] = {ipv4_routable, ipv4_private, ipv6_global_unicast, ipv4_future};
         uint64_t addr_time = (uint64_t)time(NULL);
-        for (int e = 0; e < 3; e++)
+        for (int e = 0; e < 4; e++)
         {
             unsigned char *p = entries[e];
+            /* entry 3(ipv4_future)だけ未来の値(現在時刻+1年)にする */
+            uint64_t this_entry_time = (e == 3) ? addr_time + 365ULL * 24 * 60 * 60 : addr_time;
             for (int i = 0; i < 8; i++)
             {
-                p[i] = (unsigned char)((addr_time >> (56 - 8 * i)) & 0xff);
+                p[i] = (unsigned char)((this_entry_time >> (56 - 8 * i)) & 0xff);
             }
             p += 8;
             uint32_t stream = 1;
@@ -449,9 +456,9 @@ int main(void)
         }
 
         unsigned char addr_payload[1 + sizeof(entries)];
-        bm_varint_encode(addr_payload, 3);
-        memcpy(addr_payload + bm_varint_size(3), entries, sizeof(entries));
-        size_t addr_payload_len = bm_varint_size(3) + sizeof(entries);
+        bm_varint_encode(addr_payload, 4);
+        memcpy(addr_payload + bm_varint_size(4), entries, sizeof(entries));
+        size_t addr_payload_len = bm_varint_size(4) + sizeof(entries);
 
         size_t addr_packet_len = 0;
         unsigned char *addr_packet = bm_create_packet("addr", addr_payload, addr_payload_len, &addr_packet_len);
@@ -491,6 +498,14 @@ int main(void)
               "raw (non-IPv4-mapped) IPv6 addr entry should always be filtered out, even if it looks like "
               "a routable global unicast address");
         sqlite3_finalize(ipv6_stmt);
+
+        sqlite3_stmt *future_stmt = NULL;
+        sqlite3_prepare_v2(peers_db, "SELECT COUNT(*) FROM hosts WHERE ip_address = '203.0.113.99';", -1,
+                            &future_stmt, NULL);
+        CHECK(sqlite3_step(future_stmt) == SQLITE_ROW, "future-timestamped addr count query should return a row");
+        CHECK(sqlite3_column_int(future_stmt, 0) == 0,
+              "addr entry claiming a last_seen time in the future should be filtered out, not registered");
+        sqlite3_finalize(future_stmt);
     }
 
     /* --- 7. onionpeer object(BM_OBJECT_ONIONPEER)受信 -> v3 onionピアをpeers.dbへ登録(§11)
