@@ -225,7 +225,11 @@ unsigned char *bm_create_version_payload(unsigned char *out, const char *user_ag
     size_t offset = 0;
     write_be32(out + offset, (uint32_t)version);
     offset += 4;
-    write_be64(out + offset, 0); /* services: 未対応(NODE_NETWORK等は将来追加) */
+    /* §9.6 Dandelion++完成: 自分もstemの受信側になれるようBM_SERVICE_NODE_DANDELIONを
+     * 表明する(dinv受信→自分のstem successorへの中継はStage 3で既に実装済み、
+     * DESIGN.md §9.5参照。表明していなかった間は、他の実peerがこちらをstem successor
+     * として選んでくれず一方通行だった)。NODE_NETWORK等の他のservicesビットは未対応。 */
+    write_be64(out + offset, BM_SERVICE_NODE_DANDELION);
     offset += 8;
     write_be64(out + offset, (uint64_t)time(NULL));
     offset += 8;

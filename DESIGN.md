@@ -1054,6 +1054,25 @@ fluff経路を通るため、結果的に「dinvで受け取ったobjectを自�
 という多段リレーの1ホップが実現されている。DESIGN.md §9.2で当初懸念していたほど大きな
 実装は不要だった。
 
+### 9.6 自己announceでのNODE_DANDELION表明(完成、2026-08-22)
+
+Stage 1〜3の完了時点で、`bm_create_version_payload`(`infra/protocol.c`)は§9.2の当初方針
+通り自分のversion messageの`services`を`0`固定にしており、`BM_SERVICE_NODE_DANDELION`を
+一切表明していなかった。この状態だと、こちらは他ピアへstemを送る側にはなれるが、
+**他の実peerからは「stem継続してくれない相手」とみなされ、stem successorとして選んで
+もらえない**という一方通行の状態だった。
+
+Stage 3までで`dinv`受信→自分のstem successorへの中継は実装・テスト・実daemonでの
+安定稼働まで確認済みだったため、表明しない理由が無くなっていた。`services`を
+`BM_SERVICE_NODE_DANDELION`固定に変更し、双方向の参加者にした。ctest 27件全通過
+(既存テストは`services=0`を前提にしていなかったため影響無し)。
+
+これでDandelion++はDESIGN.md §9.1の設計目標(単一ホップのstem中継・タイムアウトに
+よるfluffへの強制遷移・多段のランダムウォーク・双方向の参加)を一通り満たした。
+DB永続化を伴う本格的なper-parent nodeMap(PyBitmessageの実装により近い形)は採用せず、
+プロセス全体で単一のstem successorを使う簡略化した設計(形式的なDandelion++の
+1-regularな中継グラフとしては正しい)を意図的に選んでいる。
+
 ## 10. ディレクトリ構成・ビルド方針
 
 §1のスレッド一覧(フロント/コア暗号/インフラ/計算の4層)にモジュールを対応させ、`src/`配下を層ごとの
@@ -2082,9 +2101,8 @@ DBに対しても`init_schema`のマイグレーションが正常に働き、�
 
 - inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
   永続化)・OBJECT_ONIONPEER自己announce送信側まで全て完了。
-- Dandelion++はStage 1(§9.3、`dinv`配線)・Stage 2(§9.4、単一ホップ分のstem/fluff)まで
-  完了。dinvで受信したobjectを自分も継続してstem中継する多段リレー部分、および
-  GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外
+- Dandelion++はStage 1〜3(§9.3〜§9.5)・NODE_DANDELION自己announce(§9.6)まで完了。
+  GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外
   (引き続き見送り)。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
