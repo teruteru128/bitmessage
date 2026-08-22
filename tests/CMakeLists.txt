@@ -103,3 +103,7 @@ add_test(NAME dandelion_stage1 COMMAND test_dandelion_stage1)
 add_executable(test_dandelion_stage2 test_dandelion_stage2.c)
 target_link_libraries(test_dandelion_stage2 PRIVATE bm_core bm_infra)
 add_test(NAME dandelion_stage2 COMMAND test_dandelion_stage2)
+
+add_executable(test_dandelion_stage3 test_dandelion_stage3.c)
+target_link_libraries(test_dandelion_stage3 PRIVATE bm_core bm_infra)
+add_test(NAME dandelion_stage3 COMMAND test_dandelion_stage3)

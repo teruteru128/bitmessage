@@ -7,11 +7,13 @@
  * を指数分布で近似したもの)経過、または子ピア候補が居ない場合に通常のfluff(inv全配信)へ
  * 強制遷移させる。
  *
- * 今回実装したのは単一ホップ分のstem(DESIGN.md §9.1の「これをピアが連鎖的に繰り返す
- * ランダムウォーク」のうち自分が担う1ホップ目)のみ。dinvで受信したobjectを自分も
- * 継続してstem中継する(多段リレー)部分は未実装(DESIGN.md v1.1以降のbacklog参照、
- * 受信経路(inv/dinv受信→getdata→object到着)全体に「どちらで最初に知ったか」の状態を
- * 通す必要があり影響範囲が大きいため、ユーザーと合意の上でStage 2のスコープから外した)。
+ * §9.4(Stage 2)で単一ホップ分のstem(DESIGN.md §9.1の「これをピアが連鎖的に繰り返す
+ * ランダムウォーク」のうち自分が担う1ホップ目)を実装した。§9.5(Stage 3)で、objectを
+ * 最初にどちらのコマンドで知ったか(inv=既に他ノードがfluff済み、dinv=まだstem中)を
+ * 区別し、inv経由で知ったobjectはstemせず即座にfluffするようにした(既に公開済みの
+ * objectをそれ以上stemしても匿名性の得は無く、遅延させるだけ無駄なため)。dinv経由・
+ * 自分発(bm_dandelion_note_sourceを呼ばれていない=provenance不明)のobjectは従来通り
+ * stem→タイムアウトfluffの経路を通る。
  *
  * プロセス内シングルトンとして実装する(DESIGN.md §9.2、DB永続化不要、再起動でリセットされる
  * 仕様)。テスト容易性のため、時刻は全てUNIX秒(int64_t)を呼び出し側から明示的に渡す設計にした
@@ -41,11 +43,24 @@ void bm_dandelion_module_init(void);
 void bm_dandelion_maybe_reshuffle(struct bm_peer_registry *registry, int64_t now);
 
 /*
+ * §9.5 Stage 3: inv/dinv受信時点(object本体がまだ手元に無い、getdataを送る段階)で、
+ * このhashを最初にどちらのコマンドで知ったかを記録しておく。is_dinv=0(通常のinv)なら
+ * 「既に他ノードがfluff済み」を意味し、後でbm_dandelion_decideが呼ばれた際にstemを
+ * 一切試みず即座にFLUFFする。is_dinv=1(dinv)なら通常のstem→タイムアウトfluff経路を通る
+ * (実質的には何もしない、bm_dandelion_decideの既定動作のまま)。
+ * infra/object_sync.cのhandle_inv(inv/dinv共通処理)が、未所持だったhashについてのみ
+ * 呼ぶ想定(既知のhashは今後bm_dandelion_decideが呼ばれることも無いため記録不要)。
+ */
+void bm_dandelion_note_source(const unsigned char object_hash[32], int is_dinv, int64_t now);
+
+/*
  * infra/object.hのbm_decide_propagationの実体。object_hashを初めて見た時点でstem successorの
- * 有無を確認し、タイムアウト(固定10秒+平均30秒の指数分布)を設定する。以後同じhashに
- * ついて呼ばれるたびに: タイムアウト前かつstem successorがあればtarget_connectionが
- * stem successorと一致する場合のみSTEM、それ以外はSKIP。タイムアウト後(またはそもそも
- * stem successorが無い場合)は常にFLUFF(以後このhashについては恒久的にFLUFF)。
+ * 有無を確認し、タイムアウト(固定10秒+平均30秒の指数分布)を設定する。bm_dandelion_note_source
+ * で「通常invで知った」と記録済みのhashは、この時点でstemを試みず即座にFLUFFする
+ * (Stage 3)。それ以外(dinvで知った、または自分発でprovenance不明)は従来通り: タイムアウト
+ * 前かつstem successorがあればtarget_connectionがstem successorと一致する場合のみSTEM、
+ * それ以外はSKIP。タイムアウト後(またはそもそもstem successorが無い場合)は常にFLUFF
+ * (以後このhashについては恒久的にFLUFF)。
  */
 enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32],
                                               const struct bm_fd_data *target_connection, int64_t now);

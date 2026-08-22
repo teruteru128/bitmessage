@@ -1017,6 +1017,43 @@ outbound+`NODE_DANDELION`の接続だけを対象にすること(reservoir sampl
 stage1.c`の一部チェックも「v1は常にFLUFFのダミー」という古い前提から「stem successor
 無しなら常にFLUFF」という現状の実装に合わせて文言を更新した。ctest 26件全通過。
 
+### 9.5 Stage 3実装状況: inv/dinvの来歴を区別してstem要否を判定(2026-08-22)
+
+Stage 2と同じ日、ユーザーから続けて依頼を受けて着手。Stage 2まででは、objectを最初に
+`inv`(既に他ノードがfluff済み)で知ったか`dinv`(まだstem中)で知ったかを区別せず、
+新規object全てに同じstem→タイムアウトfluff処理をかけていた。既に公開済みのobjectを
+それ以上stemしても匿名性の得は無く、遅延させるだけ無駄なため、この区別を追加した。
+自分発object(getpubkey自応答・onionpeer announce等、inv/dinvを受信していないもの)は
+従来通りstemから開始する(provenance不明のまま、既定でstem対象)。
+
+**実装内容:**
+- `infra/dandelion.c`の`struct dandelion_entry`に`learned_via_plain_inv`を追加。
+  `bm_dandelion_note_source(hash, is_dinv, now)`を新規追加し、`is_dinv=0`(通常のinv)
+  の場合のみエントリを先回りして作成・マークする(`is_dinv=1`は「stem継続」という
+  既定動作を変えないため何もしない早期return)
+- `bm_dandelion_decide`のFLUFF判定条件に`e->learned_via_plain_inv`を追加(タイムアウト・
+  stem successor無しと同列の「即FLUFF」条件として扱う)
+- `infra/object_sync.c`の`handle_inv`(Stage 1で`inv`/`dinv`共通処理にしていた関数)が、
+  未所持hashについてのみ`msg->command`(`"inv"`か`"dinv"`か)を見て
+  `bm_dandelion_note_source`を呼ぶようにした。ワイヤーフォーマットが同一なため
+  パース・未所持判定・getdata送信自体はStage 1から変更していない
+
+**テスト:** `tests/test_dandelion_stage3.c`を新規追加。(1)`is_dinv=0`で記録した
+hashは、stem successorが存在してもタイムアウト前から常にFLUFFになること、(2)
+`is_dinv=1`で記録したhashは、記録しなかった場合と同じくSTEM判定されうること(既定動作を
+変えないことの確認)、(3)実際に`bm_object_sync_dispatch`へ`"inv"`コマンドを流し込み、
+そのhashについて`bm_decide_propagation`を呼ぶと(stem successorが利用可能でも)FLUFFに
+なることを、実際のdispatch経路を通して確認した。ctest 27件全通過。
+
+dinvで受信したobjectを自分も継続してstem中継する「多段リレー」の実質的な部分
+(自分がstem successorとしてdinvを受け取った際、単に既存のstem successorへdinvを
+中継する)は今回実装した設計で既に自然にカバーされている: `handle_inv`が`dinv`受信時に
+`is_dinv=1`で記録し、後で`handle_object`がobject本体を受け取った際に呼ぶ
+`bm_decide_propagation`は(provenance不明の自分発objectと同じく)通常のstem→タイムアウト
+fluff経路を通るため、結果的に「dinvで受け取ったobjectを自分のstem successorへ中継する」
+という多段リレーの1ホップが実現されている。DESIGN.md §9.2で当初懸念していたほど大きな
+実装は不要だった。
+
 ## 10. ディレクトリ構成・ビルド方針
 
 §1のスレッド一覧(フロント/コア暗号/インフラ/計算の4層)にモジュールを対応させ、`src/`配下を層ごとの

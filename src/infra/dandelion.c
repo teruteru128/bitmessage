@@ -22,6 +22,10 @@ struct dandelion_entry
     unsigned char hash[32];
     int64_t fluff_deadline;
     int64_t fluffed_at; /* 0 = まだfluffしていない */
+    /* §9.5 Stage 3: このhashを最初にどちらのコマンドで知ったか。0(既定、自分発object
+     * またはまだ不明)ならstem→タイムアウトfluffの通常経路。1(通常inv経由、既に他ノードが
+     * fluff済み)ならstemを一切試みず即座にFLUFFする(bm_dandelion_note_source参照)。 */
+    int learned_via_plain_inv;
 };
 
 static struct
@@ -94,7 +98,27 @@ static struct dandelion_entry *find_or_create_entry(const unsigned char hash[32]
     e->fluff_deadline =
         now + BM_DANDELION_TIMEOUT_BASE_SECONDS + (int64_t)exponential_random(BM_DANDELION_TIMEOUT_MEAN_SECONDS);
     e->fluffed_at = 0;
+    e->learned_via_plain_inv = 0; /* 既定はstem対象(自分発object、またはprovenance不明) */
     return e;
+}
+
+void bm_dandelion_note_source(const unsigned char object_hash[32], int is_dinv, int64_t now)
+{
+    if (is_dinv)
+    {
+        /* dinv経由はstem継続が既定動作のまま(find_or_create_entryのlearned_via_plain_inv=0と
+         * 同じ)なので、わざわざエントリを先回りして作る必要は無い。呼び出し元
+         * (object_sync.cのhandle_inv)からの一律呼び出しを許容するための早期returnであり、
+         * この関数はis_dinv=0の場合にのみ実質的な意味を持つ。 */
+        return;
+    }
+    pthread_mutex_lock(&g_state.lock);
+    struct dandelion_entry *e = find_or_create_entry(object_hash, now);
+    if (e != NULL)
+    {
+        e->learned_via_plain_inv = 1;
+    }
+    pthread_mutex_unlock(&g_state.lock);
 }
 
 void bm_dandelion_maybe_reshuffle(struct bm_peer_registry *registry, int64_t now)
@@ -136,7 +160,7 @@ enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32]
         return BM_PROPAGATE_FLUFF;
     }
 
-    if (e->fluffed_at != 0 || now >= e->fluff_deadline || !g_state.has_stem)
+    if (e->fluffed_at != 0 || now >= e->fluff_deadline || !g_state.has_stem || e->learned_via_plain_inv)
     {
         if (e->fluffed_at == 0)
         {

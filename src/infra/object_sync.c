@@ -21,6 +21,7 @@
 #include "../core/send_pipeline.h"
 #include "../core/trial_decrypt.h"
 #include "../pow/pow_engine.h"
+#include "dandelion.h"
 #include "object.h"
 #include "object_store.h"
 
@@ -693,6 +694,14 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
         return;
     }
 
+    /* §9.5 Dandelion++ Stage 3: このメッセージがinv(通常、既に他ノードがfluff済み)なのか
+     * dinv(stem中継、まだstem中)なのかを覚えておき、未所持hashについてのみ
+     * bm_dandelion_note_sourceへ記録する(既知のhashは今後bm_dandelion_decideが呼ばれ
+     * ないため記録不要)。inv/dinvはワイヤーフォーマットが同一なため、ここまでの処理
+     * (パース・未所持判定・getdata送信)はStage 1から変わらず共通のまま */
+    int is_dinv = (strncmp(msg->command, "dinv", 12) == 0);
+    int64_t now = (int64_t)time(NULL);
+
     unsigned char (*missing)[32] = inv_msg.count > 0 ? malloc(sizeof(*missing) * inv_msg.count) : NULL;
     size_t missing_count = 0;
     for (uint64_t i = 0; i < inv_msg.count; i++)
@@ -701,6 +710,7 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
         {
             memcpy(missing[missing_count], inv_msg.items[i], 32);
             missing_count++;
+            bm_dandelion_note_source(inv_msg.items[i], is_dinv, now);
         }
     }
     bm_free_inventory_message(&inv_msg);
