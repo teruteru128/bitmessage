@@ -1,5 +1,8 @@
 # bitmessage
 
+[![CI](https://github.com/teruteru128/bitmessage/actions/workflows/ci.yml/badge.svg)](https://github.com/teruteru128/bitmessage/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Bitmessage P2Pメッセージングプロトコルの、C言語によるフルスクラッチ実装。
 
 [PyBitmessage](https://github.com/Bitmessage/PyBitmessage) と実ネットワーク越しに相互運用できることを目標に、
