@@ -1,6 +1,5 @@
 #include "peer_registry.h"
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,26 +7,6 @@
 #include <unistd.h>
 
 #include "protocol.h"
-
-/* peer_addr(sockaddr_storage)を"ip:port"文字列にする。DNS引きはせず数値表記のみ */
-static void format_peer_addr(const struct sockaddr_storage *addr, char *out, size_t out_len)
-{
-    char ip[INET6_ADDRSTRLEN] = {0};
-    int port = 0;
-    if (addr->ss_family == AF_INET)
-    {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
-        inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
-        port = ntohs(sin->sin_port);
-    }
-    else if (addr->ss_family == AF_INET6)
-    {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
-        port = ntohs(sin6->sin6_port);
-    }
-    snprintf(out, out_len, "%s:%d", ip, port);
-}
 
 void bm_peer_registry_init(struct bm_peer_registry *reg)
 {
@@ -90,16 +69,22 @@ size_t bm_peer_registry_count(struct bm_peer_registry *reg)
 
 int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port)
 {
-    char target[INET6_ADDRSTRLEN + 8];
-    snprintf(target, sizeof(target), "%s:%d", ip, port);
-
     pthread_mutex_lock(&reg->lock);
     int found = 0;
     for (size_t i = 0; i < reg->count; i++)
     {
-        char current[INET6_ADDRSTRLEN + 8];
-        format_peer_addr(&reg->conns[i]->peer_addr, current, sizeof(current));
-        if (strcmp(current, target) == 0)
+        /* §11 2026-08-22発覚のバグ修正: 以前はreg->conns[i]->peer_addr(getpeername)を
+         * そのまま比較していたが、SOCKS5(Tor)プロキシ経由の接続ではこれがプロキシ自身の
+         * アドレス(例: 127.0.0.1:9050)になり、ipで渡される本来の候補アドレスとは
+         * 絶対に一致しない。結果としてSOCKS5有効時は「既に接続済み」判定が常に偽になり、
+         * peer_connector.cの二重接続防止(bm_peer_connector_connect_initial)が機能して
+         * いなかった(rating調査で見つかった一連のバグと同じ根本原因)。
+         * bm_network_resolve_peer_ip_port(logical_peer_ip優先、network.h参照)で解決した
+         * ip:portと比較するよう修正した。 */
+        char current_ip[INET6_ADDRSTRLEN];
+        int current_port = 0;
+        bm_network_resolve_peer_ip_port(reg->conns[i], current_ip, sizeof(current_ip), &current_port);
+        if (current_port == port && strcmp(current_ip, ip) == 0)
         {
             found = 1;
             break;

@@ -87,3 +87,7 @@ add_test(NAME config_file COMMAND test_config_file)
 add_executable(test_peer_rating_on_disconnect test_peer_rating_on_disconnect.c)
 target_link_libraries(test_peer_rating_on_disconnect PRIVATE bm_core bm_infra Threads::Threads)
 add_test(NAME peer_rating_on_disconnect COMMAND test_peer_rating_on_disconnect)
+
+add_executable(test_peer_registry_proxy test_peer_registry_proxy.c)
+target_link_libraries(test_peer_registry_proxy PRIVATE bm_core bm_infra)
+add_test(NAME peer_registry_proxy COMMAND test_peer_registry_proxy)

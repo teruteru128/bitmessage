@@ -1880,6 +1880,36 @@ size_tの引き算でアンダーフローしないことを重視した(各ス�
 実際に`text="too many connections"`のようなテスト用文字列が正しく出力されることを確認)。
 ctest 22件全通過。
 
+### バグ修正: SOCKS5プロキシ越しだとpeer_registryの二重接続防止も機能していなかった
+
+上記`error`メッセージの可視化で「Too many connections from your IP.」という実際の
+拒否理由が判明した後、ユーザーから「うちの実装にも同様の受付制限があるか」と質問された
+のをきっかけに(無い、と回答)、rating関連の3回目の修正(SOCKS5経由だと`conn->peer_addr`が
+プロキシのアドレスになる)と同じ根本原因を持つ兄弟バグが`infra/peer_registry.c`にも
+無いか確認したところ、実際に見つかった。
+
+**原因:** `bm_peer_registry_has_peer(reg, ip, port)`(`peer_connector.c`の
+`bm_peer_connector_connect_initial`が「既に接続済みの相手には二重接続しない」ために使う)は、
+`reg->conns[i]->peer_addr`(getpeername)をそのまま`"ip:port"`文字列化して比較していた。
+SOCKS5(Tor)経由の接続ではこれがプロキシ自身のアドレス(`127.0.0.1:9050`)になるため、
+候補の本来のip:portとは絶対に一致せず、SOCKS5有効時は「既に接続済み」判定が常に偽になり、
+二重接続防止が機能していなかった。
+
+**修正:** `bm_network_resolve_peer_ip_port`(3回目の修正で追加した、`logical_peer_ip`優先で
+本来の接続先を解決するヘルパー)を使うよう変更した。副次的に、この関数専用だった
+`format_peer_addr`static関数は不要になったため削除した。
+
+**テスト:** `tests/test_peer_registry_proxy.c`を新規追加。(1)SOCKS5経由を模した接続
+(`peer_addr`=ダミーのプロキシアドレス、`logical_peer_ip`=本来の接続先)が本来の接続先で
+正しく重複検知されること、プロキシ自身のアドレスは重複検知の対象にならないこと、
+(2)直接接続(`logical_peer_ip`未設定)でも従来通り`peer_addr`ベースのフォールバックで
+重複検知できること、(3)削除後は重複検知されなくなること、を確認した。ctest 23件全通過。
+
+なお`bm_post_version`が`conn->peer_addr`/`conn->local_addr`をversion messageの
+`addr_recv`/`addr_from`フィールドへエンコードする箇所もSOCKS5経由だと厳密には不正確に
+なるが、これらのフィールドを検証・利用している実装は確認できておらず情報提供以上の
+意味を持たないため、優先度が低いとして今回は対応しなかった(ユーザーとの合意)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
