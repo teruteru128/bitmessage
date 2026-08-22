@@ -2160,12 +2160,24 @@ rating推移・Dandelion動作を確認できる。
    実装コストは軽いはずだが、接続時刻・送受信バイト数・user agent等まで出すには
    `bm_fd_data`への追加フィールドが必要になる。ユーザーから「GUI専用の機能というより
    ヘッドレスdaemonでも普通に価値がある」との指摘あり。未着手。
-   - 送受信バイト数は2026-08-23に設計を詰めた。ノードごとの内訳(現在接続中のpeerのみ)
-     と、切断済みも含めた全体累積の両方が欲しい(PyBitmessageも同様の仕様だったはず、との
-     指摘あり)。前者は`bm_fd_data`に送受信バイト数フィールドを追加しrecv/send箇所で
-     インクリメント、後者はpeer_registryかnetwork.c側に別途プロセス起動時からの
-     グローバル累積カウンタ(mutex保護)を持たせ、同じ箇所で同時にインクリメントする
-     2段構えの設計とする。実装はまだ着手していない。
+   - 送受信バイト数は2026-08-23に設計を詰め、PyBitmessage実装(`~/Documents/Projects/
+     teruteru128/PyBitmessage`)も調査した。ノードごとの内訳(現在接続中のpeerのみ)と、
+     切断済みも含めた全体累積の両方が欲しい。前者は`bm_fd_data`に送受信バイト数
+     フィールドを追加しrecv/send箇所でインクリメント、後者はpeer_registryかnetwork.c
+     側に別途プロセス起動時からのグローバル累積カウンタ(mutex保護)を持たせ、同じ箇所で
+     同時にインクリメントする2段構えの設計とする。
+     - PyBitmessage側の実態: 全体累積は`network/asyncore_pollchoose.py`の
+       モジュールレベル変数`sentBytes`/`receivedBytes`(`update_sent`/`update_received`
+       で加算のみ、切断しても減らない)で、想定通りプロセス生存期間ぶん累積する方式
+       だった。ただしこれはJSON-RPC APIには一切出ておらず、GUIのNetwork Statusタブの
+       スループット表示(`network/stats.py`経由)にのみ使われている。
+     - 一方、ノードごとの内訳は`network/advanceddispatcher.py`の接続オブジェクトに
+       `self.sentBytes`/`self.receivedBytes`として確かに存在する(read/writeハンドラで
+       加算)が、`api.py`の`listConnections`実装(`host`/`port`/`fullyEstablished`/
+       `userAgent`のみを返す)を含め、どこからも参照・表示されていない、実質デッドな
+       フィールドだった。つまり「listConnections APIでノードごとの送受信バイト数を返す」
+       のはPyBitmessage自体には無い機能で、今回追加するならPyBitmessageより一歩進んだ
+       ものになる。実装はまだ着手していない。
 6. Dandelion++・inbound接続はどちらも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で
    明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
