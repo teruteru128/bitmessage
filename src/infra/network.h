@@ -10,6 +10,7 @@
  * bm_parse_result を使い分岐を明確化している(bm_network_handle_readable内)。
  */
 
+#include <sqlite3.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/socket.h>
@@ -98,6 +99,12 @@ struct bm_epoll_thread_args
     bm_command_handler_fn handler;
     void *user_data;
     struct bm_peer_registry *registry; /* NULL可(未使用ならレジストリ更新をスキップ) */
+    /* §11 outbound接続が切断された際にpeer_manager.cのratingへ失敗を反映するために使う
+     * (2026-08-22発覚のバグ修正: connect()+version送信が成功した時点でpeer_connector.cが
+     * 既にrating+0.1を記録するが、直後にECONNRESET等で切断されてもそれまでratingへ
+     * フィードバックする経路が無く、"接続はできるが即座に切れる"peerのratingが下がらず
+     * 際限なく再選出され続けていた)。NULL可(未使用ならrating更新をスキップ、テスト等)。 */
+    sqlite3 *peers_db;
 };
 
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。

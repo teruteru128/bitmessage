@@ -398,6 +398,7 @@ int main(void)
     net_args->handler = bm_object_sync_dispatch;
     net_args->user_data = &object_sync_ctx;
     net_args->registry = &peer_registry;
+    net_args->peers_db = peers_db;
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);
 

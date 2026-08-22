@@ -2,10 +2,12 @@
 
 #include "peer_registry.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "../core/peer_manager.h"
 
 #define INIT_RECV_BUFFER_SIZE 131072
 #define MAX_EPOLL_EVENTS 64
@@ -388,6 +392,27 @@ static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *
     }
 }
 
+/* peer_addr(sockaddr_storage)からip文字列とportを取り出す。DNS引きはせず数値表記のみ
+ * (peer_registry.cのformat_peer_addrと同じ考え方だが、bm_peer_manager_record_resultへ
+ * ip/portを別々の引数で渡す必要があるためip:port結合済み文字列ではなく分けて返す) */
+static void extract_ip_port(const struct sockaddr_storage *addr, char *out_ip, size_t out_ip_len, int *out_port)
+{
+    out_ip[0] = '\0';
+    *out_port = 0;
+    if (addr->ss_family == AF_INET)
+    {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &sin->sin_addr, out_ip, out_ip_len);
+        *out_port = ntohs(sin->sin_port);
+    }
+    else if (addr->ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, out_ip, out_ip_len);
+        *out_port = ntohs(sin6->sin6_port);
+    }
+}
+
 void *bm_network_epoll_thread(void *arg)
 {
     struct bm_epoll_thread_args *args = arg;
@@ -416,6 +441,25 @@ void *bm_network_epoll_thread(void *arg)
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
             if (rc != 0)
             {
+                /* §11 2026-08-22発覚のバグ修正: peer_connector.cはconnect()+version送信が
+                 * 成功した時点でrating+0.1を記録するが、その直後にECONNRESET等で切断されても
+                 * それをratingへフィードバックする経路が無く、「TCP接続とversion送信はできるが
+                 * 直後に切断される」peerのratingが下がらないまま毎回の再接続サイクルで
+                 * 選ばれ続けていた(実例: 特定の1peerへの接続が9700行超のログ中3474回に
+                 * わたって繰り返されていた)。ここで切断時にfailureとして-0.1を記録することで、
+                 * 繰り返し切断してくるpeerは他の正常なpeerと同様ratingが下がり、
+                 * peer_manager.cの低rating cleanup(既存実装)の対象にもなり得るようにする。
+                 * inbound(BM_FD_SERVER_SOCKET)接続はこちらから選んだ相手ではないため対象外。 */
+                if (conn->type == BM_FD_CLIENT_SOCKET && args->peers_db != NULL)
+                {
+                    char ip[INET6_ADDRSTRLEN];
+                    int port = 0;
+                    extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
+                    if (ip[0] != '\0')
+                    {
+                        bm_peer_manager_record_result(args->peers_db, ip, port, 1, 0);
+                    }
+                }
                 if (args->registry != NULL)
                 {
                     bm_peer_registry_remove(args->registry, conn);

@@ -83,3 +83,7 @@ add_test(NAME tor_control COMMAND test_tor_control)
 add_executable(test_config_file test_config_file.c)
 target_link_libraries(test_config_file PRIVATE bm_core)
 add_test(NAME config_file COMMAND test_config_file)
+
+add_executable(test_peer_rating_on_disconnect test_peer_rating_on_disconnect.c)
+target_link_libraries(test_peer_rating_on_disconnect PRIVATE bm_core bm_infra Threads::Threads)
+add_test(NAME peer_rating_on_disconnect COMMAND test_peer_rating_on_disconnect)

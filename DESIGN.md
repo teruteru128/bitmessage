@@ -1739,6 +1739,42 @@ env varから読むよう変更。既定値は変えず3のまま。
 作成した実際のアドレスの`identity.db`の値が2000/1500になっていることを確認した。
 ctest 21件全通過。
 
+### バグ修正: 切断したoutbound接続のratingが更新されず同じ死んだpeerに再接続し続ける(2026-08-22)
+
+v1.1.0リリース後、ユーザーが`bitmessaged_bootstrap.log`(長時間稼働のbootstrap daemon)を
+見て「ずっと同じpeerに接続しに行ってresetされていないか」と指摘。確認したところ、
+特定の1peer(`179.191.207.222:8444`)への接続が9700行超のログ中3474回にわたって
+繰り返されており、実際にバグだった。
+
+**原因:** `peer_connector.c`はconnect()+version送信が成功した時点で
+`bm_peer_manager_record_result(..., 1, 1)`を呼びrating+0.1(上限1.0)を記録するが、
+その直後に相手からECONNRESET等で切断されても、それをratingへフィードバックする経路が
+どこにも無かった。「TCPは繋がりversionも送れるが、直後に切断してくる」peerは
+一度でも接続に成功すればratingが上がる一方で、その後何度切断されても下がることが無い。
+結果としてこのようなpeerのratingが上限の1.0に張り付き、`bm_peer_manager_list_top`
+(rating降順)で毎回のreconnectサイクルの最上位候補になり続け、outbound接続枠を
+無限に消費し続けていた。
+
+**修正:** `infra/network.c`の`bm_network_epoll_thread`に、接続切断(`bm_network_handle_
+readable`が非0を返す=EOFまたは読み取りエラー)を検知した際の処理を追加した。対象の接続が
+`BM_FD_CLIENT_SOCKET`(こちらから選んで繋いだoutbound接続。相手から繋いできた`BM_FD_
+SERVER_SOCKET`はこちらが選んだ相手ではないため対象外)であれば、`conn->peer_addr`から
+ip/portを取り出し`bm_peer_manager_record_result(peers_db, ip, port, 1, 0)`を呼んで
+failureとして-0.1を記録する。これにより繰り返し切断してくるpeerは他の不安定なpeerと
+同様ratingが下がっていき、既存の低rating cleanup機構の対象にもなり得るようになった。
+
+`struct bm_epoll_thread_args`に`peers_db`(NULL可)を追加し、`main.c`から配線した。
+
+**テスト:** `tests/test_peer_rating_on_disconnect.c`を新規追加。実TCP接続+実際に
+`bm_network_epoll_thread`をpthreadで起動し、peers.dbへrating=0.5で登録済みのpeerへ
+outbound接続した直後に相手側がEOFで切断した場合、rating列が実際に0.4(0.5-0.1)へ
+更新されることを確認した(`tests/test_inbound.c`と同じ「実ソケット+実スレッドで
+決定的に検証する」方針)。ctest 22件全通過。
+
+再起動が必要なbootstrap daemon自体への適用はユーザーの明示的な指示を待って行う
+(前回誤って`pkill -f`で巻き込んで停止させてしまった経緯があるため、今回はPIDを
+明示的に指定してのみ操作する)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
