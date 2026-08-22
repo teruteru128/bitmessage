@@ -932,6 +932,39 @@ struct unlocked_identity {
   既存§1の`peer_connector_thread`(定期実行スレッド)に相乗りさせるか、専用の`dandelion_thread`を
   新設するかは実装着手時に判断する
 
+### 9.3 Stage 1実装状況(配線、2026-08-22)
+
+peer rating周りのバグ修正セッションと同じ日に着手。§9.2で確保していた`bm_decide_propagation`
+(`infra/object.h`)は定義こそあったが、実際のinv送信経路(`infra/peer_registry.c`の
+`bm_peer_registry_broadcast_inv`)からは一度も呼ばれておらず、「差し込み点」が配線されて
+いなかったことが判明した。Stage 1でこれを解消した(挙動は変えない、v1は常にFLUFFを
+返すダミーのまま)。
+
+**着手前に確認した前提:** 実装が無駄足にならないか、この3日間観測した実peerの`version`
+メッセージを集計したところ、85件全て`services=11`(1+2+8、8が`NODE_DANDELION`)で、
+100%がDandelion対応を表明していた(全て`/PyBitmessage:0.6.3.2/`)。mainnetの主要
+クライアントでは標準的に有効になっていると判断し、実装する価値があると確認した上で着手した。
+
+**実装内容:**
+- `infra/protocol.h`に`BM_SERVICE_NODE_DANDELION`(=8)を追加
+- `infra/object_sync.c`の`bm_object_sync_dispatch`に、`dinv`コマンドを`inv`と全く同じ
+  処理経路(`handle_inv`)へ流す分岐を追加(ワイヤーフォーマットが完全に同一なので安全)
+- `infra/peer_registry.c`の`bm_peer_registry_broadcast_inv`を書き換え、登録済み接続
+  ごと・hashごとに`bm_decide_propagation`を呼んでFLUFF判定されたhashだけをその接続への
+  inv送信対象に含めるようにした(v1は常にFLUFFなので、結果的に送信内容・宛先は
+  従来と完全に同じ。STEMがv1で発生することは無いが、将来STEMを実際に返すように
+  なった際は、このbroadcast関数(全接続への通常inv配信)とは別に、単一の子ピアだけへ
+  `dinv`を送る専用の送信経路をStage 2で追加する想定)
+
+**テスト:** `tests/test_dandelion_stage1.c`を新規追加。`BM_SERVICE_NODE_DANDELION`の値、
+`bm_decide_propagation`が常にFLUFFを返すこと、`dinv`受信が`inv`受信と全く同じ
+(未所持hashへ`getdata`を送り返す)処理経路に流れることを確認した。加えて
+`bm_peer_registry_broadcast_inv`の書き換え自体は既存の`tests/test_object_sync.c`の
+broadcast検証(新規object受信時、他の接続peerへ`inv`が届くこと)が引き続き通っていることで
+実質的な回帰確認になっている。ctest 25件全通過。
+
+Stage 2(実際のstem/fluff状態機械)は未着手。
+
 ## 10. ディレクトリ構成・ビルド方針
 
 §1のスレッド一覧(フロント/コア暗号/インフラ/計算の4層)にモジュールを対応させ、`src/`配下を層ごとの
@@ -1960,8 +1993,9 @@ DBに対しても`init_schema`のマイグレーションが正常に働き、�
 
 - inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
   永続化)・OBJECT_ONIONPEER自己announce送信側まで全て完了。
-- Dandelion++のstem機能、GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、
-  今回のv1完成の対象外(引き続き見送り)。
+- Dandelion++はStage 1(§9.3、`dinv`配線・`bm_decide_propagation`の実配線)まで完了。
+  実際のstem/fluff状態機械(Stage 2)とGPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と
+  決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

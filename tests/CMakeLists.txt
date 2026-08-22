@@ -95,3 +95,7 @@ add_test(NAME peer_registry_proxy COMMAND test_peer_registry_proxy)
 add_executable(test_peer_manager_self test_peer_manager_self.c)
 target_link_libraries(test_peer_manager_self PRIVATE bm_core)
 add_test(NAME peer_manager_self COMMAND test_peer_manager_self)
+
+add_executable(test_dandelion_stage1 test_dandelion_stage1.c)
+target_link_libraries(test_dandelion_stage1 PRIVATE bm_core bm_infra)
+add_test(NAME dandelion_stage1 COMMAND test_dandelion_stage1)

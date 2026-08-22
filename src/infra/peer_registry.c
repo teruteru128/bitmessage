@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "object.h"
 #include "protocol.h"
 
 void bm_peer_registry_init(struct bm_peer_registry *reg)
@@ -94,17 +95,20 @@ int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int 
     return found;
 }
 
+/* §9 Dandelion++ Stage 1: dup()した接続1本ぶんの送信予定(bm_decide_propagationで
+ * FLUFF判定されたhashだけに絞り込んだもの)。ロック解放後にまとめて書き込むための
+ * 一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */
+struct pending_inv_send
+{
+    int fd;
+    unsigned char (*hashes)[32];
+    size_t count;
+};
+
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
                                      size_t count, const struct bm_fd_data *except)
 {
     if (count == 0)
-    {
-        return;
-    }
-
-    size_t packet_len = 0;
-    unsigned char *packet = bm_create_inventory_message("inv", hashes, count, &packet_len);
-    if (packet == NULL)
     {
         return;
     }
@@ -117,8 +121,8 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
      * 誤った相手へ書き込んでしまう恐れがある。dup()した複製fdはclose(conn->fd)されても
      * 無効化されず同じsocketを指し続けるため、ロックを持っている間にdup()するだけで
      * この競合を避けつつロックを早期に解放できる */
-    int *fds = reg->count > 0 ? malloc(sizeof(int) * reg->count) : NULL;
-    size_t fd_count = 0;
+    struct pending_inv_send *pending = reg->count > 0 ? malloc(sizeof(*pending) * reg->count) : NULL;
+    size_t pending_count = 0;
 
     pthread_mutex_lock(&reg->lock);
     for (size_t i = 0; i < reg->count; i++)
@@ -128,23 +132,61 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         {
             continue;
         }
+
+        /* §9 Dandelion++差し込み点(DESIGN.md §9.2「inv送信判断は必ずこの関数を経由させる」):
+         * 接続ごと・hashごとにfluff/stem/skipを判断する。v1は常にFLUFFを返すダミーのため
+         * 全hashが素通りし挙動は変わらない。stemはv1では発生しない(bm_decide_propagationの
+         * stub参照)ため、このfluff broadcast(=全接続peerへの通常inv配信)にはFLUFFのhashだけ
+         * を含める設計にしている。将来STEMを実際に返すようになったら、stem対象のhashは
+         * このbroadcast関数とは別の、単一の子ピアだけへdinvを送る専用の送信経路で扱う想定。 */
+        unsigned char (*filtered)[32] = malloc(sizeof(*filtered) * count);
+        size_t filtered_count = 0;
+        for (size_t h = 0; h < count; h++)
+        {
+            if (bm_decide_propagation(hashes[h], conn) == BM_PROPAGATE_FLUFF)
+            {
+                memcpy(filtered[filtered_count], hashes[h], 32);
+                filtered_count++;
+            }
+        }
+
+        if (filtered_count == 0)
+        {
+            free(filtered);
+            continue;
+        }
+
         int dup_fd = dup(conn->fd);
         if (dup_fd >= 0)
         {
-            fds[fd_count++] = dup_fd;
+            pending[pending_count].fd = dup_fd;
+            pending[pending_count].hashes = filtered;
+            pending[pending_count].count = filtered_count;
+            pending_count++;
+        }
+        else
+        {
+            free(filtered);
         }
     }
     pthread_mutex_unlock(&reg->lock);
 
-    for (size_t i = 0; i < fd_count; i++)
+    for (size_t i = 0; i < pending_count; i++)
     {
-        if (bm_network_write_all(fds[i], packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
+        size_t packet_len = 0;
+        unsigned char *packet =
+            bm_create_inventory_message("inv", pending[i].hashes, pending[i].count, &packet_len);
+        if (packet != NULL)
         {
-            fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", fds[i]);
+            if (bm_network_write_all(pending[i].fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
+                != 0)
+            {
+                fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+            }
+            free(packet);
         }
-        close(fds[i]);
+        close(pending[i].fd);
+        free(pending[i].hashes);
     }
-    free(fds);
-
-    free(packet);
+    free(pending);
 }

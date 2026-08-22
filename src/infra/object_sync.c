@@ -877,8 +877,12 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             bm_free_addr_message(&addr_msg);
         }
     }
-    else if (strncmp(msg->command, "inv", 12) == 0)
+    else if (strncmp(msg->command, "inv", 12) == 0 || strncmp(msg->command, "dinv", 12) == 0)
     {
+        /* §9 Dandelion++ Stage 1: dinv(stemフェーズ中の中継、まだ周りへ撒くなという合図)は
+         * ワイヤーフォーマットがinvと完全に同一(varint(count) || hash(32byte)*count)なので、
+         * stem状態を一切保持しないv1では安全にinvと全く同じ処理経路へ流せる
+         * (DESIGN.md §9.2)。Dandelion対応ピアと接続してもプロトコル違反にはならない。 */
         handle_inv(ctx, conn, msg);
     }
     else if (strncmp(msg->command, "getdata", 12) == 0)

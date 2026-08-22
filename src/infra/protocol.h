@@ -49,6 +49,11 @@ struct bm_message
     unsigned char *payload; /* length byte、length==0ならNULL */
 };
 
+/* §9 Dandelion++。version messageのservicesビットフィールドで対応ピアを識別する
+ * (PyBitmessageのprotocol.py準拠)。v1(Stage 1)時点では自分のversion messageの
+ * servicesにこのビットを立てない(=stem対応ピアとして名乗らない、DESIGN.md §9.2)。 */
+#define BM_SERVICE_NODE_DANDELION 8
+
 struct bm_version_message
 {
     uint32_t version;
