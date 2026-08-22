@@ -1,4 +1,8 @@
-# TODO: 他モジュール(varint/base58/PoW target計算)の単体テストも追加していく
+# TODO: 他モジュール(base58/PoW target計算)の単体テストも追加していく
+
+add_executable(test_varint test_varint.c)
+target_link_libraries(test_varint PRIVATE bm_common)
+add_test(NAME varint COMMAND test_varint)
 
 add_executable(test_address_vectors test_address_vectors.c)
 target_link_libraries(test_address_vectors PRIVATE bm_core)

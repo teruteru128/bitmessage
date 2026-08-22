@@ -2170,6 +2170,42 @@ ctest 27件全通過、クリーンなbuildディレクトリでの再ビルド�
 自然に消えるため手動削除はしていない。ctest 27件全通過(素のIPv6を一律filterする
 回帰テストを`test_object_sync.c`に追加)。
 
+### 重大バグ修正: varint(0xfd/0xfe/0xff以降)がリトルエンディアンで実装されていた(2026-08-23)
+
+ユーザーが`peers.db`を`sqlite3`で直接見ていて発見。`onionpeer_obj`由来のportが全件
+`64544`になっていた。8444(2進数表現で0x20FC)をswap16すると0xFC20=64544になり一致する
+ことから、`common/varint.c`の`bm_varint_decode`/`bm_varint_encode`の多バイト部分の
+バイトオーダーを疑い、PyBitmessage本家(`addresses.py`)の`encodeVarint`/`decodeVarint`を
+確認したところ`pack('>H'/'>I'/'>Q', ...)`(ビッグエンディアン)だった。うちの実装は
+リトルエンディアンで、これは表示上の問題ではなく本物のプロトコル仕様違反だった。
+
+**気付かれなかった理由**: stream番号・addr/inv件数・user agent長といった他のvarint
+利用箇所は実運用でほぼ常に253未満(1byte varint)に収まるため、多バイト部分の
+バイトオーダーが試される機会がほとんど無かった。ポート番号(既定8444)は必ず253以上
+になるため、OBJECT_ONIONPEERのvarint(port)フィールドで初めて顕在化した。
+
+**移植元(libstudy)の状況**: `study/libstudy/src/bm_sonota.c`の`encodeVarint`にも
+同じバグがあり(`bm_protocol.c`の`decodeVarint`も同様)、しかも
+`// TODO endian関数使ってエンコーディング`というコメントが当時から付いたまま
+放置されていたことが判明。移植時に紛れ込んだものではなく、libstudy時代からの
+既存バグだった。ユーザーの指示でこちらも修正・commit・push済み(`htobeXX`/`beXXtoh`
+を使う形に書き換え、libstudyの既存ctest 9件全通過を確認)。
+
+**永続化データへの影響範囲の洗い出し**: `bm_varint_decode`の全利用箇所を確認した結果、
+実際にDBへ保存され後に残る形で壊れていたのは`peers.db`の`hosts.port`
+(`source='onionpeer_obj'`)だけと判断した。object header の`stream`もvarint経由だが
+実運用ではstream=1で固定されており(peers.db/object_pool.db双方で確認)実害無し。
+addr/inv message件数やerror messageのフィールド長はその場限りの解析にしか使わず
+DBに残らないため、当時パースし損ねていたとしても今から直す対象が無い。
+
+**修正内容**: `common/varint.c`の該当3箇所(0xfd/0xfe/0xff)を全てビッグエンディアンに
+修正。回帰テスト`tests/test_varint.c`を新設(実際に壊れていた8444のワイヤーバイト列
+`0xfd 0x20 0xfc`を含む固定期待値テスト+全サイズクラスのround-trip)、ctest 28件全通過。
+既存の壊れたpeers.dbエントリ(`onionpeer_obj`、17件、port値は64544/38667/3144の3種)は
+`UPDATE hosts SET port = ((port & 255) << 8) | ((port >> 8) & 255) WHERE
+source = 'onionpeer_obj';`で一括修正(swap16は自己逆写像なので同じ操作を再適用するだけで
+正しい値に戻る)。修正後は8444(14件)/2967(2件)/18444(1件)に復元された。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
