@@ -2094,16 +2094,81 @@ bootstrap daemonの`peers.db`には存在しない。`CREATE TABLE IF NOT EXISTS
 DBに対しても`init_schema`のマイグレーションが正常に働き、既存行を保ったまま
 `mark_self`/`list_top`が使えるようになることを確認した。ctest 24件全通過。
 
+### セッションまとめ: v1.1完成(inbound Tor対応・設定ファイル・Dandelion++)(2026-08-19〜2026-08-23)
+
+v1.0.0リリース後、複数日にわたる1つの連続したセッションで以下を完了した。詳細は
+各節を参照(このまとめは索引専用、内容はここには繰り返さない)。
+
+- **inbound接続**: Stage 1(汎用TCP listen/accept、Tor非依存)・Stage 2(Tor ControlPort
+  自動化・onion鍵永続化)・`BM_ONION_ADDRESS`(静的torrc設定への対応、PyBitmessageの
+  `onionhostname`相当)・`OBJECT_ONIONPEER`自己announce送信側。全て完了(§11「inbound接続」
+  各節、上記参照)。
+- **起動時設定ファイル`bitmessage.conf`**: INI形式の自前パーサ、`env var > 設定ファイル >
+  既定値`の優先順位、PyBitmessage keys.dat由来の`max_outbound_connections`・
+  `default_nonce_trials_per_byte`/`default_payload_length_extra_bytes`を追加。
+- **バージョンを1.1.0へ引き上げ**(`v1.1.0`タグ)。
+- **peer rating/接続まわりのバグ4連発**(いずれもユーザーが実際のbootstrap daemonの
+  ログを見て気づいた): (1) 切断したoutbound接続のratingが更新されず同じ死んだpeerに
+  再接続し続ける、(2) success記録のタイミングが早すぎて(1)の修正を打ち消していた、
+  (3) SOCKS5(Tor)プロキシ越しだと(1)(2)の修正が両方とも無効化されていた
+  (`conn->peer_addr`がプロキシ自身のアドレスになるため。`bm_fd_data.logical_peer_ip`+
+  `bm_network_resolve_peer_ip_port`で解決)、(4) 同じ根本原因の兄弟バグが
+  `bm_peer_registry_has_peer`(二重接続防止)にもあった。実daemonで4peerのratingが
+  実際に1.0から下がっていくことまで確認済み。
+- **errorメッセージの中身をログに出すよう改善**: 上記調査中、相手が実際に
+  「Too many connections from your IP」で拒否していたことが分かった(こちらの実装には
+  同種の受信側レート制限は無い、backlog参照)。
+- **自己接続の防止**: `peers.db`に`is_self`フラグ(PyBitmessage `knownnodes` `myself`
+  相当)を追加。version messageの`nonce`使い回しによる自己接続検知は、Tor経由だと
+  「同一ノードが複数circuitから接続している」という相関情報を漏らすため採用しなかった。
+- **Dandelion++**: Stage 1(`dinv`配線)・Stage 2(単一ホップのstem/fluff状態機械、
+  600秒毎のstem successor再抽選、固定10秒+平均30秒の指数分布タイムアウト)・Stage 3
+  (inv/dinvの来歴を区別し、既に公開済みのobjectはstemせず即fluff)・自分の`services`へ
+  `NODE_DANDELION`を表明(双方向の参加者化)。実装前に、実際に観測した85件のversion
+  messageが100%Dandelion対応を表明していることを確認してから着手した。
+
+**現在進行中:** ユーザー実機の静的torrc設定(実onionアドレス、内容は非公開)を使い、
+inbound・outbound Tor・Dandelion++・`is_self`を全て有効にした状態でbootstrap daemonの
+エンドツーエンド運用テストを継続中。onionアドレス自体はこのファイル・commit message・
+コード中を含め一切記載しない(ユーザーの明示的な指示)。次セッションでは
+`bitmessaged_bootstrap.log`(リポジトリルート、git管理外)でinbound接続受信の有無・
+rating推移・Dandelion動作を確認できる。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
-手動peer追加/observed_nodesリスト)は全て完了した。残るのは以下の通り。
+手動peer追加/observed_nodesリスト)は全て完了した。上記セッションで新たに洗い出した
+項目を含め、残るのは以下の通り(優先度順)。
 
-- inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
-  永続化)・OBJECT_ONIONPEER自己announce送信側まで全て完了。
-- Dandelion++はStage 1〜3(§9.3〜§9.5)・NODE_DANDELION自己announce(§9.6)まで完了。
-  GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外
-  (引き続き見送り)。
+1. **inbound接続のアイドル/ハンドシェイクタイムアウトが無い**: `infra/network.c`の
+   `bm_network_epoll_thread`は`epoll_wait(..., -1)`で無限待機固定で、TCP接続だけ確立して
+   何も送ってこない相手を切断する仕組みが無い。inbound(Stage 1/2)を有効化した以上、
+   実質的なslowlorisタイプのリソース枯渇経路になりうる。
+2. **inbound接続のレート制限が無い**: 実際に相手ノードから「Too many connections from
+   your IP」で拒否される場面を観測した(上記参照)一方、こちら側には対応する制限が
+   無い。Tor hidden service経由のinbound接続は`accept()`で見える接続元が常にTorの
+   ローカル転送(`127.0.0.1:<ephemeral>`)になるため、素朴な生IPベースの制限は
+   originally intended targetを区別できず機能しない(全部同一IPに見えるので早期に
+   全遮断してしまうか、逆に無意味になる)。同時接続数上限や単位時間あたりaccept数のような、
+   IPに依存しない方式が必要。設計方針のみ議論済み、未着手。
+3. **プロトコルバージョンの互換性チェックが無い**: `ver.version`を受信してログに出す
+   だけで、最低対応バージョンを下回る古いnodeを弾く処理が無い。優先度低。
+4. **version messageの`timestamp`が未検証**: パースはするが一切使っていない。object
+   自体のPoW/期限チェック(`object_pow_is_valid`)は別途あるため実害は小さい。優先度低。
+5. **`listConnections`的なAPI(接続一覧取得)**: PyBitmessageのGUI Network Status
+   タブ相当。`infra/peer_registry.c`の`struct bm_peer_registry`に既に接続一覧はあるため
+   実装コストは軽いはずだが、接続時刻・送受信バイト数・user agent等まで出すには
+   `bm_fd_data`への追加フィールドが必要になる。ユーザーから「GUI専用の機能というより
+   ヘッドレスdaemonでも普通に価値がある」との指摘あり。未着手。
+6. Dandelion++・inbound接続はどちらも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で
+   明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+
+**対応しないと決めたもの(参考、backlogではなく明示的な非対応判断):**
+- `bm_post_version`の`addr_recv`/`addr_from`がSOCKS5経由で不正確(検証・利用している
+  実装が見当たらず実害が無いと判断)
+- SOCKS5クライアント認証(Tor自体がSocksPortに認証を要求しないため実質価値が薄い)
+- Namecoin RPC連携(`.bit`アドレス解決)・帯域制限・blacklist/whitelistフィルタリング
+  (いずれも別途大きな機能が必要なため見送り)
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。
