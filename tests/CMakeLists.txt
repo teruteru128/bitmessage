@@ -99,3 +99,7 @@ add_test(NAME peer_manager_self COMMAND test_peer_manager_self)
 add_executable(test_dandelion_stage1 test_dandelion_stage1.c)
 target_link_libraries(test_dandelion_stage1 PRIVATE bm_core bm_infra)
 add_test(NAME dandelion_stage1 COMMAND test_dandelion_stage1)
+
+add_executable(test_dandelion_stage2 test_dandelion_stage2.c)
+target_link_libraries(test_dandelion_stage2 PRIVATE bm_core bm_infra)
+add_test(NAME dandelion_stage2 COMMAND test_dandelion_stage2)

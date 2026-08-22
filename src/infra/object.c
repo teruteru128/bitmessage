@@ -1,6 +1,9 @@
 #include "object.h"
 
+#include <time.h>
+
 #include "../common/varint.h"
+#include "dandelion.h"
 
 static uint32_t read_be32(const unsigned char *p)
 {
@@ -53,9 +56,10 @@ int bm_object_parse_header(const unsigned char *data, size_t data_len, struct bm
 enum bm_propagation_mode bm_decide_propagation(const unsigned char object_hash[32],
                                                 const struct bm_fd_data *target_connection)
 {
-    (void)object_hash;
-    (void)target_connection;
-    /* TODO(§9): Dandelion++実装時、stem状態(struct dandelion_state)を見て
-     * PROPAGATE_STEM/PROPAGATE_SKIPを返すよう差し替える。v1は常時fluff。 */
-    return BM_PROPAGATE_FLUFF;
+    /* §9 Dandelion++ Stage 2: 実ロジックはinfra/dandelion.cのプロセス内シングルトンへ
+     * 委譲する(DESIGN.md §9.2で確保していた差し込み点)。この関数自体のシグネチャは
+     * §9.2で決めた通りtarget_connectionまでしか受け取らないため、時刻はここでtime(NULL)
+     * を呼んで渡す(bm_dandelion_decide自体はテスト容易性のため時刻を明示的に受け取る
+     * 設計にしてあり、直接呼べばtime(NULL)無しでも決定的にテストできる)。 */
+    return bm_dandelion_decide(object_hash, target_connection, (int64_t)time(NULL));
 }

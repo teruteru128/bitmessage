@@ -15,6 +15,7 @@
 
 #include "../core/config_store.h"
 #include "../core/peer_manager.h"
+#include "dandelion.h"
 #include "network.h"
 #include "peer_registry.h"
 
@@ -448,6 +449,17 @@ void *bm_peer_connector_thread(void *arg)
 
         for (int waited = 0; waited < RECONNECT_INTERVAL_SECONDS && *args->stop_flag == 0; waited++)
         {
+            /* §9 Dandelion++ Stage 2: 専用スレッドを新設せず、この既存の1秒間隔ポーリング
+             * ループに相乗りさせる(DESIGN.md §9.2で「実装着手時に判断する」としていた点、
+             * PyBitmessageのInvThread.expire()相当の頻度に合わせた)。registryが無ければ
+             * (テスト等)何もしない。bm_dandelion_maybe_reshuffleは内部で10分間隔かどうかを
+             * 判定するため、1秒ごとに呼んでも大半は即returnするだけで軽い。 */
+            if (args->config.registry != NULL)
+            {
+                int64_t now = (int64_t)time(NULL);
+                bm_dandelion_maybe_reshuffle(args->config.registry, now);
+                bm_dandelion_expire_and_refluff(args->config.registry, now);
+            }
             sleep(STOP_POLL_INTERVAL_SECONDS);
         }
     }

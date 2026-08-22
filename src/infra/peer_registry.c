@@ -1,6 +1,7 @@
 #include "peer_registry.h"
 
 #include <netinet/in.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,14 +96,16 @@ int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int 
     return found;
 }
 
-/* §9 Dandelion++ Stage 1: dup()した接続1本ぶんの送信予定(bm_decide_propagationで
- * FLUFF判定されたhashだけに絞り込んだもの)。ロック解放後にまとめて書き込むための
- * 一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */
+/* §9 Dandelion++ Stage 2: dup()した接続1本ぶんの送信予定。bm_decide_propagationの
+ * 判定結果ごとにfluff_hashes(通常inv)とstem_hashes(dinv)へ振り分けたもの。
+ * ロック解放後にまとめて書き込むための一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */
 struct pending_inv_send
 {
     int fd;
-    unsigned char (*hashes)[32];
-    size_t count;
+    unsigned char (*fluff_hashes)[32];
+    size_t fluff_count;
+    unsigned char (*stem_hashes)[32];
+    size_t stem_count;
 };
 
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
@@ -134,25 +137,32 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         }
 
         /* §9 Dandelion++差し込み点(DESIGN.md §9.2「inv送信判断は必ずこの関数を経由させる」):
-         * 接続ごと・hashごとにfluff/stem/skipを判断する。v1は常にFLUFFを返すダミーのため
-         * 全hashが素通りし挙動は変わらない。stemはv1では発生しない(bm_decide_propagationの
-         * stub参照)ため、このfluff broadcast(=全接続peerへの通常inv配信)にはFLUFFのhashだけ
-         * を含める設計にしている。将来STEMを実際に返すようになったら、stem対象のhashは
-         * このbroadcast関数とは別の、単一の子ピアだけへdinvを送る専用の送信経路で扱う想定。 */
-        unsigned char (*filtered)[32] = malloc(sizeof(*filtered) * count);
-        size_t filtered_count = 0;
+         * 接続ごと・hashごとにfluff/stem/skipを判断する。FLUFFは通常のinv、STEMはdinvとして
+         * 別々のパケットで同じ接続へ送る(SKIPはその接続へは送らない)。Stage 1時点は常に
+         * FLUFFを返すダミーだったが、Stage 2でdandelion.cの実ロジックに差し替えた。 */
+        unsigned char (*fluff)[32] = malloc(sizeof(*fluff) * count);
+        unsigned char (*stem)[32] = malloc(sizeof(*stem) * count);
+        size_t fluff_count = 0;
+        size_t stem_count = 0;
         for (size_t h = 0; h < count; h++)
         {
-            if (bm_decide_propagation(hashes[h], conn) == BM_PROPAGATE_FLUFF)
+            enum bm_propagation_mode mode = bm_decide_propagation(hashes[h], conn);
+            if (mode == BM_PROPAGATE_FLUFF)
             {
-                memcpy(filtered[filtered_count], hashes[h], 32);
-                filtered_count++;
+                memcpy(fluff[fluff_count], hashes[h], 32);
+                fluff_count++;
+            }
+            else if (mode == BM_PROPAGATE_STEM)
+            {
+                memcpy(stem[stem_count], hashes[h], 32);
+                stem_count++;
             }
         }
 
-        if (filtered_count == 0)
+        if (fluff_count == 0 && stem_count == 0)
         {
-            free(filtered);
+            free(fluff);
+            free(stem);
             continue;
         }
 
@@ -160,33 +170,100 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         if (dup_fd >= 0)
         {
             pending[pending_count].fd = dup_fd;
-            pending[pending_count].hashes = filtered;
-            pending[pending_count].count = filtered_count;
+            pending[pending_count].fluff_hashes = fluff;
+            pending[pending_count].fluff_count = fluff_count;
+            pending[pending_count].stem_hashes = stem;
+            pending[pending_count].stem_count = stem_count;
             pending_count++;
         }
         else
         {
-            free(filtered);
+            free(fluff);
+            free(stem);
         }
     }
     pthread_mutex_unlock(&reg->lock);
 
     for (size_t i = 0; i < pending_count; i++)
     {
-        size_t packet_len = 0;
-        unsigned char *packet =
-            bm_create_inventory_message("inv", pending[i].hashes, pending[i].count, &packet_len);
-        if (packet != NULL)
+        if (pending[i].fluff_count > 0)
         {
-            if (bm_network_write_all(pending[i].fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
-                != 0)
+            size_t packet_len = 0;
+            unsigned char *packet =
+                bm_create_inventory_message("inv", pending[i].fluff_hashes, pending[i].fluff_count, &packet_len);
+            if (packet != NULL)
             {
-                fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                if (bm_network_write_all(pending[i].fd, packet, packet_len,
+                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
+                    != 0)
+                {
+                    fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                }
+                free(packet);
             }
-            free(packet);
+        }
+        if (pending[i].stem_count > 0)
+        {
+            size_t packet_len = 0;
+            unsigned char *packet =
+                bm_create_inventory_message("dinv", pending[i].stem_hashes, pending[i].stem_count, &packet_len);
+            if (packet != NULL)
+            {
+                if (bm_network_write_all(pending[i].fd, packet, packet_len,
+                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
+                    != 0)
+                {
+                    fprintf(stderr, "[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
+                }
+                free(packet);
+            }
         }
         close(pending[i].fd);
-        free(pending[i].hashes);
+        free(pending[i].fluff_hashes);
+        free(pending[i].stem_hashes);
     }
     free(pending);
+}
+
+int bm_peer_registry_pick_random_dandelion_peer(struct bm_peer_registry *reg, char *out_ip, size_t out_ip_len,
+                                                 int *out_port)
+{
+    pthread_mutex_lock(&reg->lock);
+    /* 古典的なreservoir sampling: 事前に候補数を数え上げなくても、条件を満たす接続を
+     * 順に見ながら「i番目の候補を1/iの確率で採用する」ことで最終的に一様ランダムな
+     * 1件を選べる */
+    size_t eligible_seen = 0;
+    int found = 0;
+    char chosen_ip[46];
+    int chosen_port = 0;
+    for (size_t i = 0; i < reg->count; i++)
+    {
+        struct bm_fd_data *conn = reg->conns[i];
+        if (conn->type != BM_FD_CLIENT_SOCKET || (conn->services & BM_SERVICE_NODE_DANDELION) == 0)
+        {
+            continue;
+        }
+        eligible_seen++;
+        unsigned char r;
+        RAND_bytes(&r, 1);
+        if ((size_t)(r % eligible_seen) == 0)
+        {
+            char ip[46];
+            int port = 0;
+            bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+            strncpy(chosen_ip, ip, sizeof(chosen_ip) - 1);
+            chosen_ip[sizeof(chosen_ip) - 1] = '\0';
+            chosen_port = port;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+
+    if (found)
+    {
+        strncpy(out_ip, chosen_ip, out_ip_len - 1);
+        out_ip[out_ip_len - 1] = '\0';
+        *out_port = chosen_port;
+    }
+    return found;
 }

@@ -963,7 +963,59 @@ peer rating周りのバグ修正セッションと同じ日に着手。§9.2で�
 broadcast検証(新規object受信時、他の接続peerへ`inv`が届くこと)が引き続き通っていることで
 実質的な回帰確認になっている。ctest 25件全通過。
 
-Stage 2(実際のstem/fluff状態機械)は未着手。
+Stage 2(実際のstem/fluff状態機械)は§9.4参照。
+
+### 9.4 Stage 2実装状況: 単一ホップ分のstem(2026-08-22)
+
+Stage 1と同じ日、ユーザーから続けて依頼を受けて着手。§9.2の完全な設計(多段リレー、
+nodeMapが親ごとに子を持つ形、hashMapのDB永続化無し等)をそのまま実装すると影響範囲が
+非常に大きくなる(特に「dinvで受信したobjectを自分も継続してstem中継する」多段リレー部分は
+受信経路(inv/dinv受信→getdata→object到着)全体に「どちらで最初に知ったか」の状態を通す
+必要がある)ため、ユーザーと合意の上でスコープを**単一ホップ分のstem**(自分が新規に検出した
+objectを1回だけ子ピアへstem中継し、タイムアウトでfluffへ強制遷移させる)に絞って実装した。
+dinvで受信したobjectを自分も継続してstem中継する多段リレー部分は次回以降のbacklog。
+
+**着手前の確認:** 実装が無駄足にならないか不安との声があったため、この3日間観測した
+実peerのversionメッセージ(85件、Stage 1の節で集計済み)が全てDandelion対応を表明して
+いることを踏まえた上で着手した。
+
+**実装内容:**
+- `infra/network.h`の`struct bm_fd_data`に`services`(相手のversion messageの
+  servicesビットフィールド)を追加。`object_sync.c`のversion受信処理で記録する
+  (stem successor選定に使う)
+- `infra/peer_registry.c`に`bm_peer_registry_pick_random_dandelion_peer`を追加。
+  outbound(`BM_FD_CLIENT_SOCKET`)かつ`BM_SERVICE_NODE_DANDELION`を立てている接続から
+  古典的reservoir samplingで一様ランダムに1つ選ぶ
+- `infra/peer_registry.c`の`bm_peer_registry_broadcast_inv`をさらに拡張し、接続ごとに
+  FLUFF判定されたhashは通常の`inv`、STEM判定されたhashは`dinv`として、同じ接続へ別々の
+  パケットで送るようにした(Stage 1で予告していた設計そのまま)
+- `infra/dandelion.c`/`.h`を新規追加。プロセス内シングルトン(`struct`、DB永続化無し、
+  §9.2通り)として、(1) 600秒ごとのstem successor再抽選
+  (`bm_dandelion_maybe_reshuffle`)、(2) objectのhashごとの状態管理
+  (`fluff_deadline` = 固定10秒 + 平均30秒の指数分布、「ポアソン分布」の近似)と
+  それに基づくFLUFF/STEM/SKIP判定(`bm_dandelion_decide`、`infra/object.c`の
+  `bm_decide_propagation`から委譲される)、(3) タイムアウトを過ぎても誰も呼び直さない
+  限りstemのまま埋もれてしまうhashを能動的にfluffする
+  `bm_dandelion_expire_and_refluff`(古いfluff済みエントリの間引きも兼ねる)、を実装した。
+  時刻は全て呼び出し側が明示的に渡す設計にしてテスト容易性を確保した(内部で`time(NULL)`を
+  呼ぶのは`bm_decide_propagation`の薄いラッパー部分のみ)
+- `infra/peer_connector.c`の`bm_peer_connector_thread`(既存の1秒間隔ポーリングループ)に
+  相乗りさせ、`bm_dandelion_maybe_reshuffle`/`bm_dandelion_expire_and_refluff`を毎秒
+  呼ぶ(PyBitmessageの`InvThread.expire()`相当の頻度、DESIGN.md §9.2で「実装着手時に
+  判断する」としていた点を解消)。専用スレッドは新設しなかった
+- `main.c`起動時に`bm_dandelion_module_init()`を呼ぶ
+
+**テスト:** `tests/test_dandelion_stage2.c`を新規追加。(1)stem successor候補選定が
+outbound+`NODE_DANDELION`の接続だけを対象にすること(reservoir samplingの安定性も
+20回試行で確認)、(2)stem successor無し/タイムアウト前/タイムアウト後でFLUFF/STEM/SKIPが
+正しく切り替わること、(3)`bm_dandelion_expire_and_refluff`がタイムアウト経過後に
+実際に`inv`をbroadcastし、それまでSKIPだった接続にも届くようになることを、実TCPソケット+
+決定的な時刻注入で確認した。開発中、`bm_peer_registry_broadcast_inv`経由の呼び出しが
+内部で`time(NULL)`(実時刻)を使う一方、テスト側が固定の架空時刻を使っていたために
+発生した不整合(タイムアウト計算がかみ合わずFLUFF/STEM判定が不安定になる)を実際に
+踏んだため、該当シナリオはテスト側も実時刻基準に統一して解消した。`tests/test_dandelion_
+stage1.c`の一部チェックも「v1は常にFLUFFのダミー」という古い前提から「stem successor
+無しなら常にFLUFF」という現状の実装に合わせて文言を更新した。ctest 26件全通過。
 
 ## 10. ディレクトリ構成・ビルド方針
 
@@ -1993,9 +2045,10 @@ DBに対しても`init_schema`のマイグレーションが正常に働き、�
 
 - inbound接続はStage 1(汎用TCP listen/accept)・Stage 2(Tor ControlPort自動化・onion鍵
   永続化)・OBJECT_ONIONPEER自己announce送信側まで全て完了。
-- Dandelion++はStage 1(§9.3、`dinv`配線・`bm_decide_propagation`の実配線)まで完了。
-  実際のstem/fluff状態機械(Stage 2)とGPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と
-  決めた項目のため、今回のv1完成の対象外(引き続き見送り)。
+- Dandelion++はStage 1(§9.3、`dinv`配線)・Stage 2(§9.4、単一ホップ分のstem/fluff)まで
+  完了。dinvで受信したobjectを自分も継続してstem中継する多段リレー部分、および
+  GPU/OpenCL PoWは§8/§9で明示的にv1スコープ外と決めた項目のため、今回のv1完成の対象外
+  (引き続き見送り)。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

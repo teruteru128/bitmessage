@@ -1,14 +1,17 @@
 /*
- * §9 Dandelion++ Stage 1(配線のみ、実際のstem/fluff状態機械は未実装)のテスト。
- * DESIGN.md §9.2で決めたv1時点の挙動:
+ * §9 Dandelion++ Stage 1(dinv配線・bm_decide_propagationの実配線)のテスト。
+ * 実際のstem/fluff判定ロジック自体はStage 2でinfra/dandelion.cに実装され、
+ * tests/test_dandelion_stage2.cで別途検証する。このファイルはStage 1時点で確保した
+ * 配線そのものを確認する:
  * - dinvコマンドはinvと完全に同一のワイヤーフォーマットで、stem状態を一切保持せず
  *   inv受信と全く同じ処理経路(handle_inv、未所持hashへgetdataを送り返す)に流す
  * - bm_decide_propagationがobject_sync_thread(実際にはpeer_registry.cの
- *   bm_peer_registry_broadcast_inv)のinv送信判断を必ず経由する(v1は常にFLUFFを
- *   返すダミーなので、broadcast_inv自体の挙動は変わらない。既存のtest_object_sync.cの
- *   broadcast検証が引き続き通っていることでも実質的に確認済み)
+ *   bm_peer_registry_broadcast_inv)のinv送信判断を必ず経由する
  * - BM_SERVICE_NODE_DANDELION(=8)のservicesビットで対応ピアを識別する定数が
  *   protocol.hに存在すること
+ * - bm_decide_propagationは、stem successorが1つも無い状態(このテストではdandelion
+ *   モジュールを初期化しているだけでbm_dandelion_maybe_reshuffleを一度も呼ばないため、
+ *   Stage 2の実ロジックでも必然的にこうなる)では常にFLUFFを返すこと
  */
 
 #include <stdio.h>
@@ -20,6 +23,7 @@
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
 #include "../src/core/messages_store.h"
+#include "../src/infra/dandelion.h"
 #include "../src/infra/network.h"
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
@@ -81,11 +85,14 @@ int main(void)
     /* --- 1. BM_SERVICE_NODE_DANDELIONがDESIGN.md §9.1通りの値であること --- */
     CHECK(BM_SERVICE_NODE_DANDELION == 8, "BM_SERVICE_NODE_DANDELION should be 8");
 
-    /* --- 2. bm_decide_propagationはv1では常にFLUFFを返すこと --- */
+    /* --- 2. stem successorが無い状態(bm_dandelion_maybe_reshuffleを一度も呼んでいない)
+     * では、bm_decide_propagationは常にFLUFFを返すこと。stem/fluffの実ロジック自体は
+     * tests/test_dandelion_stage2.cで詳しく検証する --- */
+    bm_dandelion_module_init();
     unsigned char dummy_hash[32];
     memset(dummy_hash, 0x42, sizeof(dummy_hash));
     CHECK(bm_decide_propagation(dummy_hash, NULL) == BM_PROPAGATE_FLUFF,
-          "bm_decide_propagation should always return FLUFF in v1 (Stage 1 stub)");
+          "bm_decide_propagation should return FLUFF when there is no stem successor");
 
     /* --- 3. dinv受信がinv受信と全く同じ処理経路(未所持hashへgetdataを送り返す)に
      * 流れること --- */

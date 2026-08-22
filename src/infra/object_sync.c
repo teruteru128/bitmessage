@@ -801,6 +801,9 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         bm_parse_version_message(msg->payload, msg->length, &ver);
         fprintf(stderr, "[object_sync] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
+        /* §9 Dandelion++: 相手のservicesビットフィールドを覚えておく(stem successor選定が
+         * BM_SERVICE_NODE_DANDELIONを立てているoutbound peerだけを対象にするため使う) */
+        conn->services = ver.services;
         bm_free_version_message(&ver);
         record_outbound_success(ctx, conn);
         if (bm_reply_verack(conn) != 0)

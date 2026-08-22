@@ -25,6 +25,7 @@
 #include "core/peer_manager.h"
 #include "core/send_pipeline.h"
 #include "core/trial_decrypt.h"
+#include "infra/dandelion.h"
 #include "infra/network.h"
 #include "infra/object_store.h"
 #include "infra/object_sync.h"
@@ -222,6 +223,11 @@ int main(void)
     int testnet = env_flag_or("BM_TESTNET", cfg.testnet);
     bm_protocol_set_testnet(testnet);
     fprintf(stderr, "[network] mode=%s\n", testnet ? "testnet" : "mainnet");
+
+    /* §9 Dandelion++ Stage 2: プロセス内シングルトンの初期化(DESIGN.md §9.2)。
+     * peer_connector_threadの再接続ループから定期的に呼ばれるbm_dandelion_maybe_reshuffle/
+     * bm_dandelion_expire_and_refluffより前に済ませておく。 */
+    bm_dandelion_module_init();
 
     int epfd = epoll_create1(0);
     if (epfd == -1)

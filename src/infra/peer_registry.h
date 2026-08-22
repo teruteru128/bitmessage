@@ -35,11 +35,25 @@ size_t bm_peer_registry_count(struct bm_peer_registry *reg);
 int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port);
 
 /*
- * 現在接続中の全peer(exceptが非NULLならそれを除く)へ、hashesをinvとして送る。
- * 個々のwrite失敗は無視する(接続の生死判定はnetwork_epoll_thread側のepoll_wait/readに任せ、
- * ここでは能動的に切断しない)。
+ * 現在接続中の全peer(exceptが非NULLならそれを除く)へ、hashesを送る。接続ごと・hashごとに
+ * infra/object.hのbm_decide_propagation(§9 Dandelion++の差し込み点)を呼び、FLUFF判定
+ * されたhashは通常のinv、STEM判定されたhashはdinvとして送る(SKIP判定のhashはその接続へは
+ * 送らない)。v1 Stage 1時点はbm_decide_propagationが常にFLUFFを返すダミーのため、
+ * 送信内容・宛先は「全peerへinv」のまま変わらない。個々のwrite失敗は無視する
+ * (接続の生死判定はnetwork_epoll_thread側のepoll_wait/readに任せ、ここでは能動的に
+ * 切断しない)。
  */
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
                                      size_t count, const struct bm_fd_data *except);
+
+/*
+ * §9 Dandelion++ Stage 2: registryに登録済みの接続のうち、outbound(BM_FD_CLIENT_SOCKET)
+ * かつBM_SERVICE_NODE_DANDELION(services、object_sync.cのversion受信時に記録)を
+ * 立てているものから一様ランダムに1つ選び、そのip:portをout_ip/out_portへ書き込む
+ * (dandelion.cのstem successor選定に使う)。該当する接続が1つも無ければ0を返す
+ * (out_ip/out_portは変更しない)。見つかれば1。
+ */
+int bm_peer_registry_pick_random_dandelion_peer(struct bm_peer_registry *reg, char *out_ip, size_t out_ip_len,
+                                                 int *out_port);
 
 #endif /* BM_INFRA_PEER_REGISTRY_H */

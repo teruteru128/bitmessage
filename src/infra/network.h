@@ -55,6 +55,10 @@ struct bm_fd_data
      * (network.c/object_sync.cのrating記録処理参照)。 */
     char logical_peer_ip[46]; /* INET6_ADDRSTRLEN相当。空文字列 = 未設定 */
     int logical_peer_port;
+    /* §9 Dandelion++: 相手から受信したversion messageのservicesビットフィールド。
+     * object_sync.cのversion受信処理が設定する(接続直後は0=未受信のまま)。
+     * BM_SERVICE_NODE_DANDELION(protocol.h)のstem successor選定に使う。 */
+    uint64_t services;
 };
 
 /* コマンド受信時のコールバック。DESIGN.md §1.2 command_queue へ積む処理は
