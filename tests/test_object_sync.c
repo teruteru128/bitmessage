@@ -650,6 +650,58 @@ int main(void)
         sqlite3_finalize(count_stmt);
     }
 
+    /* --- 9. errorメッセージの受信(§11 2026-08-22調査): fatal(varint) || banTime(varint) ||
+     * vector(varstr) || errorText(varstr)をパースしてログに出す。これまで中身を一切見ずに
+     * "unhandled command"として捨てていたため、rating調査中に頻発していたにも関わらず
+     * 原因が分からなかった。ここではクラッシュしない(特に手書きのbounds check、
+     * データ不足時のsize_t引き算アンダーフローが無い)ことを主眼に確認する
+     * (stderrへ出力される内容自体はテストの枠組みでは検証しない) --- */
+    {
+        /* 9a. 正常な形式: fatal=2, banTime=3600, vector="", errorText="too many connections" */
+        const char *error_text = "too many connections";
+        size_t text_len = strlen(error_text);
+        unsigned char error_payload[64];
+        unsigned char *ep = error_payload;
+        bm_varint_encode(ep, 2);
+        ep += bm_varint_size(2);
+        bm_varint_encode(ep, 3600);
+        ep += bm_varint_size(3600);
+        bm_varint_encode(ep, 0); /* vector長=0(空) */
+        ep += bm_varint_size(0);
+        bm_varint_encode(ep, text_len);
+        ep += bm_varint_size(text_len);
+        memcpy(ep, error_text, text_len);
+        ep += text_len;
+        size_t error_payload_len = (size_t)(ep - error_payload);
+
+        struct bm_message error_msg;
+        memset(&error_msg, 0, sizeof(error_msg));
+        memcpy(error_msg.command, "error", 5);
+        error_msg.length = (uint32_t)error_payload_len;
+        error_msg.payload = error_payload;
+        bm_object_sync_dispatch(conn, &error_msg, &ctx);
+        CHECK(1, "well-formed error message should be parsed without crashing");
+
+        /* 9b. 空/極端に短いペイロード(データ不足)。手書きbounds checkの
+         * アンダーフロー(size_t引き算)が無いことの確認が主目的 */
+        struct bm_message empty_error_msg;
+        memset(&empty_error_msg, 0, sizeof(empty_error_msg));
+        memcpy(empty_error_msg.command, "error", 5);
+        empty_error_msg.length = 0;
+        empty_error_msg.payload = NULL;
+        bm_object_sync_dispatch(conn, &empty_error_msg, &ctx);
+        CHECK(1, "empty/truncated error message should be ignored without crashing");
+
+        unsigned char one_byte_payload[1] = {0x02};
+        struct bm_message truncated_error_msg;
+        memset(&truncated_error_msg, 0, sizeof(truncated_error_msg));
+        memcpy(truncated_error_msg.command, "error", 5);
+        truncated_error_msg.length = 1;
+        truncated_error_msg.payload = one_byte_payload;
+        bm_object_sync_dispatch(conn, &truncated_error_msg, &ctx);
+        CHECK(1, "error message truncated right after 'fatal' should be ignored without crashing");
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

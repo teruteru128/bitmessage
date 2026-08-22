@@ -889,6 +889,49 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         handle_object(ctx, conn, msg);
     }
+    else if (strncmp(msg->command, "error", 12) == 0)
+    {
+        /* §11 2026-08-22調査: これまで単に"unhandled command: error"とだけ記録して中身を
+         * 捨てていたため、rating調査中に何度も観測されたにも関わらず原因が分からなかった。
+         * ワイヤーフォーマット(Bitmessageプロトコル仕様のerrorメッセージ):
+         *   fatal(varint: 0=Warning, 1=Error, 2=Fatal/接続を切る) || banTime(varint) ||
+         *   vector(varstr、関連objectのhash等、空文字列もあり) || errorText(varstr)
+         * 人間が読めるerrorTextだけ抜き出してログに出す(相手が実際に何を嫌がって
+         * 切断してくるのか初めて分かるようにする)。パース失敗(データ不足)は無視するだけで
+         * 接続自体には影響させない(診断用途のベストエフォート)。 */
+        const unsigned char *p = msg->payload;
+        size_t remaining = msg->length;
+        uint64_t fatal = 0;
+        size_t consumed = bm_varint_decode(p, remaining, &fatal);
+        if (consumed > 0)
+        {
+            p += consumed;
+            remaining -= consumed;
+            uint64_t ban_time = 0;
+            consumed = bm_varint_decode(p, remaining, &ban_time);
+            if (consumed > 0)
+            {
+                p += consumed;
+                remaining -= consumed;
+                uint64_t vector_len = 0;
+                consumed = bm_varint_decode(p, remaining, &vector_len);
+                if (consumed > 0 && vector_len <= remaining - consumed)
+                {
+                    p += consumed + vector_len;
+                    remaining -= consumed + vector_len;
+                    uint64_t text_len = 0;
+                    consumed = bm_varint_decode(p, remaining, &text_len);
+                    if (consumed > 0 && text_len <= remaining - consumed)
+                    {
+                        fprintf(stderr,
+                                "[object_sync] error message from peer: fatal=%" PRIu64 " banTime=%" PRIu64
+                                " text=\"%.*s\"\n",
+                                fatal, ban_time, (int)text_len, p + consumed);
+                    }
+                }
+            }
+        }
+    }
     else
     {
         char command[13] = {0};

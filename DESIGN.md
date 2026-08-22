@@ -1849,6 +1849,35 @@ verackをdispatchし、(1)本来の接続先(`203.0.113.9:8444`)のratingが正�
 再起動が必要なbootstrap daemonへの適用はユーザーの指示を待ってから、PIDを明示的に
 指定して行う。
 
+3回目の修正版をbootstrap daemonへ適用し数分観察したところ、`179.191.207.222`(1.0→0.8)・
+`95.49.240.98`(1.0→0.7)・`158.69.63.42`(1.0→0.7)・`85.114.135.102`(1.0→0.7)と、
+問題のあった4peer全てのratingが実際に下がり始めることを確認した。他のpeer(-0.1が30件、
+0.4が3件等)も含め、SOCKS5経由でsuccess/failureの両方が正しく記録されていることも
+確認できた。
+
+### errorメッセージの中身をログに出すよう改善(2026-08-22)
+
+上記のrating調査中、`[object_sync] unhandled command: error`というログが頻発している
+ことにユーザーが気づいた。Bitmessageプロトコルの`error`メッセージ(`fatal(varint) ||
+banTime(varint) || vector(varstr) || errorText(varstr)`)は相手が接続を切る前に理由を
+伝えるためのものだが、これまで中身を一切見ずに「unhandled command」として捨てていたため、
+rating調査全体を通して相手が実際に何を嫌がっていたのか(protocol不整合、接続過多、
+banされている等)が全く分からないままだった。
+
+`infra/object_sync.c`の`bm_object_sync_dispatch`に専用の`error`分岐を追加し、
+`fatal`/`banTime`/`errorText`をパースして`[object_sync] error message from peer: fatal=%d
+banTime=%d text="..."`としてログに出すようにした(`vector`フィールドは診断上重要度が低いため
+読み飛ばすだけで値は使わない)。手書きのvarint/varstrパースなので、データ不足時に
+size_tの引き算でアンダーフローしないことを重視した(各ステップで`bm_varint_decode`の
+戻り値が0でない=十分なデータがあることを確認してから次のフィールドへ進む設計)。
+
+**テスト:** `tests/test_object_sync.c`に section 9として、正常な形式のerrorメッセージが
+クラッシュ無くパースされること、空ペイロード・1byteだけの極端に短いペイロードでも
+(bounds checkのアンダーフローなどで)クラッシュしないことを確認した。パース結果の
+文字列内容自体はstderr出力なのでテストの枠組みでは検証していない(実行時に目視確認、
+実際に`text="too many connections"`のようなテスト用文字列が正しく出力されることを確認)。
+ctest 22件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
