@@ -2293,10 +2293,15 @@ onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)�
 手動peer追加/observed_nodesリスト)は全て完了した。上記セッションで新たに洗い出した
 項目を含め、残るのは以下の通り(優先度順)。
 
-1. **inbound接続のアイドル/ハンドシェイクタイムアウトが無い**: `infra/network.c`の
-   `bm_network_epoll_thread`は`epoll_wait(..., -1)`で無限待機固定で、TCP接続だけ確立して
-   何も送ってこない相手を切断する仕組みが無い。inbound(Stage 1/2)を有効化した以上、
-   実質的なslowlorisタイプのリソース枯渇経路になりうる。
+1. **inbound接続のアイドル/ハンドシェイクタイムアウトが無い、keepalive `ping`の自発送信も
+   無い**: `infra/network.c`の`bm_network_epoll_thread`は`epoll_wait(..., -1)`で無限待機
+   固定で、TCP接続だけ確立して何も送ってこない相手を切断する仕組みが無い。inbound
+   (Stage 1/2)を有効化した以上、実質的なslowlorisタイプのリソース枯渇経路になりうる。
+   2026-08-23にPyBitmessage本家(`network/connectionpool.py`のメインループ)を確認したところ、
+   (a) fully establishedな接続がidleになったら自分から`ping`を送る、(b) handshake未完了の
+   まま一定時間(20秒)経過した接続はcloseする、という2つの仕組みを持っていた。うちは`ping`
+   受信時に`pong`を返す(`infra/network.c`)だけで、自分から`ping`を送ることも無応答の相手を
+   切断することも一切していない。実装時はこの2点セットを参考にする。
 2. **inbound接続のレート制限が無い**: 実際に相手ノードから「Too many connections from
    your IP」で拒否される場面を観測した(上記参照)一方、こちら側には対応する制限が
    無い。Tor hidden service経由のinbound接続は`accept()`で見える接続元が常にTorの
@@ -2336,8 +2341,21 @@ onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)�
    見つけられなくなる。本家は起動時1回に加え`class_singleCleaner.py`の約2時間おきの周期
    処理でも再送しており、TTLも7日(±5分jitter)。addr送信とは別件のため次セッションで
    別プランとして着手予定。
-7. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
+7. **LAN内UDP broadcastによるpeer発見が無い**: 2026-08-23にPyBitmessage本家を調査していて
+   判明。`network/udp.py`のUDPSocketは実際に`connectionpool.py`から起動される機能で、死んだ
+   コードではない。同一LAN上のノードをUDPブロードキャストで発見する。以前ユーザーと
+   「LAN discoveryは優先度低い」と合意していたが、それは「あなたの具体的なユースケース
+   (自分のノード同士をLANで繋ぐ用途)には手動peer追加で十分」という判断であり、
+   「PyBitmessage自体に存在しない」という前提ではなかった点を訂正。優先度は低いままで
+   良いと思われるが、記録として残す。
+8. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+
+**2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
+`protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
+DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage
+自体のどこからも呼ばれておらず、本家で未実装のまま放置されている死んだコードだった。
+今後追いかける必要は無い。
 
 **対応しないと決めたもの(参考、backlogではなく明示的な非対応判断):**
 - `bm_post_version`の`addr_recv`/`addr_from`がSOCKS5経由で不正確(検証・利用している
