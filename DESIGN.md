@@ -1744,7 +1744,9 @@ ctest 21件全通過。
 v1.1.0リリース後、ユーザーが`bitmessaged_bootstrap.log`(長時間稼働のbootstrap daemon)を
 見て「ずっと同じpeerに接続しに行ってresetされていないか」と指摘。確認したところ、
 特定の1peer(`179.191.207.222:8444`)への接続が9700行超のログ中3474回にわたって
-繰り返されており、実際にバグだった。
+繰り返されており、実際にバグだった。この指摘から、3段階の修正(本セクション・rating
+successの記録場所の修正・SOCKS5プロキシ越しのip:port解決の修正)と`error`メッセージの
+可視化改善(後述)を経て実際にratingが正常に機能するまで、3日間を要した。
 
 **原因:** `peer_connector.c`はconnect()+version送信が成功した時点で
 `bm_peer_manager_record_result(..., 1, 1)`を呼びrating+0.1(上限1.0)を記録するが、
