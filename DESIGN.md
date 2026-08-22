@@ -2134,6 +2134,23 @@ inbound・outbound Tor・Dandelion++・`is_self`を全て有効にした状態�
 `bitmessaged_bootstrap.log`(リポジトリルート、git管理外)でinbound接続受信の有無・
 rating推移・Dandelion動作を確認できる。
 
+### バグ修正: ログ上のIPv6アドレスがportと区切れない(2026-08-23)
+
+運用テスト中のログをユーザーが確認していて発見。`[peer_connector] connecting to
+2604:8b40:f9:0:1:::1 (via SOCKS5)...`のように、IPv6アドレスを`"%s:%d"`でそのまま
+host:portのログに埋め込むと、アドレス自体が含む`:`区切りとhost/port境界の`:`が
+区別できなくなる問題があった。
+
+`infra/network.h`/`.c`に`bm_network_format_host_port(host, port, out, out_len)`を
+新設し、hostに`:`が含まれる場合(IPv6リテラル)はRFC 3986慣習に従い`[host]:port`の
+形にbracketで囲むようにした(含まれない場合はIPv4/ホスト名/onionアドレスなので
+従来通り素通しで`host:port`)。`infra/peer_connector.c`(outbound接続先・SOCKS5
+プロキシ先の全ログ)、`infra/tor_control.c`(ControlPort接続失敗ログ)、
+`core/api_server.c`(JSON-RPC APIのbind先ログ)を該当ヘルパー経由に置き換えた。
+`bitmessage-cli`(`cli/main.c`)はbm_infraを一切linkしない独立した小さな実行体の
+ため、ヘルパーを共有せず同等のロジックを1箇所だけインラインで複製した。
+ctest 27件全通過、クリーンなbuildディレクトリでの再ビルドも確認済み。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

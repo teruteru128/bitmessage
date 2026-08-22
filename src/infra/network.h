@@ -91,6 +91,15 @@ void bm_network_resolve_peer_ip_port(const struct bm_fd_data *conn, char *out_ip
                                       int *out_port);
 
 /*
+ * §11 2026-08-23発覚のバグ修正: ログ出力用に"host:port"文字列を組み立てる。hostに':'が
+ * 含まれる場合(IPv6リテラル)はRFC 3986慣習に従い"[host]:port"の形にbracketで囲む
+ * (囲わないとIPv6アドレス自体の':'区切りとホスト/ポート境界の':'が区別できない)。
+ * ホスト名やIPv4、.onionアドレスには':'が含まれないため素通しで"host:port"になる。
+ * out_lenはINET6_ADDRSTRLEN+3(bracket 2つ+終端)以上を推奨。
+ */
+void bm_network_format_host_port(const char *host, int port, char *out, size_t out_len);
+
+/*
  * §11 inbound接続(Tor hidden service)対応。bind_address:portでTCP listenする(SO_REUSEADDR、
  * backlog 16、O_NONBLOCK)。bind_addressは通常"127.0.0.1"を渡す想定(公開IPへの直接listenは
  * 意味が無い。到達可能にするのはTor hidden serviceの役目、DESIGN.md §8-10参照)。

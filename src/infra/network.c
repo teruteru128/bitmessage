@@ -422,6 +422,18 @@ void bm_network_resolve_peer_ip_port(const struct bm_fd_data *conn, char *out_ip
     bm_network_extract_ip_port(&conn->peer_addr, out_ip, out_ip_len, out_port);
 }
 
+void bm_network_format_host_port(const char *host, int port, char *out, size_t out_len)
+{
+    if (strchr(host, ':') != NULL)
+    {
+        snprintf(out, out_len, "[%s]:%d", host, port);
+    }
+    else
+    {
+        snprintf(out, out_len, "%s:%d", host, port);
+    }
+}
+
 void *bm_network_epoll_thread(void *arg)
 {
     struct bm_epoll_thread_args *args = arg;

@@ -78,7 +78,11 @@ static int call_rpc(const struct bm_cli_env *env, const char *method, bm_json_va
 
     if (resp == NULL)
     {
-        fprintf(stderr, "接続に失敗しました(%s:%d、bitmessagedは起動していますか?)\n", env->host, env->port);
+        /* §11 IPv6アドレスはhostに':'を含むため、"host:port"のままだとportとの区切りが
+         * 分からなくなる。RFC 3986慣習に合わせ"[host]:port"の形にする */
+        int host_is_ipv6 = strchr(env->host, ':') != NULL;
+        fprintf(stderr, "接続に失敗しました(%s%s%s:%d、bitmessagedは起動していますか?)\n",
+                host_is_ipv6 ? "[" : "", env->host, host_is_ipv6 ? "]" : "", env->port);
         return EXIT_FAILURE;
     }
     if (status == 401)

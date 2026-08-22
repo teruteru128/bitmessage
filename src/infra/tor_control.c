@@ -13,6 +13,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "network.h"
+
 #define BM_TOR_CONTROL_TIMEOUT_SEC 10
 #define BM_TOR_CONTROL_MAX_LINES 16
 #define BM_TOR_CONTROL_LINE_CAP 512
@@ -363,10 +365,12 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
         fd = connect_tcp_with_timeout(config->control_host, config->control_port, BM_TOR_CONTROL_TIMEOUT_SEC);
         if (fd < 0)
         {
+            char addr_buf[64];
+            bm_network_format_host_port(config->control_host, config->control_port, addr_buf, sizeof(addr_buf));
             fprintf(stderr,
-                    "[tor_control] failed to connect to ControlPort %s:%d (is Tor running with ControlPort "
+                    "[tor_control] failed to connect to ControlPort %s (is Tor running with ControlPort "
                     "enabled?)\n",
-                    config->control_host, config->control_port);
+                    addr_buf);
             return -1;
         }
     }

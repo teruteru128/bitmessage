@@ -170,9 +170,11 @@ int main(void)
      * daemon再起動なしで次の再接続サイクル(既定30秒間隔)から反映される。 */
     struct bm_socks_proxy_config socks_proxy_config;
     bm_config_store_get_socks_proxy(config_db, &socks_proxy_config);
-    fprintf(stderr, "[config] socks proxy: %s (%s:%d)\n",
-            socks_proxy_config.enabled ? "enabled" : "disabled",
-            socks_proxy_config.host, socks_proxy_config.port);
+    char socks_proxy_addr_buf[64];
+    bm_network_format_host_port(socks_proxy_config.host, socks_proxy_config.port, socks_proxy_addr_buf,
+                                 sizeof(socks_proxy_addr_buf));
+    fprintf(stderr, "[config] socks proxy: %s (%s)\n", socks_proxy_config.enabled ? "enabled" : "disabled",
+            socks_proxy_addr_buf);
 
     struct bm_queues queues;
     queues_init(&queues);

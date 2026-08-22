@@ -16,6 +16,7 @@
 #include "../common/broadcast_item.h"
 #include "../common/hash.h"
 #include "../common/json.h"
+#include "../infra/network.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
 #include "config_store.h"
@@ -1189,14 +1190,17 @@ void *bm_api_server_thread(void *arg)
     struct bm_api_server_thread_args *args = arg;
     const struct bm_api_server_config *config = args->config;
 
+    char addr_buf[64];
+    bm_network_format_host_port(config->bind_address, config->port, addr_buf, sizeof(addr_buf));
+
     int listen_fd = -1;
     if (bm_api_server_listen(config, &listen_fd) != 0)
     {
-        fprintf(stderr, "[api_server] failed to listen on %s:%d\n", config->bind_address, config->port);
+        fprintf(stderr, "[api_server] failed to listen on %s\n", addr_buf);
         free(args);
         return NULL;
     }
-    fprintf(stderr, "[api_server] listening on %s:%d\n", config->bind_address, config->port);
+    fprintf(stderr, "[api_server] listening on %s\n", addr_buf);
     bm_api_server_serve_forever(listen_fd, config, args->stop_flag);
     close(listen_fd);
     fprintf(stderr, "[api_server] stopped\n");
