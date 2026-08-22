@@ -1910,6 +1910,49 @@ SOCKS5(Tor)経由の接続ではこれがプロキシ自身のアドレス(`127.
 なるが、これらのフィールドを検証・利用している実装は確認できておらず情報提供以上の
 意味を持たないため、優先度が低いとして今回は対応しなかった(ユーザーとの合意)。
 
+### 自己接続の防止: peers.dbのis_selfフラグ(PyBitmessage knownnodes myself相当、2026-08-22)
+
+一連のrating調査の中で、ユーザーから「version messageの`nonce`による自己接続検知は
+やっていないのか」と質問された。確認したところ`bm_create_version_payload`は呼ぶたび
+`getrandom()`で新しいnonceを生成しており(プロセス全体で使い回す固定値ではない)、
+受信側でも`nonce`を一切比較していないため、自己接続検知の仕組みは存在しないことが
+判明した。
+
+実際にこれは机上の空論ではなく具体的なリスクがある: 自分自身の`OBJECT_ONIONPEER`
+自己announce(既存実装)がgossip経由で自分のpeers.dbへ戻ってくると、次の再接続サイクルで
+自分自身のonionアドレスへ接続しに行ってしまう可能性がある。
+
+**nonce使い回し方式を採用しなかった理由:** Bitcoin/Bitmessageの一般的な実装は、
+プロセス起動時に1個だけnonceを生成し全接続で使い回すことで自己接続検知を実現する
+(でなければ「送った値と一致するか」を確認する対象が無くなる)。しかしこれはclearnet
+(IPアドレス自体が既に相手を特定できる情報)を前提にした設計判断であり、Tor経由の匿名性が
+前提のこの実装でnonceを使い回すと、「同一ノードが複数circuitから接続している」という
+Tor自体が隠したいはずの相関情報を漏らしてしまう。ユーザーと議論した結果、この
+トレードオフを避けるため採用しなかった。
+
+**採用した方式:** PyBitmessageのknownnodes `myself`フィールドと同じ発想で、
+`core/peer_manager.c`の`hosts`テーブルに`is_self`列(既定0)を追加した。
+`bm_peer_manager_mark_self(db, ip_address, port, stream)`で自分自身のonionアドレスを
+`is_self=1`としてマークし(既存行があればrating/source等の履歴を保ったままis_selfだけ
+立てる、gossip等で自分のアドレスが既に学習済みだった場合に履歴を破棄しないため)、
+`bm_peer_manager_list_top`(接続候補選定)のSQLに`AND is_self = 0`を追加して除外する。
+`main.c`から、Stage 2(ControlPortのADD_ONION成功後)・`BM_ONION_ADDRESS`(静的torrc設定)
+の両方の経路で、自分のonionアドレスが判明した直後に呼ぶ。
+
+**マイグレーション:** `is_self`列は追加時点で既に稼働中の(3日間動かし続けている)
+bootstrap daemonの`peers.db`には存在しない。`CREATE TABLE IF NOT EXISTS`はテーブルが
+既に存在する場合まるごとno-opのため、`SCHEMA_SQL`を変更しただけでは既存DBに列が
+増えない。`bm_peer_manager_init_schema`に`ALTER TABLE hosts ADD COLUMN is_self ...`を
+追加し、新規DB(`CREATE TABLE`時点で既に`is_self`列を含むため必ず発生する
+"duplicate column name"エラー)は戻り値を見ずに無視することで両対応した。
+
+**テスト:** `tests/test_peer_manager_self.c`を新規追加。(1)新規行としての`mark_self`が
+`list_top`から除外されること、(2)gossipで学習済みだった行を`mark_self`した場合、
+事前に`record_result`で積んだrating(0.5)とsourceが保持されたまま`is_self`だけ立ち
+`list_top`から除外されるようになること、(3)`is_self`列を持たない古いスキーマの
+DBに対しても`init_schema`のマイグレーションが正常に働き、既存行を保ったまま
+`mark_self`/`list_top`が使えるようになることを確認した。ctest 24件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

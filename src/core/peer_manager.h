@@ -71,6 +71,19 @@ int bm_peer_manager_upsert_learned(sqlite3 *db, const char *ip_address, int port
                                     uint64_t services, int64_t last_seen, const char *source);
 
 /*
+ * §11 2026-08-22: 自分自身のonionアドレスをhostsテーブルへ"is_self=1"としてマークする
+ * (PyBitmessageのknownnodes myselfフィールドと同じ発想)。version messageのnonceによる
+ * 自己接続検知は、Torではプロセス全体で同じnonceを使い回すこと自体が「同一ノードが複数
+ * circuitから接続している」という相関情報を漏らしTorの匿名性を損なうため採用しなかった
+ * (ユーザーとの議論の結論)。代わりにbm_peer_manager_list_top(接続候補選定)がis_self=1の
+ * 行を常に除外することで、そもそも自分自身へ接続を試みないようにする。main.cがTor
+ * ControlPort連携(Stage 2)またはBM_ONION_ADDRESS(静的torrc設定)で自分のonionアドレスが
+ * 判明した直後に1回呼ぶ想定。既存行(gossip等で自分のアドレスが既に学習済みだった場合)が
+ * あればis_selfだけ立てて他の列(rating/source等)はそのまま残す。成功時0。
+ */
+int bm_peer_manager_mark_self(sqlite3 *db, const char *ip_address, int port, int stream);
+
+/*
  * §11 peers.dbの低rating/古いノードのクリーンアップ。PyBitmessage(network/knownnodes.pyの
  * cleanupKnownNodes)準拠の2条件で削除する: (1) last_seenからBM_PEER_CLEANUP_MAX_AGE_SECONDS
  * (28日)以上経過したホストはratingを問わず削除、(2) last_seenからBM_PEER_CLEANUP_MIN_AGE_

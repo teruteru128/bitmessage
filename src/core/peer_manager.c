@@ -46,13 +46,31 @@ static const char *SCHEMA_SQL =
     "last_seen INTEGER NOT NULL, "
     "rating REAL NOT NULL DEFAULT 0.0, "
     "source TEXT NOT NULL DEFAULT 'unknown', "
+    /* §11 2026-08-22発覚: version messageのnonceによる自己接続検知は、Torでは
+     * プロセス全体で同じnonceを使い回すこと自体が「同一ノードが複数circuitから接続して
+     * いる」という相関情報を漏らしTorの匿名性を損なうため採用しなかった(ユーザーとの
+     * 議論の結論)。代わりにPyBitmessageのknownnodes myselfフィールドと同じ発想で、
+     * 自分自身のonionアドレス(Stage 2のADD_ONION、またはBM_ONION_ADDRESS判明時)を
+     * bm_peer_manager_mark_selfでこの列に立て、bm_peer_manager_list_top(接続候補選定)
+     * から除外することで、そもそも自分自身へ接続を試みないようにする。 */
+    "is_self INTEGER NOT NULL DEFAULT 0, "
     "PRIMARY KEY (ip_address, port, stream)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_hosts_stream_rating ON hosts(stream, rating DESC);";
 
 int bm_peer_manager_init_schema(sqlite3 *db)
 {
-    return bm_db_init_schema(db, SCHEMA_SQL);
+    if (bm_db_init_schema(db, SCHEMA_SQL) != 0)
+    {
+        return -1;
+    }
+    /* §11 2026-08-22: is_self列は追加時点で既に稼働中のpeers.dbには存在しない。
+     * "CREATE TABLE IF NOT EXISTS"はテーブルが既に存在する場合まるごとno-opのため、
+     * SCHEMA_SQLを変更しただけでは既存DBに列が増えない。ALTER TABLEで個別に追加を試み、
+     * 新規DB(SCHEMA_SQLのCREATE TABLE時点で既にis_self列を含む)では必ず発生する
+     * "duplicate column name"エラーは無視する(戻り値を見ないのはこのため)。 */
+    sqlite3_exec(db, "ALTER TABLE hosts ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+    return 0;
 }
 
 int bm_peer_manager_upsert(sqlite3 *db, const struct bm_peer_entry *entry)
@@ -85,9 +103,12 @@ int bm_peer_manager_upsert(sqlite3 *db, const struct bm_peer_entry *entry)
 int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *results,
                               int max_results, int *out_count)
 {
+    /* §11 2026-08-22: is_self=1(自分自身、bm_peer_manager_mark_self参照)の行は
+     * 接続候補から常に除外する。自分自身へ接続しようとする(自分のonionpeer自己announceが
+     * gossip経由で自分のpeers.dbへ戻ってくるケース等)のを未然に防ぐ。 */
     static const char *SQL =
         "SELECT ip_address, port, stream, services, last_seen, rating, source "
-        "FROM hosts WHERE stream = ?1 ORDER BY rating DESC LIMIT ?2;";
+        "FROM hosts WHERE stream = ?1 AND is_self = 0 ORDER BY rating DESC LIMIT ?2;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
@@ -249,6 +270,31 @@ int bm_peer_manager_upsert_learned(sqlite3 *db, const char *ip_address, int port
     sqlite3_bind_int64(stmt, 4, (sqlite3_int64)services);
     sqlite3_bind_int64(stmt, 5, last_seen);
     sqlite3_bind_text(stmt, 6, source, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_peer_manager_mark_self(sqlite3 *db, const char *ip_address, int port, int stream)
+{
+    /* 既存行(gossip等で自分のアドレスが既に"よそのpeer"として学習済みだった場合)があれば
+     * is_selfだけ立てて他の列(rating/source等の履歴)はそのまま残す。無ければ新規に
+     * source='self'の行として作る。 */
+    static const char *SQL =
+        "INSERT INTO hosts (ip_address, port, stream, services, last_seen, rating, source, is_self) "
+        "VALUES (?1, ?2, ?3, 0, ?4, 0.0, 'self', 1) "
+        "ON CONFLICT(ip_address, port, stream) DO UPDATE SET is_self = 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, ip_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, port);
+    sqlite3_bind_int(stmt, 3, stream);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)time(NULL));
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

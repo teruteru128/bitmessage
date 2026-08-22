@@ -331,6 +331,10 @@ int main(void)
                     "(BM_ONION_ADDRESS)\n",
                     manual_onion_address, virtual_port, inbound_port);
         }
+        /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
+         * 接続候補選定(peer_manager.cのlist_top)から除外する(自分自身への接続を防ぐ、
+         * peer_manager.h参照)。 */
+        bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
     }
     /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
      * Stage 1のlistenが成功している場合のみ試みる(listen_connが無ければADD_ONIONで転送する
@@ -387,6 +391,9 @@ int main(void)
                  * 登録しておけば以後getdataで配れる状態になる(他の自己生成object、
                  * getpubkey応答等と同じ扱い、object_sync.h参照)。 */
                 bm_object_sync_announce_onion_peer(&object_sync_ctx, onion_address, virtual_port);
+                /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
+                 * 接続候補選定から除外する(peer_manager.h参照)。 */
+                bm_peer_manager_mark_self(peers_db, onion_address, virtual_port, 1);
             }
             free(onion_address);
             free(new_private_key);
