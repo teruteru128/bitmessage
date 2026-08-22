@@ -1808,6 +1808,47 @@ ratingが上限1.0に張り付いたまま永久に下がらなかった。
 では`rating`が+0.1(0.3→0.4)される一方、inbound(`BM_FD_SERVER_SOCKET`)では記録されない
 (0.3のまま)ことを確認した。ctest 22件全通過。
 
+### バグ修正(3回目): SOCKS5(Tor)プロキシ越しだと1回目・2回目の修正が両方とも無効化されていた
+
+2回目の修正版をbootstrap daemonへ適用し、続けてoutbound SOCKS5(Tor、`127.0.0.1:9050`)を
+有効化して観察したところ、`179.191.207.222`/`95.49.240.98`(1回目・2回目の修正前から
+rating 1.0に張り付いていた既存2peer)に加えて、新たに`158.69.63.42`/`85.114.135.102`も
+同様にrating 1.0へ張り付き毎サイクル再接続され続ける状態になった。ログには
+`unhandled command: error`(相手からのerrorメッセージ受信、こちらからの応答ではない)が
+頻発しており、これが調査の糸口になった。`peers.db`を直接確認したところ、これら5peerは
+全て**rating=1.0のまま一切動いていなかった**。
+
+**真因:** `bm_fd_data.peer_addr`は`getpeername()`で取得するが、SOCKS5プロキシ経由の
+接続ではOSレベルのTCP接続相手は**プロキシ自身**(`127.0.0.1:9050`)であり、実際の
+Bitmessage peerのアドレスではない(SOCKS5のCONNECT先はアプリケーション層のネゴシエーション
+でしか分からず、OSソケット層からは見えないため)。1回目・2回目の修正はどちらも
+`bm_network_extract_ip_port(&conn->peer_addr, ...)`でip:portを抽出していたため、SOCKS5
+有効時は常に`127.0.0.1:9050`を対象にratingを更新しようとしていた。`peers.db`に
+そのような行は存在しないため、`bm_peer_manager_record_result`のUPDATE文が0行にヒットし、
+エラーにもならず**静かに何も更新されない**状態になっていた。つまりSOCKS5有効化以降、
+success/failureどちらの記録も実質的に機能を失っていたことになる(直接接続時代に貯まった
+30peerのrating=-0.1は、SOCKS5と無関係な、peer_connector.cの既存のTCP接続失敗パス
+(`candidates[i].ip_address`を直接使う、今回の変更が及んでいない箇所)によるものだった)。
+
+**3回目の修正:** `struct bm_fd_data`に`logical_peer_ip`/`logical_peer_port`を追加した。
+これは`peer_connector.c`がoutbound接続(`BM_FD_CLIENT_SOCKET`)を作成した直後に、
+SOCKS5経由かどうかに関わらず常に正しい「本来選んだ接続先」(`candidates[i]`)を明示的に
+書き込むフィールドである。`network.h`に`bm_network_resolve_peer_ip_port(conn, ...)`を
+追加し、`logical_peer_ip`が設定されていればそちらを優先し、未設定(テストや将来の別経路)
+の場合のみ従来通り`peer_addr`由来のip:portへフォールバックするようにした。1回目
+(`network.c`の切断時failure記録)・2回目(`object_sync.c`のverack/version受信時success記録)
+の両方をこの新ヘルパー経由に変更した。
+
+**テスト:** `tests/test_peer_rating_on_disconnect.c`にシナリオ3を追加。`conn->peer_addr`を
+ダミーの"プロキシアドレス"(`127.0.0.1:9060`)に、`conn->logical_peer_ip`をTEST-NET-3の
+予約アドレス(`203.0.113.9:8444`、実在しないためテストとして安全)に設定した状態で
+verackをdispatchし、(1)本来の接続先(`203.0.113.9:8444`)のratingが正しく+0.1されること、
+(2)プロキシのアドレス(`127.0.0.1:9060`)がpeers.dbに一切登録されないこと、の両方を
+確認した。ctest 22件全通過。
+
+再起動が必要なbootstrap daemonへの適用はユーザーの指示を待ってから、PIDを明示的に
+指定して行う。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -38,8 +38,23 @@ struct bm_fd_data
     unsigned char *recv_buffer;
     struct sockaddr_storage local_addr;
     socklen_t local_len;
+    /* getpeername()で取得した、実際にOSレベルでTCP接続している相手。SOCKS5プロキシ
+     * (Tor等)経由の接続では、これはプロキシ自身のアドレス(例: 127.0.0.1:9050)になる
+     * ことに注意(§11 2026-08-22発覚のバグ: プロキシ越しの本来の宛先とは異なるため、
+     * peer_manager.cのrating更新にこれを使うと常にDB上のどの行にも一致しない127.0.0.1:9050
+     * 宛のUPDATEになり、0行ヒットのまま静かに失敗し続けていた)。 */
     struct sockaddr_storage peer_addr;
     socklen_t peer_len;
+    /* §11 2026-08-22発覚のバグ修正: SOCKS5プロキシ越しでも常に正しいのは、
+     * peer_connector.cが接続先として選んだ本来のip:port(candidates[i].ip_address/port)
+     * だけ。BM_FD_CLIENT_SOCKET(outbound)接続についてはpeer_connector.cが
+     * bm_fd_data_new直後に明示的にここへ設定する(直接プロキシを使わない場合もpeer_addrと
+     * 冗長ながら一致する値を入れる)。BM_FD_SERVER_SOCKET(inbound)やpeer_connector.c以外の
+     * 経路で作られたBM_FD_CLIENT_SOCKET(テスト等)ではlogical_peer_ip[0]=='\0'のまま
+     * (未設定)であり、この場合は呼び出し側がpeer_addr由来のip:portへフォールバックする
+     * (network.c/object_sync.cのrating記録処理参照)。 */
+    char logical_peer_ip[46]; /* INET6_ADDRSTRLEN相当。空文字列 = 未設定 */
+    int logical_peer_port;
 };
 
 /* コマンド受信時のコールバック。DESIGN.md §1.2 command_queue へ積む処理は
@@ -56,6 +71,20 @@ void bm_fd_data_free(struct bm_fd_data *data);
  * addr->ss_familyがAF_INET/AF_INET6のいずれでもなければout_ip[0]='\0'、*out_port=0のまま。 */
 void bm_network_extract_ip_port(const struct sockaddr_storage *addr, char *out_ip, size_t out_ip_len,
                                  int *out_port);
+
+/*
+ * §11 2026-08-22発覚のバグ修正: peer_manager.cのrating更新(bm_peer_manager_record_result)に
+ * 使うべき「本来の接続先」ip:portを解決する。conn->logical_peer_ip(peer_connector.cが
+ * BM_FD_CLIENT_SOCKET作成時に設定する、SOCKS5プロキシの有無に関わらず正しい値)が
+ * 設定済みならそれを優先し、未設定(空文字列、テストや将来の別経路でのBM_FD_CLIENT_SOCKET
+ * 作成等)ならconn->peer_addr(getpeername)から素直に抽出したip:portへフォールバックする
+ * (直接接続なら正しいが、SOCKS5経由だとプロキシのアドレスになってしまう点に注意。
+ * フォールバックはあくまで「logical_peer_ipが無いよりはまし」という位置づけ)。
+ * network.cのbm_network_epoll_thread(切断時のfailure記録)とobject_sync.cの
+ * record_outbound_success(verack/version受信時のsuccess記録)の両方で共有する。
+ */
+void bm_network_resolve_peer_ip_port(const struct bm_fd_data *conn, char *out_ip, size_t out_ip_len,
+                                      int *out_port);
 
 /*
  * §11 inbound接続(Tor hidden service)対応。bind_address:portでTCP listenする(SO_REUSEADDR、

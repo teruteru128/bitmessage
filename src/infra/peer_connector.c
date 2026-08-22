@@ -379,6 +379,12 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
+        /* §11 2026-08-22発覚のバグ修正: SOCKS5(Tor)経由の場合、conn->peer_addr(getpeername)は
+         * プロキシ自身のアドレスになりpeer_manager.cのrating更新に使えない。ここで選んだ
+         * 本来の接続先(candidates[i])を明示的に控えておき、network.c/object_sync.cの
+         * rating記録処理がこちらを優先して使うようにする(network.h参照)。 */
+        strncpy(conn->logical_peer_ip, candidates[i].ip_address, sizeof(conn->logical_peer_ip) - 1);
+        conn->logical_peer_port = candidates[i].port;
 
         struct epoll_event ev;
         ev.events = EPOLLIN;

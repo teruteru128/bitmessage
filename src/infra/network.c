@@ -410,6 +410,18 @@ void bm_network_extract_ip_port(const struct sockaddr_storage *addr, char *out_i
     }
 }
 
+void bm_network_resolve_peer_ip_port(const struct bm_fd_data *conn, char *out_ip, size_t out_ip_len, int *out_port)
+{
+    if (conn->logical_peer_ip[0] != '\0')
+    {
+        strncpy(out_ip, conn->logical_peer_ip, out_ip_len - 1);
+        out_ip[out_ip_len - 1] = '\0';
+        *out_port = conn->logical_peer_port;
+        return;
+    }
+    bm_network_extract_ip_port(&conn->peer_addr, out_ip, out_ip_len, out_port);
+}
+
 void *bm_network_epoll_thread(void *arg)
 {
     struct bm_epoll_thread_args *args = arg;
@@ -451,7 +463,7 @@ void *bm_network_epoll_thread(void *arg)
                 {
                     char ip[INET6_ADDRSTRLEN];
                     int port = 0;
-                    bm_network_extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
+                    bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
                     if (ip[0] != '\0')
                     {
                         bm_peer_manager_record_result(args->peers_db, ip, port, 1, 0);

@@ -272,6 +272,61 @@ int main(void)
         }
         CHECK(found_in, "scenario2 inbound peer row should be found");
 
+        /* --- シナリオ3: SOCKS5(Tor)プロキシ越しの接続。conn->peer_addr(getpeername)は
+         * プロキシ自身のアドレス(127.0.0.1:9060、実在しないダミーだが実際の
+         * "127.0.0.1:9050"問題と同じ形)を指すが、conn->logical_peer_ipには
+         * peer_connector.cが設定するはずの「本来の接続先」(203.0.113.9:8444、
+         * TEST-NET-3の予約アドレスなので実在せずテストとして安全)を入れておく。
+         * bm_network_resolve_peer_ip_portがlogical_peer_ipを優先することで、
+         * プロキシのアドレスではなく本来の接続先のratingが正しく更新されることを
+         * 確認する(2026-08-22発覚のバグそのものの再現+修正確認)。 --- */
+        struct bm_peer_entry entry4;
+        memset(&entry4, 0, sizeof(entry4));
+        strncpy(entry4.ip_address, "203.0.113.9", sizeof(entry4.ip_address) - 1);
+        entry4.port = 8444;
+        entry4.stream = 1;
+        entry4.rating = 0.3;
+        strncpy(entry4.source, "test", sizeof(entry4.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &entry4) == 0, "seeding the scenario3 proxied peer row");
+
+        struct sockaddr_storage fake_proxy_addr;
+        memset(&fake_proxy_addr, 0, sizeof(fake_proxy_addr));
+        struct sockaddr_in *sin_proxy = (struct sockaddr_in *)&fake_proxy_addr;
+        sin_proxy->sin_family = AF_INET;
+        sin_proxy->sin_port = htons(9060);
+        inet_pton(AF_INET, "127.0.0.1", &sin_proxy->sin_addr);
+
+        struct bm_fd_data proxied_conn;
+        memset(&proxied_conn, 0, sizeof(proxied_conn));
+        proxied_conn.type = BM_FD_CLIENT_SOCKET;
+        proxied_conn.fd = -1;
+        proxied_conn.peer_addr = fake_proxy_addr; /* OSレベルではプロキシに繋がっている */
+        strncpy(proxied_conn.logical_peer_ip, "203.0.113.9", sizeof(proxied_conn.logical_peer_ip) - 1);
+        proxied_conn.logical_peer_port = 8444; /* peer_connector.cが設定するのと同じ形 */
+
+        bm_object_sync_dispatch(&proxied_conn, &verack_msg, &ctx);
+
+        struct bm_peer_entry after_proxied[16];
+        int count_proxied = 0;
+        CHECK(bm_peer_manager_list_top(peers_db, 1, after_proxied, 16, &count_proxied) == 0
+                  && count_proxied >= 1,
+              "scenario3 peer row lookup should succeed");
+        int found_proxied = 0;
+        for (int i = 0; i < count_proxied; i++)
+        {
+            if (strcmp(after_proxied[i].ip_address, "203.0.113.9") == 0 && after_proxied[i].port == 8444)
+            {
+                found_proxied = 1;
+                CHECK(after_proxied[i].rating > 0.4 - 1e-9 && after_proxied[i].rating < 0.4 + 1e-9,
+                      "proxied outbound verack should credit the REAL target (logical_peer_ip), not the "
+                      "proxy's address: rating should become 0.4 (0.3 + 0.1)");
+            }
+            /* プロキシのアドレス(127.0.0.1:9060)が誤って登録されていないことも確認する */
+            CHECK(!(strcmp(after_proxied[i].ip_address, "127.0.0.1") == 0 && after_proxied[i].port == 9060),
+                  "the proxy's own address should never be recorded into peers.db");
+        }
+        CHECK(found_proxied, "scenario3 peer row should be found");
+
         bm_keyring_destroy(&kr);
         sqlite3_close(object_pool_db);
         sqlite3_close(identity_db);

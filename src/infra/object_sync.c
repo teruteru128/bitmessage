@@ -767,7 +767,15 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
  * peerでも毎サイクル必ず成功扱いになり、network.cが切断時に記録するfailure(-0.1)を毎回
  * 打ち消してratingが上限1.0に張り付いたまま抜け出せないバグを引き起こしていた
  * (peer_connector.c参照)。inbound(BM_FD_SERVER_SOCKET、相手が接続してきた側)は
- * こちらが選んだ相手ではないため対象外(network.cの切断時failure記録と対称)。 */
+ * こちらが選んだ相手ではないため対象外(network.cの切断時failure記録と対称)。
+ *
+ * §11 2026-08-22発覚の追加バグ修正: SOCKS5(Tor)プロキシ有効時はconn->peer_addr
+ * (getpeername)がプロキシ自身のアドレスになり、bm_network_extract_ip_portだけでは
+ * peers.dbのどの行にも一致しないUPDATEになって静かに失敗し続けていた
+ * (実際にbootstrap daemonで確認: SOCKS5有効化後、success/failureどちらの記録も
+ * 一切反映されなくなっていた)。conn->logical_peer_ip(プロキシの有無に関わらず
+ * peer_connector.cが設定する本来の接続先)を優先するbm_network_resolve_peer_ip_portを
+ * 使うよう変更した(network.h参照)。 */
 static void record_outbound_success(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn)
 {
     if (conn->type != BM_FD_CLIENT_SOCKET || ctx->peers_db == NULL)
@@ -776,7 +784,7 @@ static void record_outbound_success(struct bm_object_sync_ctx *ctx, const struct
     }
     char ip[INET6_ADDRSTRLEN];
     int port = 0;
-    bm_network_extract_ip_port(&conn->peer_addr, ip, sizeof(ip), &port);
+    bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
     if (ip[0] != '\0')
     {
         bm_peer_manager_record_result(ctx->peers_db, ip, port, 1, 1);
