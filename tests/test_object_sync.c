@@ -10,6 +10,7 @@
  */
 
 #include <arpa/inet.h>
+#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,6 +112,27 @@ static struct bm_message *read_one_message(int fd)
             return msg;
         }
     }
+}
+
+/*
+ * §11 2026-08-23 backlog項目4のテスト用: bm_new_version_messageは常にtime(NULL)を
+ * timestampに使うため、時計ズレを意図的に再現するにはこのヘルパーで一度組み立ててから
+ * timestampフィールド(offset 4+8=12から8byte、bm_create_version_payloadのレイアウト参照)
+ * だけ上書きする。完成メッセージ(24byteヘッダ込み、malloc済み、呼び出し側でfree)を返す。
+ */
+static unsigned char *build_version_packet_with_timestamp(const char *user_agent_str, int version,
+                                                            const struct sockaddr_storage *peer_addr,
+                                                            const struct sockaddr_storage *local_addr,
+                                                            uint64_t timestamp, size_t *out_len)
+{
+    size_t payload_len = bm_version_payload_size(user_agent_str);
+    unsigned char *payload = malloc(payload_len);
+    bm_create_version_payload(payload, user_agent_str, version, peer_addr, local_addr);
+    uint64_t be_timestamp = htobe64(timestamp);
+    memcpy(payload + 12, &be_timestamp, sizeof(be_timestamp));
+    unsigned char *packet = bm_create_packet("version", payload, payload_len, out_len);
+    free(payload);
+    return packet;
 }
 
 int main(void)
@@ -1005,6 +1027,130 @@ int main(void)
         close(fds11b[0]);
         close(fds11b[1]);
         bm_fd_data_free(conn11b);
+    }
+
+    /* --- 12. version messageのtimestamp検証(§11 2026-08-23 backlog項目4、
+     * PyBitmessage network/bmproto.pyのpeerValidityChecks、timeOffsetチェック相当)。
+     * 自分の時計とBM_MAX_TIME_OFFSET_SECONDS(1時間)を超えてずれたtimestampを送ってくる
+     * 相手はverackを送らずfatal=2のerrorで切断されることを、未来方向・過去方向の両方で
+     * 確認する。境界値(ちょうどBM_MAX_TIME_OFFSET_SECONDS)は許容されることも確認する --- */
+    {
+        /* 12a. 未来方向に大きくズレている */
+        int fds12a[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds12a) == 0, "socketpair for future-timestamp scenario");
+        struct bm_fd_data *conn12a = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds12a[0]);
+        CHECK(conn12a != NULL, "bm_fd_data_new for future-timestamp scenario");
+
+        uint64_t future_ts = (uint64_t)time(NULL) + BM_MAX_TIME_OFFSET_SECONDS + 60;
+        size_t future_len = 0;
+        unsigned char *future_packet = build_version_packet_with_timestamp(
+                "/bitmessage-c-test:0.1.0/", BM_MIN_PROTOCOL_VERSION, &conn12a->peer_addr, &conn12a->local_addr,
+                future_ts, &future_len);
+        CHECK(future_packet != NULL, "build_version_packet_with_timestamp should build a future-timestamp packet");
+
+        struct bm_message *future_msg = NULL;
+        size_t future_consumed = 0;
+        CHECK(bm_parse_message(future_packet, future_len, &future_msg, &future_consumed) == BM_PARSE_OK,
+              "the constructed future-timestamp packet should parse back successfully");
+        if (future_msg != NULL)
+        {
+            bm_object_sync_dispatch(conn12a, future_msg, &ctx);
+            bm_free_message(future_msg);
+        }
+        CHECK(conn12a->should_disconnect == 1,
+              "a peer whose version timestamp is too far in the future should be marked for disconnect");
+
+        struct bm_message *future_reply = read_one_message(fds12a[1]);
+        CHECK(future_reply != NULL, "an error message should have been sent back for the future timestamp");
+        if (future_reply != NULL)
+        {
+            CHECK(strncmp(future_reply->command, "error", 12) == 0,
+                  "the reply command should be 'error', not 'verack'");
+            bm_free_message(future_reply);
+        }
+
+        free(future_packet);
+        close(fds12a[0]);
+        close(fds12a[1]);
+        bm_fd_data_free(conn12a);
+
+        /* 12b. 過去方向に大きくズレている */
+        int fds12b[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds12b) == 0, "socketpair for past-timestamp scenario");
+        struct bm_fd_data *conn12b = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds12b[0]);
+        CHECK(conn12b != NULL, "bm_fd_data_new for past-timestamp scenario");
+
+        uint64_t past_ts = (uint64_t)time(NULL) - BM_MAX_TIME_OFFSET_SECONDS - 60;
+        size_t past_len = 0;
+        unsigned char *past_packet = build_version_packet_with_timestamp(
+                "/bitmessage-c-test:0.1.0/", BM_MIN_PROTOCOL_VERSION, &conn12b->peer_addr, &conn12b->local_addr,
+                past_ts, &past_len);
+        CHECK(past_packet != NULL, "build_version_packet_with_timestamp should build a past-timestamp packet");
+
+        struct bm_message *past_msg = NULL;
+        size_t past_consumed = 0;
+        CHECK(bm_parse_message(past_packet, past_len, &past_msg, &past_consumed) == BM_PARSE_OK,
+              "the constructed past-timestamp packet should parse back successfully");
+        if (past_msg != NULL)
+        {
+            bm_object_sync_dispatch(conn12b, past_msg, &ctx);
+            bm_free_message(past_msg);
+        }
+        CHECK(conn12b->should_disconnect == 1,
+              "a peer whose version timestamp is too far in the past should be marked for disconnect");
+
+        struct bm_message *past_reply = read_one_message(fds12b[1]);
+        CHECK(past_reply != NULL, "an error message should have been sent back for the past timestamp");
+        if (past_reply != NULL)
+        {
+            CHECK(strncmp(past_reply->command, "error", 12) == 0,
+                  "the reply command should be 'error', not 'verack'");
+            bm_free_message(past_reply);
+        }
+
+        free(past_packet);
+        close(fds12b[0]);
+        close(fds12b[1]);
+        bm_fd_data_free(conn12b);
+
+        /* 12c. 境界値(ちょうどBM_MAX_TIME_OFFSET_SECONDS)は許容される(回帰確認) */
+        int fds12c[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds12c) == 0, "socketpair for boundary-timestamp scenario");
+        struct bm_fd_data *conn12c = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds12c[0]);
+        CHECK(conn12c != NULL, "bm_fd_data_new for boundary-timestamp scenario");
+
+        uint64_t boundary_ts = (uint64_t)time(NULL) + BM_MAX_TIME_OFFSET_SECONDS;
+        size_t boundary_len = 0;
+        unsigned char *boundary_packet = build_version_packet_with_timestamp(
+                "/bitmessage-c-test:0.1.0/", BM_MIN_PROTOCOL_VERSION, &conn12c->peer_addr, &conn12c->local_addr,
+                boundary_ts, &boundary_len);
+        CHECK(boundary_packet != NULL, "build_version_packet_with_timestamp should build a boundary packet");
+
+        struct bm_message *boundary_msg = NULL;
+        size_t boundary_consumed = 0;
+        CHECK(bm_parse_message(boundary_packet, boundary_len, &boundary_msg, &boundary_consumed) == BM_PARSE_OK,
+              "the constructed boundary packet should parse back successfully");
+        if (boundary_msg != NULL)
+        {
+            bm_object_sync_dispatch(conn12c, boundary_msg, &ctx);
+            bm_free_message(boundary_msg);
+        }
+        CHECK(conn12c->should_disconnect == 0,
+              "a peer whose version timestamp offset is exactly BM_MAX_TIME_OFFSET_SECONDS should be accepted");
+
+        struct bm_message *boundary_reply = read_one_message(fds12c[1]);
+        CHECK(boundary_reply != NULL, "a reply should have been sent back for an acceptable timestamp");
+        if (boundary_reply != NULL)
+        {
+            CHECK(strncmp(boundary_reply->command, "verack", 12) == 0,
+                  "the reply command should be 'verack' when the timestamp offset is within range");
+            bm_free_message(boundary_reply);
+        }
+
+        free(boundary_packet);
+        close(fds12c[0]);
+        close(fds12c[1]);
+        bm_fd_data_free(conn12c);
     }
 
     close(fds[0]);

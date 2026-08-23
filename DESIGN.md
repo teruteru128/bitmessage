@@ -2609,6 +2609,37 @@ verackではなくfatal=2のerrorメッセージだけが返ること、(b)
 version=`BM_MIN_PROTOCOL_VERSION`(境界値)では従来通りverackが返ること、の両方を
 `bm_new_version_message`で実際のwireパケットを組み立てて確認した。ctest 34件全通過。
 
+### version messageのtimestamp検証(2026-08-23)
+
+backlog項目4に着手。`ver.timestamp`はパースするだけで一切使っていなかった。
+
+**設計**: PyBitmessage本家の`peerValidityChecks`(前項のバージョンチェックと同じ関数)
+には、バージョンチェックのすぐ後に`timeOffset`(相手のtimestamp - 自分の現在時刻)が
+`MAX_TIME_OFFSET`(`protocol.py`で3600秒=1時間)を超えたら(未来・過去どちらの方向でも)
+`fatal=2`のerrorを送って切断する処理があった。これをそのまま移植した。PyBitmessage側は
+併せて`timeOffsetWrongCount`という「時計がズレたpeerが一定数を超えたらGUIの
+ステータスバーに『あなたの時計がズレているかも』と警告する」仕組みも持っているが、
+これは完全にGUI専用の機能でこのヘッドレスdaemonには対応するUIが無いため移植対象外とした
+(`BM_MIN_PROTOCOL_VERSION`のバージョンチェックと同様の理由でスコープを絞った)。
+
+**実装**: `infra/protocol.h`に`BM_MAX_TIME_OFFSET_SECONDS`(=3600)を追加。
+`infra/object_sync.c`の`version`コマンド処理で、前項のバージョンチェックの直後に
+`time_offset = (int64_t)ver.timestamp - (int64_t)time(NULL)`を計算し、
+`|time_offset| > BM_MAX_TIME_OFFSET_SECONDS`ならバージョンチェックと全く同じ
+パターン(fatal=2のerrorメッセージ送信+`conn->should_disconnect=1`+即return)で
+切断する。未来方向/過去方向でエラーメッセージの文言をPyBitmessageに合わせて
+出し分けた。この時点で`bm_create_error_message`(前項で新設)と`should_disconnect`
+フラグ(同じく前項で新設した汎用の切断シグナル)の両方をそのまま再利用でき、
+新規のインフラ追加は不要だった。
+
+**テスト**: `tests/test_object_sync.c`にシナリオ12を追加。`bm_new_version_message`は
+常に`time(NULL)`をtimestampに使うため、意図的な時計ズレを再現する専用ヘルパー
+`build_version_packet_with_timestamp`(`bm_create_version_payload`で組み立てた後、
+timestampフィールドだけ`htobe64`で上書き)を新設した。(a)未来方向に大きくズレた
+timestampで切断されること、(b)過去方向に大きくズレたtimestampで切断されること、
+(c)境界値(ちょうど`BM_MAX_TIME_OFFSET_SECONDS`)は許容されverackが返ることの3点を
+確認した。ctest 34件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2624,8 +2655,9 @@ version=`BM_MIN_PROTOCOL_VERSION`(境界値)では従来通りverackが返るこ
    改めて検討する(ユーザーからの申し送り、未着手)。
 3. ~~**プロトコルバージョンの互換性チェックが無い**~~: 2026-08-23完了(上記まとめ参照)。
    `BM_MIN_PROTOCOL_VERSION`(=3)未満を名乗る相手にはfatal errorを送って切断する。
-4. **version messageの`timestamp`が未検証**: パースはするが一切使っていない。object
-   自体のPoW/期限チェック(`object_pow_is_valid`)は別途あるため実害は小さい。優先度低。
+4. ~~**version messageの`timestamp`が未検証**~~: 2026-08-23完了(上記まとめ参照)。
+   `BM_MAX_TIME_OFFSET_SECONDS`(=3600秒)を超えて自分の時計とズレていればfatal
+   errorを送って切断する。
 5. **`listConnections`的なAPI(接続一覧取得)**: PyBitmessageのGUI Network Status
    タブ相当。`infra/peer_registry.c`の`struct bm_peer_registry`に既に接続一覧はあるため
    実装コストは軽いはずだが、接続時刻・送受信バイト数・user agent等まで出すには
@@ -2687,8 +2719,8 @@ version=`BM_MIN_PROTOCOL_VERSION`(境界値)では従来通りverackが返るこ
      十分と判断。
 10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
-    プロトコルバージョン互換性チェックはいずれも完了(上記まとめ参照)。
-    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
+    プロトコルバージョン互換性チェック・version messageのtimestamp検証はいずれも完了
+    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
     対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:

@@ -60,6 +60,11 @@ struct bm_message
  * bm_post_version参照)。 */
 #define BM_MIN_PROTOCOL_VERSION 3
 
+/* §11 2026-08-23 backlog項目4: version messageのtimestampが自分の時計とどれだけ
+ * ずれていれば拒否するか(秒)。PyBitmessage(`protocol.py`の`MAX_TIME_OFFSET`)に
+ * 合わせた(1時間)。 */
+#define BM_MAX_TIME_OFFSET_SECONDS 3600
+
 struct bm_version_message
 {
     uint32_t version;
