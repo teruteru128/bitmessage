@@ -2780,6 +2780,22 @@ hashを含むことを確認した。ctest 34件全通過(既存シナリオ10�
 形になったが、書き込み順序がaddr→bigInvのため既存の「最初の1メッセージだけ読む」
 アサーションには影響しないことを確認済み)。
 
+### テストカバレッジの穴の解消: inbound接続でのaddr/big inv送信(2026-08-23)
+
+sendBigInv実装直後、ユーザーから「outboundから接続を受けたとき(inbound)でも
+verack後にaddr/invを送っていたか」と確認された。コードを読んだ結果、
+`object_sync.c`のverackハンドラは`conn->type`による分岐が無く
+「inbound/outbound問わず」addr/big inv送信を行う設計だったが、実際に
+`BM_FD_SERVER_SOCKET`(inbound、相手から接続してきた側)がverackを受信するケースを
+直接検証しているテストが無かったことが判明した(`tests/test_inbound.c`は
+「inbound接続が相手のversionを受けてverack+versionを送り返す」ところまでしか
+カバーしておらず、その後こちらが相手からのverackを受信する側は未検証だった)。
+
+`tests/test_object_sync.c`にシナリオ14を追加。シナリオ13(outbound版)と同じ
+検証を`BM_FD_SERVER_SOCKET`で行い、`conn->handshake_complete`が1になることと、
+種として仕込んだ2件のhashを含む"inv"が正しく送られることを確認した。実装コード自体の
+変更は無し(既存実装が正しいことをテストで裏付けただけ)。ctest 34件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

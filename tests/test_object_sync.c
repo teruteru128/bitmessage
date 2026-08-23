@@ -1225,6 +1225,83 @@ int main(void)
         bm_fd_data_free(conn13);
     }
 
+    /* --- 14. シナリオ13のinbound版(§11 2026-08-23、ユーザーからの指摘で判明した
+     * テストカバレッジの穴)。verackハンドラ(object_sync.c)はconn->typeによる分岐が
+     * 無く「inbound/outbound問わず」addr/big inv送信を行うはずだが、実際に
+     * BM_FD_SERVER_SOCKET(相手からの接続)がverackを受信した場合でも同じことが
+     * 起きることを直接確認できているテストが無かった。test_inbound.cは
+     * 「inbound接続が相手のversionを受けてverack+versionを送り返す」ところまでしか
+     * カバーしておらず、その後こちらが相手からのverackを受信する側は未検証だった --- */
+    {
+        sqlite3_exec(object_pool_db, "DELETE FROM objects;", NULL, NULL, NULL);
+        sqlite3_exec(peers_db, "DELETE FROM hosts;", NULL, NULL, NULL);
+
+        unsigned char hash_c[32], hash_d[32];
+        memset(hash_c, 0xCC, sizeof(hash_c));
+        memset(hash_d, 0xDD, sizeof(hash_d));
+        unsigned char dummy_payload14[16] = {0};
+        int64_t now14 = (int64_t)time(NULL);
+        CHECK(bm_object_store_insert(object_pool_db, hash_c, BM_OBJECT_MSG, 1, dummy_payload14,
+                                      sizeof(dummy_payload14), now14 + 86400, now14)
+                  == 0,
+              "seed object C for inbound big-inv scenario");
+        CHECK(bm_object_store_insert(object_pool_db, hash_d, BM_OBJECT_MSG, 1, dummy_payload14,
+                                      sizeof(dummy_payload14), now14 + 86400, now14)
+                  == 0,
+              "seed object D for inbound big-inv scenario");
+
+        int fds14[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds14) == 0, "socketpair for inbound big-inv scenario");
+        /* シナリオ13と違い、ここではBM_FD_SERVER_SOCKET(inbound、相手から接続してきた側)を使う */
+        struct bm_fd_data *conn14 = bm_fd_data_new(BM_FD_SERVER_SOCKET, fds14[0]);
+        CHECK(conn14 != NULL, "bm_fd_data_new for inbound big-inv scenario");
+
+        struct bm_message verack_msg14;
+        memset(&verack_msg14, 0, sizeof(verack_msg14));
+        memcpy(verack_msg14.command, "verack", 6);
+        verack_msg14.length = 0;
+        verack_msg14.payload = NULL;
+        bm_object_sync_dispatch(conn14, &verack_msg14, &ctx);
+
+        CHECK(conn14->handshake_complete == 1, "inbound connection should also become fully established on verack");
+
+        struct bm_message *inv_reply14 = read_one_message(fds14[1]);
+        CHECK(inv_reply14 != NULL,
+              "an inv message should have been sent right after verack on an inbound connection too");
+        if (inv_reply14 != NULL)
+        {
+            CHECK(strncmp(inv_reply14->command, "inv", 12) == 0, "the reply command should be 'inv'");
+
+            struct bm_inventory_message parsed14;
+            memset(&parsed14, 0, sizeof(parsed14));
+            int parse_rc14 = bm_parse_inventory_message(inv_reply14->payload, inv_reply14->length, &parsed14);
+            CHECK(parse_rc14 == 0, "the sent big-inv payload should parse back successfully");
+            if (parse_rc14 == 0)
+            {
+                CHECK(parsed14.count == 2, "big inv should contain exactly the 2 seeded objects");
+                int saw_c = 0, saw_d = 0;
+                for (uint64_t i = 0; i < parsed14.count; i++)
+                {
+                    if (memcmp(parsed14.items[i], hash_c, 32) == 0)
+                    {
+                        saw_c = 1;
+                    }
+                    if (memcmp(parsed14.items[i], hash_d, 32) == 0)
+                    {
+                        saw_d = 1;
+                    }
+                }
+                CHECK(saw_c && saw_d, "big inv should include both seeded object hashes on inbound too");
+                bm_free_inventory_message(&parsed14);
+            }
+            bm_free_message(inv_reply14);
+        }
+
+        close(fds14[0]);
+        close(fds14[1]);
+        bm_fd_data_free(conn14);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);
