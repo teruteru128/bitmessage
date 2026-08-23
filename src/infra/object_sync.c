@@ -859,6 +859,26 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         bm_parse_version_message(msg->payload, msg->length, &ver);
         bm_log("[object_sync] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
+        /* §11 2026-08-23 backlog項目3: プロトコルバージョン互換性チェック
+         * (PyBitmessage network/bmproto.pyのpeerValidityChecks相当)。verackを送らずに
+         * errorメッセージ(fatal=2)だけ送って切断する。conn->should_disconnectを立てて
+         * network.c側の既存の切断経路(rating失敗記録込み)へ合流させる(network.hのdoc参照)。 */
+        if (ver.version < BM_MIN_PROTOCOL_VERSION)
+        {
+            bm_log("[object_sync] closing connection: peer protocol version %u is below minimum %d\n",
+                    ver.version, BM_MIN_PROTOCOL_VERSION);
+            bm_free_version_message(&ver);
+            size_t err_len = 0;
+            unsigned char *err_packet =
+                    bm_create_error_message(2, 0, "Your is using an old protocol. Closing connection.", &err_len);
+            if (err_packet != NULL)
+            {
+                bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+                free(err_packet);
+            }
+            conn->should_disconnect = 1;
+            return;
+        }
         /* §9 Dandelion++: 相手のservicesビットフィールドを覚えておく(stem successor選定が
          * BM_SERVICE_NODE_DANDELIONを立てているoutbound peerだけを対象にするため使う) */
         conn->services = ver.services;

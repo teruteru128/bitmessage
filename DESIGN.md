@@ -2569,6 +2569,46 @@ onionアドレス自体は一切git管理下に置かない方針)のため、�
 追記して解決した。今後onionアドレスが変わる(Tor hidden serviceを作り直す等)場合を
 除き、この節の1.の問題自体を再び踏む必要は無くなったはず。
 
+### プロトコルバージョン互換性チェック(2026-08-23)
+
+backlog項目3に着手。これまで`ver.version`を受信してログに出すだけで、
+最低対応バージョンを下回るnodeを弾く処理が無かった。
+
+**設計**: PyBitmessage本家(`network/bmproto.py`の`peerValidityChecks`)を調査した
+ところ、`remoteProtocolVersion < 3`の相手には`fatal=2`のerrorメッセージ
+(`"Your is using an old protocol. Closing connection."`、原文ママのタイプミースも
+含め忠実に踏襲)を送った上でverackを送らずに切断する、という実装だった
+(`peerValidityChecks`は同時に`timeOffset`検証・共有stream有無・重複IP接続も
+チェックしているが、今回はbacklog項目3の範囲であるバージョンチェックのみ移植した)。
+この関数は同じファイルの`bm_command_version`(受信したversionのパース直後、
+verack送信より前)から呼ばれている。
+
+**実装**:
+- `infra/protocol.h`に`BM_MIN_PROTOCOL_VERSION`(=3)を追加。
+- `infra/protocol.c`に`bm_create_error_message(fatal, ban_time, error_text,
+  out_len)`を新設(既存の受信側パース処理と対称のエンコーダ、`bm_create_packet`を
+  内部で使う。vectorは常に空文字列固定、接続全般への苦情ではobjectのhashを指す
+  意味が無いため)。
+- `infra/network.h`の`struct bm_fd_data`に`should_disconnect`フラグを追加。
+  コマンドハンドラ(`object_sync.c`)がメッセージ処理の結果「この接続を切るべき」と
+  判断した場合に立てる、汎用の仕組みとして設計した(今回のバージョンチェック専用に
+  せず、将来同様の「受信した内容次第で切断すべき」判定が増えても使い回せるように
+  した)。ハンドラ自身はfdをcloseせず、必要なerrorメッセージを書き込んだ上でこの
+  フラグだけ立てて返る。`network.c`の`bm_network_handle_readable`がハンドラ呼び出し
+  直後にこのフラグを見て、戻り値-1(既存の読み取りエラー経路、`close_connection`
+  経由でrating失敗記録・registry除去・epoll登録解除・closeまで一括処理される)へ
+  合流させる。
+- `infra/object_sync.c`の`version`コマンド処理の先頭(ログ出力の直後、
+  `conn->services`設定より前)でバージョンチェックを行う。閾値未満ならerror送信+
+  `should_disconnect=1`を立てて即returnし、以降の通常処理(services記録・rating
+  成功記録・verack返信)を一切行わない。
+
+**テスト**: `tests/test_object_sync.c`にシナリオ11を追加(専用socketpair、他
+シナリオとの取り違え防止)。(a) version=2を送ると`should_disconnect`が立ち、
+verackではなくfatal=2のerrorメッセージだけが返ること、(b)
+version=`BM_MIN_PROTOCOL_VERSION`(境界値)では従来通りverackが返ること、の両方を
+`bm_new_version_message`で実際のwireパケットを組み立てて確認した。ctest 34件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2582,8 +2622,8 @@ onionアドレス自体は一切git管理下に置かない方針)のため、�
    (`BM_INBOUND_ACCEPT_MAX_PER_WINDOW`)ともIPに依存しない固定値で実装した。
    実運用でこれらの定数に頻繁に到達するようなら、`config_store.c`への設定化を
    改めて検討する(ユーザーからの申し送り、未着手)。
-3. **プロトコルバージョンの互換性チェックが無い**: `ver.version`を受信してログに出す
-   だけで、最低対応バージョンを下回る古いnodeを弾く処理が無い。優先度低。
+3. ~~**プロトコルバージョンの互換性チェックが無い**~~: 2026-08-23完了(上記まとめ参照)。
+   `BM_MIN_PROTOCOL_VERSION`(=3)未満を名乗る相手にはfatal errorを送って切断する。
 4. **version messageの`timestamp`が未検証**: パースはするが一切使っていない。object
    自体のPoW/期限チェック(`object_pow_is_valid`)は別途あるため実害は小さい。優先度低。
 5. **`listConnections`的なAPI(接続一覧取得)**: PyBitmessageのGUI Network Status
@@ -2646,8 +2686,9 @@ onionアドレス自体は一切git管理下に置かない方針)のため、�
      追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
      十分と判断。
 10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
-    ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限はいずれも完了
-    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
+    ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
+    プロトコルバージョン互換性チェックはいずれも完了(上記まとめ参照)。
+    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
     対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:

@@ -54,6 +54,12 @@ struct bm_message
  * servicesにこのビットを立てない(=stem対応ピアとして名乗らない、DESIGN.md §9.2)。 */
 #define BM_SERVICE_NODE_DANDELION 8
 
+/* §11 2026-08-23 backlog項目3: 互換性チェックできる最低プロトコルバージョン。
+ * PyBitmessage(`network/bmproto.py`の`peerValidityChecks`)がremoteProtocolVersion<3の
+ * 相手を強制切断しているのに合わせた(このプロジェクト自身も常にversion=3で送信している、
+ * bm_post_version参照)。 */
+#define BM_MIN_PROTOCOL_VERSION 3
+
 struct bm_version_message
 {
     uint32_t version;
@@ -150,5 +156,15 @@ unsigned char *bm_create_packet(const char *command, const unsigned char *payloa
  * commandには"inv"または"getdata"を渡す。完成メッセージ(24byteヘッダ込み)をmallocして返す */
 unsigned char *bm_create_inventory_message(const char *command, const unsigned char (*hashes)[32],
                                             size_t count, size_t *out_len);
+
+/*
+ * §11 2026-08-23 backlog項目3: object_sync.cの受信側パース処理(errorメッセージの
+ * ワイヤーフォーマットに関するコメント参照)と対称のエンコーダ。
+ * fatal(varint: 0=Warning, 1=Error, 2=Fatal/接続を切る) || banTime(varint) ||
+ * vector(varstr、常に空文字列固定。相手のprotocol version不足のような接続全般への
+ * 苦情ではobjectのhashを指す意味が無いため) || errorText(varstr)。
+ * 完成メッセージ(24byteヘッダ込み)をmallocして返す(呼び出し側でfree)、*out_lenへ全長を設定。
+ */
+unsigned char *bm_create_error_message(uint64_t fatal, uint64_t ban_time, const char *error_text, size_t *out_len);
 
 #endif /* BM_INFRA_PROTOCOL_H */

@@ -887,6 +887,126 @@ int main(void)
         bm_fd_data_free(conn10);
     }
 
+    /* --- 11. プロトコルバージョン互換性チェック(§11 2026-08-23 backlog項目3、
+     * PyBitmessage network/bmproto.pyのpeerValidityChecks相当)。BM_MIN_PROTOCOL_VERSION
+     * (=3)未満のversionを名乗る相手にはverackを送らず、fatal=2のerrorメッセージだけ送って
+     * conn->should_disconnectを立てることを確認する。3以上なら従来通りverackが返ることも
+     * 併せて確認する(専用のsocketpairを使う、他シナリオとの取り違え防止のため) --- */
+    {
+        /* 11a. version=2(閾値未満) */
+        int fds11a[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds11a) == 0, "socketpair for old-protocol-version scenario");
+        struct bm_fd_data *conn11a = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds11a[0]);
+        CHECK(conn11a != NULL, "bm_fd_data_new for old-protocol-version scenario");
+
+        size_t old_ver_len = 0;
+        unsigned char *old_ver_packet = bm_new_version_message("/bitmessage-c-test:0.1.0/", 2, &conn11a->peer_addr,
+                                                                 &conn11a->local_addr, &old_ver_len);
+        CHECK(old_ver_packet != NULL, "bm_new_version_message should build a version=2 packet");
+
+        struct bm_message *old_ver_msg = NULL;
+        size_t old_ver_consumed = 0;
+        CHECK(bm_parse_message(old_ver_packet, old_ver_len, &old_ver_msg, &old_ver_consumed) == BM_PARSE_OK,
+              "the constructed version=2 packet should parse back successfully");
+        if (old_ver_msg != NULL)
+        {
+            bm_object_sync_dispatch(conn11a, old_ver_msg, &ctx);
+            bm_free_message(old_ver_msg);
+        }
+        CHECK(conn11a->should_disconnect == 1,
+              "a peer announcing a protocol version below BM_MIN_PROTOCOL_VERSION should be marked for disconnect");
+
+        unsigned char reply_buf[512];
+        size_t reply_total = 0;
+        struct bm_message *reply_msg = NULL;
+        size_t reply_consumed = 0;
+        for (;;)
+        {
+            ssize_t n = read(fds11a[1], reply_buf + reply_total, sizeof(reply_buf) - reply_total);
+            if (n <= 0)
+            {
+                break;
+            }
+            reply_total += (size_t)n;
+            if (bm_parse_message(reply_buf, reply_total, &reply_msg, &reply_consumed) == BM_PARSE_OK)
+            {
+                break;
+            }
+        }
+        CHECK(reply_msg != NULL, "an error message should have been sent back for the too-old protocol version");
+        if (reply_msg != NULL)
+        {
+            CHECK(strncmp(reply_msg->command, "error", 12) == 0,
+                  "the reply command should be 'error', not 'verack'");
+            uint64_t fatal = 0;
+            size_t consumed = bm_varint_decode(reply_msg->payload, reply_msg->length, &fatal);
+            CHECK(consumed > 0 && fatal == 2, "the error message's fatal field should be 2 (Fatal)");
+            bm_free_message(reply_msg);
+        }
+        /* 相手に届いた分がerrorメッセージだけ(verackは送られていない)であることも確認する */
+        CHECK(reply_total == reply_consumed,
+              "no extra bytes (e.g. a verack) should follow the error message");
+
+        free(old_ver_packet);
+        close(fds11a[0]);
+        close(fds11a[1]);
+        bm_fd_data_free(conn11a);
+
+        /* 11b. version=BM_MIN_PROTOCOL_VERSION(閾値以上)なら従来通りverackが返る(回帰確認) */
+        int fds11b[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds11b) == 0, "socketpair for min-protocol-version scenario");
+        struct bm_fd_data *conn11b = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds11b[0]);
+        CHECK(conn11b != NULL, "bm_fd_data_new for min-protocol-version scenario");
+
+        size_t ok_ver_len = 0;
+        unsigned char *ok_ver_packet =
+                bm_new_version_message("/bitmessage-c-test:0.1.0/", BM_MIN_PROTOCOL_VERSION, &conn11b->peer_addr,
+                                        &conn11b->local_addr, &ok_ver_len);
+        CHECK(ok_ver_packet != NULL, "bm_new_version_message should build a version=BM_MIN_PROTOCOL_VERSION packet");
+
+        struct bm_message *ok_ver_msg = NULL;
+        size_t ok_ver_consumed = 0;
+        CHECK(bm_parse_message(ok_ver_packet, ok_ver_len, &ok_ver_msg, &ok_ver_consumed) == BM_PARSE_OK,
+              "the constructed minimum-version packet should parse back successfully");
+        if (ok_ver_msg != NULL)
+        {
+            bm_object_sync_dispatch(conn11b, ok_ver_msg, &ctx);
+            bm_free_message(ok_ver_msg);
+        }
+        CHECK(conn11b->should_disconnect == 0,
+              "a peer at exactly BM_MIN_PROTOCOL_VERSION should not be marked for disconnect");
+
+        unsigned char reply_buf2[512];
+        size_t reply2_total = 0;
+        struct bm_message *reply_msg2 = NULL;
+        size_t reply2_consumed = 0;
+        for (;;)
+        {
+            ssize_t n = read(fds11b[1], reply_buf2 + reply2_total, sizeof(reply_buf2) - reply2_total);
+            if (n <= 0)
+            {
+                break;
+            }
+            reply2_total += (size_t)n;
+            if (bm_parse_message(reply_buf2, reply2_total, &reply_msg2, &reply2_consumed) == BM_PARSE_OK)
+            {
+                break;
+            }
+        }
+        CHECK(reply_msg2 != NULL, "a reply should have been sent back for an acceptable protocol version");
+        if (reply_msg2 != NULL)
+        {
+            CHECK(strncmp(reply_msg2->command, "verack", 12) == 0,
+                  "the reply command should be 'verack' when the protocol version is acceptable");
+            bm_free_message(reply_msg2);
+        }
+
+        free(ok_ver_packet);
+        close(fds11b[0]);
+        close(fds11b[1]);
+        bm_fd_data_free(conn11b);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

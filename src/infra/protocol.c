@@ -427,3 +427,25 @@ unsigned char *bm_create_inventory_message(const char *command, const unsigned c
     free(payload);
     return packet;
 }
+
+unsigned char *bm_create_error_message(uint64_t fatal, uint64_t ban_time, const char *error_text, size_t *out_len)
+{
+    size_t text_len = strlen(error_text);
+    size_t payload_len = bm_varint_size(fatal) + bm_varint_size(ban_time) + bm_varint_size(0)
+                          + bm_varint_size(text_len) + text_len;
+    unsigned char *payload = malloc(payload_len);
+    unsigned char *p = payload;
+    bm_varint_encode(p, fatal);
+    p += bm_varint_size(fatal);
+    bm_varint_encode(p, ban_time);
+    p += bm_varint_size(ban_time);
+    bm_varint_encode(p, 0); /* vector: 常に空(protocol.hのdoc参照) */
+    p += bm_varint_size(0);
+    bm_varint_encode(p, text_len);
+    p += bm_varint_size(text_len);
+    memcpy(p, error_text, text_len);
+
+    unsigned char *packet = bm_create_packet("error", payload, payload_len, out_len);
+    free(payload);
+    return packet;
+}

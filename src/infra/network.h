@@ -78,6 +78,15 @@ struct bm_fd_data
      * 時点で相手も既にこちらのversionを受け取っている(既存のコメント参照)ため、
      * ここが正しい"fully established"判定点になる。0=未完了(既定)。 */
     int handshake_complete;
+    /* §11 2026-08-23 backlog項目3: コマンドハンドラ(object_sync.c)が「このメッセージを
+     * 処理した結果、この接続を切るべき」と判断した場合に立てるフラグ(例: 相手の
+     * プロトコルバージョンがBM_MIN_PROTOCOL_VERSION未満)。ハンドラ自身はfdをcloseしたり
+     * せず(registryからの除去・epoll登録解除・rating記録等の後始末はnetwork.c側に
+     * 一元化されている、close_connection参照)、必要なerrorメッセージをconn->fdへ
+     * 書き込んだ上でこのフラグだけ立てて返る。bm_network_handle_readableがハンドラ呼び出し
+     * 直後にこのフラグを見て、切断が必要な通常の読み取りエラーと同じ経路(戻り値-1)へ
+     * 合流させる。0=切断不要(既定)。 */
+    int should_disconnect;
 };
 
 /*

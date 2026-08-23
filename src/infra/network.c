@@ -348,6 +348,14 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         conn->length -= consumed;
         handler(conn, msg, user_data);
         bm_free_message(msg);
+        if (conn->should_disconnect)
+        {
+            /* §11 2026-08-23 backlog項目3: ハンドラが「この接続を切るべき」と判断した
+             * (network.hのdoc参照)。必要なerrorメッセージ等の送信はハンドラ側で既に
+             * 済ませている前提で、切断そのものは既存の読み取りエラー経路(呼び出し元の
+             * rc!=0分岐→close_connection)へそのまま合流させる。 */
+            return -1;
+        }
     }
 
     return 0;
