@@ -2890,6 +2890,28 @@ backlog項目5の残り(送受信バイト数)に着手。ユーザーと相談�
 `tests/test_api_server.c`の既存`listConnections`シナリオへ`sentBytes`/`receivedBytes`の
 検証を追加し、`getNetworkStats`のHTTP経由シナリオも新設した。ctest 36件全通過。
 
+### 運用メモ: daemon Aが原因不明のまま突然終了した(2026-08-23、未解決)
+
+23:23:17起動のdaemon Aが、23:36:26のログ出力(通常運用中、`sent big inv`等が
+活発に流れていた)を最後に、以後一切ログが無いままプロセスごと消えていた
+(`pgrep`で存在確認、ユーザーが気付いて発覚)。以下を確認したが原因を特定できなかった:
+
+- ログに`シグナル 15 を受信`(SIGTERMによる正常終了)の記録が無い → 通常のkill/
+  再起動操作によるものではない
+- `journalctl -k`(sudo無しで読める範囲)にOOM killer・segfault・coredumpいずれの
+  痕跡も無し
+- `journalctl -u systemd-coredump`も該当時間帯に記録無し
+- `dmesg`本体は権限で読めず未確認(要sudo、今夜は確認できなかった)
+- `ulimit -c`が0(コアダンプ無効)のため、仮にsegfaultだったとしても解析用のcore
+  ファイルは残らない設定だった
+
+死んだ直前は、複数の新規接続が短時間に連続して確立し(`sent big inv`が数秒間隔で
+何度も発生)、`send_big_inv`が呼ばれるたびに一時的な配列(hash件数ぶん×32byte、
+今夜の時点でobject_pool.dbが約1万件)を複数回mallocしていた。この負荷と無関係かは
+未確認。次回同じ現象が起きたら、`ulimit -c unlimited`を設定してからdaemonを起動し
+coreファイルを残す、または`journalctl -k`をリアルタイムで`tail -f`しながら再現を待つ、
+のいずれかで原因究明を試みる。今回は同じバイナリでそのまま再起動して復旧した。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
