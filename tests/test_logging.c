@@ -3,6 +3,7 @@
  * BM_LOG_TIMESTAMPS)を確認する。stderrを一時ファイルへリダイレクトして出力内容を検証する。
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,24 @@ static int failures = 0;
             failures++;                                                     \
         }                                                                   \
     } while (0)
+
+#define N_THREADS 8
+#define N_ITERS 200
+
+struct thread_arg
+{
+    int thread_id;
+};
+
+static void *worker(void *arg_ptr)
+{
+    struct thread_arg *a = arg_ptr;
+    for (int i = 0; i < N_ITERS; i++)
+    {
+        bm_log("thread%d-iter%d\n", a->thread_id, i);
+    }
+    return NULL;
+}
 
 /* stderrを一時ファイルへ切り替えてbm_logを1回呼び、書き込まれた内容を返す(呼び出し側でfree) */
 static char *capture_one_log_line(void)
@@ -112,6 +131,81 @@ int main(void)
         {
             CHECK(line[0] == '[', "with neither env var set, the safe default should add a timestamp prefix");
             free(line);
+        }
+    }
+
+    /* --- 5. §11 2026-08-23発覚のバグ修正: マルチスレッドから同時にbm_logを呼んでも
+     * 行が混ざらないことを確認する。以前は時刻部分と本文部分を別々のfprintf呼び出しに
+     * 分けていたため、2回の呼び出しの間に別スレッドの出力が割り込み、
+     * "[ts][ts] 片方のメッセージ"+"(時刻無し)もう片方のメッセージ"のように行が
+     * 混ざることがあった(実daemonの運用中にユーザーが実際に観測して発覚)。 */
+    {
+        setenv("BM_LOG_TIMESTAMPS", "1", 1);
+        unsetenv("JOURNAL_STREAM");
+        bm_log_init();
+
+        fflush(stderr);
+        FILE *redirected = freopen(TEST_LOG_FILE, "w", stderr);
+        CHECK(redirected != NULL, "redirecting stderr for the concurrency scenario should succeed");
+
+        if (redirected != NULL)
+        {
+            struct thread_arg args[N_THREADS];
+            pthread_t threads[N_THREADS];
+            for (int t = 0; t < N_THREADS; t++)
+            {
+                args[t].thread_id = t;
+                pthread_create(&threads[t], NULL, worker, &args[t]);
+            }
+            for (int t = 0; t < N_THREADS; t++)
+            {
+                pthread_join(threads[t], NULL);
+            }
+            fflush(stderr);
+
+            FILE *f = fopen(TEST_LOG_FILE, "r");
+            CHECK(f != NULL, "reopening the concurrency scenario log file should succeed");
+            if (f != NULL)
+            {
+                int seen[N_THREADS][N_ITERS];
+                memset(seen, 0, sizeof(seen));
+                int line_count = 0;
+                int malformed = 0;
+                char line[512];
+                while (fgets(line, sizeof(line), f) != NULL)
+                {
+                    line_count++;
+                    const char *close_bracket = strstr(line, "] ");
+                    int tid = -1, iter = -1;
+                    if (line[0] != '[' || close_bracket == NULL
+                        || sscanf(close_bracket + 2, "thread%d-iter%d", &tid, &iter) != 2
+                        || tid < 0 || tid >= N_THREADS || iter < 0 || iter >= N_ITERS)
+                    {
+                        malformed++;
+                        continue;
+                    }
+                    seen[tid][iter]++;
+                }
+                fclose(f);
+
+                CHECK(line_count == N_THREADS * N_ITERS,
+                      "the total line count should exactly match what all threads wrote (no merged/split lines)");
+                CHECK(malformed == 0, "every line should be well-formed: '[timestamp] threadN-iterM'");
+
+                int missing_or_duplicated = 0;
+                for (int t = 0; t < N_THREADS; t++)
+                {
+                    for (int i = 0; i < N_ITERS; i++)
+                    {
+                        if (seen[t][i] != 1)
+                        {
+                            missing_or_duplicated++;
+                        }
+                    }
+                }
+                CHECK(missing_or_duplicated == 0,
+                      "every (thread, iteration) message should appear exactly once, intact");
+            }
         }
     }
 
