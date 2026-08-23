@@ -2309,6 +2309,19 @@ onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)�
 `logical_peer_ip`付き接続でfatal=2のerrorを受信させ、rating 0.9の行が実際に下がることを
 確認)、ctest 29件全通過。
 
+### バグ修正: ログ上でonionアドレスのportが空になる(host:portバッファが62文字onionに対し小さすぎた)(2026-08-23)
+
+上記調査中、`[peer_connector] connecting to xxxxx.onion: (via SOCKS5)...`のようにonion
+アドレス宛のログでportが空になっているのに気付いた。v3 onionアドレスは56文字+".onion"で
+62文字あり、当日夜のIPv6ログ修正(§11参照)で導入した`bm_network_format_host_port`の
+呼び出し側バッファが`char addr_buf[64]`だったため、62文字のホスト名+":"で63文字使い
+切ってしまい、port桁が入る余地が無く無言で切り捨てられていた。実際の接続処理自体は
+`candidates[i].ip_address`/`.port`を直接使っており影響を受けていなかった(ログ表示のみの
+問題)ため実害は無かったが、診断ログとしては機能していなかった。`peer_connector.c`
+(3箇所)・`api_server.c`・`tor_control.c`・`main.c`の該当バッファを全て64→80byteに拡張。
+回帰テスト`tests/test_network_format_host_port.c`を新設(IPv4/IPv6/62文字onionアドレスの
+3パターンでport桁が切り捨てられないことを確認)、ctest 30件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

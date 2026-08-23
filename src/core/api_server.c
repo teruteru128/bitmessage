@@ -1190,7 +1190,7 @@ void *bm_api_server_thread(void *arg)
     struct bm_api_server_thread_args *args = arg;
     const struct bm_api_server_config *config = args->config;
 
-    char addr_buf[64];
+    char addr_buf[80];
     bm_network_format_host_port(config->bind_address, config->port, addr_buf, sizeof(addr_buf));
 
     int listen_fd = -1;

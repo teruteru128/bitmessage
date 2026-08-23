@@ -192,7 +192,7 @@ static const char *socks5_rep_to_string(unsigned char rep)
  */
 static int socks5_connect(int sock, const char *dest_host, int dest_port, int timeout_sec)
 {
-    char addr_buf[64];
+    char addr_buf[80];
     bm_network_format_host_port(dest_host, dest_port, addr_buf, sizeof(addr_buf));
 
     size_t host_len = strlen(dest_host);
@@ -300,7 +300,7 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
         int sock = connect_with_timeout(socks_proxy->host, socks_proxy->port, timeout_sec);
         if (sock < 0)
         {
-            char proxy_addr_buf[64];
+            char proxy_addr_buf[80];
             bm_network_format_host_port(socks_proxy->host, socks_proxy->port, proxy_addr_buf,
                                          sizeof(proxy_addr_buf));
             fprintf(stderr, "[peer_connector] socks5: failed to reach proxy %s (is Tor/the proxy "
@@ -370,7 +370,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             continue; /* 既に接続済みの相手には二重接続しない */
         }
 
-        char addr_buf[64];
+        char addr_buf[80];
         bm_network_format_host_port(candidates[i].ip_address, candidates[i].port, addr_buf, sizeof(addr_buf));
 
         fprintf(stderr, "[peer_connector] connecting to %s%s...\n", addr_buf,
