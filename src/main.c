@@ -345,11 +345,16 @@ int main(void)
                     "[tor_control] using statically configured onion address: %s:%d -> 127.0.0.1:%d "
                     "(%s)\n",
                     manual_onion_address, virtual_port, inbound_port, onion_address_source);
+            /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
+             * 接続候補選定(peer_manager.cのlist_top)から除外する(自分自身への接続を防ぐ、
+             * peer_manager.h参照)。§11 2026-08-23発覚のバグ修正: 以前はannounce成功可否を
+             * 見ずに無条件で呼んでいたため、BM_ONION_ADDRESSが空文字列や末尾に空白混入の
+             * 不正な値だった場合でも、そのままis_self=1の壊れた行がpeers.dbへ書き込まれて
+             * いた(bm_object_sync_announce_onion_peerが-1を返す=bm_build_onionpeerの
+             * 長さ検証に落ちる、まさにそのケース)。実害は無い(list_topはis_self=0でしか
+             * 選ばないため接続候補には影響しない)が、announce成功時のみ呼ぶよう修正した。 */
+            bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
         }
-        /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
-         * 接続候補選定(peer_manager.cのlist_top)から除外する(自分自身への接続を防ぐ、
-         * peer_manager.h参照)。 */
-        bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
     }
     /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
      * Stage 1のlistenが成功している場合のみ試みる(listen_connが無ければADD_ONIONで転送する

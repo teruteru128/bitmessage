@@ -2640,6 +2640,32 @@ timestampで切断されること、(b)過去方向に大きくズレたtimestam
 (c)境界値(ちょうど`BM_MAX_TIME_OFFSET_SECONDS`)は許容されverackが返ることの3点を
 確認した。ctest 34件全通過。
 
+### バグ修正: onionアドレスが不正でもis_self行がpeers.dbへ書き込まれていた(2026-08-23)
+
+ユーザーがobject_pool.db/peers.dbの中身を`sqlite3`で直接調べていて発覚。今夜の
+onionアドレス復旧トラブル(前述の運用メモ参照)の過程で、`BM_ONION_ADDRESS`が
+空文字列だった回・末尾に空白が混入した63文字の回、それぞれの起動時に`peers.db`へ
+`is_self=1`の壊れた行(`ip_address`が空文字列/63文字)が作られていたことが分かった。
+
+**原因**: `main.c`の`bm_peer_manager_mark_self()`呼び出しが、直前の
+`bm_object_sync_announce_onion_peer()`の成功可否(`bm_build_onionpeer`の長さ検証)を
+見ずに無条件で呼ばれていた。ログ出力だけが成功時条件付きになっており、DB書き込みは
+条件から漏れていた。
+
+**実害**: `bm_peer_manager_list_top`(接続候補選定)は`is_self = 0`でしか絞り込まないため、
+壊れた`is_self`行が接続候補として選ばれることは無く、機能的な実害は無かった(単なる
+DBの汚れ)。
+
+**修正**: `bm_peer_manager_mark_self`呼び出しを`bm_object_sync_announce_onion_peer`の
+成功分岐(`== 0`)の内側へ移動した。稼働中daemon Aの`peers.db`から既存の壊れた行2件
+(空文字列/63文字)も直接`DELETE`で削除し、正しい62文字の行(以前から存在していた)
+だけを残した。ctest 34件全通過(既存テストの回帰確認のみ、専用の新規テストは追加
+していない。理由: `bm_peer_manager_mark_self`自体の単体動作は既に
+`tests/test_peer_manager_self.c`で検証済みで、今回のバグは「呼ぶかどうかの条件分岐」
+というmain.c内の配線ミスであり、main.cの起動シーケンス全体は自動テストの対象外
+(cli_integration.shが実バイナリの起動はカバーするが、onion関連の分岐は
+BM_ONION_ADDRESS未設定のCI環境では通らない)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
