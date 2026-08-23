@@ -129,7 +129,7 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
         }
         else
         {
-            fprintf(stderr,
+            bm_log(
                     "[object_sync] resend attempt skipped for %s (fromAddress not unlocked or "
                     "recipient pubkey not cached?)\n",
                     c->to_address);
@@ -284,7 +284,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL);
         }
-        fprintf(stderr,
+        bm_log(
                 "[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
                 address_version);
         return;
@@ -942,7 +942,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     }
                 }
             }
-            fprintf(stderr,
+            bm_log(
                     "[object_sync] addr: %" PRIu64 " entries (%d registered to peers.db, %d filtered)\n",
                     addr_msg.count, registered, filtered);
             bm_free_addr_message(&addr_msg);
@@ -998,7 +998,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     consumed = bm_varint_decode(p, remaining, &text_len);
                     if (consumed > 0 && text_len <= remaining - consumed)
                     {
-                        fprintf(stderr,
+                        bm_log(
                                 "[object_sync] error message from peer: fatal=%" PRIu64 " banTime=%" PRIu64
                                 " text=\"%.*s\"\n",
                                 fatal, ban_time, (int)text_len, p + consumed);

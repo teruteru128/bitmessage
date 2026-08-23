@@ -291,7 +291,7 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
         int observed = bm_peer_manager_load_observed_nodes(db, "seeds/observed_nodes.txt");
         if (observed > 0)
         {
-            fprintf(stderr,
+            bm_log(
                     "[peer_manager] seeded %d observed node(s) from seeds/observed_nodes.txt "
                     "(unverified operators, see DESIGN.md §11)\n",
                     observed);

@@ -65,7 +65,7 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
             int v = atoi(value);
             if (v <= 0)
             {
-                fprintf(stderr,
+                bm_log(
                         "[config_file] %s:%d: max_outbound_connections must be positive, ignoring "
                         "(keeping %d)\n",
                         path, line_no, out->max_outbound_connections);
@@ -82,7 +82,7 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
             long long v = atoll(value);
             if (v <= 0)
             {
-                fprintf(stderr,
+                bm_log(
                         "[config_file] %s:%d: default_nonce_trials_per_byte must be positive, ignoring "
                         "(a value of 0 would make PoW target calculation divide by zero)\n",
                         path, line_no);
@@ -96,7 +96,7 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
             long long v = atoll(value);
             if (v <= 0)
             {
-                fprintf(stderr,
+                bm_log(
                         "[config_file] %s:%d: default_payload_length_extra_bytes must be positive, "
                         "ignoring\n",
                         path, line_no);

@@ -339,7 +339,7 @@ int main(void)
     {
         if (bm_object_sync_announce_onion_peer(&object_sync_ctx, manual_onion_address, virtual_port) == 0)
         {
-            fprintf(stderr,
+            bm_log(
                     "[tor_control] using statically configured onion address: %s:%d -> 127.0.0.1:%d "
                     "(BM_ONION_ADDRESS)\n",
                     manual_onion_address, virtual_port, inbound_port);

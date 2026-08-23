@@ -359,7 +359,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     {
         if (config->control_host == NULL)
         {
-            fprintf(stderr,
+            bm_log(
                     "[tor_control] no reachable ControlPort (unix socket failed, no TCP fallback configured)\n");
             return -1;
         }
@@ -368,7 +368,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
         {
             char addr_buf[80];
             bm_network_format_host_port(config->control_host, config->control_port, addr_buf, sizeof(addr_buf));
-            fprintf(stderr,
+            bm_log(
                     "[tor_control] failed to connect to ControlPort %s (is Tor running with ControlPort "
                     "enabled?)\n",
                     addr_buf);
@@ -414,7 +414,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
 
     if (!auth_methods_support_cookie(auth_line->text))
     {
-        fprintf(stderr,
+        bm_log(
                 "[tor_control] ControlPort requires HASHEDPASSWORD authentication, which is not supported "
                 "(cookie auth only). AUTH line: %s\n",
                 auth_line->text);
@@ -433,7 +433,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     FILE *cookie_fp = fopen(cookie_path, "rb");
     if (cookie_fp == NULL)
     {
-        fprintf(stderr,
+        bm_log(
                 "[tor_control] failed to open cookie file %s (permission denied? this user may need to be "
                 "added to Tor's control group)\n",
                 cookie_path);
