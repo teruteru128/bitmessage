@@ -2556,6 +2556,19 @@ onionアドレス自体は一切git管理下に置かない方針)のため、�
    失敗し続ける**(daemonの起動自体は成功するため気づきにくい)。
    `tr -d '[:space:]'`で明示的にトリムしてから`BM_ONION_ADDRESS`へ渡すこと。
 
+**恒久的な解決策として採用したもの(2026-08-23、ユーザー提案)**: `main.c`の
+起動時設定読み込みには元々`env var(`BM_ONION_ADDRESS`) > bitmessage.confの
+`[tor] onion_address` > 組み込みの既定値`という優先順位が実装済みだった
+(`core/config_file.c`の`onion_address`フィールド、既存コード。今回新規実装した
+ものではない)。`bitmessage.conf`自体は`.gitignore`で最初から除外されている
+(`git check-ignore`で確認済み)ため、ここへ一度書いておけば以後の再起動では
+`BM_ONION_ADDRESS`を毎回用意する必要が無く、Torの`hostname`ファイルにも
+(パーミッション変更は言うまでもなく、読み取りすら)一切触れずに済む。今回は
+稼働中daemon Aの`/proc/<pid>/environ`から(生きているプロセスの環境からなら
+`setfacl`等の危険な回避策無しに読める)値を1回だけ複製し、`bitmessage.conf`へ
+追記して解決した。今後onionアドレスが変わる(Tor hidden serviceを作り直す等)場合を
+除き、この節の1.の問題自体を再び踏む必要は無くなったはず。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
