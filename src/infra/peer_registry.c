@@ -240,6 +240,8 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
     }
     pthread_mutex_unlock(&reg->lock);
 
+    size_t inv_sent_peers = 0;
+    size_t dinv_sent_peers = 0;
     for (size_t i = 0; i < pending_count; i++)
     {
         if (pending[i].fluff_count > 0)
@@ -254,6 +256,10 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                     != 0)
                 {
                     bm_log("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                }
+                else
+                {
+                    inv_sent_peers++;
                 }
                 free(packet);
             }
@@ -271,12 +277,26 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                 {
                     bm_log("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
                 }
+                else
+                {
+                    dinv_sent_peers++;
+                }
                 free(packet);
             }
         }
         close(pending[i].fd);
         free(pending[i].fluff_hashes);
         free(pending[i].stem_hashes);
+    }
+    /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(何件のhashを何peerへ
+     * 配信できたか)が可視化されていなかった(handle_inv等の可視化と同種の穴、
+     * ユーザー指摘)。宛先ごとの個別ログにはせず(peer数が多いと大量に出るため)
+     * 1回のbroadcast呼び出しにつき1行のサマリにした。誰にも送るものが無かった
+     * (pending_count==0)場合は出さない。 */
+    if (pending_count > 0)
+    {
+        bm_log("[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s)\n", count,
+                inv_sent_peers, dinv_sent_peers);
     }
     free(pending);
 }

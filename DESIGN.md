@@ -2967,6 +2967,23 @@ bashの規約でシグナル終了時の終了コードは`128+シグナル番�
 ctest 36件全通過。今夜の時点では次にまた発生するか経過観察が必要(watchdogにより
 放置は可能)。
 
+### ログ改善: getdata送信・通常inv/dinv配信の正常系にログが無かった(2026-08-24)
+
+ユーザーの指摘で発覚。今夜これまでに`inv`/`dinv`/`getdata`受信側の正常系ログは
+追加済みだったが、送信側の一部にまだ同じ穴が残っていた:
+
+- `handle_inv`(`object_sync.c`)のgetdata送信: 失敗時("failed to send getdata")の
+  ログしか無く、実際に何件送れたかが分からなかった
+- `bm_peer_registry_broadcast_inv`(`peer_registry.c`、新規object受信時に既存の
+  接続中peerへ配る、`send_big_inv`とは別の通常経路)のinv/dinv配信: こちらも
+  失敗時のログしか無かった
+
+前者は`bm_log("[object_sync] sent getdata: %zu item(s)\n", missing_count)`を
+追加。後者は宛先ごとの個別ログにはせず(peer数が多いと大量に出るため)、
+1回のbroadcast呼び出しにつき`"broadcast inv: %zu hash(es) inv to %zu peer(s),
+dinv to %zu peer(s)"`という1行のサマリにした(誰にも送るものが無ければ出さない)。
+ctest 36件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -716,6 +716,10 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
             else
             {
                 conn->bytes_sent += (uint64_t)packet_len;
+                /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
+                 * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
+                 * 受信側の可視化と同種の穴、ユーザー指摘)。 */
+                bm_log("[object_sync] sent getdata: %zu item(s)\n", missing_count);
             }
             free(packet);
         }
