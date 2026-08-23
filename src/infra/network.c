@@ -17,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../common/logging.h"
 #include "../core/peer_manager.h"
 
 #define INIT_RECV_BUFFER_SIZE 131072
@@ -199,23 +200,23 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         struct bm_version_message ver;
         bm_parse_version_message(msg->payload, msg->length, &ver);
-        fprintf(stderr, "[network] version: v=%u services=%" PRIu64 " ua=%s\n",
+        bm_log("[network] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
         bm_free_version_message(&ver);
         if (bm_reply_verack(conn) != 0)
         {
-            fprintf(stderr, "[network] failed to reply verack\n");
+            bm_log("[network] failed to reply verack\n");
         }
     }
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
-        fprintf(stderr, "[network] verack received\n");
+        bm_log("[network] verack received\n");
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {
         if (bm_reply_pong(conn) != 0)
         {
-            fprintf(stderr, "[network] failed to reply pong\n");
+            bm_log("[network] failed to reply pong\n");
         }
     }
     else if (strncmp(msg->command, "addr", 12) == 0)
@@ -223,7 +224,7 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_addr_message addr_msg;
         if (bm_parse_addr_message(msg->payload, msg->length, &addr_msg) == 0)
         {
-            fprintf(stderr, "[network] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n", addr_msg.count);
+            bm_log("[network] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n", addr_msg.count);
             bm_free_addr_message(&addr_msg);
         }
     }
@@ -232,17 +233,17 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_inventory_message inv_msg;
         if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) == 0)
         {
-            fprintf(stderr, "[network] inv: %" PRIu64 " items (TODO: object_store未実装、getdata未送信)\n", inv_msg.count);
+            bm_log("[network] inv: %" PRIu64 " items (TODO: object_store未実装、getdata未送信)\n", inv_msg.count);
             bm_free_inventory_message(&inv_msg);
         }
     }
     else if (strncmp(msg->command, "object", 12) == 0)
     {
-        fprintf(stderr, "[network] object received, %u bytes (TODO: object_store/decrypt_worker未実装)\n", msg->length);
+        bm_log("[network] object received, %u bytes (TODO: object_store/decrypt_worker未実装)\n", msg->length);
     }
     else
     {
-        fprintf(stderr, "[network] unhandled command: %s\n", command);
+        bm_log("[network] unhandled command: %s\n", command);
     }
 }
 
@@ -282,7 +283,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
                 /* §11 単一メッセージの上限(BM_MAX_MESSAGE_LENGTH)は通常bm_parse_messageの
                  * BM_PARSE_MESSAGE_TOO_LARGEで先に検知されるが、それより前にここへ到達する
                  * ケース(単一read()で大量データが一度に届く等)に備えた二重の防御 */
-                fprintf(stderr, "[network] recv buffer would exceed %u bytes, dropping connection\n",
+                bm_log("[network] recv buffer would exceed %u bytes, dropping connection\n",
                         MAX_RECV_BUFFER_SIZE);
                 return -1;
             }
@@ -310,7 +311,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         }
         if (result == BM_PARSE_BAD_CHECKSUM)
         {
-            fprintf(stderr, "[network] checksum mismatch, dropping %zu bytes\n", consumed);
+            bm_log("[network] checksum mismatch, dropping %zu bytes\n", consumed);
             memmove(conn->recv_buffer, conn->recv_buffer + consumed, conn->length - consumed);
             conn->length -= consumed;
             continue;
@@ -327,7 +328,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         {
             /* §11 巨大なlengthを申告された。resyncを試みるコスト自体もDoSになりうるため、
              * 即座に接続を切断する(呼び出し元でclose・registry除去される) */
-            fprintf(stderr, "[network] declared message length exceeds %u bytes, dropping connection\n",
+            bm_log("[network] declared message length exceeds %u bytes, dropping connection\n",
                     BM_MAX_MESSAGE_LENGTH);
             return -1;
         }
@@ -388,7 +389,7 @@ static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *
         {
             bm_peer_registry_add(args->registry, conn);
         }
-        fprintf(stderr, "[network] accepted inbound connection (fd=%d)\n", client_fd);
+        bm_log("[network] accepted inbound connection (fd=%d)\n", client_fd);
     }
 }
 

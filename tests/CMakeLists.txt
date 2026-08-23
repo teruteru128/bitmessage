@@ -119,3 +119,7 @@ add_test(NAME peer_connector_shutdown COMMAND test_peer_connector_shutdown)
 add_executable(test_network_format_host_port test_network_format_host_port.c)
 target_link_libraries(test_network_format_host_port PRIVATE bm_infra)
 add_test(NAME network_format_host_port COMMAND test_network_format_host_port)
+
+add_executable(test_logging test_logging.c)
+target_link_libraries(test_logging PRIVATE bm_common)
+add_test(NAME logging COMMAND test_logging)

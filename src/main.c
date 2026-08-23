@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "common/db_common.h"
+#include "common/logging.h"
 #include "common/queue.h"
 #include "core/api_server.h"
 #include "core/config_file.h"
@@ -136,6 +137,10 @@ static uint64_t env_or_u64(const char *env_name, uint64_t file_value)
 
 int main(void)
 {
+    /* §11 2026-08-23: ログ行に時刻を付けるかどうかの判定(JOURNAL_STREAM/BM_LOG_TIMESTAMPS)を
+     * 他のどのbm_log呼び出しよりも前に済ませておく */
+    bm_log_init();
+
     /* §1.3: DBはスレッドごとに個別接続を開く方針だが、v1では起動時のスキーマ初期化のみ行う */
     sqlite3 *peers_db = open_and_init("peers.db", bm_peer_manager_init_schema);
     sqlite3 *object_pool_db = open_and_init("object_pool.db", bm_object_store_init_schema);
@@ -146,10 +151,10 @@ int main(void)
     if (peers_db == NULL || object_pool_db == NULL || identity_db == NULL || messages_db == NULL
         || config_db == NULL)
     {
-        fprintf(stderr, "DB初期化に失敗しました\n");
+        bm_log("DB初期化に失敗しました\n");
         return EXIT_FAILURE;
     }
-    fprintf(stderr, "DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
+    bm_log("DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
 
     /* §11 起動時設定ファイル(既定"bitmessage.conf"、BM_CONFIG_FILEで別の場所を指定可能)。
      * env var > 設定ファイル > 組み込みの既定値、という優先順位でこの後の各設定に使う
@@ -161,7 +166,7 @@ int main(void)
     }
     struct bm_config_file cfg;
     int config_file_found = bm_config_file_load(config_file_path, &cfg);
-    fprintf(stderr, "[config] %s (%s)\n", config_file_path,
+    bm_log("[config] %s (%s)\n", config_file_path,
             config_file_found ? "読み込み完了" : "見つからないため既定値を使用");
 
     /* §11 outbound接続用SOCKS5プロキシ設定。起動時ログ用に一度読むだけで、実際に
@@ -173,7 +178,7 @@ int main(void)
     char socks_proxy_addr_buf[80];
     bm_network_format_host_port(socks_proxy_config.host, socks_proxy_config.port, socks_proxy_addr_buf,
                                  sizeof(socks_proxy_addr_buf));
-    fprintf(stderr, "[config] socks proxy: %s (%s)\n", socks_proxy_config.enabled ? "enabled" : "disabled",
+    bm_log("[config] socks proxy: %s (%s)\n", socks_proxy_config.enabled ? "enabled" : "disabled",
             socks_proxy_addr_buf);
 
     struct bm_queues queues;
@@ -217,14 +222,14 @@ int main(void)
         env_or_u64("BM_DEFAULT_NONCE_TRIALS_PER_BYTE", cfg.default_nonce_trials_per_byte);
     api_config.default_payload_length_extra_bytes =
         env_or_u64("BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES", cfg.default_payload_length_extra_bytes);
-    fprintf(stderr, "[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
+    bm_log("[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
             api_password, api_port);
 
     /* testnet切り替え。bitmessage.confの[network] testnet、またはBM_TESTNET=1で切り替える
      * (既定mainnet)。 */
     int testnet = env_flag_or("BM_TESTNET", cfg.testnet);
     bm_protocol_set_testnet(testnet);
-    fprintf(stderr, "[network] mode=%s\n", testnet ? "testnet" : "mainnet");
+    bm_log("[network] mode=%s\n", testnet ? "testnet" : "mainnet");
 
     /* §9 Dandelion++ Stage 2: プロセス内シングルトンの初期化(DESIGN.md §9.2)。
      * peer_connector_threadの再接続ループから定期的に呼ばれるbm_dandelion_maybe_reshuffle/
@@ -281,7 +286,7 @@ int main(void)
         int listen_fd = bm_network_listen("127.0.0.1", inbound_port);
         if (listen_fd < 0)
         {
-            fprintf(stderr, "[network] failed to listen on 127.0.0.1:%d for inbound connections\n",
+            bm_log("[network] failed to listen on 127.0.0.1:%d for inbound connections\n",
                     inbound_port);
         }
         else
@@ -289,7 +294,7 @@ int main(void)
             listen_conn = bm_fd_data_new(BM_FD_LISTEN_SOCKET, listen_fd);
             if (listen_conn == NULL)
             {
-                fprintf(stderr, "[network] bm_fd_data_new failed for inbound listen socket\n");
+                bm_log("[network] bm_fd_data_new failed for inbound listen socket\n");
                 close(listen_fd);
             }
             else
@@ -306,7 +311,7 @@ int main(void)
                 }
                 else
                 {
-                    fprintf(stderr, "[network] listening for inbound connections on 127.0.0.1:%d\n",
+                    bm_log("[network] listening for inbound connections on 127.0.0.1:%d\n",
                             inbound_port);
                 }
             }
@@ -366,7 +371,7 @@ int main(void)
         tor_control_fd = bm_tor_control_connect_and_authenticate(&tor_config);
         if (tor_control_fd < 0)
         {
-            fprintf(stderr, "[tor_control] hidden serviceの自動作成をスキップします(ControlPortに"
+            bm_log("[tor_control] hidden serviceの自動作成をスキップします(ControlPortに"
                             "接続できませんでした)\n");
         }
         else
@@ -381,7 +386,7 @@ int main(void)
                                                           &new_private_key);
             if (add_onion_rc != 0)
             {
-                fprintf(stderr, "[tor_control] hidden serviceの作成に失敗しました\n");
+                bm_log("[tor_control] hidden serviceの作成に失敗しました\n");
                 close(tor_control_fd);
                 tor_control_fd = -1;
             }
@@ -391,7 +396,7 @@ int main(void)
                 {
                     bm_config_store_set_tor_onion_key(config_db, new_private_key);
                 }
-                fprintf(stderr, "[tor_control] hidden service ready: %s:%d -> 127.0.0.1:%d\n", onion_address,
+                bm_log("[tor_control] hidden service ready: %s:%d -> 127.0.0.1:%d\n", onion_address,
                         virtual_port, inbound_port);
 
                 /* §11 onionpeer objectでの自己announce(送信側)。registryはこの時点では
@@ -434,7 +439,7 @@ int main(void)
     volatile sig_atomic_t peer_connector_stop = 0;
     if (env_flag_or("BM_NO_CONNECT", cfg.no_connect))
     {
-        fprintf(stderr, "[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
+        bm_log("[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
     }
     else
     {
@@ -461,7 +466,7 @@ int main(void)
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     int sig = 0;
     sigwait(&set, &sig);
-    fprintf(stderr, "シグナル %d を受信、終了処理を開始します\n", sig);
+    bm_log("シグナル %d を受信、終了処理を開始します\n", sig);
 
     queues_shutdown(&queues);
     peer_connector_stop = 1;

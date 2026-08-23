@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include "../common/db_common.h"
+#include "../common/logging.h"
 
 /* §11 peers.dbクリーンアップ。PyBitmessage network/knownnodes.pyのcleanupKnownNodes
  * (28日/3時間/-0.5)準拠 */
@@ -282,7 +283,7 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
             return -1;
         }
     }
-    fprintf(stderr, "[peer_manager] seeded %zu bootstrap nodes (%s)\n", seed_count,
+    bm_log("[peer_manager] seeded %zu bootstrap nodes (%s)\n", seed_count,
             testnet ? "testnet" : "mainnet");
 
     if (!testnet)

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../common/logging.h"
 #include "object.h"
 #include "protocol.h"
 
@@ -197,7 +198,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                                           BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
                     != 0)
                 {
-                    fprintf(stderr, "[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                    bm_log("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
                 }
                 free(packet);
             }
@@ -213,7 +214,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                                           BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
                     != 0)
                 {
-                    fprintf(stderr, "[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
+                    bm_log("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
                 }
                 free(packet);
             }

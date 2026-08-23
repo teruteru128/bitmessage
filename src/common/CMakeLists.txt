@@ -5,6 +5,7 @@ add_library(bm_common STATIC
     hash.c
     db_common.c
     json.c
+    logging.c
 )
 
 target_include_directories(bm_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

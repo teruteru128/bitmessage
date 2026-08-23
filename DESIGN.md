@@ -2322,6 +2322,31 @@ onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)�
 回帰テスト`tests/test_network_format_host_port.c`を新設(IPv4/IPv6/62文字onionアドレスの
 3パターンでport桁が切り捨てられないことを確認)、ctest 30件全通過。
 
+### ログ行への時刻付与(`common/logging.c`、2026-08-23)
+
+11時間超の連続稼働テスト中、ユーザーが「ログのどの行がいつのものか分からない」ことに
+気付いた。`fprintf(stderr, ...)`には時刻が一切無く、実際にどの起動(run)のログなのか
+行番号と`DB初期化完了`の区切りから推測するしかなかった(今夜の調査でも何度もこれで
+手間取った)。
+
+実運用ではsystemd配下での起動を想定しており、その場合journaldがログ受信時刻を別途
+正確に記録するため、こちらで時刻を埋め込むと二重になってしまう。systemdはjournald接続の
+stdout/stderrに対して環境変数`JOURNAL_STREAM`をセットするので、これを起動時に一度だけ
+確認する薄いロガー`common/logging.c`(`bm_log_init()`/`bm_log()`)を新設した。
+
+- `JOURNAL_STREAM`が未設定(手動nohup運用等) → 既定で`[YYYY-MM-DD HH:MM:SS] `を先頭に付与
+- `JOURNAL_STREAM`が設定済み(systemd/journald配下) → journald側が記録するため付与しない
+- `BM_LOG_TIMESTAMPS=0/1`で明示上書き可能(自動判定が外れた場合の保険)
+
+`main.c`/`infra/*.c`(全ファイル)/`core/config_file.c`・`api_server.c`・`peer_manager.c`・
+`common/db_common.c`の`fprintf(stderr, ...)`診断ログ呼び出し(約120箇所)を`bm_log(...)`へ
+一括置換した。`cli/main.c`(`bitmessage-cli`のUsage/エラー出力、対話コマンドの直接応答であり
+daemonのログストリームとは性質が違う)は対象外とした。ログレベル(DEBUG/INFO/WARN/ERROR)の
+導入は今回スコープ外とし、別途backlogとした(既存呼び出し箇所を1つずつ分類し直す作業が
+必要で、機械的な今回の置換とは規模が違うため)。回帰テスト`tests/test_logging.c`を新設
+(`BM_LOG_TIMESTAMPS`明示指定・`JOURNAL_STREAM`検出・既定値の4パターンを確認)、
+ctest 31件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2383,7 +2408,12 @@ onionpeer自己announceを再送しており(TTLも7日、うちは2日固定)�
    (自分のノード同士をLANで繋ぐ用途)には手動peer追加で十分」という判断であり、
    「PyBitmessage自体に存在しない」という前提ではなかった点を訂正。優先度は低いままで
    良いと思われるが、記録として残す。
-8. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
+8. **ログレベル(DEBUG/INFO/WARN/ERROR)が無い**: 2026-08-23に`common/logging.c`
+   (`bm_log`)を新設した際、時刻付与とあわせて検討したがスコープ外とした。既存の
+   約120箇所の呼び出しを1つずつ「どのレベルに当たるか」判断し直す作業が必要で、
+   時刻付与のような機械的な置換とは規模が違う。フィルタリング方式(環境変数で
+   最低レベル指定等)も別途設計が要る。優先度低。
+9. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:

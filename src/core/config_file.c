@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/logging.h"
+
 static void set_defaults(struct bm_config_file *out)
 {
     memset(out, 0, sizeof(*out));
@@ -153,7 +155,7 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
             return;
         }
     }
-    fprintf(stderr, "[config_file] %s:%d: unknown key '%s' in section [%s], ignoring\n", path, line_no, key,
+    bm_log("[config_file] %s:%d: unknown key '%s' in section [%s], ignoring\n", path, line_no, key,
             section);
 }
 
@@ -191,7 +193,7 @@ int bm_config_file_load(const char *path, struct bm_config_file *out)
         char *eq = strchr(trimmed, '=');
         if (eq == NULL)
         {
-            fprintf(stderr, "[config_file] %s:%d: malformed line (no '='), ignoring: %s\n", path, line_no,
+            bm_log("[config_file] %s:%d: malformed line (no '='), ignoring: %s\n", path, line_no,
                     trimmed);
             continue;
         }

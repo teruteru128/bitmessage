@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "../common/logging.h"
 #include "network.h"
 
 #define BM_TOR_CONTROL_TIMEOUT_SEC 10
@@ -232,23 +233,23 @@ static int read_full_reply(struct line_reader *lr, struct reply_line *lines, siz
     {
         if (count >= max_lines)
         {
-            fprintf(stderr, "[tor_control] reply has too many lines (>%zu)\n", max_lines);
+            bm_log("[tor_control] reply has too many lines (>%zu)\n", max_lines);
             return -1;
         }
         char raw[BM_TOR_CONTROL_LINE_CAP];
         if (line_reader_next(lr, raw, sizeof(raw)) != 0)
         {
-            fprintf(stderr, "[tor_control] connection closed/timed out while reading reply\n");
+            bm_log("[tor_control] connection closed/timed out while reading reply\n");
             return -1;
         }
         if (parse_reply_line(raw, &lines[count]) != 0)
         {
-            fprintf(stderr, "[tor_control] malformed reply line: %s\n", raw);
+            bm_log("[tor_control] malformed reply line: %s\n", raw);
             return -1;
         }
         if (lines[count].sep == '+')
         {
-            fprintf(stderr, "[tor_control] unsupported data-block reply (sep='+'): %s\n", raw);
+            bm_log("[tor_control] unsupported data-block reply (sep='+'): %s\n", raw);
             return -1;
         }
         int final_line = (lines[count].sep == ' ');
@@ -350,7 +351,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
         fd = connect_unix(config->control_socket_path);
         if (fd < 0)
         {
-            fprintf(stderr, "[tor_control] failed to connect to unix socket %s, falling back to TCP\n",
+            bm_log("[tor_control] failed to connect to unix socket %s, falling back to TCP\n",
                     config->control_socket_path);
         }
     }
@@ -383,7 +384,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     static const char protocolinfo_cmd[] = "PROTOCOLINFO 1\r\n";
     if (send_all_blocking(fd, protocolinfo_cmd, sizeof(protocolinfo_cmd) - 1) != 0)
     {
-        fprintf(stderr, "[tor_control] failed to send PROTOCOLINFO\n");
+        bm_log("[tor_control] failed to send PROTOCOLINFO\n");
         close(fd);
         return -1;
     }
@@ -397,7 +398,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     }
     if (lines[line_count - 1].code != 250)
     {
-        fprintf(stderr, "[tor_control] PROTOCOLINFO failed: %d%c%s\n", lines[line_count - 1].code,
+        bm_log("[tor_control] PROTOCOLINFO failed: %d%c%s\n", lines[line_count - 1].code,
                 lines[line_count - 1].sep, lines[line_count - 1].text);
         close(fd);
         return -1;
@@ -406,7 +407,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     const struct reply_line *auth_line = find_line_with_prefix(lines, line_count, "AUTH ");
     if (auth_line == NULL)
     {
-        fprintf(stderr, "[tor_control] PROTOCOLINFO reply had no AUTH line\n");
+        bm_log("[tor_control] PROTOCOLINFO reply had no AUTH line\n");
         close(fd);
         return -1;
     }
@@ -424,7 +425,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     char cookie_path[512];
     if (extract_cookie_file(auth_line->text, cookie_path, sizeof(cookie_path)) != 0)
     {
-        fprintf(stderr, "[tor_control] could not find COOKIEFILE in AUTH line: %s\n", auth_line->text);
+        bm_log("[tor_control] could not find COOKIEFILE in AUTH line: %s\n", auth_line->text);
         close(fd);
         return -1;
     }
@@ -444,7 +445,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     fclose(cookie_fp);
     if (cookie_len == 0)
     {
-        fprintf(stderr, "[tor_control] cookie file %s is empty\n", cookie_path);
+        bm_log("[tor_control] cookie file %s is empty\n", cookie_path);
         close(fd);
         return -1;
     }
@@ -456,7 +457,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     int auth_cmd_len = snprintf(auth_cmd, sizeof(auth_cmd), "AUTHENTICATE %s\r\n", cookie_hex);
     if (send_all_blocking(fd, auth_cmd, (size_t)auth_cmd_len) != 0)
     {
-        fprintf(stderr, "[tor_control] failed to send AUTHENTICATE\n");
+        bm_log("[tor_control] failed to send AUTHENTICATE\n");
         close(fd);
         return -1;
     }
@@ -468,7 +469,7 @@ int bm_tor_control_connect_and_authenticate(const struct bm_tor_control_config *
     }
     if (lines[line_count - 1].code != 250)
     {
-        fprintf(stderr, "[tor_control] AUTHENTICATE failed: %d%c%s\n", lines[line_count - 1].code,
+        bm_log("[tor_control] AUTHENTICATE failed: %d%c%s\n", lines[line_count - 1].code,
                 lines[line_count - 1].sep, lines[line_count - 1].text);
         close(fd);
         return -1;
@@ -486,13 +487,13 @@ int bm_tor_control_add_onion(int fd, const char *existing_private_key, int virtu
                             local_port);
     if (written < 0 || (size_t)written >= sizeof(cmd))
     {
-        fprintf(stderr, "[tor_control] ADD_ONION command too long\n");
+        bm_log("[tor_control] ADD_ONION command too long\n");
         return -1;
     }
 
     if (send_all_blocking(fd, cmd, (size_t)written) != 0)
     {
-        fprintf(stderr, "[tor_control] failed to send ADD_ONION\n");
+        bm_log("[tor_control] failed to send ADD_ONION\n");
         return -1;
     }
 
@@ -508,7 +509,7 @@ int bm_tor_control_add_onion(int fd, const char *existing_private_key, int virtu
     }
     if (lines[line_count - 1].code != 250)
     {
-        fprintf(stderr, "[tor_control] ADD_ONION failed: %d%c%s\n", lines[line_count - 1].code,
+        bm_log("[tor_control] ADD_ONION failed: %d%c%s\n", lines[line_count - 1].code,
                 lines[line_count - 1].sep, lines[line_count - 1].text);
         return -1;
     }
@@ -516,7 +517,7 @@ int bm_tor_control_add_onion(int fd, const char *existing_private_key, int virtu
     const struct reply_line *service_id_line = find_line_with_prefix(lines, line_count, "ServiceID=");
     if (service_id_line == NULL)
     {
-        fprintf(stderr, "[tor_control] ADD_ONION reply had no ServiceID line\n");
+        bm_log("[tor_control] ADD_ONION reply had no ServiceID line\n");
         return -1;
     }
     const char *service_id = service_id_line->text + strlen("ServiceID=");
@@ -535,7 +536,7 @@ int bm_tor_control_add_onion(int fd, const char *existing_private_key, int virtu
         const struct reply_line *pk_line = find_line_with_prefix(lines, line_count, "PrivateKey=");
         if (pk_line == NULL)
         {
-            fprintf(stderr, "[tor_control] ADD_ONION with a new key did not return a PrivateKey line\n");
+            bm_log("[tor_control] ADD_ONION with a new key did not return a PrivateKey line\n");
             free(onion_address);
             return -1;
         }

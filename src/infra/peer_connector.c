@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../common/logging.h"
 #include "../core/config_store.h"
 #include "../core/peer_manager.h"
 #include "dandelion.h"
@@ -187,7 +188,7 @@ static const char *socks5_rep_to_string(unsigned char rep)
  * あること。宛先は常にドメイン名形式(ATYP=0x03)で送る: dest_hostが数字IPの文字列であっても
  * Tor等のSOCKS5サーバーは正しく扱う(ローカルでDNS解決せずそのままCONNECT先として使うため、
  * 将来onionアドレスに対応する際もこの経路がそのまま使える)。成功時0。失敗時は原因を
- * fprintf(stderr, "[peer_connector] socks5: ...")で診断ログに出す(§11、実際にTorへ繋いだ
+ * bm_log("[peer_connector] socks5: ...")で診断ログに出す(§11、実際にTorへ繋いだ
  * 際の切り分けを容易にするため)
  */
 static int socks5_connect(int sock, const char *dest_host, int dest_port, int timeout_sec)
@@ -198,26 +199,26 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
     size_t host_len = strlen(dest_host);
     if (host_len == 0 || host_len > 255)
     {
-        fprintf(stderr, "[peer_connector] socks5: destination host name too long (%zu bytes)\n", host_len);
+        bm_log("[peer_connector] socks5: destination host name too long (%zu bytes)\n", host_len);
         return -1;
     }
 
     unsigned char greeting[3] = {0x05, 0x01, 0x00}; /* version=5, 1 method, no-auth */
     if (socks5_send_all(sock, greeting, sizeof(greeting), timeout_sec) != 0)
     {
-        fprintf(stderr, "[peer_connector] socks5: failed to send greeting to proxy\n");
+        bm_log("[peer_connector] socks5: failed to send greeting to proxy\n");
         return -1;
     }
     unsigned char method_resp[2];
     if (socks5_recv_all(sock, method_resp, sizeof(method_resp), timeout_sec) != 0)
     {
-        fprintf(stderr, "[peer_connector] socks5: no greeting response from proxy (unreachable/not a "
+        bm_log("[peer_connector] socks5: no greeting response from proxy (unreachable/not a "
                         "SOCKS5 server?)\n");
         return -1;
     }
     if (method_resp[0] != 0x05 || method_resp[1] != 0x00)
     {
-        fprintf(stderr, "[peer_connector] socks5: proxy rejected no-auth (version=0x%02x method=0x%02x)\n",
+        bm_log("[peer_connector] socks5: proxy rejected no-auth (version=0x%02x method=0x%02x)\n",
                 method_resp[0], method_resp[1]);
         return -1;
     }
@@ -235,21 +236,21 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
     req[req_len++] = (unsigned char)(dest_port & 0xff);
     if (socks5_send_all(sock, req, req_len, timeout_sec) != 0)
     {
-        fprintf(stderr, "[peer_connector] socks5: failed to send CONNECT request to proxy\n");
+        bm_log("[peer_connector] socks5: failed to send CONNECT request to proxy\n");
         return -1;
     }
 
     unsigned char reply_head[4];
     if (socks5_recv_all(sock, reply_head, sizeof(reply_head), timeout_sec) != 0)
     {
-        fprintf(stderr, "[peer_connector] socks5: no CONNECT reply from proxy (target %s unreachable "
+        bm_log("[peer_connector] socks5: no CONNECT reply from proxy (target %s unreachable "
                         "via Tor circuit, or proxy timed out)\n",
                 addr_buf);
         return -1;
     }
     if (reply_head[0] != 0x05 || reply_head[1] != 0x00)
     {
-        fprintf(stderr, "[peer_connector] socks5: CONNECT to %s failed: %s (REP=0x%02x)\n", addr_buf,
+        bm_log("[peer_connector] socks5: CONNECT to %s failed: %s (REP=0x%02x)\n", addr_buf,
                 socks5_rep_to_string(reply_head[1]), reply_head[1]);
         return -1;
     }
@@ -268,21 +269,21 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
             unsigned char len_byte;
             if (socks5_recv_all(sock, &len_byte, 1, timeout_sec) != 0)
             {
-                fprintf(stderr, "[peer_connector] socks5: failed to read BND.ADDR length\n");
+                bm_log("[peer_connector] socks5: failed to read BND.ADDR length\n");
                 return -1;
             }
             bnd_addr_len = len_byte;
             break;
         }
         default:
-            fprintf(stderr, "[peer_connector] socks5: unsupported BND.ADDR type 0x%02x in reply\n",
+            bm_log("[peer_connector] socks5: unsupported BND.ADDR type 0x%02x in reply\n",
                     reply_head[3]);
             return -1;
     }
     unsigned char discard[256];
     if (socks5_recv_all(sock, discard, bnd_addr_len + 2, timeout_sec) != 0)
     {
-        fprintf(stderr, "[peer_connector] socks5: failed to read BND.ADDR/BND.PORT\n");
+        bm_log("[peer_connector] socks5: failed to read BND.ADDR/BND.PORT\n");
         return -1; /* BND.ADDR + BND.PORT。値自体は使わない */
     }
     return 0;
@@ -303,7 +304,7 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
             char proxy_addr_buf[80];
             bm_network_format_host_port(socks_proxy->host, socks_proxy->port, proxy_addr_buf,
                                          sizeof(proxy_addr_buf));
-            fprintf(stderr, "[peer_connector] socks5: failed to reach proxy %s (is Tor/the proxy "
+            bm_log("[peer_connector] socks5: failed to reach proxy %s (is Tor/the proxy "
                             "running?)\n",
                     proxy_addr_buf);
             return -1;
@@ -327,7 +328,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     int cleaned = bm_peer_manager_cleanup(config->peers_db, (int64_t)time(NULL));
     if (cleaned > 0)
     {
-        fprintf(stderr, "[peer_connector] cleaned up %d stale/low-rating peer(s) from peers.db\n", cleaned);
+        bm_log("[peer_connector] cleaned up %d stale/low-rating peer(s) from peers.db\n", cleaned);
     }
 
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
@@ -373,13 +374,13 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         char addr_buf[80];
         bm_network_format_host_port(candidates[i].ip_address, candidates[i].port, addr_buf, sizeof(addr_buf));
 
-        fprintf(stderr, "[peer_connector] connecting to %s%s...\n", addr_buf,
+        bm_log("[peer_connector] connecting to %s%s...\n", addr_buf,
                 socks_proxy.enabled ? " (via SOCKS5)" : "");
         int sock = open_peer_connection(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC,
                                          &socks_proxy);
         if (sock < 0)
         {
-            fprintf(stderr, "[peer_connector] failed to connect to %s\n", addr_buf);
+            bm_log("[peer_connector] failed to connect to %s\n", addr_buf);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
@@ -387,7 +388,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         struct bm_fd_data *conn = bm_fd_data_new(BM_FD_CLIENT_SOCKET, sock);
         if (conn == NULL)
         {
-            fprintf(stderr, "[peer_connector] bm_fd_data_new failed for %s\n", addr_buf);
+            bm_log("[peer_connector] bm_fd_data_new failed for %s\n", addr_buf);
             close(sock);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
@@ -413,7 +414,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
 
         if (bm_post_version(sock, config->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
         {
-            fprintf(stderr, "[peer_connector] failed to send version to %s\n", addr_buf);
+            bm_log("[peer_connector] failed to send version to %s\n", addr_buf);
             epoll_ctl(config->epfd, EPOLL_CTL_DEL, sock, NULL);
             bm_fd_data_free(conn);
             close(sock);
@@ -435,7 +436,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
          * 接続し続けていたのを確認済み)。successの記録はinfra/object_sync.cのversion/verack
          * 受信時点(=相手が実際に応答した確かな証拠が得られた時点)へ移した。 */
 
-        fprintf(stderr, "[peer_connector] connected to %s, version sent\n", addr_buf);
+        bm_log("[peer_connector] connected to %s, version sent\n", addr_buf);
         connected++;
     }
 
@@ -457,7 +458,7 @@ void *bm_peer_connector_thread(void *arg)
         int connected = bm_peer_connector_connect_initial(&args->config);
         if (connected > 0)
         {
-            fprintf(stderr, "[peer_connector] %d new outbound connection(s) established\n", connected);
+            bm_log("[peer_connector] %d new outbound connection(s) established\n", connected);
         }
 
         for (int waited = 0; waited < RECONNECT_INTERVAL_SECONDS && *args->stop_flag == 0; waited++)

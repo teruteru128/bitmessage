@@ -16,6 +16,7 @@
 #include "../common/broadcast_item.h"
 #include "../common/hash.h"
 #include "../common/json.h"
+#include "../common/logging.h"
 #include "../infra/network.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
@@ -1196,14 +1197,14 @@ void *bm_api_server_thread(void *arg)
     int listen_fd = -1;
     if (bm_api_server_listen(config, &listen_fd) != 0)
     {
-        fprintf(stderr, "[api_server] failed to listen on %s\n", addr_buf);
+        bm_log("[api_server] failed to listen on %s\n", addr_buf);
         free(args);
         return NULL;
     }
-    fprintf(stderr, "[api_server] listening on %s\n", addr_buf);
+    bm_log("[api_server] listening on %s\n", addr_buf);
     bm_api_server_serve_forever(listen_fd, config, args->stop_flag);
     close(listen_fd);
-    fprintf(stderr, "[api_server] stopped\n");
+    bm_log("[api_server] stopped\n");
     free(args);
     return NULL;
 }
