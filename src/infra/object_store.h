@@ -27,4 +27,13 @@ int bm_object_store_get(sqlite3 *db, const unsigned char hash[32],
 /* 期限切れ(expires_time < now)のobjectを削除する。削除件数を返す(エラー時-1) */
 int bm_object_store_delete_expired(sqlite3 *db, int64_t now);
 
+/*
+ * §11 2026-08-23 backlog: PyBitmessage本家のsendBigInv相当(handshake完了時に自分の
+ * 保有object全件を新規peerへ知らせる)で使う。指定streamの未期限切れ(expires_time > now)
+ * object hashを全件取得する。成功時0で*out_hashesをmalloc(呼び出し側でfree、0件でも
+ * NULLにはせずmalloc(0)相当を返す)、*out_countへ件数を設定。エラー時-1。
+ */
+int bm_object_store_list_hashes_by_stream(sqlite3 *db, int stream, int64_t now,
+                                           unsigned char (**out_hashes)[32], size_t *out_count);
+
 #endif /* BM_INFRA_OBJECT_STORE_H */

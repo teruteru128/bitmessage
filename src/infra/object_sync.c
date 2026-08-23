@@ -856,6 +856,96 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
     free(addresses);
 }
 
+/*
+ * §11 2026-08-23: PyBitmessage本家(network/tcp.pyのsendBigInv)相当。verack受信=
+ * handshake完了時に、自分が保有する全objectのhashを新規peerへ知らせる(本家のdocstring
+ * 通り"Initiate inventory synchronisation")。これが無いと、新規に繋がったpeerから見て
+ * 「何も持っていない役に立たないノード」に見えてしまい、相手からgetdataが一切来ない
+ * (=自分が保有するobjectが他のnodeへ一切伝播しない)。addr送信と同じくverack受信時に
+ * 1回だけ送る(定期的な再送はしない、本家も同様)。
+ *
+ * hashごとの実際のinv/dinv振り分けはbm_decide_propagation(DESIGN.md §9.2の差し込み点、
+ * bm_peer_registry_broadcast_invと同じ経由方針)に委ねる。新規接続のconnがstem
+ * successorとして選ばれていることは通常無い(選定はbm_dandelion_maybe_reshuffleが
+ * 既存のoutbound接続の中から行うため)ので、実質的には「stemタイムアウト前でこの接続が
+ * successorではないhash」=SKIPが除外され、それ以外がFLUFF(=通常のinv)としてまとめて
+ * 送られる形になる。本家の「stem中のhashはbigInvから除外する」という方針と結果的に
+ * 一致する。
+ */
+static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn)
+{
+    unsigned char(*hashes)[32] = NULL;
+    size_t hash_count = 0;
+    if (bm_object_store_list_hashes_by_stream(ctx->object_pool_db, 1, (int64_t)time(NULL), &hashes, &hash_count)
+        != 0)
+    {
+        return;
+    }
+    if (hash_count == 0)
+    {
+        free(hashes);
+        return;
+    }
+
+    unsigned char(*fluff)[32] = malloc(sizeof(*fluff) * hash_count);
+    unsigned char(*stem)[32] = malloc(sizeof(*stem) * hash_count);
+    size_t fluff_count = 0;
+    size_t stem_count = 0;
+    for (size_t i = 0; i < hash_count; i++)
+    {
+        enum bm_propagation_mode mode = bm_decide_propagation(hashes[i], conn);
+        if (mode == BM_PROPAGATE_FLUFF)
+        {
+            memcpy(fluff[fluff_count], hashes[i], 32);
+            fluff_count++;
+        }
+        else if (mode == BM_PROPAGATE_STEM)
+        {
+            memcpy(stem[stem_count], hashes[i], 32);
+            stem_count++;
+        }
+    }
+    free(hashes);
+
+    /* §11: 単一メッセージあたりBM_MAX_INVENTORY_ITEMS件まで(本家のMAX_OBJECT_COUNTと
+     * 同じ50000。相手側もこの上限で受信するため超過分は複数メッセージに分ける) */
+    for (size_t sent = 0; sent < fluff_count; sent += BM_MAX_INVENTORY_ITEMS)
+    {
+        size_t chunk = fluff_count - sent;
+        if (chunk > BM_MAX_INVENTORY_ITEMS)
+        {
+            chunk = BM_MAX_INVENTORY_ITEMS;
+        }
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_inventory_message("inv", fluff + sent, chunk, &packet_len);
+        if (packet != NULL)
+        {
+            bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+            free(packet);
+        }
+    }
+    for (size_t sent = 0; sent < stem_count; sent += BM_MAX_INVENTORY_ITEMS)
+    {
+        size_t chunk = stem_count - sent;
+        if (chunk > BM_MAX_INVENTORY_ITEMS)
+        {
+            chunk = BM_MAX_INVENTORY_ITEMS;
+        }
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_inventory_message("dinv", stem + sent, chunk, &packet_len);
+        if (packet != NULL)
+        {
+            bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+            free(packet);
+        }
+    }
+    bm_log("[object_sync] sent big inv to new peer: %zu fluff, %zu stem (of %zu total)\n", fluff_count, stem_count,
+            hash_count);
+
+    free(fluff);
+    free(stem);
+}
+
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
 {
     struct bm_object_sync_ctx *ctx = user_data;
@@ -952,6 +1042,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         conn->handshake_complete = 1;
         record_outbound_success(ctx, conn);
         send_addr_reply(ctx, conn);
+        send_big_inv(ctx, conn);
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {

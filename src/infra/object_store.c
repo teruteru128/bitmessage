@@ -107,3 +107,56 @@ int bm_object_store_delete_expired(sqlite3 *db, int64_t now)
     }
     return sqlite3_changes(db);
 }
+
+int bm_object_store_list_hashes_by_stream(sqlite3 *db, int stream, int64_t now,
+                                           unsigned char (**out_hashes)[32], size_t *out_count)
+{
+    static const char *COUNT_SQL = "SELECT COUNT(*) FROM objects WHERE stream = ?1 AND expires_time > ?2;";
+    sqlite3_stmt *count_stmt = NULL;
+    if (sqlite3_prepare_v2(db, COUNT_SQL, -1, &count_stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(count_stmt, 1, stream);
+    sqlite3_bind_int64(count_stmt, 2, now);
+    if (sqlite3_step(count_stmt) != SQLITE_ROW)
+    {
+        sqlite3_finalize(count_stmt);
+        return -1;
+    }
+    size_t count = (size_t)sqlite3_column_int64(count_stmt, 0);
+    sqlite3_finalize(count_stmt);
+
+    unsigned char(*hashes)[32] = count > 0 ? malloc(sizeof(*hashes) * count) : malloc(1);
+    if (hashes == NULL)
+    {
+        return -1;
+    }
+
+    static const char *SQL = "SELECT hash FROM objects WHERE stream = ?1 AND expires_time > ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        free(hashes);
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, stream);
+    sqlite3_bind_int64(stmt, 2, now);
+
+    size_t n = 0;
+    while (n < count && sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        const void *blob = sqlite3_column_blob(stmt, 0);
+        int blob_len = sqlite3_column_bytes(stmt, 0);
+        if (blob != NULL && blob_len == 32)
+        {
+            memcpy(hashes[n], blob, 32);
+            n++;
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    *out_hashes = hashes;
+    *out_count = n;
+    return 0;
+}

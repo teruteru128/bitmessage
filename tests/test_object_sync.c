@@ -1153,6 +1153,78 @@ int main(void)
         bm_fd_data_free(conn12c);
     }
 
+    /* --- 13. handshake完了時のbig inv送信(§11 2026-08-23、PyBitmessage本家の
+     * sendBigInv相当)。自分が保有する全objectのhashを新規peerへverack受信時に知らせる
+     * ことを確認する。専用のsocketpairと、object_pool_dbをクリアした上で既知の2件だけを
+     * 種として使う(他シナリオで積み上がった大量のobjectと混ざらないよう、以降このtestでは
+     * object_pool_dbを使わないため安全にクリアできる)。peers.dbもクリアし、addr送信を
+     * 空にしてinv1本だけが届く状態にする(read_one_messageで単純に読める) --- */
+    {
+        sqlite3_exec(object_pool_db, "DELETE FROM objects;", NULL, NULL, NULL);
+        sqlite3_exec(peers_db, "DELETE FROM hosts;", NULL, NULL, NULL);
+
+        unsigned char hash_a[32], hash_b[32];
+        memset(hash_a, 0xAA, sizeof(hash_a));
+        memset(hash_b, 0xBB, sizeof(hash_b));
+        unsigned char dummy_payload[16] = {0};
+        int64_t now13 = (int64_t)time(NULL);
+        CHECK(bm_object_store_insert(object_pool_db, hash_a, BM_OBJECT_MSG, 1, dummy_payload,
+                                      sizeof(dummy_payload), now13 + 86400, now13)
+                  == 0,
+              "seed object A for big-inv scenario");
+        CHECK(bm_object_store_insert(object_pool_db, hash_b, BM_OBJECT_MSG, 1, dummy_payload,
+                                      sizeof(dummy_payload), now13 + 86400, now13)
+                  == 0,
+              "seed object B for big-inv scenario");
+
+        int fds13[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds13) == 0, "socketpair for big-inv scenario");
+        struct bm_fd_data *conn13 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds13[0]);
+        CHECK(conn13 != NULL, "bm_fd_data_new for big-inv scenario");
+
+        struct bm_message verack_msg13;
+        memset(&verack_msg13, 0, sizeof(verack_msg13));
+        memcpy(verack_msg13.command, "verack", 6);
+        verack_msg13.length = 0;
+        verack_msg13.payload = NULL;
+        bm_object_sync_dispatch(conn13, &verack_msg13, &ctx);
+
+        struct bm_message *inv_reply = read_one_message(fds13[1]);
+        CHECK(inv_reply != NULL, "an inv message should have been sent right after verack (sendBigInv)");
+        if (inv_reply != NULL)
+        {
+            CHECK(strncmp(inv_reply->command, "inv", 12) == 0, "the reply command should be 'inv'");
+
+            struct bm_inventory_message parsed13;
+            memset(&parsed13, 0, sizeof(parsed13));
+            int parse_rc13 = bm_parse_inventory_message(inv_reply->payload, inv_reply->length, &parsed13);
+            CHECK(parse_rc13 == 0, "the sent big-inv payload should parse back successfully");
+            if (parse_rc13 == 0)
+            {
+                CHECK(parsed13.count == 2, "big inv should contain exactly the 2 seeded objects");
+                int saw_a = 0, saw_b = 0;
+                for (uint64_t i = 0; i < parsed13.count; i++)
+                {
+                    if (memcmp(parsed13.items[i], hash_a, 32) == 0)
+                    {
+                        saw_a = 1;
+                    }
+                    if (memcmp(parsed13.items[i], hash_b, 32) == 0)
+                    {
+                        saw_b = 1;
+                    }
+                }
+                CHECK(saw_a && saw_b, "big inv should include both seeded object hashes");
+                bm_free_inventory_message(&parsed13);
+            }
+            bm_free_message(inv_reply);
+        }
+
+        close(fds13[0]);
+        close(fds13[1]);
+        bm_fd_data_free(conn13);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

@@ -2741,6 +2741,45 @@ ctest 34件全通過(専用の新規テストは追加せず、ログ文言は�
 received_count, missing_count)`を追加した(`msg->command`で"inv"/"dinv"どちらかを
 区別する)。ctest 34件全通過(ログ文言は既存の慣習通りアサート対象外)。
 
+### 重大な機能欠落の発見・修正: handshake完了時に自分のobject一覧を送っていなかった(sendBigInv)(2026-08-23)
+
+ユーザーからの疑問(「version/verackの後に相手からaddrが最初に来るのでは、プロトコル
+順序を間違えてinvまで進めていないのでは」)がきっかけで発覚。PyBitmessage本家
+(`network/tcp.py`)の`set_connection_fully_established`(docstring: "Initiate
+inventory synchronisation")を確認したところ、handshake完了時に`sendAddr()`
+(実装済み)に加えて`sendBigInv()`(自分が保有する全objectのhashを新規peerへ知らせる、
+50,000件区切りでチャンク送信)を無条件で呼んでいたが、**うちには`sendBigInv`相当が
+丸ごと存在しなかった**(DESIGN.mdにも記載無し、backlogにすら挙がっていなかった)。
+
+**実害の見立て**: 新規に繋がった実peerから見ると、うちは「何も持っていない役に
+立たないノード」に見えてしまい、相手からgetdataが一切来ない(=うちが保有する
+objectが他ノードへ伝播しない)。今夜観測していた「verack受信→addr送信直後に
+Connection resetされる」というパターン(SOCKS5を外しても再現し、かつログの
+544行目=プロジェクト最初期から起きていたことを確認済み)についても、こちらが
+まともに喋らないノードに見えることが遠因の可能性がある(確証は無いが、少なくとも
+本家との明確な仕様差分であり優先して埋めるべき欠落だった)。
+
+**実装**:
+- `infra/object_store.h/.c`に`bm_object_store_list_hashes_by_stream(db, stream,
+  now, out_hashes, out_count)`を新設。指定streamの未期限切れobject hashを全件
+  取得する(COUNT→malloc→SELECTの2段クエリ)。
+- `infra/object_sync.c`に`send_big_inv(ctx, conn)`を新設。取得した全hashについて
+  `bm_decide_propagation`(DESIGN.md §9.2の差し込み点、`bm_peer_registry_
+  broadcast_inv`と同じ経由方針)でFLUFF/STEM/SKIPを判定し、FLUFFは"inv"、STEMは
+  "dinv"としてそれぞれ`BM_MAX_INVENTORY_ITEMS`(50000、本家のMAX_OBJECT_COUNTと
+  同値)件ずつチャンク送信する。新規接続がstem successorに選ばれていることは
+  通常無い(選定は既存のoutbound接続の中からのみ行われるため)ため、実質的には
+  「stemタイムアウト前でSKIP判定されたhashだけがbigInvから除外される」形になり、
+  本家の「stem中のhashは除外する」という方針と結果的に一致する。
+- verack受信ハンドラで`send_addr_reply`の直後に`send_big_inv`を呼ぶ(addr→bigInvの
+  順、本家と同じ)。
+
+**テスト**: `tests/test_object_sync.c`にシナリオ13を追加。object_pool_dbをクリアし
+既知の2件だけを種として使い、verack送信直後に届く"inv"メッセージが正しくその2件の
+hashを含むことを確認した。ctest 34件全通過(既存シナリオ10もsend_big_invが割り込む
+形になったが、書き込み順序がaddr→bigInvのため既存の「最初の1メッセージだけ読む」
+アサーションには影響しないことを確認済み)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
