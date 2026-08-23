@@ -530,6 +530,8 @@ int main(void)
     lc_conn_out->logical_peer_port = 8444;
     lc_conn_out->handshake_complete = 1;
     lc_conn_out->user_agent = strdup("/bitmessage-c-test-outbound:0.1.0/");
+    lc_conn_out->bytes_sent = 1234;
+    lc_conn_out->bytes_received = 5678;
     bm_peer_registry_add(&registry, lc_conn_out);
 
     int lc_fds_in[2];
@@ -569,6 +571,10 @@ int main(void)
                              "/bitmessage-c-test-outbound:0.1.0/")
                           == 0,
                       "outbound entry's userAgent should match");
+                CHECK((uint64_t)bm_json_as_number(bm_json_object_get(entry, "sentBytes")) == 1234,
+                      "outbound entry's sentBytes should match conn->bytes_sent");
+                CHECK((uint64_t)bm_json_as_number(bm_json_object_get(entry, "receivedBytes")) == 5678,
+                      "outbound entry's receivedBytes should match conn->bytes_received");
             }
             if (inbound != NULL && inbound->item_count == 1)
             {
@@ -593,6 +599,35 @@ int main(void)
     close(lc_fds_in[1]);
     bm_fd_data_free(lc_conn_out);
     bm_fd_data_free(lc_conn_in);
+
+    /* §11 2026-08-23 backlog項目5(送受信バイト数、後半分): getNetworkStats。
+     * listConnectionsとは別メソッドとして、プロセス起動時からの送受信バイト数の全体累積
+     * ({sentBytes, receivedBytes})が返ることを確認する。値そのもの(このプロセス内で
+     * それまでに実際に行われた通信量に依存する)ではなく、フィールドが存在し数値であることと、
+     * 直前のHTTPリクエスト自体の送受信でカウンタが0より増えていることを確認する
+     * (bm_network_get_statsはHTTPサーバー自身の通信も同じbm_network_write_all/
+     * bm_network_handle_readable経由でカウントしているはず) */
+    resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getNetworkStats\",\"params\":[],\"id\":19}", "testuser",
+                       "testpass");
+    CHECK(resp != NULL, "getNetworkStats HTTP request");
+    if (resp != NULL)
+    {
+        bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+        CHECK(v != NULL, "getNetworkStats response is valid JSON");
+        if (v != NULL)
+        {
+            const bm_json_value_t *result = bm_json_object_get(v, "result");
+            const bm_json_value_t *sent_bytes = result != NULL ? bm_json_object_get(result, "sentBytes") : NULL;
+            const bm_json_value_t *received_bytes =
+                    result != NULL ? bm_json_object_get(result, "receivedBytes") : NULL;
+            CHECK(sent_bytes != NULL && sent_bytes->type == BM_JSON_NUMBER,
+                  "getNetworkStats should return a numeric sentBytes");
+            CHECK(received_bytes != NULL && received_bytes->type == BM_JSON_NUMBER,
+                  "getNetworkStats should return a numeric receivedBytes");
+            bm_json_free(v);
+        }
+        free(resp);
+    }
 
     /* 存在しないメソッドはエラーを返す */
     resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"noSuchMethod\",\"params\":[],\"id\":7}",

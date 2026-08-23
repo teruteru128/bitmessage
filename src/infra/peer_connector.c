@@ -492,6 +492,10 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
             continue;
         }
+        /* §11 2026-08-23 backlog項目5: bm_post_versionはfdだけを取りconnを持たないため、
+         * ここで送信済みバイト数を積む(bm_version_message_sizeは実際に送った長さと
+         * 同じ計算をするだけの副作用の無い関数、network.hのdoc参照)。 */
+        conn->bytes_sent += (uint64_t)bm_version_message_size(config->user_agent);
 
         if (config->registry != NULL)
         {

@@ -2858,6 +2858,38 @@ ctest 35件全通過(ログ文言は既存の慣習通りアサート対象外)�
 `errno`直接参照箇所は無かったため今回初めて必要になった)。ctest 35件全通過
 (ログ文言はアサート対象外)。
 
+### listConnections送受信バイト数(後半分)+getNetworkStats(2026-08-23)
+
+backlog項目5の残り(送受信バイト数)に着手。ユーザーと相談し、全体累積は
+`listConnections`とは別の新規メソッド`getNetworkStats`に分離した(「listConnectionsと
+いう名前でtotalsまで返すのは名前と実態が合わない」というユーザー指摘による)。
+接続ごとの送信バイト数がbroadcast_inv経由(dup()したfdへの書き込み、connを持たない)の
+分だけ取りこぼす制約はユーザー了承の上で受容した(全体累積には含まれる)。
+
+**実装**:
+- `infra/network.h`の`struct bm_fd_data`に`bytes_sent`/`bytes_received`を追加。
+- `infra/network.c`にプロセス内シングルトンの全体累積(`bm_network_get_stats`、
+  mutex保護、dandelion.cのg_stateと同じ方針)を追加。`bm_network_write_all`成功時に
+  全体送信累積を、`bm_network_handle_readable`の読み取り成功時に接続ごと・全体受信累積の
+  両方を更新する(受信側は読み取りが成功する箇所がこの1箇所しか無いため経路を問わず
+  正確に集計できる)。
+- 接続ごとの送信バイト数は、connを持つ呼び出し元(`bm_reply_verack`/`bm_reply_pong`
+  [`send_header_only`をconn引数に変更]、`send_addr_reply`、`send_big_inv`、
+  `handle_getdata`、`handle_inv`のgetdata送信、プロトコルバージョン/timestamp
+  エラー送信、inbound版versionの送り返し、`peer_connector.c`のversion送信
+  [`bm_version_message_size`で長さを再計算])で個別に積む。
+- `core/api_server.c`: `listConnections`の各エントリへ`sentBytes`/`receivedBytes`を
+  追加。新規メソッド`getNetworkStats`(`{sentBytes, receivedBytes}`、全体累積を返す、
+  PyBitmessage自体には無いAPI)を追加。
+- `cli/main.c`に`list-connections`(usageのみ更新)・`get-network-stats`サブコマンドを
+  追加。
+
+**テスト**: `tests/test_network_stats.c`を新規追加(受信側の接続ごと・全体累積、
+送信側の`bm_reply_verack`/`bm_reply_pong`の接続ごと累積、conn無しの
+`bm_network_write_all`直接呼び出しでも全体累積には計上されること、の3シナリオ)。
+`tests/test_api_server.c`の既存`listConnections`シナリオへ`sentBytes`/`receivedBytes`の
+検証を追加し、`getNetworkStats`のHTTP経由シナリオも新設した。ctest 36件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2877,26 +2909,10 @@ ctest 35件全通過(ログ文言は既存の慣習通りアサート対象外)�
    `BM_MAX_TIME_OFFSET_SECONDS`(=3600秒)を超えて自分の時計とズレていればfatal
    errorを送って切断する。
 5. ~~**`listConnections`的なAPI(接続一覧取得)**~~: MVP(host/port/fullyEstablished/
-   userAgent、PyBitmessage本家と同形式)は2026-08-23完了(上記まとめ参照)。
-   送受信バイト数は別タスクとして未着手のまま残す(下記)。
-   - 送受信バイト数は2026-08-23に設計を詰め、PyBitmessage実装(個人手元clone)も調査した。
-     ノードごとの内訳(現在接続中のpeerのみ)と、
-     切断済みも含めた全体累積の両方が欲しい。前者は`bm_fd_data`に送受信バイト数
-     フィールドを追加しrecv/send箇所でインクリメント、後者はpeer_registryかnetwork.c
-     側に別途プロセス起動時からのグローバル累積カウンタ(mutex保護)を持たせ、同じ箇所で
-     同時にインクリメントする2段構えの設計とする。
-     - PyBitmessage側の実態: 全体累積は`network/asyncore_pollchoose.py`の
-       モジュールレベル変数`sentBytes`/`receivedBytes`(`update_sent`/`update_received`
-       で加算のみ、切断しても減らない)で、想定通りプロセス生存期間ぶん累積する方式
-       だった。ただしこれはJSON-RPC APIには一切出ておらず、GUIのNetwork Statusタブの
-       スループット表示(`network/stats.py`経由)にのみ使われている。
-     - 一方、ノードごとの内訳は`network/advanceddispatcher.py`の接続オブジェクトに
-       `self.sentBytes`/`self.receivedBytes`として確かに存在する(read/writeハンドラで
-       加算)が、`api.py`の`listConnections`実装(`host`/`port`/`fullyEstablished`/
-       `userAgent`のみを返す)を含め、どこからも参照・表示されていない、実質デッドな
-       フィールドだった。つまり「listConnections APIでノードごとの送受信バイト数を返す」
-       のはPyBitmessage自体には無い機能で、今回追加するならPyBitmessageより一歩進んだ
-       ものになる。実装はまだ着手していない。
+   userAgent、PyBitmessage本家と同形式)、送受信バイト数(接続ごと+`getNetworkStats`
+   での全体累積)とも2026-08-23完了(上記まとめ参照)。PyBitmessage自体には無い機能
+   (本家の`self.sentBytes`/`self.receivedBytes`は実質デッドなフィールドで、どこからも
+   参照・表示されていなかった)を一歩進めて実装した形になる。
 6. **onionpeer自己announceの定期再送・TTL見直し**: 2026-08-23にPyBitmessage本家を調査して
    判明。うちは起動時1回・TTL2日固定で、再起動しない限り2日でannounceが切れて誰からも
    見つけられなくなる。本家は起動時1回に加え`class_singleCleaner.py`の約2時間おきの周期

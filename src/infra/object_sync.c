@@ -713,6 +713,10 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
             {
                 bm_log("[object_sync] failed to send getdata\n");
             }
+            else
+            {
+                conn->bytes_sent += (uint64_t)packet_len;
+            }
             free(packet);
         }
     }
@@ -758,6 +762,7 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
             else
             {
                 sent_count++;
+                conn->bytes_sent += (uint64_t)packet_len;
             }
             free(packet);
         }
@@ -863,6 +868,7 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
             else
             {
                 bm_log("[object_sync] sent addr (%d entries)\n", n);
+                conn->bytes_sent += (uint64_t)packet_len;
             }
             free(packet);
         }
@@ -934,7 +940,10 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
         unsigned char *packet = bm_create_inventory_message("inv", fluff + sent, chunk, &packet_len);
         if (packet != NULL)
         {
-            bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0)
+            {
+                conn->bytes_sent += (uint64_t)packet_len;
+            }
             free(packet);
         }
     }
@@ -949,7 +958,10 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
         unsigned char *packet = bm_create_inventory_message("dinv", stem + sent, chunk, &packet_len);
         if (packet != NULL)
         {
-            bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0)
+            {
+                conn->bytes_sent += (uint64_t)packet_len;
+            }
             free(packet);
         }
     }
@@ -984,7 +996,10 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     bm_create_error_message(2, 0, "Your is using an old protocol. Closing connection.", &err_len);
             if (err_packet != NULL)
             {
-                bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+                if (bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0)
+                {
+                    conn->bytes_sent += (uint64_t)err_len;
+                }
                 free(err_packet);
             }
             conn->should_disconnect = 1;
@@ -1013,7 +1028,10 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             unsigned char *err_packet = bm_create_error_message(2, 0, err_text, &err_len);
             if (err_packet != NULL)
             {
-                bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+                if (bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0)
+                {
+                    conn->bytes_sent += (uint64_t)err_len;
+                }
                 free(err_packet);
             }
             conn->should_disconnect = 1;
@@ -1043,6 +1061,10 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
             {
                 bm_log("[object_sync] failed to send version to inbound peer\n");
+            }
+            else
+            {
+                conn->bytes_sent += (uint64_t)bm_version_message_size(ctx->user_agent);
             }
         }
     }

@@ -825,6 +825,14 @@ static void list_connections_one(struct bm_fd_data *conn, void *user_data)
     bm_json_object_set(entry, "port", bm_json_new_number((double)port));
     bm_json_object_set(entry, "fullyEstablished", bm_json_new_bool(conn->handshake_complete));
     bm_json_object_set(entry, "userAgent", bm_json_new_string(conn->user_agent != NULL ? conn->user_agent : ""));
+    /* §11 2026-08-23 backlog項目5(送受信バイト数、後半分)。PyBitmessage自体には
+     * 無い機能(本家のadvanceddispatcher.pyのsentBytes/receivedBytesはどこからも
+     * 参照・表示されない実質デッドなフィールドだった、DESIGN.md参照)。受信バイト数は
+     * 全経路を正確に集計できるが、送信バイト数はbroadcast_inv経由(dup()したfdへの
+     * 書き込み、connを持たない)の分だけこの接続の集計に含められない(ユーザー了承済み、
+     * 全体累積のgetNetworkStatsには含まれる)。 */
+    bm_json_object_set(entry, "sentBytes", bm_json_new_number((double)conn->bytes_sent));
+    bm_json_object_set(entry, "receivedBytes", bm_json_new_number((double)conn->bytes_received));
 
     bm_json_array_append(conn->type == BM_FD_SERVER_SOCKET ? ctx->inbound : ctx->outbound, entry);
 }
@@ -850,6 +858,31 @@ static bm_json_value_t *h_listConnections(const struct bm_api_server_config *con
     bm_json_value_t *result = bm_json_new_object();
     bm_json_object_set(result, "inbound", ctx.inbound);
     bm_json_object_set(result, "outbound", ctx.outbound);
+    return result;
+}
+
+/*
+ * getNetworkStats: [] -> {sentBytes, receivedBytes}
+ * §11 2026-08-23 backlog項目5(送受信バイト数、後半分)。プロセス起動時からの送受信
+ * バイト数の全体累積(切断済みの接続ぶんも含む)。listConnectionsとは別メソッドにした
+ * (ユーザーの指摘: "listConnections"という名前でtotalsまで返すのは名前と実態が
+ * 合わない)。PyBitmessage自体には無いAPI(本家はGUIのNetwork Statusタブの
+ * スループット表示にのみ内部的に使っている、DESIGN.md参照)。
+ */
+static bm_json_value_t *h_getNetworkStats(const struct bm_api_server_config *config,
+                                           const bm_json_value_t *params, char **out_error)
+{
+    (void)config;
+    (void)params;
+    (void)out_error;
+
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+    bm_network_get_stats(&bytes_sent, &bytes_received);
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "sentBytes", bm_json_new_number((double)bytes_sent));
+    bm_json_object_set(result, "receivedBytes", bm_json_new_number((double)bytes_received));
     return result;
 }
 
@@ -906,6 +939,7 @@ static const struct bm_api_method METHODS[] = {
     {"setSocksProxy", h_setSocksProxy},
     {"addPeer", h_addPeer},
     {"listConnections", h_listConnections},
+    {"getNetworkStats", h_getNetworkStats},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

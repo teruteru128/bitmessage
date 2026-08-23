@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,38 @@
  * BM_IDLE_PING_TIMEOUT_SECONDSはnetwork.hで公開(テストが実際の値で境界を検証できるように
  * するため)。 */
 #define BM_IDLE_SWEEP_INTERVAL_MS 5000
+
+/* §11 2026-08-23 backlog項目5: プロセス起動時からの送受信バイト数の全体累積
+ * (network.hのbm_network_get_statsのdoc参照)。切断済み接続ぶんも失われず積み上がる、
+ * dandelion.cのg_stateと同じくプロセス内シングルトン+mutex保護の方針。 */
+static struct
+{
+    pthread_mutex_t lock;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+} g_net_stats = {PTHREAD_MUTEX_INITIALIZER, 0, 0};
+
+void bm_network_get_stats(uint64_t *out_bytes_sent, uint64_t *out_bytes_received)
+{
+    pthread_mutex_lock(&g_net_stats.lock);
+    *out_bytes_sent = g_net_stats.bytes_sent;
+    *out_bytes_received = g_net_stats.bytes_received;
+    pthread_mutex_unlock(&g_net_stats.lock);
+}
+
+static void net_stats_add_sent(uint64_t n)
+{
+    pthread_mutex_lock(&g_net_stats.lock);
+    g_net_stats.bytes_sent += n;
+    pthread_mutex_unlock(&g_net_stats.lock);
+}
+
+static void net_stats_add_received(uint64_t n)
+{
+    pthread_mutex_lock(&g_net_stats.lock);
+    g_net_stats.bytes_received += n;
+    pthread_mutex_unlock(&g_net_stats.lock);
+}
 
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
 {
@@ -163,26 +196,34 @@ int bm_network_write_all(int fd, const unsigned char *data, size_t len, int time
         }
         return -1; /* 相手が切断した(n==0)、またはその他のエラー */
     }
+    net_stats_add_sent((uint64_t)len);
     return 0;
 }
 
-static int send_header_only(int fd, const char *command)
+/* §11 2026-08-23 backlog項目5: connを取るようにした(以前はint fdのみ)。connの
+ * bytes_sentへも積むため(network.hのdoc参照、broadcast_inv経由のdup()したfdのように
+ * connを持たない書き込み経路は対象外だが、verack/pong/pingはいずれもconnを持っている)。 */
+static int send_header_only(struct bm_fd_data *conn, const char *command)
 {
     size_t len = 0;
     unsigned char *packet = bm_create_packet(command, NULL, 0, &len);
-    int rc = bm_network_write_all(fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+    int rc = bm_network_write_all(conn->fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+    if (rc == 0)
+    {
+        conn->bytes_sent += (uint64_t)len;
+    }
     free(packet);
     return rc;
 }
 
 int bm_reply_verack(struct bm_fd_data *conn)
 {
-    return send_header_only(conn->fd, "verack");
+    return send_header_only(conn, "verack");
 }
 
 int bm_reply_pong(struct bm_fd_data *conn)
 {
-    return send_header_only(conn->fd, "pong");
+    return send_header_only(conn, "pong");
 }
 
 int bm_post_version(int sock, const char *user_agent_str, int version,
@@ -282,6 +323,10 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         /* §11 2026-08-23: アイドルタイムアウト判定用の最終活動時刻。読み取れた時点で更新する
          * (bm_network_idle_sweep参照)。 */
         conn->last_activity = (int64_t)time(NULL);
+        /* §11 2026-08-23 backlog項目5: 受信バイト数(接続ごと・全体累積の両方)を、
+         * 読み取りが成功した唯一の箇所であるここで一括更新する(network.hのdoc参照)。 */
+        conn->bytes_received += (uint64_t)n;
+        net_stats_add_received((uint64_t)n);
         if (conn->length + (size_t)n > conn->size)
         {
             size_t new_size = conn->size;
@@ -551,7 +596,7 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * 送信直後にlast_activityをここで更新することで、無応答の相手へ毎回のsweepで
          * ping spamしてしまうのを防ぐ(次にpingを送るのはさらにBM_IDLE_PING_TIMEOUT_SECONDS
          * 経ってから)。 */
-        if (send_header_only(conn->fd, "ping") == 0)
+        if (send_header_only(conn, "ping") == 0)
         {
             bm_log("[network] sent idle keepalive ping (fd=%d, %s, idle %" PRId64 "s)\n", conn->fd,
                     conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds);

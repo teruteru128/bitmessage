@@ -61,7 +61,12 @@ static void print_usage(const char *prog)
             "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n"
             "  list-connections\n"
             "      現在接続中のpeer一覧({inbound:[...], outbound:[...]}、各要素host/port/\n"
-            "      fullyEstablished/userAgent)を返す\n",
+            "      fullyEstablished/userAgent/sentBytes/receivedBytes)を返す。sentBytesは\n"
+            "      broadcast_inv経由の分だけ含まれない場合がある(get-network-statsの\n"
+            "      全体累積には含まれる)\n"
+            "  get-network-stats\n"
+            "      プロセス起動時からの送受信バイト数の全体累積({sentBytes,\n"
+            "      receivedBytes}、切断済みの接続ぶんも含む)\n",
             prog);
 }
 
@@ -375,6 +380,11 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "list-connections") == 0)
     {
         return call_rpc(&env, "listConnections", params);
+    }
+
+    if (strcmp(cmd, "get-network-stats") == 0)
+    {
+        return call_rpc(&env, "getNetworkStats", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);

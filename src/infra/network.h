@@ -92,6 +92,15 @@ struct bm_fd_data
      * object_sync.cのversion受信処理が設定する(接続直後・まだversion未受信の間はNULL)。
      * bm_fd_data_freeでfreeする。 */
     char *user_agent;
+    /* §11 2026-08-23 backlog項目5(listConnections送受信バイト数)。この接続で実際に
+     * 送信/受信したバイト数の累積(切断されるとこの接続ぶんは失われる、切断済み分も
+     * 含めた累積はbm_network_get_statsの方を使う)。送信側はbm_network_write_allを
+     * 直接呼ぶ箇所のうちconn(バイト数を積む先)を持っている呼び出し元だけが更新する
+     * (peer_registry.cのbroadcast_invはdup()したfdへ書くだけでconnを持たないため対象外、
+     * その分はbm_network_get_statsの全体累積にのみ計上される。ユーザーとの合意事項)。
+     * 受信側はbm_network_handle_readableが読み取り成功のたびに一箇所で更新する。 */
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
 };
 
 /*
@@ -192,6 +201,15 @@ int bm_network_listen(const char *bind_address, int port);
 #define BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS 2
 #define BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS 5
 int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec);
+
+/*
+ * §11 2026-08-23 backlog項目5: プロセス起動時からの送受信バイト数の全体累積
+ * (切断済みの接続ぶんも含む、mutex保護)。bm_network_write_all成功時/
+ * bm_network_handle_readableの読み取り成功時に、呼び出し元(fdだけを持ちconnを
+ * 持たない箇所も含めた"経路を問わない"全ての送受信)から更新される。
+ * core/api_server.cのgetNetworkStats APIが読む。
+ */
+void bm_network_get_stats(uint64_t *out_bytes_sent, uint64_t *out_bytes_received);
 
 int bm_reply_verack(struct bm_fd_data *conn);
 int bm_reply_pong(struct bm_fd_data *conn);
