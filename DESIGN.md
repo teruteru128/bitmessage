@@ -2702,6 +2702,25 @@ outbound 1本(handshake完了・user agent設定済み)・inbound 1本(handshake
 registryへ直接登録し、それぞれが正しい配列・フィールドで返ることを確認した。ctest
 34件全通過。
 
+### ログ改善: 読み取りエラー/EOFによる接続切断が無言だった(2026-08-23)
+
+listConnections APIの動作確認中にユーザーが発見。実daemon Aへ`listConnections`を
+何度呼んでも`inbound`/`outbound`とも空配列ばかり返ってきたため調査したところ、
+`/proc/<pid>/net/tcp`で見るとoutbound接続のfdが確認するたびに入れ替わっており、
+接続が数秒〜十数秒単位の高頻度で切断されていることが判明した(`listConnections`
+自体は正確にその瞬間の空を反映していただけで、バグではなかった)。
+
+この調査で副次的に見つかったのが、`bm_network_epoll_thread`の読み取りエラー/EOFに
+よる切断経路(`rc != 0`分岐)が`close_connection`を呼ぶだけで一切ログを出していない
+という非対称さ。`bm_network_idle_sweep`側の能動的切断(ハンドシェイクタイムアウト)は
+ログを出すのに対し、こちらの「相手から切られた」経路は完全に無言だった。今夜のような
+高頻度churnはこのログが無かったため今まで全く見えていなかった。
+
+`network.c`の`rc != 0`分岐に`bm_log("[network] closing %s connection (fd=%d): %s\n",
+...)`を追加し、`rc==1`(EOF)/`rc==-1`(読み取りエラー)を区別して出力するようにした。
+ctest 34件全通過(専用の新規テストは追加せず、ログ文言はアサート対象外という
+既存の慣習に合わせた)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -612,6 +612,14 @@ void *bm_network_epoll_thread(void *arg)
                  * peer_manager.cの低rating cleanup(既存実装)の対象にもなり得るようにする。
                  * inbound(BM_FD_SERVER_SOCKET)接続はこちらから選んだ相手ではないため対象外。
                  * (§11 2026-08-23切り出し: close_connectionへ共通化) */
+                /* §11 2026-08-23 backlog項目5調査中に発覚: この経路(読み取りエラー/EOFによる
+                 * 切断)は元々一切ログを出しておらず、bm_network_idle_sweep側の能動的切断
+                 * (ログあり)と非対称だった。listConnections APIで接続の生死を追うように
+                 * なって初めて、outbound接続がここを通って頻繁に(数秒〜十数秒単位で)切断
+                 * されていることが分かったため、可視化のためログを追加した。 */
+                bm_log("[network] closing %s connection (fd=%d): %s\n",
+                        conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
+                        rc == 1 ? "peer closed (EOF)" : "read error");
                 close_connection(args, conn);
             }
         }
