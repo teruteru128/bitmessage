@@ -138,6 +138,17 @@ static uint64_t env_or_u64(const char *env_name, uint64_t file_value)
 
 int main(void)
 {
+    /* §11 2026-08-24発覚の重大バグ修正: SIGPIPEを無視する。デフォルトのままだと、
+     * 相手が既に閉じたソケットへwrite()した瞬間にプロセス全体が即座に終了する
+     * (デフォルト動作が「終了」でコアダンプ対象でもないため、シグナルハンドラ・
+     * dmesg・apportいずれにも一切痕跡が残らない)。今夜だけでdaemon Aが原因不明のまま
+     * 6回連続で消え、watchdog_daemon_a.sh導入後にようやく終了コード141(=128+13=SIGPIPE)
+     * という形で正体が判明した。bm_network_write_allは既にwrite()失敗を-1として正しく
+     * 扱っている(EPIPE時は単なる接続エラーとして既存の切断処理に合流する)ため、
+     * SIGPIPEを無視するだけで直る。他のどのスレッドがwrite()する可能性よりも前に
+     * 済ませる必要があるため、main()の文字通り最初の行にした。 */
+    signal(SIGPIPE, SIG_IGN);
+
     /* §11 2026-08-23: ログ行に時刻を付けるかどうかの判定(JOURNAL_STREAM/BM_LOG_TIMESTAMPS)を
      * 他のどのbm_log呼び出しよりも前に済ませておく */
     bm_log_init();
