@@ -509,6 +509,8 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * 経ってから)。 */
         if (send_header_only(conn->fd, "ping") == 0)
         {
+            bm_log("[network] sent idle keepalive ping (fd=%d, %s, idle %" PRId64 "s)\n", conn->fd,
+                    conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds);
             conn->last_activity = ctx->now;
         }
     }
