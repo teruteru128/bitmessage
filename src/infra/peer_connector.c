@@ -476,7 +476,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         ev.data.ptr = conn;
         if (epoll_ctl(config->epfd, EPOLL_CTL_ADD, sock, &ev) != 0)
         {
-            perror("[peer_connector] epoll_ctl");
+            bm_log("[peer_connector] epoll_ctl: %s\n", strerror(errno));
             bm_fd_data_free(conn);
             close(sock);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);

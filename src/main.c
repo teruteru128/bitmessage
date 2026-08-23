@@ -4,6 +4,7 @@
  * まずスレッド起動〜終了までの骨格を通し、各モジュールを順次実装で埋めていく方針。
  */
 
+#include <errno.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <signal.h>
@@ -250,7 +251,7 @@ int main(void)
     int epfd = epoll_create1(0);
     if (epfd == -1)
     {
-        perror("epoll_create1");
+        bm_log("epoll_create1: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
 
@@ -309,7 +310,7 @@ int main(void)
                 listen_ev.data.ptr = listen_conn;
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &listen_ev) != 0)
                 {
-                    perror("[network] epoll_ctl (listen socket)");
+                    bm_log("[network] epoll_ctl (listen socket): %s\n", strerror(errno));
                     bm_fd_data_free(listen_conn);
                     close(listen_fd);
                     listen_conn = NULL;

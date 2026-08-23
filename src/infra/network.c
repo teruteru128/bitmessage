@@ -50,7 +50,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
     data->local_len = sizeof(data->local_addr);
     if (getsockname(fd, (struct sockaddr *)&data->local_addr, &data->local_len) == -1)
     {
-        perror("getsockname");
+        bm_log("getsockname: %s\n", strerror(errno));
         free(data);
         return NULL;
     }
@@ -61,7 +61,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
         data->peer_len = sizeof(data->peer_addr);
         if (getpeername(fd, (struct sockaddr *)&data->peer_addr, &data->peer_len) == -1)
         {
-            perror("getpeername");
+            bm_log("getpeername: %s\n", strerror(errno));
             free(data);
             return NULL;
         }
@@ -272,7 +272,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
             {
                 break;
             }
-            perror("read");
+            bm_log("[network] read (fd=%d): %s\n", conn->fd, strerror(errno));
             return -1;
         }
         if (n == 0)
@@ -397,7 +397,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         {
             if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
             {
-                perror("[network] accept");
+                bm_log("[network] accept: %s\n", strerror(errno));
             }
             break;
         }
@@ -434,7 +434,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         ev.data.ptr = conn;
         if (epoll_ctl(args->epfd, EPOLL_CTL_ADD, client_fd, &ev) != 0)
         {
-            perror("[network] epoll_ctl (inbound accept)");
+            bm_log("[network] epoll_ctl (inbound accept): %s\n", strerror(errno));
             bm_fd_data_free(conn);
             close(client_fd);
             continue;
@@ -584,7 +584,7 @@ void *bm_network_epoll_thread(void *arg)
             {
                 continue;
             }
-            perror("epoll_wait");
+            bm_log("epoll_wait: %s\n", strerror(errno));
             break;
         }
         /* §11 2026-08-23: 1ループぶんの基準時刻を一度だけ取得し、accept()のレート制限判定と
