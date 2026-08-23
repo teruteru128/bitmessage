@@ -334,6 +334,8 @@ int main(void)
      * (PyBitmessageもonionhostname設定時はstemによる自動作成を試みない、同じ優先順位)。 */
     int tor_control_fd = -1;
     const char *onion_address_from_file = (cfg.onion_address[0] != '\0') ? cfg.onion_address : NULL;
+    const char *onion_address_source = (getenv("BM_ONION_ADDRESS") != NULL) ? "BM_ONION_ADDRESS"
+                                                                             : "bitmessage.conf [tor] onion_address";
     const char *manual_onion_address = env_or_str("BM_ONION_ADDRESS", onion_address_from_file);
     if (listen_conn != NULL && manual_onion_address != NULL)
     {
@@ -341,8 +343,8 @@ int main(void)
         {
             bm_log(
                     "[tor_control] using statically configured onion address: %s:%d -> 127.0.0.1:%d "
-                    "(BM_ONION_ADDRESS)\n",
-                    manual_onion_address, virtual_port, inbound_port);
+                    "(%s)\n",
+                    manual_onion_address, virtual_port, inbound_port, onion_address_source);
         }
         /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
          * 接続候補選定(peer_manager.cのlist_top)から除外する(自分自身への接続を防ぐ、
