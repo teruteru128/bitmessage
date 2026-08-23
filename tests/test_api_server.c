@@ -20,6 +20,8 @@
 #include "../src/core/messages_store.h"
 #include "../src/core/peer_manager.h"
 #include "../src/core/pubkey_cache.h"
+#include "../src/infra/network.h"
+#include "../src/infra/peer_registry.h"
 
 #define TEST_PORT 18442
 #define TEST_IDENTITY_DB "test_api_server_identity.db"
@@ -184,6 +186,12 @@ int main(void)
     bm_keyring_t kr;
     bm_keyring_init(&kr);
 
+    /* §11 2026-08-23 backlog項目5: listConnections用のregistry。config.registryへ
+     * アドレスを渡すため、config構築より前に初期化しておく必要がある(main.cと同じ順序、
+     * DESIGN.md参照)。 */
+    struct bm_peer_registry registry;
+    bm_peer_registry_init(&registry);
+
     struct bm_api_server_config config;
     memset(&config, 0, sizeof(config));
     config.bind_address = "127.0.0.1";
@@ -196,6 +204,7 @@ int main(void)
     config.peers_db = peers_db;
     config.default_nonce_trials_per_byte = 1000;
     config.default_payload_length_extra_bytes = 1000;
+    config.registry = &registry;
 
     volatile sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
@@ -510,6 +519,80 @@ int main(void)
         bm_json_free(v);
         free(resp);
     }
+
+    /* §11 2026-08-23 backlog項目5: listConnections。outbound1本・inbound1本をregistryへ
+     * 直接登録し、それぞれ{host,port,fullyEstablished,userAgent}が正しく返ることを確認する */
+    int lc_fds_out[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, lc_fds_out) == 0, "socketpair for outbound listConnections fixture");
+    struct bm_fd_data *lc_conn_out = bm_fd_data_new(BM_FD_CLIENT_SOCKET, lc_fds_out[0]);
+    CHECK(lc_conn_out != NULL, "bm_fd_data_new for outbound listConnections fixture");
+    strncpy(lc_conn_out->logical_peer_ip, "203.0.113.201", sizeof(lc_conn_out->logical_peer_ip) - 1);
+    lc_conn_out->logical_peer_port = 8444;
+    lc_conn_out->handshake_complete = 1;
+    lc_conn_out->user_agent = strdup("/bitmessage-c-test-outbound:0.1.0/");
+    bm_peer_registry_add(&registry, lc_conn_out);
+
+    int lc_fds_in[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, lc_fds_in) == 0, "socketpair for inbound listConnections fixture");
+    struct bm_fd_data *lc_conn_in = bm_fd_data_new(BM_FD_SERVER_SOCKET, lc_fds_in[0]);
+    CHECK(lc_conn_in != NULL, "bm_fd_data_new for inbound listConnections fixture");
+    lc_conn_in->handshake_complete = 0; /* まだhandshake未完了の状態も確認する */
+    lc_conn_in->user_agent = strdup("/bitmessage-c-test-inbound:0.1.0/");
+    bm_peer_registry_add(&registry, lc_conn_in);
+
+    resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"listConnections\",\"params\":[],\"id\":18}", "testuser",
+                       "testpass");
+    CHECK(resp != NULL, "listConnections HTTP request");
+    if (resp != NULL)
+    {
+        bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+        CHECK(v != NULL, "listConnections response is valid JSON");
+        if (v != NULL)
+        {
+            const bm_json_value_t *result = bm_json_object_get(v, "result");
+            const bm_json_value_t *inbound = result != NULL ? bm_json_object_get(result, "inbound") : NULL;
+            const bm_json_value_t *outbound = result != NULL ? bm_json_object_get(result, "outbound") : NULL;
+            CHECK(inbound != NULL && inbound->type == BM_JSON_ARRAY && inbound->item_count == 1,
+                  "listConnections should report exactly 1 inbound connection");
+            CHECK(outbound != NULL && outbound->type == BM_JSON_ARRAY && outbound->item_count == 1,
+                  "listConnections should report exactly 1 outbound connection");
+            if (outbound != NULL && outbound->item_count == 1)
+            {
+                const bm_json_value_t *entry = bm_json_array_get(outbound, 0);
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "host")), "203.0.113.201") == 0,
+                      "outbound entry's host should match logical_peer_ip");
+                CHECK((int)bm_json_as_number(bm_json_object_get(entry, "port")) == 8444,
+                      "outbound entry's port should match logical_peer_port");
+                CHECK(bm_json_object_get(entry, "fullyEstablished")->boolean == 1,
+                      "outbound entry's fullyEstablished should be true");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "userAgent")),
+                             "/bitmessage-c-test-outbound:0.1.0/")
+                          == 0,
+                      "outbound entry's userAgent should match");
+            }
+            if (inbound != NULL && inbound->item_count == 1)
+            {
+                const bm_json_value_t *entry = bm_json_array_get(inbound, 0);
+                CHECK(bm_json_object_get(entry, "fullyEstablished")->boolean == 0,
+                      "inbound entry's fullyEstablished should be false (handshake not complete)");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "userAgent")),
+                             "/bitmessage-c-test-inbound:0.1.0/")
+                          == 0,
+                      "inbound entry's userAgent should match");
+            }
+            bm_json_free(v);
+        }
+        free(resp);
+    }
+
+    bm_peer_registry_remove(&registry, lc_conn_out);
+    bm_peer_registry_remove(&registry, lc_conn_in);
+    close(lc_fds_out[0]);
+    close(lc_fds_out[1]);
+    close(lc_fds_in[0]);
+    close(lc_fds_in[1]);
+    bm_fd_data_free(lc_conn_out);
+    bm_fd_data_free(lc_conn_in);
 
     /* 存在しないメソッドはエラーを返す */
     resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"noSuchMethod\",\"params\":[],\"id\":7}",

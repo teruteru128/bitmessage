@@ -48,6 +48,22 @@ void bm_peer_registry_for_each(struct bm_peer_registry *reg, void (*callback)(st
                                 void *user_data);
 
 /*
+ * §11 2026-08-23 backlog項目5: bm_peer_registry_for_eachと違い、ロックを持ったまま
+ * callbackを呼ぶ(=イテレーション全体が単一の重い操作としてatomicに実行される)。
+ * これまでbm_peer_registry_for_eachの利用者(idle_sweep等)はnetwork_epoll_threadという
+ * 単一スレッドの中だけで動いていたため、ロックを早期解放してもconnが他スレッドから
+ * 並行にfree()される心配が無かった。しかしcore/api_server.c(listConnections)は
+ * 別スレッド(APIサーバのaccept loop)からconnのフィールド(user_agent等)を読むため、
+ * ロック解放後にnetwork_epoll_thread側で該当connがclose_connection経由でfree()される
+ * use-after-freeを起こしうる。callbackがconnのフィールドを読むだけ(bm_peer_registry_add/
+ * remove/count/has_peer/for_each等、同じmutexを再度lockする関数は一切呼ばない)なら、
+ * ロックを持ったまま呼んでも安全かつ正しい(bm_peer_registry_removeも同じmutexを
+ * 取るため、held中は他スレッドからのremove/freeがブロックされる)。
+ */
+void bm_peer_registry_for_each_locked(struct bm_peer_registry *reg,
+                                       void (*callback)(struct bm_fd_data *conn, void *user_data), void *user_data);
+
+/*
  * 現在接続中の全peer(exceptが非NULLならそれを除く)へ、hashesを送る。接続ごと・hashごとに
  * infra/object.hのbm_decide_propagation(§9 Dandelion++の差し込み点)を呼び、FLUFF判定
  * されたhashは通常のinv、STEM判定されたhashはdinvとして送る(SKIP判定のhashはその接続へは

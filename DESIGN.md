@@ -2666,6 +2666,42 @@ DBの汚れ)。
 (cli_integration.shが実バイナリの起動はカバーするが、onion関連の分岐は
 BM_ONION_ADDRESS未設定のCI環境では通らない)。
 
+### listConnections API(MVP)(2026-08-23)
+
+backlog項目5に着手。ユーザーと相談し、まずPyBitmessage本家と同等のMVP(host/port/
+fullyEstablished/userAgent)のみを実装し、送受信バイト数(前セッションで設計だけ
+詰めていた発展項目)は別タスクとして切り出すことにした。
+
+**設計**: PyBitmessage本家(`api.py`の`HandleListConnections`)の戻り値形式
+`{"inbound": [...], "outbound": [...]}`(各要素`{host, port, fullyEstablished,
+userAgent}`)をそのまま踏襲した。
+
+**実装**:
+- `infra/network.h`の`struct bm_fd_data`に`char *user_agent`を追加。
+  `object_sync.c`のversion受信処理(プロトコルバージョン/timestampチェックを
+  通過した後)で、`bm_free_version_message`する前に`strdup`して複製する。
+  `bm_fd_data_free`でfreeする。
+- `infra/peer_registry.c`に`bm_peer_registry_for_each_locked`を新設。既存の
+  `bm_peer_registry_for_each`はロックを早期解放してからcallbackを呼ぶ設計だが、
+  これは呼び出し元がnetwork_epoll_threadという単一スレッドの中だけで動く前提
+  (idle_sweep等)だったため安全だった。api_server.cのlistConnectionsは別スレッド
+  (APIサーバのaccept loop)からconnのフィールドを読むため、ロック解放後に
+  network_epoll_thread側で該当connがclose_connection経由でfree()される
+  use-after-freeを起こしうる。`for_each_locked`はロックを持ったままcallbackを
+  呼ぶことでこれを防ぐ(callback側がbm_peer_registry_remove等、同じmutexを
+  再度lockする関数を呼ばないことが前提の変種)。
+- `core/api_server.h`の`struct bm_api_server_config`に`struct bm_peer_registry
+  *registry`(NULL可)を追加。`core/api_server.c`に`h_listConnections`を実装し
+  `METHODS[]`へ登録した。
+- `main.c`: `peer_registry`の初期化(元は`api_server`スレッド起動より後だった)を
+  `api_config`構築より前へ移動する必要があった(`api_config.registry`が
+  そのアドレスを持つため、未初期化の変数のアドレスを渡すわけにはいかない)。
+
+**テスト**: `tests/test_api_server.c`にlistConnectionsシナリオを追加。socketpairで
+outbound 1本(handshake完了・user agent設定済み)・inbound 1本(handshake未完了)を
+registryへ直接登録し、それぞれが正しい配列・フィールドで返ることを確認した。ctest
+34件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2684,11 +2720,9 @@ BM_ONION_ADDRESS未設定のCI環境では通らない)。
 4. ~~**version messageの`timestamp`が未検証**~~: 2026-08-23完了(上記まとめ参照)。
    `BM_MAX_TIME_OFFSET_SECONDS`(=3600秒)を超えて自分の時計とズレていればfatal
    errorを送って切断する。
-5. **`listConnections`的なAPI(接続一覧取得)**: PyBitmessageのGUI Network Status
-   タブ相当。`infra/peer_registry.c`の`struct bm_peer_registry`に既に接続一覧はあるため
-   実装コストは軽いはずだが、接続時刻・送受信バイト数・user agent等まで出すには
-   `bm_fd_data`への追加フィールドが必要になる。ユーザーから「GUI専用の機能というより
-   ヘッドレスdaemonでも普通に価値がある」との指摘あり。未着手。
+5. ~~**`listConnections`的なAPI(接続一覧取得)**~~: MVP(host/port/fullyEstablished/
+   userAgent、PyBitmessage本家と同形式)は2026-08-23完了(上記まとめ参照)。
+   送受信バイト数は別タスクとして未着手のまま残す(下記)。
    - 送受信バイト数は2026-08-23に設計を詰め、PyBitmessage実装(個人手元clone)も調査した。
      ノードごとの内訳(現在接続中のpeerのみ)と、
      切断済みも含めた全体累積の両方が欲しい。前者は`bm_fd_data`に送受信バイト数
@@ -2745,9 +2779,9 @@ BM_ONION_ADDRESS未設定のCI環境では通らない)。
      十分と判断。
 10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
-    プロトコルバージョン互換性チェック・version messageのtimestamp検証はいずれも完了
-    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
-    対象外(引き続き見送り)。
+    プロトコルバージョン互換性チェック・version messageのtimestamp検証・
+    listConnections API(MVP)はいずれも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で
+    明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

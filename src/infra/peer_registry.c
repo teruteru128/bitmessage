@@ -141,6 +141,17 @@ void bm_peer_registry_for_each(struct bm_peer_registry *reg, void (*callback)(st
     free(snapshot);
 }
 
+void bm_peer_registry_for_each_locked(struct bm_peer_registry *reg,
+                                       void (*callback)(struct bm_fd_data *conn, void *user_data), void *user_data)
+{
+    pthread_mutex_lock(&reg->lock);
+    for (size_t i = 0; i < reg->count; i++)
+    {
+        callback(reg->conns[i], user_data);
+    }
+    pthread_mutex_unlock(&reg->lock);
+}
+
 /* §9 Dandelion++ Stage 2: dup()した接続1本ぶんの送信予定。bm_decide_propagationの
  * 判定結果ごとにfluff_hashes(通常inv)とstem_hashes(dinv)へ振り分けたもの。
  * ロック解放後にまとめて書き込むための一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */

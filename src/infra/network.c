@@ -83,6 +83,7 @@ void bm_fd_data_free(struct bm_fd_data *data)
         return;
     }
     free(data->recv_buffer);
+    free(data->user_agent);
     free(data);
 }
 

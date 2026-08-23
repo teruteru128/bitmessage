@@ -206,6 +206,16 @@ int main(void)
      * 既定の8442を取り合って衝突した)。CLIと同じ環境変数名で揃える。 */
     int api_port = env_or_int("BM_API_PORT", cfg.api_port);
 
+    /* §11 接続レジストリ。現在epollに登録中の接続一覧で、object_sync_threadが「新しく手に入れた
+     * objectを他の接続中peerへinv broadcastする」ために使う。registryもmain()がsigwaitで
+     * ブロックしている間ずっと生存するスタック変数。§11 2026-08-23 backlog項目5:
+     * api_configがこれのアドレスを持つため、api_configの構築より前に初期化しておく必要がある
+     * (以前はapi_server thread起動より後で初期化していたが、その並び順のままだと
+     * api_config.registryへ渡すアドレスがまだ初期化されていない変数を指すことになるため
+     * ここへ移動した)。 */
+    struct bm_peer_registry peer_registry;
+    bm_peer_registry_init(&peer_registry);
+
     struct bm_api_server_config api_config;
     memset(&api_config, 0, sizeof(api_config));
     api_config.bind_address = "127.0.0.1";
@@ -222,6 +232,7 @@ int main(void)
         env_or_u64("BM_DEFAULT_NONCE_TRIALS_PER_BYTE", cfg.default_nonce_trials_per_byte);
     api_config.default_payload_length_extra_bytes =
         env_or_u64("BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES", cfg.default_payload_length_extra_bytes);
+    api_config.registry = &peer_registry;
     bm_log("[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
             api_password, api_port);
 
@@ -259,12 +270,6 @@ int main(void)
     api_args->config = &api_config;
     api_args->stop_flag = &api_server_stop;
     pthread_create(&th_api_server, NULL, bm_api_server_thread, api_args);
-
-    /* §11 接続レジストリ。現在epollに登録中の接続一覧で、object_sync_threadが「新しく手に入れた
-     * objectを他の接続中peerへinv broadcastする」ために使う。registryもmain()がsigwaitで
-     * ブロックしている間ずっと生存するスタック変数。 */
-    struct bm_peer_registry peer_registry;
-    bm_peer_registry_init(&peer_registry);
 
     /* §1.1 object_sync_thread。ctxはmain()がsigwaitでブロックしている間ずっと生存する
      * スタック変数(api_configと同じ扱い)。network_epoll_threadはdetach済みなのでpthread_join

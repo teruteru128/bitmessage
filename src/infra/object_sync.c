@@ -911,6 +911,11 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         /* §9 Dandelion++: 相手のservicesビットフィールドを覚えておく(stem successor選定が
          * BM_SERVICE_NODE_DANDELIONを立てているoutbound peerだけを対象にするため使う) */
         conn->services = ver.services;
+        /* §11 2026-08-23 backlog項目5: listConnections API用に相手のuser agentを覚えておく。
+         * verが解放される前に複製する(通常は接続ごとに1回しかversionを受け取らないが、
+         * 念のため既存値があれば先にfreeしてリークを防ぐ)。 */
+        free(conn->user_agent);
+        conn->user_agent = (ver.user_agent != NULL) ? strdup(ver.user_agent) : NULL;
         bm_free_version_message(&ver);
         record_outbound_success(ctx, conn);
         if (bm_reply_verack(conn) != 0)

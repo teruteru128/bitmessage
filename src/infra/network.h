@@ -87,6 +87,11 @@ struct bm_fd_data
      * 直後にこのフラグを見て、切断が必要な通常の読み取りエラーと同じ経路(戻り値-1)へ
      * 合流させる。0=切断不要(既定)。 */
     int should_disconnect;
+    /* §11 2026-08-23 backlog項目5: listConnections API(core/api_server.c)用。相手から
+     * 受信したversion messageのuser agent文字列(malloc済み、NUL終端)。
+     * object_sync.cのversion受信処理が設定する(接続直後・まだversion未受信の間はNULL)。
+     * bm_fd_data_freeでfreeする。 */
+    char *user_agent;
 };
 
 /*

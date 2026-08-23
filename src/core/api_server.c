@@ -18,6 +18,7 @@
 #include "../common/json.h"
 #include "../common/logging.h"
 #include "../infra/network.h"
+#include "../infra/peer_registry.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
 #include "config_store.h"
@@ -796,6 +797,62 @@ static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
     return bm_json_new_bool(1);
 }
 
+/*
+ * listConnections: [] -> {inbound: [{host,port,fullyEstablished,userAgent}], outbound: [...]}
+ * §11 2026-08-23 backlog項目5。PyBitmessage(api.pyのHandleListConnections)と同じ形。
+ * ヘッドレスdaemonのGUI Network Statusタブ相当として、現在接続中のpeer一覧を返す。
+ */
+struct list_connections_ctx
+{
+    bm_json_value_t *inbound;
+    bm_json_value_t *outbound;
+};
+
+static void list_connections_one(struct bm_fd_data *conn, void *user_data)
+{
+    struct list_connections_ctx *ctx = user_data;
+    if (conn->type == BM_FD_LISTEN_SOCKET)
+    {
+        return; /* listenソケット自体は接続ではない */
+    }
+
+    char ip[BM_PEER_IP_STRLEN];
+    int port = 0;
+    bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+
+    bm_json_value_t *entry = bm_json_new_object();
+    bm_json_object_set(entry, "host", bm_json_new_string(ip));
+    bm_json_object_set(entry, "port", bm_json_new_number((double)port));
+    bm_json_object_set(entry, "fullyEstablished", bm_json_new_bool(conn->handshake_complete));
+    bm_json_object_set(entry, "userAgent", bm_json_new_string(conn->user_agent != NULL ? conn->user_agent : ""));
+
+    bm_json_array_append(conn->type == BM_FD_SERVER_SOCKET ? ctx->inbound : ctx->outbound, entry);
+}
+
+static bm_json_value_t *h_listConnections(const struct bm_api_server_config *config,
+                                           const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    if (config->registry == NULL)
+    {
+        *out_error = dup_cstr("connection registry is not available");
+        return NULL;
+    }
+
+    struct list_connections_ctx ctx;
+    ctx.inbound = bm_json_new_array();
+    ctx.outbound = bm_json_new_array();
+    /* §11 2026-08-23: for_each_locked(APIサーバスレッドからの呼び出し専用の変種)を使う。
+     * 通常のfor_eachはロックを早期解放するため、network_epoll_thread側で該当connが
+     * close_connection経由でfree()されるuse-after-freeを起こしうる(peer_registry.h参照)。 */
+    bm_peer_registry_for_each_locked(config->registry, list_connections_one, &ctx);
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "inbound", ctx.inbound);
+    bm_json_object_set(result, "outbound", ctx.outbound);
+    return result;
+}
+
 static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
                                             const bm_json_value_t *params, char **out_error)
 {
@@ -848,6 +905,7 @@ static const struct bm_api_method METHODS[] = {
     {"getSocksProxy", h_getSocksProxy},
     {"setSocksProxy", h_setSocksProxy},
     {"addPeer", h_addPeer},
+    {"listConnections", h_listConnections},
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 

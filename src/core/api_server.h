@@ -13,6 +13,8 @@
 #include "../common/queue.h"
 #include "keyring.h"
 
+struct bm_peer_registry; /* infra/peer_registry.h、循環includeを避けるため前方宣言のみ */
+
 struct bm_api_server_config
 {
     const char *bind_address; /* 既定"127.0.0.1"(§6.1) */
@@ -42,6 +44,9 @@ struct bm_api_server_config
      * テスト等)がこの構造体を直接組み立てる場合も、必ず1000等の正の値を設定すること。 */
     uint64_t default_nonce_trials_per_byte;
     uint64_t default_payload_length_extra_bytes;
+    /* §11 2026-08-23 backlog項目5。NULL可(その場合listConnectionsはエラーを返す。testや
+     * ネットワーク無効構成用)。listConnectionsが現在の接続一覧を読むために使う。 */
+    struct bm_peer_registry *registry;
 };
 
 /* bind+listenする。成功時0、*out_listen_fdにfdを設定。失敗時(ポート使用中等)は非0 */
