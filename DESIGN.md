@@ -2503,8 +2503,27 @@ onion優遇は実データで既に自然に高rating傾向のため見送り)�
    約120箇所の呼び出しを1つずつ「どのレベルに当たるか」判断し直す作業が必要で、
    時刻付与のような機械的な置換とは規模が違う。フィルタリング方式(環境変数で
    最低レベル指定等)も別途設計が要る。優先度低。
-9. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
-   GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+9. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
+   ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
+   実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
+   (最適化によるUB顕在化・タイミング変化の可能性は未検証)。`cmake --install`用の
+   `install()`定義、DBファイル置き場をCWD依存から固定パス(`/var/lib/bitmessage/`等)へ
+   切り替える設計判断、`.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)が
+   必要。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこの
+   systemd化を見越したもの。
+   - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
+     ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
+     視野に入れていない(対応するなら`kqueue`バックエンド追加という別の大仕事になる)。
+     現実的な論点は「Linuxのどのディストリまで」に限られる。実質Ubuntu前提になっている
+     箇所: (a) CIが`ubuntu-latest`のみ(`.github/workflows/ci.yml`)、(b)
+     `core/config_file.c`の既定値`tor_control_socket = "/run/tor/control"`
+     (Debian/Ubuntu系のTorパッケージのデフォルトパスで、Fedora/Arch等は異なる可能性)。
+     ビルド依存(OpenSSL/SQLite3/pthread)自体はどのディストリでもパッケージ名が違うだけで
+     標準的に入手可能なため、大掛かりな対応は不要。CIにもう1ディストリ(Fedora等)を
+     追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
+     十分と判断。
+10. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
+    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
