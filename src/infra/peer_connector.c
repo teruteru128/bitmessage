@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,10 @@
 #include "network.h"
 #include "peer_registry.h"
 
-#define MAX_CANDIDATES 32
+/* §11 2026-08-23発覚のバグ修正: 以前は32件(=rating上位32件)しか候補として取得しておらず、
+ * peers.dbの大半(実測417件中385件)がそもそも接続選定の対象外になっていた。256は
+ * struct bm_peer_entry candidates[256]がスタック上でも問題ないサイズ(1件約112byte×256≒28KB) */
+#define MAX_CANDIDATES 256
 #define CONNECT_TIMEOUT_SEC 5
 /* SOCKS5ハンドシェイク(特にCONNECT応答待ち)は、宛先がTor等の場合に回線構築で数秒〜十数秒
  * かかることがあるため、ローカルのプロキシ自体へのTCP接続(CONNECT_TIMEOUT_SEC)より長めに取る */
@@ -319,6 +323,72 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
     return connect_with_timeout(ip, port, timeout_sec);
 }
 
+/* §11 2026-08-23発覚のバグ修正: 以前はbm_peer_manager_list_top(rating降順)の先頭から
+ * 順に候補を試していたため、rating上位の少数peerだけが毎サイクル選ばれ続け(接続しても
+ * すぐ切断されるpeerでも、verack成功+0.1と切断失敗-0.1がサイクルごとにほぼ相殺して
+ * ratingが高いまま維持されるため)、実測で40候補中9件が11回以上・最大222回(ほぼ毎サイクル)
+ * 再接続される一方、他の25件は1回しか試されない「強者総取り」状態になっていた。
+ *
+ * PyBitmessage本家(network/connectionchooser.pyのchooseConnection)を調査したところ、
+ * 決定的な「rating上位N件」ではなく確率的な重み付きランダムサンプリングを使っていた:
+ * 候補から毎回一様ランダムに1件選び、ratingに応じた確率(0.05/(1-rating)、rating=0で
+ * 5%、rating=0.9で50%、rating→1でほぼ100%)で採用するかどうかを乱数判定し、棄却されたら
+ * 別の候補を再度試す(最大50回)。この方式を移植する(LAN discovery優先・bootstrap
+ * serverモード用cooldown・onion rating強制ブーストは対象外、DESIGN.md参照)。 */
+#define CHOOSE_CANDIDATE_MAX_ATTEMPTS 50
+#define CHOOSE_CANDIDATE_BASE_PROB 0.05
+
+/* [0,1)の一様乱数(PyBitmessageのrandom.random()相当)。dandelion.cのexponential_randomと
+ * 同じRAND_bytesベースの正規化手法を使う(暗号強度は不要、他のnonce生成箇所と手段を揃える) */
+static double uniform_random(void)
+{
+    unsigned char buf[4];
+    RAND_bytes(buf, sizeof(buf));
+    uint32_t r;
+    memcpy(&r, buf, sizeof(r));
+    return (double)r / 4294967296.0; /* 2^32、[0,1)に収まる */
+}
+
+/*
+ * candidates[0..candidate_count)から確率的に1件選ぶ。既に接続済みの相手(registry)は
+ * 無条件で不採用として次のランダムな1件を試す。見つからなければ-1を返す
+ * (呼び出し側は今回のサイクルでの接続をこれ以上試みない)。
+ */
+int bm_peer_connector_choose_candidate_index(const struct bm_peer_entry *candidates, int candidate_count,
+                                              struct bm_peer_registry *registry, int max_attempts)
+{
+    if (candidate_count <= 0)
+    {
+        return -1;
+    }
+    for (int attempt = 0; attempt < max_attempts; attempt++)
+    {
+        unsigned char buf[4];
+        RAND_bytes(buf, sizeof(buf));
+        uint32_t r;
+        memcpy(&r, buf, sizeof(r));
+        int idx = (int)(r % (uint32_t)candidate_count);
+
+        if (registry != NULL
+            && bm_peer_registry_has_peer(registry, candidates[idx].ip_address, candidates[idx].port))
+        {
+            continue; /* 既に接続済みの相手には二重接続しない */
+        }
+
+        double rating = candidates[idx].rating;
+        if (rating >= 1.0)
+        {
+            return idx; /* PyBitmessageのZeroDivisionError->即採用と同じ扱い */
+        }
+        double prob = CHOOSE_CANDIDATE_BASE_PROB / (1.0 - rating);
+        if (prob > uniform_random())
+        {
+            return idx;
+        }
+    }
+    return -1;
+}
+
 int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *config)
 {
     /* §11 peers.dbの低rating/古いノードのクリーンアップ。seed_bootstrapより前に呼ぶことで、
@@ -358,17 +428,18 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     }
 
     int connected = 0;
-    for (int i = 0; i < candidate_count && connected < want; i++)
+    while (connected < want)
     {
         if (config->stop_flag != NULL && *config->stop_flag != 0)
         {
             break; /* §11 2026-08-23発覚のバグ修正: shutdown中は残り候補を試さず速やかに戻る */
         }
 
-        if (config->registry != NULL
-            && bm_peer_registry_has_peer(config->registry, candidates[i].ip_address, candidates[i].port))
+        int i = bm_peer_connector_choose_candidate_index(candidates, candidate_count, config->registry,
+                                                          CHOOSE_CANDIDATE_MAX_ATTEMPTS);
+        if (i < 0)
         {
-            continue; /* 既に接続済みの相手には二重接続しない */
+            break; /* 今回のサイクルではこれ以上の候補が見つからない(PyBitmessageのValueError相当) */
         }
 
         char addr_buf[80];
