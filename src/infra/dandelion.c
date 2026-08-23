@@ -3,6 +3,7 @@
 #include <math.h>
 #include <openssl/rand.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,6 +17,25 @@
 /* 1回のbm_dandelion_expire_and_refluff呼び出しでまとめてfluffする上限(1秒間隔で呼ばれる
  * 想定のため、1秒間にこれ以上のobjectが同時にstemタイムアウトを迎えることは通常無い) */
 #define BM_DANDELION_MAX_EXPIRE_PER_CALL 64
+
+/* §11 2026-08-23発覚の重大な性能バグ修正: find_or_create_entryがg_state.entriesを
+ * 先頭から線形探索(memcmp)していたため、handle_inv(未所持hashごとに呼ぶ)や
+ * send_big_inv(保有する全hashごとに呼ぶ)がO(n^2)になっていた。今夜object_pool.dbが
+ * 1万件規模まで育った状態でsend_big_invを1回呼ぶだけで概算5000万回超のmemcmpが発生し、
+ * g_state.lockを握ったまま単一のnetwork_epoll_thread全体を一瞬止めていた(新規peerが
+ * 繋がるたびに発生し、object_pool.dbが増えるほど二次関数的に悪化する)。相手から見ると
+ * 「handshake後しばらく応答が無いnode」に見えてタイムアウト切断されうる、今夜観測していた
+ * 接続churnの有力な一因と考えられる。
+ *
+ * オープンアドレッシング(線形探索、hash先頭8byteをキーにした単純なもの。Bitmessageの
+ * hashは既に暗号学的ハッシュ値のため先頭8byteだけで十分一様分布する)のハッシュテーブルを
+ * g_state.entriesと並行して持たせ、O(1)平均でfind_or_create_entryできるようにした。
+ * g_state.entriesはbm_dandelion_expire_and_refluffの定期的な全走査(fluffタイムアウト
+ * 判定・古いエントリの間引き)用に配列のまま維持し、間引き後(要素の位置がずれる)にだけ
+ * インデックスを再構築する(その関数自体が既にO(n)なので、再構築を足しても計算量は
+ * 変わらない)。 */
+#define BM_DANDELION_INDEX_INITIAL_CAPACITY 128
+#define BM_DANDELION_INDEX_EMPTY SIZE_MAX
 
 struct dandelion_entry
 {
@@ -40,6 +60,13 @@ static struct
     struct dandelion_entry *entries;
     size_t entry_count;
     size_t entry_capacity;
+
+    /* §11 2026-08-23: find_or_create_entry高速化用インデックス(上記doc参照)。
+     * index_slots[i]はg_state.entriesのインデックス、BM_DANDELION_INDEX_EMPTYなら空き
+     * スロット。entry_countとは独立してcapacityを管理する(負荷率50%を超えたら倍に
+     * 拡張する、index_ensure_capacity参照)。 */
+    size_t *index_slots;
+    size_t index_capacity;
 } g_state;
 
 /* g_state.lockが初期化済みかどうか(未初期化のmutexをdestroy/lockするのはUBのため、
@@ -53,6 +80,7 @@ void bm_dandelion_module_init(void)
         pthread_mutex_destroy(&g_state.lock);
     }
     free(g_state.entries);
+    free(g_state.index_slots);
     memset(&g_state, 0, sizeof(g_state));
     pthread_mutex_init(&g_state.lock, NULL);
     g_state_lock_initialized = 1;
@@ -71,17 +99,97 @@ static double exponential_random(double mean)
     return -mean * log(u);
 }
 
+/* hash先頭8byteをそのままキーにする(既に暗号学的ハッシュ値のため十分一様分布する、
+ * 追加のハッシュ関数は不要)。 */
+static uint64_t index_key(const unsigned char hash[32])
+{
+    uint64_t key;
+    memcpy(&key, hash, sizeof(key));
+    return key;
+}
+
+/* g_state.lockを保持したまま呼ぶこと。g_state.entries[0..entry_count)の内容から
+ * インデックスをcapacity個のスロットで作り直す(古い内容は破棄)。
+ * bm_dandelion_expire_and_refluffがg_state.entriesを間引いて要素の位置がずれた直後や、
+ * 負荷率が高くなり拡張が必要な時に呼ぶ。malloc失敗時は既存のindex_slotsを維持したまま
+ * 諦める(呼び出し元はindex_capacityが変わっていないことを前提にできる)。 */
+static void index_rebuild(size_t capacity)
+{
+    size_t *slots = malloc(sizeof(*slots) * capacity);
+    if (slots == NULL)
+    {
+        return;
+    }
+    for (size_t i = 0; i < capacity; i++)
+    {
+        slots[i] = BM_DANDELION_INDEX_EMPTY;
+    }
+    for (size_t i = 0; i < g_state.entry_count; i++)
+    {
+        size_t slot = (size_t)(index_key(g_state.entries[i].hash) % capacity);
+        while (slots[slot] != BM_DANDELION_INDEX_EMPTY)
+        {
+            slot = (slot + 1) % capacity;
+        }
+        slots[slot] = i;
+    }
+    free(g_state.index_slots);
+    g_state.index_slots = slots;
+    g_state.index_capacity = capacity;
+}
+
+/* 負荷率(entry_count/index_capacity)が50%を超えないよう、必要なら拡張(倍に)する。
+ * g_state.lockを保持したまま呼ぶこと。 */
+static void index_ensure_capacity(void)
+{
+    if (g_state.index_capacity == 0)
+    {
+        index_rebuild(BM_DANDELION_INDEX_INITIAL_CAPACITY);
+        return;
+    }
+    if ((g_state.entry_count + 1) * 2 > g_state.index_capacity)
+    {
+        index_rebuild(g_state.index_capacity * 2);
+    }
+}
+
+/* hashが見つかればそのentries内インデックス、無ければBM_DANDELION_INDEX_EMPTYを返す。
+ * g_state.lockを保持したまま呼ぶこと。index_slots未初期化(capacity==0、通常は
+ * find_or_create_entryがindex_ensure_capacityで先に確保しているため起きない)の場合も
+ * 安全にBM_DANDELION_INDEX_EMPTYを返す。 */
+static size_t index_lookup(const unsigned char hash[32])
+{
+    if (g_state.index_capacity == 0)
+    {
+        return BM_DANDELION_INDEX_EMPTY;
+    }
+    size_t slot = (size_t)(index_key(hash) % g_state.index_capacity);
+    for (size_t probes = 0; probes < g_state.index_capacity; probes++)
+    {
+        size_t idx = g_state.index_slots[slot];
+        if (idx == BM_DANDELION_INDEX_EMPTY)
+        {
+            return BM_DANDELION_INDEX_EMPTY; /* このhashは無い(空きスロットに到達) */
+        }
+        if (memcmp(g_state.entries[idx].hash, hash, 32) == 0)
+        {
+            return idx;
+        }
+        slot = (slot + 1) % g_state.index_capacity;
+    }
+    return BM_DANDELION_INDEX_EMPTY; /* 理論上index_ensure_capacityのおかげで起きないはず */
+}
+
 /* g_state.lockを保持したまま呼ぶこと。既存エントリを返すか、無ければ新規作成して返す
  * (この時点でタイムアウトも決定する)。malloc失敗時のみNULL */
 static struct dandelion_entry *find_or_create_entry(const unsigned char hash[32], int64_t now)
 {
-    for (size_t i = 0; i < g_state.entry_count; i++)
+    size_t existing = index_lookup(hash);
+    if (existing != BM_DANDELION_INDEX_EMPTY)
     {
-        if (memcmp(g_state.entries[i].hash, hash, 32) == 0)
-        {
-            return &g_state.entries[i];
-        }
+        return &g_state.entries[existing];
     }
+
     if (g_state.entry_count >= g_state.entry_capacity)
     {
         size_t new_cap = g_state.entry_capacity == 0 ? 64 : g_state.entry_capacity * 2;
@@ -93,12 +201,27 @@ static struct dandelion_entry *find_or_create_entry(const unsigned char hash[32]
         g_state.entries = grown;
         g_state.entry_capacity = new_cap;
     }
-    struct dandelion_entry *e = &g_state.entries[g_state.entry_count++];
+    struct dandelion_entry *e = &g_state.entries[g_state.entry_count];
+    size_t new_index = g_state.entry_count;
+    g_state.entry_count++;
     memcpy(e->hash, hash, 32);
     e->fluff_deadline =
         now + BM_DANDELION_TIMEOUT_BASE_SECONDS + (int64_t)exponential_random(BM_DANDELION_TIMEOUT_MEAN_SECONDS);
     e->fluffed_at = 0;
     e->learned_via_plain_inv = 0; /* 既定はstem対象(自分発object、またはprovenance不明) */
+
+    /* インデックスへ登録する。entries配列を伸ばした直後でも(realloc)既存の
+     * index_slotsが指すインデックス番号自体は不変(位置がずれるのはentries配列の中身の
+     * 並び替え時=間引き時だけ)なので、そのまま追記できる。負荷率次第でここが拡張の
+     * トリガーにもなる(次回呼び出し用、今回のnew_indexの登録は拡張後のテーブルへ行う) */
+    index_ensure_capacity();
+    size_t slot = (size_t)(index_key(hash) % g_state.index_capacity);
+    while (g_state.index_slots[slot] != BM_DANDELION_INDEX_EMPTY)
+    {
+        slot = (slot + 1) % g_state.index_capacity;
+    }
+    g_state.index_slots[slot] = new_index;
+
     return e;
 }
 
@@ -203,6 +326,7 @@ int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t n
     }
 
     /* 古いfluff済みエントリを間引く */
+    size_t original_count = g_state.entry_count;
     size_t write = 0;
     for (size_t i = 0; i < g_state.entry_count; i++)
     {
@@ -218,6 +342,14 @@ int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t n
         write++;
     }
     g_state.entry_count = write;
+    /* §11 2026-08-23: 間引きでentries内の要素が移動した(=以前のインデックスが古い
+     * ハッシュを指さなくなった)場合のみ、find_or_create_entry高速化用インデックスを
+     * 作り直す。何も間引かれなかった通常時は位置がずれないため不要(この関数は1秒間隔で
+     * 呼ばれる想定のため、毎回無条件で再構築するとそれ自体がO(n)コストの積み重ねになる)。 */
+    if (write != original_count && g_state.index_capacity > 0)
+    {
+        index_rebuild(g_state.index_capacity);
+    }
     pthread_mutex_unlock(&g_state.lock);
 
     for (size_t i = 0; i < to_fluff_count; i++)

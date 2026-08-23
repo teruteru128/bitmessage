@@ -2796,6 +2796,39 @@ verack後にaddr/invを送っていたか」と確認された。コードを読
 種として仕込んだ2件のhashを含む"inv"が正しく送られることを確認した。実装コード自体の
 変更は無し(既存実装が正しいことをテストで裏付けただけ)。ctest 34件全通過。
 
+### 重大な性能バグ修正: dandelion.cのhash探索がO(n^2)だった(2026-08-23)
+
+sendBigInv実装直後、コードを見直していて発覚。`dandelion.c`の`find_or_create_entry`
+(`bm_dandelion_note_source`・`bm_dandelion_decide`の両方が使う内部関数)が
+`g_state.entries`配列を先頭から線形探索(`memcmp`)しており、`handle_inv`(受信した
+未所持hashごとに呼ぶ)や今夜実装した`send_big_inv`(保有する全hashごとに呼ぶ)が
+実質O(n^2)になっていた。今夜object_pool.dbが約1万件規模まで育った状態で
+`send_big_inv`を1回呼ぶだけで概算5000万回超の`memcmp`が発生する計算になり、
+`g_state.lock`を握ったまま単一の`network_epoll_thread`全体を一瞬(新規peer1件あたり
+概算0.2〜0.5秒)止めていたことになる。しかもobject_pool.dbが増えるほど二次関数的に
+悪化する(上限の50,000件まで育てば1回あたり数秒規模)。相手から見ると
+「handshake後しばらく応答が無いnode」に見えてタイムアウト切断されうるため、今夜
+ずっと観測していた接続churnの有力な一因と考えられる。
+
+**修正**: オープンアドレッシング(線形探索、hashの先頭8byteをキーにした単純なもの。
+Bitmessageのhashは既に暗号学的ハッシュ値のため先頭8byteだけで十分一様分布する)の
+ハッシュテーブルを`g_state`へ追加した(`index_slots`/`index_capacity`)。
+`find_or_create_entry`はまずこのテーブルで既存エントリを探し(O(1)平均)、無ければ
+`g_state.entries`へ追記した上でテーブルにも登録する。負荷率が50%を超えたら
+テーブルを倍に拡張して作り直す(`index_ensure_capacity`/`index_rebuild`)。
+`g_state.entries`自体は`bm_dandelion_expire_and_refluff`の定期的な全走査
+(fluffタイムアウト判定・古いエントリの間引き)用に配列のまま維持し、間引きで要素の
+位置がずれた場合のみインデックスを作り直す(その関数自体が既にO(n)のため、
+再構築を足しても計算量は変わらない)。
+
+**テスト**: `tests/test_dandelion_index.c`を新規追加。50,000件(実運用の上限
+`BM_MAX_INVENTORY_ITEMS`と同数)の相異なるhashを用意し、半数は事前に
+`bm_dandelion_note_source`で印を付け(FLUFF確定になるはず)、残り半数はstem
+successorへSTEMになるはずという状態を作った上で、`bm_dandelion_decide`が全件について
+正しい判定を返すこと(索引が既存エントリを取り違えたり重複作成したりしていないことの
+証明)と、処理全体が3秒以内(実測0.23秒、旧O(n^2)実装なら概算6秒規模)に完了することを
+確認した。ctest 35件全通過(既存のdandelion_stage1〜3も回帰無し)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

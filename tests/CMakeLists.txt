@@ -112,6 +112,10 @@ add_executable(test_dandelion_stage3 test_dandelion_stage3.c)
 target_link_libraries(test_dandelion_stage3 PRIVATE bm_core bm_infra)
 add_test(NAME dandelion_stage3 COMMAND test_dandelion_stage3)
 
+add_executable(test_dandelion_index test_dandelion_index.c)
+target_link_libraries(test_dandelion_index PRIVATE bm_core bm_infra)
+add_test(NAME dandelion_index COMMAND test_dandelion_index)
+
 add_executable(test_peer_connector_shutdown test_peer_connector_shutdown.c)
 target_link_libraries(test_peer_connector_shutdown PRIVATE bm_core bm_infra)
 add_test(NAME peer_connector_shutdown COMMAND test_peer_connector_shutdown)
