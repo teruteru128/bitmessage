@@ -694,7 +694,14 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
             bm_dandelion_note_source(inv_msg.items[i], is_dinv, now);
         }
     }
+    uint64_t received_count = inv_msg.count;
     bm_free_inventory_message(&inv_msg);
+
+    /* §11 2026-08-23: これまで正常系(パース成功・上限内)には一切ログが無く、malformed/上限超過
+     * といった異常系のログしか出ていなかった(listConnections調査中にユーザーが発見した
+     * 「無言の切断」と同種の穴)。受信件数・未所持(=getdataを送る)件数を可視化する。 */
+    bm_log("[object_sync] received %s: %" PRIu64 " item(s), %zu missing\n", msg->command, received_count,
+            missing_count);
 
     if (missing_count > 0)
     {

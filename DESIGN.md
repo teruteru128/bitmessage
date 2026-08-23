@@ -2729,6 +2729,18 @@ listConnections APIの動作確認中にユーザーが発見。実daemon Aへ`l
 ctest 34件全通過(専用の新規テストは追加せず、ログ文言はアサート対象外という
 既存の慣習に合わせた)。
 
+### ログ改善: inv/dinv受信の正常系にログが無かった(2026-08-23)
+
+ユーザーの指摘で発覚。`handle_inv`(`object_sync.c`)はmalformed/上限超過等の異常系にしか
+ログを出しておらず、正常にinv/dinvを受信・処理した場合(何件受信し何件getdataを
+送ったか)は完全に無言だった。直前に見つけた「読み取りエラー/EOFによる切断が無言
+だった」件と同種の穴。
+
+`bm_free_inventory_message`直後(getdata送信より前)に
+`bm_log("[object_sync] received %s: %llu item(s), %zu missing\n", msg->command,
+received_count, missing_count)`を追加した(`msg->command`で"inv"/"dinv"どちらかを
+区別する)。ctest 34件全通過(ログ文言は既存の慣習通りアサート対象外)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
