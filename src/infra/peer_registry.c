@@ -97,6 +97,35 @@ int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int 
     return found;
 }
 
+void bm_peer_registry_for_each(struct bm_peer_registry *reg, void (*callback)(struct bm_fd_data *conn, void *user_data),
+                                void *user_data)
+{
+    /* §11 2026-08-23: broadcast_inv/pick_random_dandelion_peerと同じ「ロックを持っている間に
+     * スナップショットだけ取り、実際の処理(コールバック呼び出し)はロック解放後に行う」方針。
+     * コールバック側がbm_peer_registry_remove(切断処理の一部)を呼ぶ可能性があり、reg->lockを
+     * 持ったままそれを許すと同じmutexを再帰的にロックしてデッドロックする。呼び出し元
+     * (bm_network_idle_sweep)はnetwork_epoll_threadという単一スレッドの中でのみ動くため、
+     * ロック解放後にスナップショット中の接続が他スレッドから並行にfreeされる心配は無い。 */
+    pthread_mutex_lock(&reg->lock);
+    size_t count = reg->count;
+    struct bm_fd_data **snapshot = count > 0 ? malloc(sizeof(*snapshot) * count) : NULL;
+    if (snapshot != NULL)
+    {
+        memcpy(snapshot, reg->conns, sizeof(*snapshot) * count);
+    }
+    pthread_mutex_unlock(&reg->lock);
+
+    if (snapshot == NULL)
+    {
+        return;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        callback(snapshot[i], user_data);
+    }
+    free(snapshot);
+}
+
 /* §9 Dandelion++ Stage 2: dup()した接続1本ぶんの送信予定。bm_decide_propagationの
  * 判定結果ごとにfluff_hashes(通常inv)とstem_hashes(dinv)へ振り分けたもの。
  * ロック解放後にまとめて書き込むための一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */

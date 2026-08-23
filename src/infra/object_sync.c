@@ -884,6 +884,11 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
         bm_log("[object_sync] verack received\n");
+        /* §11 2026-08-23: inbound/outbound問わず、verack受信時点で双方向のversion/verack
+         * 交換が完了している(相手も既にこちらのversionを受け取っている)。
+         * network.cのアイドル/ハンドシェイクタイムアウト判定(bm_network_idle_sweep)が
+         * 使う「fully established」フラグをここで立てる。 */
+        conn->handshake_complete = 1;
         record_outbound_success(ctx, conn);
         send_addr_reply(ctx, conn);
     }

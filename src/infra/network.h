@@ -67,6 +67,17 @@ struct bm_fd_data
      * object_sync.cのversion受信処理が設定する(接続直後は0=未受信のまま)。
      * BM_SERVICE_NODE_DANDELION(protocol.h)のstem successor選定に使う。 */
     uint64_t services;
+    /* §11 2026-08-23: inbound接続のアイドル/ハンドシェイクタイムアウト用。読み取り成功時
+     * (bm_network_handle_readable)に更新される「最終活動時刻」。bm_fd_data_new時点の
+     * 接続確立時刻で初期化する。keepalive ping送信時にも自己完結的に更新することで
+     * (PyBitmessageのlastTxが読み書き両方で更新されるのと同じ効果を、pingという1箇所の
+     * 書き込みだけで再現)、無応答の相手へping spamしてしまうのを防ぐ。 */
+    int64_t last_activity;
+    /* §11 2026-08-23: verack受信済み(=双方向のversion/verack交換が完了済み)かどうか。
+     * object_sync.cのverack受信ブランチが立てる。inbound/outbound問わず、verack受信
+     * 時点で相手も既にこちらのversionを受け取っている(既存のコメント参照)ため、
+     * ここが正しい"fully established"判定点になる。0=未完了(既定)。 */
+    int handshake_complete;
 };
 
 /* コマンド受信時のコールバック。DESIGN.md §1.2 command_queue へ積む処理は
@@ -168,5 +179,22 @@ struct bm_epoll_thread_args
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。
  * argは struct bm_epoll_thread_args* (malloc済み、スレッド終了時にfreeされる) */
 void *bm_network_epoll_thread(void *arg);
+
+/* §11 2026-08-23: PyBitmessage本家(network/connectionpool.pyのメインループ)に
+ * 合わせた値。ヘッダで公開しているのは、テストが「境界値の前後」を実際の値で検証
+ * できるようにするため(bm_network_idle_sweepのdocも参照)。 */
+#define BM_HANDSHAKE_TIMEOUT_SECONDS 20
+#define BM_IDLE_PING_TIMEOUT_SECONDS 300
+
+/*
+ * §11 2026-08-23: inbound接続のアイドル/ハンドシェイクタイムアウト+keepalive ping送信
+ * (PyBitmessage本家のnetwork/connectionpool.pyメインループを移植)。args->registryに
+ * 登録済みの全接続を走査し、handshake_complete==0でBM_HANDSHAKE_TIMEOUT_SECONDS以上
+ * 無活動なら切断(rating失敗記録込み、outboundのみ)、handshake_complete==1で
+ * BM_IDLE_PING_TIMEOUT_SECONDS以上無活動ならpingを送信する。nowを明示引数に取ることで
+ * テストが実際の壁時計待ちをせずに呼べる(bm_peer_manager_cleanup等と同じ慣習)。
+ * bm_network_epoll_threadが自身のepoll_waitタイムアウトのたびに呼ぶ。
+ */
+void bm_network_idle_sweep(struct bm_epoll_thread_args *args, int64_t now);
 
 #endif /* BM_INFRA_NETWORK_H */

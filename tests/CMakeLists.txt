@@ -127,3 +127,7 @@ add_test(NAME network_format_host_port COMMAND test_network_format_host_port)
 add_executable(test_logging test_logging.c)
 target_link_libraries(test_logging PRIVATE bm_common Threads::Threads)
 add_test(NAME logging COMMAND test_logging)
+
+add_executable(test_idle_sweep test_idle_sweep.c)
+target_link_libraries(test_idle_sweep PRIVATE bm_core bm_infra)
+add_test(NAME idle_sweep COMMAND test_idle_sweep)

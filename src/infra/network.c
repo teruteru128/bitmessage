@@ -28,6 +28,12 @@
  * ケースも考慮し、単一メッセージの上限より少し余裕を持たせる)。 */
 #define MAX_RECV_BUFFER_SIZE (2u * (BM_MESSAGE_HEADER_SIZE + BM_MAX_MESSAGE_LENGTH))
 
+/* §11 2026-08-23: epoll_waitのタイムアウト(socket活動が無くても定期的に
+ * bm_network_idle_sweepへ戻ってくるための間隔)。BM_HANDSHAKE_TIMEOUT_SECONDS/
+ * BM_IDLE_PING_TIMEOUT_SECONDSはnetwork.hで公開(テストが実際の値で境界を検証できるように
+ * するため)。 */
+#define BM_IDLE_SWEEP_INTERVAL_MS 5000
+
 struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
 {
     struct bm_fd_data *data = calloc(1, sizeof(struct bm_fd_data));
@@ -39,6 +45,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
     data->fd = fd;
     data->size = INIT_RECV_BUFFER_SIZE;
     data->length = 0;
+    data->last_activity = (int64_t)time(NULL);
 
     data->local_len = sizeof(data->local_addr);
     if (getsockname(fd, (struct sockaddr *)&data->local_addr, &data->local_len) == -1)
@@ -271,6 +278,9 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         {
             return 1; /* peer closed */
         }
+        /* §11 2026-08-23: アイドルタイムアウト判定用の最終活動時刻。読み取れた時点で更新する
+         * (bm_network_idle_sweep参照)。 */
+        conn->last_activity = (int64_t)time(NULL);
         if (conn->length + (size_t)n > conn->size)
         {
             size_t new_size = conn->size;
@@ -435,6 +445,85 @@ void bm_network_format_host_port(const char *host, int port, char *out, size_t o
     }
 }
 
+/*
+ * §11 2026-08-22発覚のバグ修正+2026-08-23切り出し: 接続を切断する際の後始末一式
+ * (rating失敗記録・registryからの除去・epoll登録解除・close・bm_fd_data_free)。
+ * 以前はbm_network_epoll_thread内の「読み取り失敗」パス専用に直書きされていたが、
+ * §11 2026-08-23で新設したアイドル/ハンドシェイクタイムアウトによる能動的な切断とも
+ * 共有するため切り出した。rating失敗記録は元のコメント通りoutbound
+ * (BM_FD_CLIENT_SOCKET)のみが対象(こちらから選んだ相手ではないinboundは対象外)。
+ */
+static void close_connection(struct bm_epoll_thread_args *args, struct bm_fd_data *conn)
+{
+    if (conn->type == BM_FD_CLIENT_SOCKET && args->peers_db != NULL)
+    {
+        char ip[BM_PEER_IP_STRLEN];
+        int port = 0;
+        bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+        if (ip[0] != '\0')
+        {
+            bm_peer_manager_record_result(args->peers_db, ip, port, 1, 0);
+        }
+    }
+    if (args->registry != NULL)
+    {
+        bm_peer_registry_remove(args->registry, conn);
+    }
+    epoll_ctl(args->epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+    close(conn->fd);
+    bm_fd_data_free(conn);
+}
+
+struct idle_sweep_ctx
+{
+    struct bm_epoll_thread_args *args;
+    int64_t now;
+};
+
+static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
+{
+    struct idle_sweep_ctx *ctx = user_data;
+    if (conn->type == BM_FD_LISTEN_SOCKET)
+    {
+        return; /* listenソケット自体は対象外 */
+    }
+    int64_t idle_seconds = ctx->now - conn->last_activity;
+
+    if (!conn->handshake_complete)
+    {
+        if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)
+        {
+            bm_log("[network] closing %s connection (fd=%d): handshake not completed within %ds\n",
+                    conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
+                    BM_HANDSHAKE_TIMEOUT_SECONDS);
+            close_connection(ctx->args, conn);
+        }
+        return;
+    }
+
+    if (idle_seconds > BM_IDLE_PING_TIMEOUT_SECONDS)
+    {
+        /* §11 2026-08-23: pingを送るだけで切断はしない(PyBitmessage本家と同じ)。
+         * 送信直後にlast_activityをここで更新することで、無応答の相手へ毎回のsweepで
+         * ping spamしてしまうのを防ぐ(次にpingを送るのはさらにBM_IDLE_PING_TIMEOUT_SECONDS
+         * 経ってから)。 */
+        if (send_header_only(conn->fd, "ping") == 0)
+        {
+            conn->last_activity = ctx->now;
+        }
+    }
+}
+
+void bm_network_idle_sweep(struct bm_epoll_thread_args *args, int64_t now)
+{
+    if (args->registry == NULL)
+    {
+        return; /* registry無しではどの接続が生きているか把握できない(テスト等) */
+    }
+    struct idle_sweep_ctx ctx = {.args = args, .now = now};
+    bm_peer_registry_for_each(args->registry, idle_sweep_one, &ctx);
+}
+
 void *bm_network_epoll_thread(void *arg)
 {
     struct bm_epoll_thread_args *args = arg;
@@ -442,7 +531,7 @@ void *bm_network_epoll_thread(void *arg)
 
     for (;;)
     {
-        int nfds = epoll_wait(args->epfd, events, MAX_EPOLL_EVENTS, -1);
+        int nfds = epoll_wait(args->epfd, events, MAX_EPOLL_EVENTS, BM_IDLE_SWEEP_INTERVAL_MS);
         if (nfds == -1)
         {
             if (errno == EINTR)
@@ -471,26 +560,14 @@ void *bm_network_epoll_thread(void *arg)
                  * わたって繰り返されていた)。ここで切断時にfailureとして-0.1を記録することで、
                  * 繰り返し切断してくるpeerは他の正常なpeerと同様ratingが下がり、
                  * peer_manager.cの低rating cleanup(既存実装)の対象にもなり得るようにする。
-                 * inbound(BM_FD_SERVER_SOCKET)接続はこちらから選んだ相手ではないため対象外。 */
-                if (conn->type == BM_FD_CLIENT_SOCKET && args->peers_db != NULL)
-                {
-                    char ip[BM_PEER_IP_STRLEN];
-                    int port = 0;
-                    bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
-                    if (ip[0] != '\0')
-                    {
-                        bm_peer_manager_record_result(args->peers_db, ip, port, 1, 0);
-                    }
-                }
-                if (args->registry != NULL)
-                {
-                    bm_peer_registry_remove(args->registry, conn);
-                }
-                epoll_ctl(args->epfd, EPOLL_CTL_DEL, conn->fd, NULL);
-                close(conn->fd);
-                bm_fd_data_free(conn);
+                 * inbound(BM_FD_SERVER_SOCKET)接続はこちらから選んだ相手ではないため対象外。
+                 * (§11 2026-08-23切り出し: close_connectionへ共通化) */
+                close_connection(args, conn);
             }
         }
+        /* §11 2026-08-23: socket活動が無くても(nfds==0のタイムアウト時も含め)定期的に
+         * アイドル/ハンドシェイクタイムアウトを走査する */
+        bm_network_idle_sweep(args, (int64_t)time(NULL));
     }
     free(args);
     return NULL;

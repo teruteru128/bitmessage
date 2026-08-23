@@ -35,6 +35,15 @@ size_t bm_peer_registry_count(struct bm_peer_registry *reg);
 int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port);
 
 /*
+ * §11 2026-08-23: 登録済みの全接続についてcallbackを呼ぶ汎用イテレータ(network.cの
+ * アイドル/ハンドシェイクタイムアウト走査で使う)。ロックを持っている間にconnポインタの
+ * スナップショットだけ取り、callback自体はロック解放後に呼ぶ(callbackが
+ * bm_peer_registry_removeを呼んでも同じmutexの再帰ロックにならない)。
+ */
+void bm_peer_registry_for_each(struct bm_peer_registry *reg, void (*callback)(struct bm_fd_data *conn, void *user_data),
+                                void *user_data);
+
+/*
  * 現在接続中の全peer(exceptが非NULLならそれを除く)へ、hashesを送る。接続ごと・hashごとに
  * infra/object.hのbm_decide_propagation(§9 Dandelion++の差し込み点)を呼び、FLUFF判定
  * されたhashは通常のinv、STEM判定されたhashはdinvとして送る(SKIP判定のhashはその接続へは

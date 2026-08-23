@@ -2437,21 +2437,46 @@ onion優遇は実データで既に自然に高rating傾向のため見送り)�
 上位候補の方が1件あたり明確に高い頻度(実測で約19倍、理論値の`0.5/0.0263`とほぼ一致)で
 選ばれることを確認)、ctest 32件全通過。
 
+### inbound接続のアイドル/ハンドシェイクタイムアウト + keepalive ping送信(2026-08-23)
+
+backlog項目1(2026-08-21洗い出し)に着手。`infra/network.c`の`bm_network_epoll_thread`は
+`epoll_wait(..., -1)`で無限待機固定で、TCP接続だけ確立して何も送ってこない相手を
+切断する仕組みが無かった。inbound(Stage 1/2)を有効化した以上、実質的なslowloris
+タイプのリソース枯渇経路になりうる懸念があった。
+
+**設計**: PyBitmessage本家(`network/connectionpool.py`のメインループ)を調査したところ、
+「ハンドシェイク未完了のまま20秒経過したら切断、fully established後はidleTimeout
+(既定300秒)経過ごとにpingを送るだけ(切断はしない)」という仕組みを持っていた。この
+値・方針をそのまま踏襲した。`lastTx`(最終活動時刻)は本家では読み書き両方で更新される
+が、うちでは簡略化してREAD成功時のみ更新(central dispatch点である
+`bm_network_handle_readable`の1箇所で済む)し、pingを送った直後だけその場で
+`last_activity`を更新することで「無応答の相手へping spamし続ける」のを防ぐ、という形にした。
+
+**実装**: `struct bm_fd_data`(`network.h`)に`last_activity`/`handshake_complete`を追加。
+`handshake_complete`は`object_sync.c`のverack受信ブランチで立てる(inbound/outbound
+問わず、verack受信時点で双方向のversion/verack交換が完了しているため)。
+`bm_network_epoll_thread`の`epoll_wait`タイムアウトを`-1`→5秒に変更し、socket活動が
+無くても定期的に`bm_network_idle_sweep(args, now)`(新設、`now`を明示引数に取り
+テストが壁時計待ちせず呼べるようにした、`bm_peer_manager_cleanup`等と同じ慣習)を
+呼ぶようにした。既存の「切断時クリーンアップ」処理(rating失敗記録・registry除去・
+epoll登録解除・close・free)は`close_connection`として切り出し、読み取り失敗時の
+既存パスと新設のアイドルタイムアウトパスの両方から共有する。`peer_registry.c`に
+汎用イテレータ`bm_peer_registry_for_each`を新設(ロック中はポインタのスナップショット
+だけ取り、実処理はロック解放後に行うことでcallbackが`bm_peer_registry_remove`を
+呼んでも再帰ロックにならないようにした)。
+
+回帰テスト`tests/test_idle_sweep.c`を新設(固定の`now`を使い、ハンドシェイク未完了
+接続が境界の前後で切断される/されないこと、fully established接続がタイムアウト後に
+実際に`ping`パケットを送信しつつ切断はされないことを確認)、ctest 33件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。上記セッションで新たに洗い出した
 項目を含め、残るのは以下の通り(優先度順)。
 
-1. **inbound接続のアイドル/ハンドシェイクタイムアウトが無い、keepalive `ping`の自発送信も
-   無い**: `infra/network.c`の`bm_network_epoll_thread`は`epoll_wait(..., -1)`で無限待機
-   固定で、TCP接続だけ確立して何も送ってこない相手を切断する仕組みが無い。inbound
-   (Stage 1/2)を有効化した以上、実質的なslowlorisタイプのリソース枯渇経路になりうる。
-   2026-08-23にPyBitmessage本家(`network/connectionpool.py`のメインループ)を確認したところ、
-   (a) fully establishedな接続がidleになったら自分から`ping`を送る、(b) handshake未完了の
-   まま一定時間(20秒)経過した接続はcloseする、という2つの仕組みを持っていた。うちは`ping`
-   受信時に`pong`を返す(`infra/network.c`)だけで、自分から`ping`を送ることも無応答の相手を
-   切断することも一切していない。実装時はこの2点セットを参考にする。
+1. ~~**inbound接続のアイドル/ハンドシェイクタイムアウトが無い、keepalive `ping`の自発送信も
+   無い**~~: 2026-08-23完了(上記まとめ参照)。
 2. **inbound接続のレート制限が無い**: 実際に相手ノードから「Too many connections from
    your IP」で拒否される場面を観測した(上記参照)一方、こちら側には対応する制限が
    無い。Tor hidden service経由のinbound接続は`accept()`で見える接続元が常にTorの
@@ -2522,7 +2547,8 @@ onion優遇は実データで既に自然に高rating傾向のため見送り)�
      標準的に入手可能なため、大掛かりな対応は不要。CIにもう1ディストリ(Fedora等)を
      追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
      十分と判断。
-10. Dandelion++・inbound接続・outbound addrメッセージ送信はいずれも完了(上記まとめ参照)。
+10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+    ハンドシェイクタイムアウト+keepalive pingはいずれも完了(上記まとめ参照)。
     GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
