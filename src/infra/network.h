@@ -80,6 +80,38 @@ struct bm_fd_data
     int handshake_complete;
 };
 
+/*
+ * §11 2026-08-23: inbound接続のレート制限(DoS対策、backlog項目2)。Tor hidden service経由の
+ * inboundはaccept()で見える接続元IPが常にTorのローカル転送(127.0.0.1:<ephemeral>)になり、
+ * 実際に相手ノードから「Too many connections from your IP」で拒否される場面を観測しているにも
+ * 関わらずこちら側には対応する制限が無かった。生IPベースの制限はoriginally intended targetを
+ * 区別できず機能しない(全接続が同一IPに見える)ため、IPに依存しない2種類の制限を設ける:
+ * (1) 同時接続数の上限(BM_MAX_INBOUND_CONNECTIONS、bm_peer_registry_count_by_typeで判定)、
+ * (2) 単位時間あたりのaccept数の上限(固定窓カウンタ、BM_INBOUND_ACCEPT_WINDOW_SECONDS秒
+ * ごとにリセット)。どちらも超過時はaccept()自体は行った上で即座にcloseする
+ * (listen backlogキューに溜め続けさせず次の接続試行にすぐ空きを渡すため。recv_buffer確保や
+ * handshake処理は一切しない)。
+ */
+#define BM_MAX_INBOUND_CONNECTIONS 64
+#define BM_INBOUND_ACCEPT_WINDOW_SECONDS 10
+#define BM_INBOUND_ACCEPT_MAX_PER_WINDOW 20
+
+struct bm_inbound_rate_limiter
+{
+    int64_t window_start;
+    int count_in_window;
+};
+
+void bm_inbound_rate_limiter_init(struct bm_inbound_rate_limiter *rl);
+
+/*
+ * 呼ぶたびに今回のaccept 1件ぶんとして内部カウンタを進める。窓内の累積数が
+ * BM_INBOUND_ACCEPT_MAX_PER_WINDOWを超えていなければ1(許可)、超えていれば0(拒否)を返す。
+ * nowを明示引数に取ることで、テストが実際の壁時計待ちをせずに呼べる
+ * (bm_network_idle_sweep等、このプロジェクト全体の慣習と同じ)。
+ */
+int bm_inbound_rate_limiter_allow(struct bm_inbound_rate_limiter *rl, int64_t now);
+
 /* コマンド受信時のコールバック。DESIGN.md §1.2 command_queue へ積む処理は
  * このコールバックの実装(infra/object.c等)側で行う想定 */
 typedef void (*bm_command_handler_fn)(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data);
@@ -174,6 +206,10 @@ struct bm_epoll_thread_args
      * フィードバックする経路が無く、"接続はできるが即座に切れる"peerのratingが下がらず
      * 際限なく再選出され続けていた)。NULL可(未使用ならrating更新をスキップ、テスト等)。 */
     sqlite3 *peers_db;
+    /* §11 2026-08-23: inbound accept数のレート制限用状態。main.cが起動時に
+     * bm_inbound_rate_limiter_initで初期化してから渡すこと(mallocでは自動でゼロ初期化
+     * されない)。listenソケットを使わない(=inbound無効)構成のargsでは未使用のまま無害。 */
+    struct bm_inbound_rate_limiter inbound_rate_limiter;
 };
 
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。
@@ -196,5 +232,19 @@ void *bm_network_epoll_thread(void *arg);
  * bm_network_epoll_threadが自身のepoll_waitタイムアウトのたびに呼ぶ。
  */
 void bm_network_idle_sweep(struct bm_epoll_thread_args *args, int64_t now);
+
+/*
+ * §11 inbound接続(Tor hidden service)対応。listenソケットがreadable(=accept可能)になった際に
+ * 呼ぶ。EAGAINになるまで(=溜まっている分を全部)accept()し、BM_MAX_INBOUND_CONNECTIONS
+ * (同時接続数)/BM_INBOUND_ACCEPT_MAX_PER_WINDOW(単位時間あたりaccept数)のいずれかを
+ * 超える分は即座にcloseする(2026-08-23 backlog項目2、上記の各定数のdoc参照)。
+ * 上限内の接続はBM_FD_SERVER_SOCKETとしてepoll登録・registry登録する。inbound接続はこの
+ * 時点ではまだ相手のversionを受け取っていないため、自分からは何も送らずに待つ(相手からの
+ * versionを受けてobject_sync.cが自分のversionを送り返す、object_sync_dispatch参照)。
+ * nowはbm_inbound_rate_limiter_allowへそのまま渡す(テスト容易性、他の同種APIと同じ慣習)。
+ * ヘッダで公開しているのはtest_idle_sweep.cと同様、テストがepollスレッド自体
+ * (無限ループ)を起動せず直接呼べるようにするため。
+ */
+void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *listener, int64_t now);
 
 #endif /* BM_INFRA_NETWORK_H */

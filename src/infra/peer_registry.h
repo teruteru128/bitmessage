@@ -31,6 +31,10 @@ void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *co
 /* 現在の登録数(peer_connectorが接続数維持の判断に使う) */
 size_t bm_peer_registry_count(struct bm_peer_registry *reg);
 
+/* §11 2026-08-23: typeで絞り込んだ登録数。network.cのinbound同時接続数上限チェックに使う
+ * (bm_peer_registry_countはoutbound/inbound合算のため、inbound専用の上限判定には使えない)。 */
+size_t bm_peer_registry_count_by_type(struct bm_peer_registry *reg, enum bm_fd_type type);
+
 /* ip:portが既に登録済みの接続の中にあるか(peer_connectorが同じ相手への二重接続を避けるため) */
 int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port);
 

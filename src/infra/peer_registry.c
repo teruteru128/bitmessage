@@ -70,6 +70,21 @@ size_t bm_peer_registry_count(struct bm_peer_registry *reg)
     return count;
 }
 
+size_t bm_peer_registry_count_by_type(struct bm_peer_registry *reg, enum bm_fd_type type)
+{
+    pthread_mutex_lock(&reg->lock);
+    size_t count = 0;
+    for (size_t i = 0; i < reg->count; i++)
+    {
+        if (reg->conns[i]->type == type)
+        {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return count;
+}
+
 int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int port)
 {
     pthread_mutex_lock(&reg->lock);

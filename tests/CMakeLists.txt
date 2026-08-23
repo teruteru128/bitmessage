@@ -131,3 +131,7 @@ add_test(NAME logging COMMAND test_logging)
 add_executable(test_idle_sweep test_idle_sweep.c)
 target_link_libraries(test_idle_sweep PRIVATE bm_core bm_infra)
 add_test(NAME idle_sweep COMMAND test_idle_sweep)
+
+add_executable(test_inbound_rate_limit test_inbound_rate_limit.c)
+target_link_libraries(test_inbound_rate_limit PRIVATE bm_core bm_infra)
+add_test(NAME inbound_rate_limit COMMAND test_inbound_rate_limit)

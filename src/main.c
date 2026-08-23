@@ -419,6 +419,7 @@ int main(void)
     net_args->user_data = &object_sync_ctx;
     net_args->registry = &peer_registry;
     net_args->peers_db = peers_db;
+    bm_inbound_rate_limiter_init(&net_args->inbound_rate_limiter);
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);
 

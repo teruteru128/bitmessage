@@ -2469,6 +2469,58 @@ epoll登録解除・close・free)は`close_connection`として切り出し、�
 接続が境界の前後で切断される/されないこと、fully established接続がタイムアウト後に
 実際に`ping`パケットを送信しつつ切断はされないことを確認)、ctest 33件全通過。
 
+### inbound接続のレート制限(DoS対策)(2026-08-23)
+
+backlog項目2に着手。実際に相手ノードから「Too many connections from your IP」で
+拒否される場面をログ上で観測していた一方、こちら側には対応する制限が無かった。
+実ネットワーク上の未知のnodeからの着信を受け付ける以上、素朴なリソース枯渇型DoSの
+入口になりうるという懸念から、実際のinbound到達実績(daemon-b-inbound-testでの
+2件の成功接続確認)を待たずに先に着手した。
+
+**設計上の制約**: Tor hidden service経由のinboundは`accept()`で見える接続元が
+常にTorのローカル転送(`127.0.0.1:<ephemeral>`)になり、生IPベースのレート制限は
+originally intended targetを区別できず機能しない(全接続が同一IPに見えるため、
+早期に全遮断するか無意味になるかのどちらかになる)。そのためIPに依存しない
+2種類の制限を設けた。
+
+**実装**:
+- 同時接続数の上限(`BM_MAX_INBOUND_CONNECTIONS`=64、`network.h`)。
+  `peer_registry.c`に`bm_peer_registry_count_by_type`を新設(既存の
+  `bm_peer_registry_count`はoutbound/inbound合算のため、inbound専用の上限判定には
+  使えなかった)。
+- 単位時間あたりのaccept数の上限(`BM_INBOUND_ACCEPT_MAX_PER_WINDOW`=20 /
+  `BM_INBOUND_ACCEPT_WINDOW_SECONDS`=10秒、固定窓カウンタ)。`struct
+  bm_inbound_rate_limiter`(`network.h`)として新設し、`bm_network_epoll_thread`の
+  1ループぶんの`now`(idle_sweepと共有、`time(NULL)`呼び出しを1回に節約)を明示引数に
+  取る(`bm_inbound_rate_limiter_allow`、他の時刻依存ロジックと同じテスト容易性の慣習)。
+  状態は`struct bm_epoll_thread_args`に`inbound_rate_limiter`フィールドとして持たせ、
+  `main.c`起動時に`bm_inbound_rate_limiter_init`で初期化する。
+- どちらの上限も超過時は`accept()`自体は行った上で即座に`close()`する(listen
+  backlogキューに溜め続けさせず、次の接続試行にすぐ空きを渡すため。recv_buffer確保や
+  handshake処理は一切しない)。
+- 既存のprivate関数`handle_accept`を`bm_network_handle_accept`として公開した
+  (`bm_network_idle_sweep`と同様、テストがepollスレッド自体を起動せず直接呼べるように
+  するため)。
+
+**テスト**: `tests/test_inbound_rate_limit.c`を新設。単体テスト(窓カウンタの境界値・
+リセット)に加え、実listenソケット+実クライアント接続を使った統合テストも書いた。
+統合テストの初版では、同時接続数上限のケースを検証するために
+`BM_MAX_INBOUND_CONNECTIONS+2`本(66本)ものTCP接続を先にqueueさせてから
+`bm_network_handle_accept`を1回呼ぶ実装にしたが、`bm_network_listen`のlisten
+backlog(16)を大幅に超えるconnect()を同時に発行することになり、backlogに
+入りきらない分の`connect()`がカーネルのSYNリトライで長時間ブロックし、ctest全体が
+13分以上ハングする事故を起こした(ユーザーからの「長いですね……」の指摘で発覚)。
+実際に大量のTCP接続を同時にqueueさせる方式は避け、`bm_peer_registry_add`で
+registryへ合成のinbound接続(socketpair)をあらかじめ上限ぶん直接投入して「既に
+上限に達している」状態を決定的に作った上で、実クライアントを1本だけ接続して
+検証する方式に書き直した(レート制限側の検証も同様に、`bm_inbound_rate_limiter_allow`
+を直接呼んで窓を使い切ってから実クライアント1本で検証)。ctest 34件全通過。
+
+DESIGN.md執筆時点でのユーザーからの申し送り: 各定数(`BM_MAX_INBOUND_CONNECTIONS`
+等)は現状ハードコードのままとした。実運用でこの上限に頻繁に到達するようであれば、
+`core/config_store.c`(SOCKS5プロキシ設定と同じ枠組み)への設定化を検討する
+(未着手、次回以降の判断待ち)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -2477,13 +2529,11 @@ epoll登録解除・close・free)は`close_connection`として切り出し、�
 
 1. ~~**inbound接続のアイドル/ハンドシェイクタイムアウトが無い、keepalive `ping`の自発送信も
    無い**~~: 2026-08-23完了(上記まとめ参照)。
-2. **inbound接続のレート制限が無い**: 実際に相手ノードから「Too many connections from
-   your IP」で拒否される場面を観測した(上記参照)一方、こちら側には対応する制限が
-   無い。Tor hidden service経由のinbound接続は`accept()`で見える接続元が常にTorの
-   ローカル転送(`127.0.0.1:<ephemeral>`)になるため、素朴な生IPベースの制限は
-   originally intended targetを区別できず機能しない(全部同一IPに見えるので早期に
-   全遮断してしまうか、逆に無意味になる)。同時接続数上限や単位時間あたりaccept数のような、
-   IPに依存しない方式が必要。設計方針のみ議論済み、未着手。
+2. ~~**inbound接続のレート制限が無い**~~: 2026-08-23完了(上記まとめ参照)。同時接続数
+   上限(`BM_MAX_INBOUND_CONNECTIONS`)・単位時間あたりaccept数上限
+   (`BM_INBOUND_ACCEPT_MAX_PER_WINDOW`)ともIPに依存しない固定値で実装した。
+   実運用でこれらの定数に頻繁に到達するようなら、`config_store.c`への設定化を
+   改めて検討する(ユーザーからの申し送り、未着手)。
 3. **プロトコルバージョンの互換性チェックが無い**: `ver.version`を受信してログに出す
    だけで、最低対応バージョンを下回る古いnodeを弾く処理が無い。優先度低。
 4. **version messageの`timestamp`が未検証**: パースはするが一切使っていない。object
@@ -2548,8 +2598,9 @@ epoll登録解除・close・free)は`close_connection`として切り出し、�
      追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
      十分と判断。
 10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
-    ハンドシェイクタイムアウト+keepalive pingはいずれも完了(上記まとめ参照)。
-    GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+    ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限はいずれも完了
+    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
+    対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

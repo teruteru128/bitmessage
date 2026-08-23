@@ -126,6 +126,7 @@ int main(void)
     args->user_data = NULL;
     args->registry = NULL;
     args->peers_db = peers_db;
+    bm_inbound_rate_limiter_init(&args->inbound_rate_limiter);
 
     pthread_t epoll_thread;
     CHECK(pthread_create(&epoll_thread, NULL, bm_network_epoll_thread, args) == 0,

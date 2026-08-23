@@ -353,14 +353,33 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
     return 0;
 }
 
+void bm_inbound_rate_limiter_init(struct bm_inbound_rate_limiter *rl)
+{
+    rl->window_start = 0;
+    rl->count_in_window = 0;
+}
+
+int bm_inbound_rate_limiter_allow(struct bm_inbound_rate_limiter *rl, int64_t now)
+{
+    if (now - rl->window_start >= BM_INBOUND_ACCEPT_WINDOW_SECONDS)
+    {
+        rl->window_start = now;
+        rl->count_in_window = 0;
+    }
+    rl->count_in_window++;
+    return rl->count_in_window <= BM_INBOUND_ACCEPT_MAX_PER_WINDOW;
+}
+
 /*
  * §11 inbound接続(Tor hidden service)対応。listenソケットがreadable(=accept可能)に
  * なった際に呼ぶ。EAGAINになるまで(=溜まっている分を全部)accept()し、各接続を
  * BM_FD_SERVER_SOCKETとしてepoll登録・registry登録する。inbound接続はこの時点では
  * まだ相手のversionを受け取っていないため、自分からは何も送らずに待つ(相手からの
  * versionを受けてobject_sync.cが自分のversionを送り返す、object_sync_dispatch参照)。
+ * §11 2026-08-23 backlog項目2: 同時接続数上限/accept数レート制限を超える分はここで
+ * 即座にcloseする(network.h各定数のdoc参照)。
  */
-static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *listener)
+void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *listener, int64_t now)
 {
     for (;;)
     {
@@ -372,6 +391,22 @@ static void handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_data *
                 perror("[network] accept");
             }
             break;
+        }
+
+        if (!bm_inbound_rate_limiter_allow(&args->inbound_rate_limiter, now))
+        {
+            bm_log("[network] rejecting inbound connection (fd=%d): accept rate limit exceeded (>%d per %ds)\n",
+                    client_fd, BM_INBOUND_ACCEPT_MAX_PER_WINDOW, BM_INBOUND_ACCEPT_WINDOW_SECONDS);
+            close(client_fd);
+            continue;
+        }
+        if (args->registry != NULL
+            && bm_peer_registry_count_by_type(args->registry, BM_FD_SERVER_SOCKET) >= BM_MAX_INBOUND_CONNECTIONS)
+        {
+            bm_log("[network] rejecting inbound connection (fd=%d): concurrent inbound limit reached (%d)\n",
+                    client_fd, BM_MAX_INBOUND_CONNECTIONS);
+            close(client_fd);
+            continue;
         }
 
         int flags = fcntl(client_fd, F_GETFL, 0);
@@ -543,12 +578,16 @@ void *bm_network_epoll_thread(void *arg)
             perror("epoll_wait");
             break;
         }
+        /* §11 2026-08-23: 1ループぶんの基準時刻を一度だけ取得し、accept()のレート制限判定と
+         * 末尾のidle_sweepの両方で共有する(time(NULL)の呼び出しを1回に節約しつつ、同じ
+         * ループ内で判定基準がずれないようにする)。 */
+        int64_t now = (int64_t)time(NULL);
         for (int i = 0; i < nfds; i++)
         {
             struct bm_fd_data *conn = events[i].data.ptr;
             if (conn->type == BM_FD_LISTEN_SOCKET)
             {
-                handle_accept(args, conn);
+                bm_network_handle_accept(args, conn, now);
                 continue;
             }
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
@@ -569,7 +608,7 @@ void *bm_network_epoll_thread(void *arg)
         }
         /* §11 2026-08-23: socket活動が無くても(nfds==0のタイムアウト時も含め)定期的に
          * アイドル/ハンドシェイクタイムアウトを走査する */
-        bm_network_idle_sweep(args, (int64_t)time(NULL));
+        bm_network_idle_sweep(args, now);
     }
     free(args);
     return NULL;
