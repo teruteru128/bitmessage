@@ -909,6 +909,18 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
 
     unsigned char(*fluff)[32] = malloc(sizeof(*fluff) * hash_count);
     unsigned char(*stem)[32] = malloc(sizeof(*stem) * hash_count);
+    /* §11 2026-08-24発覚: mallocの戻り値を確認していなかった(hash_countは現状1万件超、
+     * 接続のたびに毎回この規模で呼ばれる)。失敗時にNULL参照でクラッシュしないよう
+     * ガードする(daemon Aが原因不明で2回突然終了した件の調査中に発見、確証は無いが
+     * 直接の原因候補として塞いでおく)。 */
+    if (fluff == NULL || stem == NULL)
+    {
+        bm_log("[object_sync] send_big_inv: malloc failed for %zu hashes, aborting\n", hash_count);
+        free(fluff);
+        free(stem);
+        free(hashes);
+        return;
+    }
     size_t fluff_count = 0;
     size_t stem_count = 0;
     for (size_t i = 0; i < hash_count; i++)

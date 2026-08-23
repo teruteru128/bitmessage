@@ -215,6 +215,17 @@ static struct dandelion_entry *find_or_create_entry(const unsigned char hash[32]
      * 並び替え時=間引き時だけ)なので、そのまま追記できる。負荷率次第でここが拡張の
      * トリガーにもなる(次回呼び出し用、今回のnew_indexの登録は拡張後のテーブルへ行う) */
     index_ensure_capacity();
+    /* §11 2026-08-24発覚: index_rebuildのmalloc失敗時、g_state.index_capacityが0のまま
+     * 呼び出し元へ戻ってくる(index_rebuild自身はエラー時に既存の状態を維持したまま
+     * 諦める設計、上記doc参照)。それに気付かず%g_state.index_capacityへ進むと
+     * ゼロ除算(SIGFPE)になる。エントリ自体はentries配列には既に追加済みなので、
+     * この場合は索引登録だけ諦める(次回find_or_create_entry呼び出し時、索引に
+     * 無いため線形探索フォールバックは無いが、次のindex_ensure_capacity呼び出しで
+     * 再度拡張を試みるため、メモリ不足が解消すれば自然に復旧する)。 */
+    if (g_state.index_capacity == 0)
+    {
+        return e;
+    }
     size_t slot = (size_t)(index_key(hash) % g_state.index_capacity);
     while (g_state.index_slots[slot] != BM_DANDELION_INDEX_EMPTY)
     {

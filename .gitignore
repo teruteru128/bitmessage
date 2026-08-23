@@ -4,3 +4,4 @@ build-*/
 *.db-shm
 compile_commands.json
 bitmessage.conf
+watchdog_daemon_a.sh
