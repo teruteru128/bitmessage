@@ -2702,6 +2702,14 @@ outbound 1本(handshake完了・user agent設定済み)・inbound 1本(handshake
 registryへ直接登録し、それぞれが正しい配列・フィールドで返ることを確認した。ctest
 34件全通過。
 
+**CLI連携の抜け(ユーザー指摘、同日中に追加)**: 既存の全APIメソッドは
+`bitmessage-cli`に1:1でサブコマンドが用意されている慣習があったが、
+listConnections実装時にそこを見落としていた。`cli/main.c`へ`list-connections`
+(引数無し、`listConnections`をそのまま呼ぶだけ)を追加し、usageにも追記した。
+実daemon Aに対して動作確認済み。ctest 34件全通過(既存の`cli_integration.sh`が
+`bitmessage-cli`バイナリ自体のビルドはカバーするが、個々のサブコマンド網羅は
+対象外のため専用の新規テストは追加していない)。
+
 ### ログ改善: 読み取りエラー/EOFによる接続切断が無言だった(2026-08-23)
 
 listConnections APIの動作確認中にユーザーが発見。実daemon Aへ`listConnections`を

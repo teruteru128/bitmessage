@@ -58,7 +58,10 @@ static void print_usage(const char *prog)
             "      bitmessagedにも次の再接続サイクル(既定30秒以内)で反映される(再起動不要)\n"
             "  add-peer <ipAddress> <port> [stream]\n"
             "      個人的に存在を確認した(掲示板等の匿名リストではなく実際に運用者と面識のある\n"
-            "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n",
+            "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n"
+            "  list-connections\n"
+            "      現在接続中のpeer一覧({inbound:[...], outbound:[...]}、各要素host/port/\n"
+            "      fullyEstablished/userAgent)を返す\n",
             prog);
 }
 
@@ -367,6 +370,11 @@ int main(int argc, char **argv)
             bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
         }
         return call_rpc(&env, "addPeer", params);
+    }
+
+    if (strcmp(cmd, "list-connections") == 0)
+    {
+        return call_rpc(&env, "listConnections", params);
     }
 
     fprintf(stderr, "不明なコマンド: %s\n\n", cmd);
