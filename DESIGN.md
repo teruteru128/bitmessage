@@ -2532,18 +2532,23 @@ onionアドレス自体は一切git管理下に置かない方針)のため、�
 
 1. **`HiddenServiceDir`は`debian-tor:debian-tor`所有・`0700`で非対話的に読めない**。
    `sudo -n cat`はパスワードキャッシュが無ければ失敗する(このリポジトリの操作環境は
-   `sudo`にTTYを割り当てられないため、Claude Code側からの`sudo`実行は原理的に不可能。
-   ユーザー自身が別の実ターミナルで一度だけ以下を実行し、以後は非rootで読めるように
-   しておく必要がある)。
-   ```
-   sudo setfacl -m u:<user>:x /var/lib/tor           # 親ディレクトリの通過権
-   sudo setfacl -m u:<user>:x /var/lib/tor/bitmessage # HiddenServiceDir自体の通過権
-   sudo setfacl -m u:<user>:r /var/lib/tor/bitmessage/hostname # ファイル自体の読取権
-   ```
-   Tor自身の所有者・パーミッションのオクテット表記(`0700`)は変更されないため、
-   Tor起動時のパーミッションチェック(`torrc`ロード時)への影響は無いはず、との
-   ユーザーによる指摘あり(このセッションでは実際にTorの再起動を伴わなかったため
-   影響の有無は未検証のまま)。
+   `sudo`にTTYを割り当てられないため、Claude Code側からの`sudo`実行は原理的に不可能)。
+
+   **`setfacl`による回避は失敗、絶対にやらないこと**: 当初
+   `sudo setfacl -m u:<user>:x /var/lib/tor`等でACLを付与し非rootでの読み取りを
+   実現したが、その状態で(権限確認のため)`systemctl restart tor@default.service`
+   した結果、Torが`Permissions on directory /var/lib/tor/bitmessage/ are too
+   permissive.` / `Failed to parse/validate config` でCONFIG読み込みに失敗し
+   `tor@default.service`が起動不能になった(実際に発生させてしまった障害)。
+   Torの`check_private_dir`はオクテット表記のパーミッションだけでなく拡張ACL
+   エントリの存在自体を「too permissive」として拒否する。`setfacl -b`で全ACLを
+   削除し`systemctl restart tor@default.service`することで復旧したが、
+   **Tor管理下のディレクトリ・ファイルへのパーミッション変更(ACL含む)は
+   一切行わないこと**。恒久的な解決策は次回セッションで検討する(候補:
+   onionアドレスをTorのファイルからではなくユーザー管理の非追跡ファイル
+   (例: `~/.bitmessage_onion`、0600、非Tor所有)に複製して保持する、または
+   このcatコマンド1つに限定したsudoers NOPASSWDルールを設ける、等。
+   いずれも未着手)。
 2. **`hostname`ファイルの内容には末尾に空白文字(おそらく`\r`)が1文字混入しており、
    単純な`$(cat hostname)`だと62文字であるべきv3 onionアドレスが63文字になり、
    `bm_object_sync_ctx`の`OBJECT_ONIONPEER`自己announce構築が
