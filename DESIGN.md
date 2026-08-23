@@ -2521,6 +2521,36 @@ DESIGN.md執筆時点でのユーザーからの申し送り: 各定数(`BM_MAX_
 `core/config_store.c`(SOCKS5プロキシ設定と同じ枠組み)への設定化を検討する
 (未着手、次回以降の判断待ち)。
 
+### 運用メモ: daemon再起動時のonionアドレス復元手順(2026-08-23)
+
+上記のレート制限機能をdaemon Aへ反映する再起動作業中に判明した運用上の注意点。
+`BM_ONION_ADDRESS`は環境変数としてのみ渡す設計(§11「自己接続の防止」節参照、
+onionアドレス自体は一切git管理下に置かない方針)のため、プロセスを一度落とすと
+`/proc/<pid>/environ`からの復元経路も失われる。この場合、Tor hidden serviceの
+`HiddenServiceDir`配下の`hostname`ファイルから読み直す必要があるが、以下2点に
+注意する。
+
+1. **`HiddenServiceDir`は`debian-tor:debian-tor`所有・`0700`で非対話的に読めない**。
+   `sudo -n cat`はパスワードキャッシュが無ければ失敗する(このリポジトリの操作環境は
+   `sudo`にTTYを割り当てられないため、Claude Code側からの`sudo`実行は原理的に不可能。
+   ユーザー自身が別の実ターミナルで一度だけ以下を実行し、以後は非rootで読めるように
+   しておく必要がある)。
+   ```
+   sudo setfacl -m u:<user>:x /var/lib/tor           # 親ディレクトリの通過権
+   sudo setfacl -m u:<user>:x /var/lib/tor/bitmessage # HiddenServiceDir自体の通過権
+   sudo setfacl -m u:<user>:r /var/lib/tor/bitmessage/hostname # ファイル自体の読取権
+   ```
+   Tor自身の所有者・パーミッションのオクテット表記(`0700`)は変更されないため、
+   Tor起動時のパーミッションチェック(`torrc`ロード時)への影響は無いはず、との
+   ユーザーによる指摘あり(このセッションでは実際にTorの再起動を伴わなかったため
+   影響の有無は未検証のまま)。
+2. **`hostname`ファイルの内容には末尾に空白文字(おそらく`\r`)が1文字混入しており、
+   単純な`$(cat hostname)`だと62文字であるべきv3 onionアドレスが63文字になり、
+   `bm_object_sync_ctx`の`OBJECT_ONIONPEER`自己announce構築が
+   `failed to build onionpeer object (malformed onion address?)`で毎回黙って
+   失敗し続ける**(daemonの起動自体は成功するため気づきにくい)。
+   `tr -d '[:space:]'`で明示的にトリムしてから`BM_ONION_ADDRESS`へ渡すこと。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
