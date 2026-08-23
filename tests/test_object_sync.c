@@ -730,6 +730,50 @@ int main(void)
         truncated_error_msg.payload = one_byte_payload;
         bm_object_sync_dispatch(conn, &truncated_error_msg, &ctx);
         CHECK(1, "error message truncated right after 'fatal' should be ignored without crashing");
+
+        /* 9c. §11 2026-08-23発覚のバグ修正: fatal>=1のerrorを受信したら、ratingへ追加の
+         * ペナルティ(-0.1)を与えることを確認する。verack受信時の成功クレジット(+0.1)と
+         * 切断時の失敗クレジット(-0.1)がほぼ相殺し、"Server full"等で明確に拒否している
+         * peerへ毎サイクル再接続し続けてしまっていた問題への対策。専用のsocketpair/peers.db
+         * 行を使う(他シナリオのconnはUNIXソケットでlogical_peer_ipが無く、この検証には
+         * 使えないため) */
+        int fds9c[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds9c) == 0, "socketpair for error-penalty scenario");
+        struct bm_fd_data *conn9c = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds9c[0]);
+        CHECK(conn9c != NULL, "bm_fd_data_new for error-penalty scenario");
+        strncpy(conn9c->logical_peer_ip, "203.0.113.55", sizeof(conn9c->logical_peer_ip) - 1);
+        conn9c->logical_peer_port = 8444;
+
+        struct bm_peer_entry rejecting_peer;
+        memset(&rejecting_peer, 0, sizeof(rejecting_peer));
+        strncpy(rejecting_peer.ip_address, "203.0.113.55", sizeof(rejecting_peer.ip_address) - 1);
+        rejecting_peer.port = 8444;
+        rejecting_peer.stream = 1;
+        rejecting_peer.services = 1;
+        rejecting_peer.last_seen = (int64_t)time(NULL);
+        rejecting_peer.rating = 0.9; /* verack成功クレジットの積み重ねを模擬した高いrating */
+        strncpy(rejecting_peer.source, "test", sizeof(rejecting_peer.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &rejecting_peer) == 0, "seed the rejecting peer");
+
+        struct bm_message fatal_error_msg;
+        memset(&fatal_error_msg, 0, sizeof(fatal_error_msg));
+        memcpy(fatal_error_msg.command, "error", 5);
+        fatal_error_msg.length = (uint32_t)error_payload_len; /* 9aと同じfatal=2ペイロードを再利用 */
+        fatal_error_msg.payload = error_payload;
+        bm_object_sync_dispatch(conn9c, &fatal_error_msg, &ctx);
+
+        sqlite3_stmt *penalty_stmt = NULL;
+        sqlite3_prepare_v2(peers_db, "SELECT rating FROM hosts WHERE ip_address = '203.0.113.55' AND port = 8444;",
+                            -1, &penalty_stmt, NULL);
+        CHECK(sqlite3_step(penalty_stmt) == SQLITE_ROW, "the seeded peer row should still exist");
+        double rating_after = sqlite3_column_double(penalty_stmt, 0);
+        CHECK(rating_after < 0.9 - 1e-9,
+              "receiving a fatal error message should decrease the peer's rating, not leave it unchanged");
+        sqlite3_finalize(penalty_stmt);
+
+        close(fds9c[0]);
+        close(fds9c[1]);
+        bm_fd_data_free(conn9c);
     }
 
     /* --- 10. addr送信(§11 2026-08-23): verack受信時に、自分が知っているshareableなpeerを

@@ -1005,6 +1005,25 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                 }
             }
         }
+        /* §11 2026-08-23発覚のバグ修正: fatal>=1(Error/Fatal、ワイヤーフォーマット仕様上
+         * 0=Warning/1=Error/2=Fatal)を受信してもratingに一切反映していなかった。相手は
+         * verack後すぐに"Server full, please try again later."のようなfatal=2を送って
+         * 切断してくるケースが多く、verack受信時の成功クレジット(+0.1)とその後の切断による
+         * 失敗クレジット(-0.1)がほぼ相殺してratingが高いまま維持されてしまい、明確に
+         * 拒否されているpeerへ毎サイクル再接続し続ける実害が見つかった(peers.dbの大半が
+         * わずかにマイナスで塩漬けになる一方、この種のpeerだけratingが高止まりしていた)。
+         * ここで追加のペナルティを与えることで、1サイクル全体(成功+error受信+最終的な切断)
+         * が正味マイナスへ傾くようにする。 */
+        if (fatal >= 1 && conn->type == BM_FD_CLIENT_SOCKET && ctx->peers_db != NULL)
+        {
+            char ip[INET6_ADDRSTRLEN];
+            int port = 0;
+            bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+            if (ip[0] != '\0')
+            {
+                bm_peer_manager_record_result(ctx->peers_db, ip, port, 1, 0);
+            }
+        }
     }
     else
     {
