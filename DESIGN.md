@@ -2347,6 +2347,39 @@ daemonのログストリームとは性質が違う)は対象外とした。ロ�
 (`BM_LOG_TIMESTAMPS`明示指定・`JOURNAL_STREAM`検出・既定値の4パターンを確認)、
 ctest 31件全通過。
 
+### 重大バグ修正: onion peerのrating/last_seenが一切更新されていなかった(`logical_peer_ip`が62文字onionアドレスに対し小さすぎた)(2026-08-23)
+
+ユーザーが「logで接続したonion peerと時刻が、peers.dbのonion peerの時刻と一致していない」
+ことに気付いた。実際に稼働中daemonのログとDBを突き合わせたところ、直近(数分以内)に
+onion peerとのverack受信が複数回成功しているにもかかわらず、`peers.db`のonion peer行の
+`last_seen`は40分以上前(今回の起動より前)のまま一切更新されていないことを確認した。
+
+**原因**: `infra/network.h`の`struct bm_fd_data.logical_peer_ip`が`char[46]`
+(`INET6_ADDRSTRLEN`相当)で、v3 onionアドレス(56文字base32+".onion"=62文字)を
+保持できるサイズが無かった。`peer_connector.c`が`candidates[i].ip_address`
+(`peer_manager.h`の`bm_peer_entry.ip_address[64]`、正しく62文字収まるサイズ)を
+`logical_peer_ip`へ`strncpy`する際、45文字+NULへ黙って切り捨てられていた。この
+切り捨てられた文字列が`bm_peer_manager_record_result`等のSQL`WHERE ip_address = ?`
+の照合キーに使われるため、peers.dbの本物の行(フルの62文字)とは絶対に一致せず、
+0行ヒットのままrating/last_seen更新が静かに失敗し続けていた(同種の切り捨てバグは
+当日夜の別のログ表示バグ(`peer_connector.c`のhost:portバッファ)と同根で、いずれも
+「IPv4/IPv6用に想定したサイズがv3 onionアドレスの長さを見落としていた」パターン)。
+
+**影響範囲**: `bm_network_resolve_peer_ip_port`の戻り値を受け取る全ての箇所が同様に
+影響を受けていた: `network.c`(切断時のrating失敗記録)、`peer_registry.c`
+(`bm_peer_registry_has_peer`の二重接続防止・Dandelion stem peer選定)、
+`object_sync.c`(`record_outbound_success`・error受信ペナルティ)、`dandelion.c`
+(stem successorの記憶・比較)。dedup/stem比較は「切り捨てられた同じ45文字同士」を
+比較するため偶然壊れずに機能していたが、peers.dbとの照合を伴うrating/last_seen更新は
+確実に0行ヒットで失敗していた。
+
+**修正**: `network.h`に`#define BM_PEER_IP_STRLEN 64`(`bm_peer_entry.ip_address[64]`と
+揃えたサイズ)を新設し、`logical_peer_ip`本体および上記全箇所のローカルバッファを
+`INET6_ADDRSTRLEN`/`46`から`BM_PEER_IP_STRLEN`へ置き換えた。回帰テストを
+`tests/test_peer_rating_on_disconnect.c`へ追加(シナリオ4: 62文字onionアドレスを
+`logical_peer_ip`に設定してverackを流し込み、peers.dbの該当行のratingが実際に
+更新されることを確認)、ctest 31件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

@@ -474,7 +474,7 @@ void *bm_network_epoll_thread(void *arg)
                  * inbound(BM_FD_SERVER_SOCKET)接続はこちらから選んだ相手ではないため対象外。 */
                 if (conn->type == BM_FD_CLIENT_SOCKET && args->peers_db != NULL)
                 {
-                    char ip[INET6_ADDRSTRLEN];
+                    char ip[BM_PEER_IP_STRLEN];
                     int port = 0;
                     bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
                     if (ip[0] != '\0')

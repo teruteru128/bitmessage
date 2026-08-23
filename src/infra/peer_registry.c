@@ -84,7 +84,7 @@ int bm_peer_registry_has_peer(struct bm_peer_registry *reg, const char *ip, int 
          * いなかった(rating調査で見つかった一連のバグと同じ根本原因)。
          * bm_network_resolve_peer_ip_port(logical_peer_ip優先、network.h参照)で解決した
          * ip:portと比較するよう修正した。 */
-        char current_ip[INET6_ADDRSTRLEN];
+        char current_ip[BM_PEER_IP_STRLEN];
         int current_port = 0;
         bm_network_resolve_peer_ip_port(reg->conns[i], current_ip, sizeof(current_ip), &current_port);
         if (current_port == port && strcmp(current_ip, ip) == 0)
@@ -235,7 +235,7 @@ int bm_peer_registry_pick_random_dandelion_peer(struct bm_peer_registry *reg, ch
      * 1件を選べる */
     size_t eligible_seen = 0;
     int found = 0;
-    char chosen_ip[46];
+    char chosen_ip[BM_PEER_IP_STRLEN];
     int chosen_port = 0;
     for (size_t i = 0; i < reg->count; i++)
     {
@@ -249,7 +249,7 @@ int bm_peer_registry_pick_random_dandelion_peer(struct bm_peer_registry *reg, ch
         RAND_bytes(&r, 1);
         if ((size_t)(r % eligible_seen) == 0)
         {
-            char ip[46];
+            char ip[BM_PEER_IP_STRLEN];
             int port = 0;
             bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
             strncpy(chosen_ip, ip, sizeof(chosen_ip) - 1);

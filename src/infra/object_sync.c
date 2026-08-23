@@ -773,7 +773,7 @@ static void record_outbound_success(struct bm_object_sync_ctx *ctx, const struct
     {
         return;
     }
-    char ip[INET6_ADDRSTRLEN];
+    char ip[BM_PEER_IP_STRLEN];
     int port = 0;
     bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
     if (ip[0] != '\0')
@@ -1017,7 +1017,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
          * が正味マイナスへ傾くようにする。 */
         if (fatal >= 1 && conn->type == BM_FD_CLIENT_SOCKET && ctx->peers_db != NULL)
         {
-            char ip[INET6_ADDRSTRLEN];
+            char ip[BM_PEER_IP_STRLEN];
             int port = 0;
             bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
             if (ip[0] != '\0')

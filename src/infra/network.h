@@ -19,6 +19,14 @@
 
 struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
 
+/* §11 2026-08-23発覚のバグ修正: IPv4/IPv6文字列(INET6_ADDRSTRLEN=46で足りる)だけでなく、
+ * v3 onionアドレス(56文字base32+".onion"=62文字)も切り捨てずに保持できるサイズ。
+ * peer_manager.hのbm_peer_entry.ip_address[64]と合わせている。logical_peer_ipや
+ * bm_network_resolve_peer_ip_portの出力先バッファがこれより小さいと、onion peerの
+ * アドレスが黙って途中で切り捨てられ、peers.dbの実際の行(フルの62文字)と一致しなくなり
+ * rating/last_seen更新が0行ヒットのまま静かに失敗する(実際に発覚した不具合)。 */
+#define BM_PEER_IP_STRLEN 64
+
 enum bm_fd_type
 {
     BM_FD_CLIENT_SOCKET, /* outbound: 自分からconnect()した接続 */
@@ -53,7 +61,7 @@ struct bm_fd_data
      * 経路で作られたBM_FD_CLIENT_SOCKET(テスト等)ではlogical_peer_ip[0]=='\0'のまま
      * (未設定)であり、この場合は呼び出し側がpeer_addr由来のip:portへフォールバックする
      * (network.c/object_sync.cのrating記録処理参照)。 */
-    char logical_peer_ip[46]; /* INET6_ADDRSTRLEN相当。空文字列 = 未設定 */
+    char logical_peer_ip[BM_PEER_IP_STRLEN]; /* 空文字列 = 未設定 */
     int logical_peer_port;
     /* §9 Dandelion++: 相手から受信したversion messageのservicesビットフィールド。
      * object_sync.cのversion受信処理が設定する(接続直後は0=未受信のまま)。

@@ -32,7 +32,7 @@ static struct
 {
     pthread_mutex_t lock;
 
-    char stem_ip[46];
+    char stem_ip[BM_PEER_IP_STRLEN];
     int stem_port;
     int has_stem;
     int64_t epoch_started; /* 0 = まだ一度も抽選していない */
@@ -131,7 +131,7 @@ void bm_dandelion_maybe_reshuffle(struct bm_peer_registry *registry, int64_t now
     }
     g_state.epoch_started = now;
 
-    char ip[46];
+    char ip[BM_PEER_IP_STRLEN];
     int port = 0;
     int found = bm_peer_registry_pick_random_dandelion_peer(registry, ip, sizeof(ip), &port);
     if (found)
@@ -173,7 +173,7 @@ enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32]
     enum bm_propagation_mode result = BM_PROPAGATE_SKIP;
     if (target_connection != NULL)
     {
-        char ip[46];
+        char ip[BM_PEER_IP_STRLEN];
         int port = 0;
         bm_network_resolve_peer_ip_port(target_connection, ip, sizeof(ip), &port);
         if (port == g_state.stem_port && strcmp(ip, g_state.stem_ip) == 0)

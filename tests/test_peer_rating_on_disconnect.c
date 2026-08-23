@@ -327,6 +327,52 @@ int main(void)
         }
         CHECK(found_proxied, "scenario3 peer row should be found");
 
+        /* --- シナリオ4: §11 2026-08-23発覚のバグ修正確認。logical_peer_ipにv3 onion
+         * アドレス(56文字base32+".onion"=62文字)を入れた場合でも、途中で切り捨てられず
+         * peers.dbの実際の行(同じくフルの62文字)と一致してratingが更新されることを確認する。
+         * 以前はlogical_peer_ip[46]がINET6_ADDRSTRLEN相当のサイズしか無く、62文字の
+         * onionアドレスがstrncpyで45文字+NULへ黙って切り捨てられ、peers.db上のフルの
+         * 行と一致しなくなり0行ヒットのままrating/last_seen更新が静かに失敗していた --- */
+        const char *onion_peer = "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion";
+        CHECK(strlen(onion_peer) == 62, "sanity check: v3 onion address string should be 62 chars");
+
+        struct bm_peer_entry entry5;
+        memset(&entry5, 0, sizeof(entry5));
+        strncpy(entry5.ip_address, onion_peer, sizeof(entry5.ip_address) - 1);
+        entry5.port = 8444;
+        entry5.stream = 1;
+        entry5.rating = 0.3;
+        strncpy(entry5.source, "test", sizeof(entry5.source) - 1);
+        CHECK(bm_peer_manager_upsert(peers_db, &entry5) == 0, "seeding the scenario4 onion peer row");
+
+        struct bm_fd_data onion_conn;
+        memset(&onion_conn, 0, sizeof(onion_conn));
+        onion_conn.type = BM_FD_CLIENT_SOCKET;
+        onion_conn.fd = -1;
+        strncpy(onion_conn.logical_peer_ip, onion_peer, sizeof(onion_conn.logical_peer_ip) - 1);
+        CHECK(strcmp(onion_conn.logical_peer_ip, onion_peer) == 0,
+              "logical_peer_ip should hold the full 62-char onion address without truncation");
+        onion_conn.logical_peer_port = 8444;
+
+        bm_object_sync_dispatch(&onion_conn, &verack_msg, &ctx);
+
+        struct bm_peer_entry after_onion[16];
+        int count_onion = 0;
+        CHECK(bm_peer_manager_list_top(peers_db, 1, after_onion, 16, &count_onion) == 0 && count_onion >= 1,
+              "scenario4 peer row lookup should succeed");
+        int found_onion = 0;
+        for (int i = 0; i < count_onion; i++)
+        {
+            if (strcmp(after_onion[i].ip_address, onion_peer) == 0 && after_onion[i].port == 8444)
+            {
+                found_onion = 1;
+                CHECK(after_onion[i].rating > 0.4 - 1e-9 && after_onion[i].rating < 0.4 + 1e-9,
+                      "verack from an onion peer should credit the full-length onion address's row: "
+                      "rating should become 0.4 (0.3 + 0.1)");
+            }
+        }
+        CHECK(found_onion, "scenario4 onion peer row should be found (not silently missed due to truncation)");
+
         bm_keyring_destroy(&kr);
         sqlite3_close(object_pool_db);
         sqlite3_close(identity_db);
