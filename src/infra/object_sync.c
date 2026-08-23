@@ -734,12 +734,16 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         return;
     }
 
+    uint64_t requested_count = inv_msg.count;
+    size_t sent_count = 0;
+    size_t not_found_count = 0;
     for (uint64_t i = 0; i < inv_msg.count; i++)
     {
         unsigned char *payload = NULL;
         size_t payload_len = 0;
         if (bm_object_store_get(ctx->object_pool_db, inv_msg.items[i], &payload, &payload_len) != 0)
         {
+            not_found_count++;
             continue; /* 持っていない要求は黙って無視(切断まではしない) */
         }
         size_t packet_len = 0;
@@ -751,10 +755,20 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
             {
                 bm_log("[object_sync] failed to send object for getdata\n");
             }
+            else
+            {
+                sent_count++;
+            }
             free(packet);
         }
     }
     bm_free_inventory_message(&inv_msg);
+
+    /* §11 2026-08-23: inv受信の正常系ログ追加と同じ理由(ユーザーの指摘: 「外部から
+     * getdataを1回でも受信したか、ログから確認できない」)。受信件数・実際に送れた件数・
+     * 持っていなかった件数を可視化する。 */
+    bm_log("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu sent, %zu not found\n",
+            requested_count, sent_count, not_found_count);
 }
 
 /*

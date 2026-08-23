@@ -2829,6 +2829,21 @@ successorへSTEMになるはずという状態を作った上で、`bm_dandelion
 証明)と、処理全体が3秒以内(実測0.23秒、旧O(n^2)実装なら概算6秒規模)に完了することを
 確認した。ctest 35件全通過(既存のdandelion_stage1〜3も回帰無し)。
 
+### ログ改善: getdata受信の正常系にログが無かった(2026-08-23)
+
+ユーザーからの「外部からgetdataを1回でも受信したことがあるか、ログから確認できるか」
+という質問がきっかけで発覚。ログ全体(bitmessaged_bootstrap.log)を`getdata`で
+grepすると28件全てが「こちらが送ろうとして失敗した("failed to send getdata")」側の
+記録のみで、外部から受信した記録は0件だった。ただし`handle_getdata`(`object_sync.c`)は
+inv受信と同じく正常系に一切ログが無く、malformed/上限超過の異常系ログしか出ていな
+かったため、「本当に一度も受信していない」のか「受信していたが記録が残っていないだけ」
+なのかログからは判別できなかった。
+
+`handle_getdata`に、`handle_inv`と同じ方針でログを追加した:
+`bm_log("[object_sync] received getdata: %llu item(s) requested, %zu sent, %zu not
+found\n", ...)`。要求件数・実際に送れた件数・持っていなかった件数を可視化する。
+ctest 35件全通過(ログ文言は既存の慣習通りアサート対象外)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
