@@ -231,7 +231,11 @@ int bm_peer_manager_load_observed_nodes(sqlite3 *db, const char *path)
 
         struct bm_peer_entry entry;
         memset(&entry, 0, sizeof(entry));
-        strncpy(entry.ip_address, ip, sizeof(entry.ip_address) - 1);
+        /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: strncpy+手動NUL終端の
+         * 組み合わせでも、srcの最大長(sscanfの%63s)とdestサイズがちょうど一致する場合
+         * -Wstringop-truncationが警告する(手動NUL終端の有無をGCCは追跡しない)。
+         * snprintfなら常にNUL終端されることが型から明らかなため警告が出ない。 */
+        snprintf(entry.ip_address, sizeof(entry.ip_address), "%s", ip);
         entry.port = port;
         entry.stream = 1;
         entry.services = 1;

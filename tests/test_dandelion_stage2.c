@@ -93,8 +93,6 @@ int main(void)
         bm_peer_registry_add(&reg, conn_b);
         bm_peer_registry_add(&reg, conn_c);
 
-        char picked_ip[64];
-        int picked_port = 0;
         int found = 0;
         for (int i = 0; i < 20; i++) /* reservoir samplingなので複数回試して安定性を見る */
         {
@@ -103,8 +101,6 @@ int main(void)
             if (bm_peer_registry_pick_random_dandelion_peer(&reg, ip, sizeof(ip), &port))
             {
                 found = 1;
-                strncpy(picked_ip, ip, sizeof(picked_ip) - 1);
-                picked_port = port;
                 char conn_a_ip[64];
                 int conn_a_port = 0;
                 bm_network_resolve_peer_ip_port(conn_a, conn_a_ip, sizeof(conn_a_ip), &conn_a_port);
@@ -113,8 +109,6 @@ int main(void)
             }
         }
         CHECK(found, "pick_random_dandelion_peer should find the one eligible peer");
-        (void)picked_ip;
-        (void)picked_port;
 
         bm_peer_registry_remove(&reg, conn_a);
         bm_peer_registry_remove(&reg, conn_b);

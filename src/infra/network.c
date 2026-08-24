@@ -514,8 +514,10 @@ void bm_network_resolve_peer_ip_port(const struct bm_fd_data *conn, char *out_ip
 {
     if (conn->logical_peer_ip[0] != '\0')
     {
-        strncpy(out_ip, conn->logical_peer_ip, out_ip_len - 1);
-        out_ip[out_ip_len - 1] = '\0';
+        /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: strncpy+手動NUL終端でも
+         * -O2ビルドではconn->logical_peer_ipとout_ip_lenの実際の呼び出しサイズが一致する
+         * ケースを-Wstringop-truncationが検出して警告する。snprintfへ置き換えて解消。 */
+        snprintf(out_ip, out_ip_len, "%s", conn->logical_peer_ip);
         *out_port = conn->logical_peer_port;
         return;
     }

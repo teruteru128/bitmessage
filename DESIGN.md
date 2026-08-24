@@ -3303,6 +3303,63 @@ GitHub Actionsのrunnerも同じ理由(モダンなUbuntuカーネルの高ASLR�
 
 これでbacklog項目9(ASan/UBSan/TSan)は全て着手・CI統合まで完了した。
 
+### Releaseビルド検証(backlog項目10の1/5、2026-08-24)
+
+**経緯**: backlog項目10(Releaseビルドでのテスト・インストール・systemdサービス化)を
+5つに分割し(Releaseビルド検証→DBファイル置き場の固定パス化→`cmake --install`定義→
+systemdユニットファイル→非Ubuntu環境への軽い手当て、この順で依存関係がある)、まず
+検証から着手した。
+
+**`-DCMAKE_BUILD_TYPE=Release`で初めて顕在化した警告、3系統**:
+1. **`-Wstringop-truncation`(5箇所)**: `strncpy(dst, src, sizeof(dst)-1)`(直後に手動で
+   NUL終端する箇所を含む)で、GCCがsrcの最大長とdstサイズがちょうど一致すると判断できる
+   場合に警告する。`-O2`でのデータフロー解析強化により初めて検出可能になった
+   (`peer_manager.c`/`trial_decrypt.c`/`network.c`/`tests/test_dandelion_stage2.c`)。
+   このうち**`main.c`の1箇所は実際のバグだった**: `self_onion_address`
+   (`char[BM_PEER_IP_STRLEN]`)は宣言直後に`self_onion_address[0]='\0'`しかしておらず
+   (配列全体のゼロ初期化ではない)、`manual_onion_address`(bitmessage.confの
+   `[tor] onion_address`やBM_ONION_ADDRESS経由、長さ検証なし)が63文字以上だと
+   NUL終端されないまま未初期化のスタック領域を文字列として読むバッファオーバーリードに
+   なりうる状態だった(正規のv3 onionアドレスは62文字なので通常は踏まないが、設定
+   ミスがあれば容易に踏みうる)。全箇所を`snprintf(dst, sizeof(dst), "%s", src)`
+   (常にNUL終端される)へ置き換えて解消。`tests/test_dandelion_stage2.c`の1箇所は
+   書き込むだけで読まれない完全な死コード(`(void)picked_ip`していた)だったため、
+   変数ごと削除した。
+2. **`-Wunused-result`(6箇所)**: `write()`(`core/api_server.c`2箇所、テスト3ファイル
+   4箇所)・`getrandom()`(`infra/protocol.c`、version messageのnonce生成)の戻り値を
+   無視していた(`-O2`で有効化される`_FORTIFY_SOURCE`経由で警告化される)。
+   `api_server.c`は既存の`bm_network_write_all`(部分書き込み対応、`peer_registry.c`等と
+   同じヘルパー)へ置き換え。`protocol.c`のgetrandomは戻り値をチェックし、失敗時は
+   nonce=0にフォールバックするコメント付きの分岐にした(nonceは自己接続検出用で
+   暗号的な秘密ではないため、失敗しても致命的ではないと判断)。テスト側4箇所は
+   `CHECK`マクロで検証することで警告を解消しつつ、万一の部分書き込みもテスト失敗として
+   可視化されるようにした。
+3. **`-Wdeprecated-declarations`(9箇所、`core/crypto.c`のEC_KEY/ECDSA系)**: これは
+   `-O2`固有ではなく、実は`build-Debug`でも以前から出ていた警告だった。発覚の経緯:
+   このセッション中`crypto.c`が一度も再ビルドされておらず(インクリメンタルビルドの
+   対象外)、`cmake --build build-Debug`を何度実行しても再コンパイルされないため警告が
+   再表示されず、「警告ゼロ」を誤って確認できていた。`crypto.c`には既に
+   「EC_KEY/ECDSA系はOpenSSL 3.0で非推奨だが、生成される署名はビット単位で同一かつ
+   API自体は当面removeされない見込みのため、書き換えコストに見合わないとあえてこのまま
+   使う」という設計判断のコメントが記されていたが、実際に警告を抑制する`#pragma`が
+   付いておらず「警告ゼロ」を満たせていなかった。既存の判断はそのまま尊重し、
+   `build_ec_key`〜`bm_crypto_verify`の範囲だけ`#pragma GCC diagnostic ignored
+   "-Wdeprecated-declarations"`で局所的に抑制した(ファイル全体ではなく該当範囲のみに
+   絞ることで、将来他の箇所で新たに非推奨APIが使われたら引き続き警告されるようにした)。
+   EVP_PKEYベースAPIへの本格移行(署名・ECDH双方に影響する大掛かりな書き換え)は
+   別途backlog項目として記録する(下記参照)。
+
+**この発覚を受けた運用上の教訓**: `cmake --build`はインクリメンタルビルドのため、
+変更していないファイルは再コンパイルされず、そのファイルの警告も再表示されない。
+「警告ゼロ」を確実に確認するには、疑わしい時は`rm -rf build-*`してクリーンビルドする
+必要がある(このセッションでも実際にRelease検証以外の3ビルド全て、この方法で
+再確認した)。
+
+**検証結果**: `build-Debug`・`build-Release`・`build-Sanitize`(ASan/UBSan)・
+`build-TSan`の4種全てクリーンビルドで警告ゼロ・ctest 37件全通過を確認した
+(Releaseビルドでの`-O2`最適化によるUB顕在化・タイミング変化は、この時点では
+確認されなかった)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3340,13 +3397,17 @@ GitHub Actionsのrunnerも同じ理由(モダンなUbuntuカーネルの高ASLR�
    dandelion/peer_registry間のロック順序逆転(潜在的デッドロック)を発見・修正した。
    いずれもCIへ別ジョブとして統合済み。
 10. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
-    ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
-    実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
-    (最適化によるUB顕在化・タイミング変化の可能性は未検証、項目9のASan/UBSan導入で
-    先に洗い出す方針)。`cmake --install`用の`install()`定義、DBファイル置き場をCWD依存
-    から固定パス(`/var/lib/bitmessage/`等)へ切り替える設計判断、`.service`ユニット
-    ファイル(`Type=simple`、`Restart=on-failure`)が必要。当日夜に実装した
-    `common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこのsystemd化を見越したもの。
+    ユーザーと議論。2026-08-24にユーザーと合意の上で5つに分割(依存順):
+    1. ~~Releaseビルド検証~~ 完了(上記まとめ参照)。`-DCMAKE_BUILD_TYPE=Release`で
+       初めて顕在化した警告(バグ1件含む)を修正し、`build-Debug`/`build-Release`/
+       `build-Sanitize`/`build-TSan`全てクリーンビルドで警告ゼロ・ctest全通過を確認した。
+    2. DBファイル置き場をCWD依存から固定パス(`/var/lib/bitmessage/`等)へ切り替える
+       設計判断(未着手)。
+    3. `cmake --install`用の`install()`定義(未着手、2に依存)。
+    4. `.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)作成(未着手、
+       2に依存)。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、
+       まさにこのsystemd化を見越したもの。
+    5. 非Ubuntu環境への軽い手当て(未着手、詳細下記)。
     - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
       ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
       視野に入れていない(対応するなら`kqueue`バックエンド追加という別の大仕事になる)。
@@ -3368,7 +3429,20 @@ GitHub Actionsのrunnerも同じ理由(モダンなUbuntuカーネルの高ASLR�
     再度確認し、この訂正は優先度を上げる根拠にはならない(Tor onion peer運用が主軸の
     このプロジェクトではLAN discoveryはそもそもユースケース外)と判断、backlog内で
     さらに優先度を下げて末尾へ移動した。
-12. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+12. **`core/crypto.c`のEC_KEY/ECDSA系をEVP_PKEYベースAPIへ移行**: 2026-08-24、
+    backlog項目10(Releaseビルド検証)着手中に発覚。`EC_KEY_new_by_curve_name`/
+    `EC_KEY_set_private_key`/`o2i_ECPublicKey`/`ECDSA_size`/`ECDSA_sign`/
+    `ECDSA_verify`/`EC_KEY_free`がOpenSSL 3.0で非推奨(`-Wdeprecated-declarations`)。
+    現状は`build_ec_key`〜`bm_crypto_verify`の範囲を`#pragma GCC diagnostic ignored`
+    で局所的に警告抑制して凌いでいる(署名結果はビット単位で同一かつAPI自体は当面
+    removeされない見込みのため、というのが既存の判断、上記まとめ参照)。将来的に
+    OpenSSLがこれらのAPIを実際に削除する場合に備え、`EVP_PKEY_new_raw_private_key`
+    (secp256k1)+`EVP_DigestSign`/`EVP_DigestVerify`ベースへの書き換えが必要になる。
+    ECIES側(`ecdh_shared_secret`等)にも同様のEC_KEY依存が無いか要確認。署名アルゴリズム
+    自体を変えない書き換えなので理論上は機械的だが、鍵管理・エラーハンドリング含め
+    署名・検証という認証の根幹に関わるコードのため、慎重なテスト(既存署名データとの
+    後方互換確認含む)が要る。優先度低(OpenSSLが実際に削除を予告するまでは急がない)。
+13. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル

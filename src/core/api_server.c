@@ -1119,10 +1119,18 @@ static void write_http_response(int fd, int status, const char *status_text,
                                "\r\n",
                                status, status_text, content_type, body_len,
                                extra_header != NULL ? extra_header : "");
-    write(fd, header, (size_t)header_len);
+    /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: 生のwrite()は
+     * warn_unused_result属性が付いており、戻り値を無視すると-Wunused-resultが警告する
+     * (-O2で有効化される_FORTIFY_SOURCE経由)。加えて生write()は部分書き込みの可能性も
+     * 元々ハンドリングしていなかったため、既存のbm_network_write_all(部分書き込み対応・
+     * タイムアウト付き、peer_registry.c等で使っているのと同じヘルパー)へ置き換えた。
+     * レスポンス送信の失敗自体はこの後すぐclose(client_fd)するだけなので、戻り値は
+     * 意図的に無視する(bm_network_write_all自体にはwarn_unused_result属性が無い)。 */
+    bm_network_write_all(fd, (const unsigned char *)header, (size_t)header_len,
+                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
     if (body_len > 0)
     {
-        write(fd, body, body_len);
+        bm_network_write_all(fd, (const unsigned char *)body, body_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
     }
 }
 

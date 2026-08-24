@@ -238,7 +238,16 @@ unsigned char *bm_create_version_payload(unsigned char *out, const char *user_ag
     bm_encode_network_address(out + offset, local_addr);
     offset += 26;
     uint64_t nonce = 0;
-    getrandom(&nonce, sizeof(nonce), 0);
+    /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: getrandom()には
+     * warn_unused_result属性が付いており、-O2(_FORTIFY_SOURCE有効)では戻り値を無視すると
+     * 警告になる。8byte以下の要求はLinuxカーネルの保証によりシグナル割り込み以外では
+     * 部分読み出しにならないため通常成功するが、万一失敗してもnonceはこのversion
+     * messageの自己接続検出用(暗号的な秘密ではない)にしか使わないため、0のまま
+     * フォールバックして続行する(致命的ではない)。 */
+    if (getrandom(&nonce, sizeof(nonce), 0) != (ssize_t)sizeof(nonce))
+    {
+        nonce = 0;
+    }
     write_be64(out + offset, nonce);
     offset += 8;
     bm_varstr_encode(out + offset, user_agent_str);

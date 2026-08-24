@@ -106,7 +106,11 @@ static char *do_request(const char *body, const char *auth_user, const char *aut
                             "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\n%s",
                             strlen(body), body);
     }
-    write(fd, request, (size_t)req_len);
+    /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: -O2では戻り値無視の
+     * write()が-Wunused-resultで警告する。ローカルループバックへの数KB程度の書き込みが
+     * 部分書き込みになることは実質無いが、CHECKで検証することで警告を解消しつつ
+     * 万一の部分書き込みもテスト失敗として可視化する。 */
+    CHECK(write(fd, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");
 
     char *resp = malloc(65536);
     size_t resp_len = 0;
@@ -165,7 +169,7 @@ static int is_unauthorized(const char *body, const char *auth_user, const char *
                             "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\n"
                             "Content-Length: %zu\r\n\r\n%s",
                             encoded, strlen(body), body);
-    write(fd, request, (size_t)req_len);
+    CHECK(write(fd, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");
 
     char resp[256];
     ssize_t n = read(fd, resp, sizeof(resp) - 1);

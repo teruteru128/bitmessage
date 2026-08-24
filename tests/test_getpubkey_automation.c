@@ -112,7 +112,7 @@ static char *do_http_post(const char *host, int port, const char *user, const ch
                             "Content-Type: application/json\r\nContent-Length: %zu\r\n"
                             "Connection: close\r\n\r\n%s",
                             host, auth_b64, strlen(body), body);
-    write(sock, request, (size_t)req_len);
+    CHECK(write(sock, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");
 
     char buf[65536];
     ssize_t total = 0;

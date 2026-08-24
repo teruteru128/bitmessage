@@ -384,8 +384,24 @@ int main(void)
             bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
             /* §11 2026-08-24 backlog項目6: 上でannounce済みなので、peer_connector_threadの
              * 定期reannounceゲートが起動直後の1回目で即座に二重announceしないよう、
-             * last_onion_announceを今セットしておく。 */
-            strncpy(self_onion_address, manual_onion_address, sizeof(self_onion_address) - 1);
+             * last_onion_announceを今セットしておく。
+             * §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚した重大バグ: 以前は
+             * strncpyのみでNUL終端していなかった。self_onion_addressは宣言直後に
+             * self_onion_address[0]='\0'しかしていない(配列全体のゼロ初期化ではない)ため、
+             * manual_onion_address(bitmessage.confの[tor] onion_addressやBM_ONION_ADDRESS
+             * 経由でユーザーが指定、長さの検証は無い)がsizeof(self_onion_address)-1
+             * (63文字)以上だと、NUL終端されないまま未初期化のスタック領域を読む
+             * 文字列として扱われてしまう(正規のv3 onionアドレスは62文字なので通常は
+             * 踏まないが、設定ミスがあれば容易に踏みうるバッファオーバーリード)。
+             * snprintfなら常にNUL終端されるため安全(この時点でbm_object_sync_announce_
+             * onion_peerが既に成功しており、manual_onion_addressはbm_build_onionpeerの
+             * 検証を通過済み=正規のv3 onionアドレス(62文字)であることが保証されている
+             * ため実際には切り詰めは発生しないが、-Wformat-truncationはその保証を
+             * 追跡できず、cfg.onion_address[256]相当の宣言サイズだけを見て「255byte書き
+             * うる」と警告する。精度指定(%.*s)で「最大でもdestサイズ-1までしか読まない」
+             * ことを明示し、警告を解消する)。 */
+            snprintf(self_onion_address, sizeof(self_onion_address), "%.*s",
+                     (int)(sizeof(self_onion_address) - 1), manual_onion_address);
             object_sync_ctx.last_onion_announce = time(NULL);
         }
     }

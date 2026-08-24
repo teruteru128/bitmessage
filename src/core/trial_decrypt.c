@@ -1,6 +1,7 @@
 #include "trial_decrypt.h"
 
 #include <openssl/crypto.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -244,10 +245,15 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
     char *from_addr_str = bm_address_encode(from_ver, from_stream, from_ripe, 20);
     if (from_addr_str != NULL)
     {
-        strncpy(out->from_address, from_addr_str, sizeof(out->from_address) - 1);
+        /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: to_address側は
+         * matched.address(固定長char[40]、out->to_addressと同サイズ)がsrcとなるため
+         * -Wstringop-truncationが警告する。snprintfなら常にNUL終端されるため警告が
+         * 出ない(from_addr_strはmalloc由来でGCCが長さを静的に追えず元々警告されないが、
+         * 統一のためこちらもsnprintfにした)。 */
+        snprintf(out->from_address, sizeof(out->from_address), "%s", from_addr_str);
         free(from_addr_str);
     }
-    strncpy(out->to_address, matched.address, sizeof(out->to_address) - 1);
+    snprintf(out->to_address, sizeof(out->to_address), "%s", matched.address);
 
     if (encoding == 2)
     {

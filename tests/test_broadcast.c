@@ -333,7 +333,7 @@ int main(void)
                             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\n"
                             "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
                             auth_b64, strlen(body), body);
-    write(sock, request, (size_t)req_len);
+    CHECK(write(sock, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");
     char resp_buf[8192];
     ssize_t total = 0;
     ssize_t n;
@@ -361,7 +361,8 @@ int main(void)
                  "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\n"
                  "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
                  auth_b64, strlen(broadcast_body), broadcast_body);
-    write(sock2, broadcast_request, (size_t)broadcast_req_len);
+    CHECK(write(sock2, broadcast_request, (size_t)broadcast_req_len) == broadcast_req_len,
+          "writing the HTTP broadcast request should not short-write");
     char broadcast_resp[8192];
     ssize_t broadcast_total = 0;
     ssize_t bn;

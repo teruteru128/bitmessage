@@ -273,7 +273,21 @@ int bm_crypto_ecies_decrypt(const unsigned char *ciphertext, size_t ciphertext_l
  * EC_KEY/ECDSA_sign/ECDSA_verify系はOpenSSL 3.0で非推奨(EVP_PKEY+OSSL_PARAM経由が推奨)だが、
  * 生成される署名はビット単位で同一かつAPI自体は当面removeされない見込みのため、
  * OSSL_PARAM_BLDによる書き換えコストに見合わないと判断しあえてこのまま使う。
+ *
+ * §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: 上記の判断自体はこの時点で
+ * 既に記録されていたが、実際に-Wdeprecated-declarations警告を抑制するpragmaが
+ * 付いておらず、CLAUDE.mdの「警告ゼロ」を満たせていなかった(このファイルがセッション中
+ * 再ビルドされずインクリメンタルビルドの対象外だったため、警告が出ていること自体
+ * 見落とされていた)。build_ec_key〜bm_crypto_verifyの範囲だけ-Wdeprecated-declarations
+ * を局所的に無効化する(ファイル全体ではなく、実際に非推奨APIを使っている範囲のみに
+ * 絞ることで、将来他の場所で新たに非推奨APIが使われた場合は引き続き警告されるように
+ * している)。EVP_PKEY移行自体はDESIGN.md §11のbacklogへ別項目として記録した。
  */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 static EC_KEY *build_ec_key(const unsigned char priv[32], const unsigned char pub[65])
 {
     EC_KEY *key = EC_KEY_new_by_curve_name(NID_secp256k1);
@@ -359,3 +373,7 @@ int bm_crypto_verify(const unsigned char *data, size_t data_len,
     EC_KEY_free(key);
     return (rc == 1) ? 1 : 0;
 }
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
