@@ -691,7 +691,7 @@ int main(void)
                   == NULL,
               "bm_build_onionpeer should reject a malformed onion address");
 
-        int announce_rc = bm_object_sync_announce_onion_peer(&ctx, send_onion, 7777);
+        int announce_rc = bm_object_sync_announce_onion_peer(&ctx, send_onion, 7777, (int64_t)time(NULL));
         CHECK(announce_rc == 0, "bm_object_sync_announce_onion_peer should succeed");
 
         sqlite3_stmt *count_stmt = NULL;

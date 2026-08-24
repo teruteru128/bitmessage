@@ -83,7 +83,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
     data->local_len = sizeof(data->local_addr);
     if (getsockname(fd, (struct sockaddr *)&data->local_addr, &data->local_len) == -1)
     {
-        bm_log("getsockname: %s\n", strerror(errno));
+        bm_log_warn("getsockname: %s\n", strerror(errno));
         free(data);
         return NULL;
     }
@@ -94,7 +94,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
         data->peer_len = sizeof(data->peer_addr);
         if (getpeername(fd, (struct sockaddr *)&data->peer_addr, &data->peer_len) == -1)
         {
-            bm_log("getpeername: %s\n", strerror(errno));
+            bm_log_warn("getpeername: %s\n", strerror(errno));
             free(data);
             return NULL;
         }
@@ -249,23 +249,23 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         struct bm_version_message ver;
         bm_parse_version_message(msg->payload, msg->length, &ver);
-        bm_log("[network] version: v=%u services=%" PRIu64 " ua=%s\n",
+        bm_log_info("[network] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
         bm_free_version_message(&ver);
         if (bm_reply_verack(conn) != 0)
         {
-            bm_log("[network] failed to reply verack\n");
+            bm_log_warn("[network] failed to reply verack\n");
         }
     }
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
-        bm_log("[network] verack received\n");
+        bm_log_debug("[network] verack received\n");
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {
         if (bm_reply_pong(conn) != 0)
         {
-            bm_log("[network] failed to reply pong\n");
+            bm_log_warn("[network] failed to reply pong\n");
         }
     }
     else if (strncmp(msg->command, "addr", 12) == 0)
@@ -273,7 +273,7 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_addr_message addr_msg;
         if (bm_parse_addr_message(msg->payload, msg->length, &addr_msg) == 0)
         {
-            bm_log("[network] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n", addr_msg.count);
+            bm_log_debug("[network] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n", addr_msg.count);
             bm_free_addr_message(&addr_msg);
         }
     }
@@ -282,17 +282,17 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_inventory_message inv_msg;
         if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) == 0)
         {
-            bm_log("[network] inv: %" PRIu64 " items (TODO: object_store未実装、getdata未送信)\n", inv_msg.count);
+            bm_log_debug("[network] inv: %" PRIu64 " items (TODO: object_store未実装、getdata未送信)\n", inv_msg.count);
             bm_free_inventory_message(&inv_msg);
         }
     }
     else if (strncmp(msg->command, "object", 12) == 0)
     {
-        bm_log("[network] object received, %u bytes (TODO: object_store/decrypt_worker未実装)\n", msg->length);
+        bm_log_debug("[network] object received, %u bytes (TODO: object_store/decrypt_worker未実装)\n", msg->length);
     }
     else
     {
-        bm_log("[network] unhandled command: %s\n", command);
+        bm_log_warn("[network] unhandled command: %s\n", command);
     }
 }
 
@@ -313,7 +313,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
             {
                 break;
             }
-            bm_log("[network] read (fd=%d): %s\n", conn->fd, strerror(errno));
+            bm_log_warn("[network] read (fd=%d): %s\n", conn->fd, strerror(errno));
             return -1;
         }
         if (n == 0)
@@ -339,7 +339,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
                 /* §11 単一メッセージの上限(BM_MAX_MESSAGE_LENGTH)は通常bm_parse_messageの
                  * BM_PARSE_MESSAGE_TOO_LARGEで先に検知されるが、それより前にここへ到達する
                  * ケース(単一read()で大量データが一度に届く等)に備えた二重の防御 */
-                bm_log("[network] recv buffer would exceed %u bytes, dropping connection\n",
+                bm_log_warn("[network] recv buffer would exceed %u bytes, dropping connection\n",
                         MAX_RECV_BUFFER_SIZE);
                 return -1;
             }
@@ -367,7 +367,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         }
         if (result == BM_PARSE_BAD_CHECKSUM)
         {
-            bm_log("[network] checksum mismatch, dropping %zu bytes\n", consumed);
+            bm_log_warn("[network] checksum mismatch, dropping %zu bytes\n", consumed);
             memmove(conn->recv_buffer, conn->recv_buffer + consumed, conn->length - consumed);
             conn->length -= consumed;
             continue;
@@ -384,7 +384,7 @@ int bm_network_handle_readable(struct bm_fd_data *conn, bm_command_handler_fn ha
         {
             /* §11 巨大なlengthを申告された。resyncを試みるコスト自体もDoSになりうるため、
              * 即座に接続を切断する(呼び出し元でclose・registry除去される) */
-            bm_log("[network] declared message length exceeds %u bytes, dropping connection\n",
+            bm_log_warn("[network] declared message length exceeds %u bytes, dropping connection\n",
                     BM_MAX_MESSAGE_LENGTH);
             return -1;
         }
@@ -442,14 +442,14 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         {
             if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
             {
-                bm_log("[network] accept: %s\n", strerror(errno));
+                bm_log_warn("[network] accept: %s\n", strerror(errno));
             }
             break;
         }
 
         if (!bm_inbound_rate_limiter_allow(&args->inbound_rate_limiter, now))
         {
-            bm_log("[network] rejecting inbound connection (fd=%d): accept rate limit exceeded (>%d per %ds)\n",
+            bm_log_warn("[network] rejecting inbound connection (fd=%d): accept rate limit exceeded (>%d per %ds)\n",
                     client_fd, BM_INBOUND_ACCEPT_MAX_PER_WINDOW, BM_INBOUND_ACCEPT_WINDOW_SECONDS);
             close(client_fd);
             continue;
@@ -457,7 +457,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         if (args->registry != NULL
             && bm_peer_registry_count_by_type(args->registry, BM_FD_SERVER_SOCKET) >= BM_MAX_INBOUND_CONNECTIONS)
         {
-            bm_log("[network] rejecting inbound connection (fd=%d): concurrent inbound limit reached (%d)\n",
+            bm_log_warn("[network] rejecting inbound connection (fd=%d): concurrent inbound limit reached (%d)\n",
                     client_fd, BM_MAX_INBOUND_CONNECTIONS);
             close(client_fd);
             continue;
@@ -479,7 +479,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         ev.data.ptr = conn;
         if (epoll_ctl(args->epfd, EPOLL_CTL_ADD, client_fd, &ev) != 0)
         {
-            bm_log("[network] epoll_ctl (inbound accept): %s\n", strerror(errno));
+            bm_log_warn("[network] epoll_ctl (inbound accept): %s\n", strerror(errno));
             bm_fd_data_free(conn);
             close(client_fd);
             continue;
@@ -488,7 +488,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
         {
             bm_peer_registry_add(args->registry, conn);
         }
-        bm_log("[network] accepted inbound connection (fd=%d)\n", client_fd);
+        bm_log_info("[network] accepted inbound connection (fd=%d)\n", client_fd);
     }
 }
 
@@ -582,7 +582,7 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
     {
         if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)
         {
-            bm_log("[network] closing %s connection (fd=%d): handshake not completed within %ds\n",
+            bm_log_warn("[network] closing %s connection (fd=%d): handshake not completed within %ds\n",
                     conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
                     BM_HANDSHAKE_TIMEOUT_SECONDS);
             close_connection(ctx->args, conn);
@@ -598,7 +598,7 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * 経ってから)。 */
         if (send_header_only(conn, "ping") == 0)
         {
-            bm_log("[network] sent idle keepalive ping (fd=%d, %s, idle %" PRId64 "s)\n", conn->fd,
+            bm_log_debug("[network] sent idle keepalive ping (fd=%d, %s, idle %" PRId64 "s)\n", conn->fd,
                     conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds);
             conn->last_activity = ctx->now;
         }
@@ -629,7 +629,7 @@ void *bm_network_epoll_thread(void *arg)
             {
                 continue;
             }
-            bm_log("epoll_wait: %s\n", strerror(errno));
+            bm_log_warn("epoll_wait: %s\n", strerror(errno));
             break;
         }
         /* §11 2026-08-23: 1ループぶんの基準時刻を一度だけ取得し、accept()のレート制限判定と
@@ -662,7 +662,7 @@ void *bm_network_epoll_thread(void *arg)
                  * (ログあり)と非対称だった。listConnections APIで接続の生死を追うように
                  * なって初めて、outbound接続がここを通って頻繁に(数秒〜十数秒単位で)切断
                  * されていることが分かったため、可視化のためログを追加した。 */
-                bm_log("[network] closing %s connection (fd=%d): %s\n",
+                bm_log_warn("[network] closing %s connection (fd=%d): %s\n",
                         conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
                         rc == 1 ? "peer closed (EOF)" : "read error");
                 close_connection(args, conn);

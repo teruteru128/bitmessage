@@ -79,7 +79,7 @@ static void maybe_run_gc(struct bm_object_sync_ctx *ctx)
         int deleted = bm_object_sync_gc(ctx, (int64_t)now);
         if (deleted > 0)
         {
-            bm_log("[object_sync] GC: removed %d expired object(s)\n", deleted);
+            bm_log_info("[object_sync] GC: removed %d expired object(s)\n", deleted);
         }
     }
 }
@@ -125,12 +125,12 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
                     }
                 }
             }
-            bm_log("[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
+            bm_log_info("[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
             free(object);
         }
         else
         {
-            bm_log(
+            bm_log_warn(
                     "[object_sync] resend attempt skipped for %s (fromAddress not unlocked or "
                     "recipient pubkey not cached?)\n",
                     c->to_address);
@@ -285,7 +285,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL);
         }
-        bm_log(
+        bm_log_debug(
                 "[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
                 address_version);
         return;
@@ -335,7 +335,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
         }
-        bm_log("[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
+        bm_log_info("[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
                 address_version);
     }
     free(object);
@@ -367,7 +367,7 @@ static void handle_incoming_broadcast(struct bm_object_sync_ctx *ctx, const stru
         if (bm_trial_decrypt_broadcast_and_store(ctx->messages_db, msg->payload, msg->length, candidate_version,
                                                   candidate_stream, candidate_ripe) == 0)
         {
-            bm_log("[object_sync] broadcast decrypted (subscribed address %s)\n", subs[i].address);
+            bm_log_info("[object_sync] broadcast decrypted (subscribed address %s)\n", subs[i].address);
             break;
         }
     }
@@ -443,7 +443,7 @@ static void handle_incoming_onionpeer(struct bm_object_sync_ctx *ctx, const stru
         && bm_peer_manager_upsert_learned(ctx->peers_db, onion_address, (int)port, (int)hdr->stream, 1,
                                            (int64_t)time(NULL), "onionpeer_obj") == 0)
     {
-        bm_log("[object_sync] discovered v3 onion peer: %s:%" PRIu64 "\n", onion_address, port);
+        bm_log_info("[object_sync] discovered v3 onion peer: %s:%" PRIu64 "\n", onion_address, port);
     }
 }
 
@@ -453,9 +453,9 @@ static void handle_incoming_onionpeer(struct bm_object_sync_ctx *ctx, const stru
  * ttl引数)も軽くなり、daemon起動時にmain()を長時間ブロックしにくくなる副次効果もある */
 #define BM_ONIONPEER_ANNOUNCE_TTL_SECONDS (2 * 24 * 60 * 60)
 
-int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port)
+int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
+                                        int64_t now)
 {
-    int64_t now = (int64_t)time(NULL);
     uint64_t expires_time = (uint64_t)now + BM_ONIONPEER_ANNOUNCE_TTL_SECONDS;
     uint64_t stream = 1;
 
@@ -463,7 +463,7 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
     unsigned char *payload = bm_build_onionpeer(onion_address, (uint16_t)port, stream, expires_time, &payload_len);
     if (payload == NULL)
     {
-        bm_log("[object_sync] failed to build onionpeer object (malformed onion address?)\n");
+        bm_log_warn("[object_sync] failed to build onionpeer object (malformed onion address?)\n");
         return -1;
     }
 
@@ -493,7 +493,7 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
         }
-        bm_log("[object_sync] announced our onion peer: %s:%d\n", onion_address, port);
+        bm_log_info("[object_sync] announced our onion peer: %s:%d\n", onion_address, port);
     }
     free(object);
     return 0;
@@ -516,7 +516,7 @@ void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, 
         return;
     }
     ctx->last_onion_announce = (time_t)now;
-    bm_object_sync_announce_onion_peer(ctx, onion_address, port);
+    bm_object_sync_announce_onion_peer(ctx, onion_address, port, now);
 }
 
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
@@ -524,28 +524,28 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
 {
     if (msg->length > BM_MAX_OBJECT_PAYLOAD_SIZE)
     {
-        bm_log("[object_sync] object too large (%u bytes), ignoring\n", msg->length);
+        bm_log_warn("[object_sync] object too large (%u bytes), ignoring\n", msg->length);
         return;
     }
 
     struct bm_object_header hdr;
     if (bm_object_parse_header(msg->payload, msg->length, &hdr) != 0)
     {
-        bm_log("[object_sync] malformed object header, ignoring\n");
+        bm_log_warn("[object_sync] malformed object header, ignoring\n");
         return;
     }
 
     int64_t now0 = (int64_t)time(NULL);
     if ((int64_t)hdr.expires_time <= now0)
     {
-        bm_log("[object_sync] object already expired, ignoring\n");
+        bm_log_debug("[object_sync] object already expired, ignoring\n");
         return;
     }
     /* §11: ネットワーク既定の最低難易度を満たさないobjectは受け入れない(悪意ある相手に
      * PoW無しのobjectで負荷をかけられるのを防ぐ、既知だった制限への対応) */
     if (!object_pow_is_valid(msg->payload, msg->length, &hdr, now0))
     {
-        bm_log("[object_sync] insufficient PoW, ignoring\n");
+        bm_log_warn("[object_sync] insufficient PoW, ignoring\n");
         return;
     }
 
@@ -580,7 +580,7 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         if (bm_trial_decrypt_and_store(ctx->keyring, ctx->messages_db, msg->payload, msg->length,
                                         &ack_payload, &ack_payload_len) == 0)
         {
-            bm_log("[object_sync] msg decrypted and stored to inbox\n");
+            bm_log_info("[object_sync] msg decrypted and stored to inbox\n");
             if (ack_payload_len > 0)
             {
                 validate_and_store_ack(ctx, conn, ack_payload, ack_payload_len);
@@ -621,7 +621,7 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         {
             bm_pubkey_cache_upsert(ctx->identity_db, &cached, now0);
             bm_pubkey_cache_clear_request(ctx->identity_db, cached.ripe);
-            bm_log("[object_sync] pubkey (v%" PRIu64 ") cached\n", hdr.version);
+            bm_log_info("[object_sync] pubkey (v%" PRIu64 ") cached\n", hdr.version);
         }
     }
     else if (hdr.object_type == BM_OBJECT_GETPUBKEY)
@@ -686,12 +686,12 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
     struct bm_inventory_message inv_msg;
     if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) != 0)
     {
-        bm_log("[object_sync] malformed inv\n");
+        bm_log_warn("[object_sync] malformed inv\n");
         return;
     }
     if (inv_msg.count > BM_MAX_INVENTORY_ITEMS)
     {
-        bm_log("[object_sync] inv with %" PRIu64 " items exceeds limit, ignoring\n", inv_msg.count);
+        bm_log_warn("[object_sync] inv with %" PRIu64 " items exceeds limit, ignoring\n", inv_msg.count);
         bm_free_inventory_message(&inv_msg);
         return;
     }
@@ -721,7 +721,7 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
     /* §11 2026-08-23: これまで正常系(パース成功・上限内)には一切ログが無く、malformed/上限超過
      * といった異常系のログしか出ていなかった(listConnections調査中にユーザーが発見した
      * 「無言の切断」と同種の穴)。受信件数・未所持(=getdataを送る)件数を可視化する。 */
-    bm_log("[object_sync] received %s: %" PRIu64 " item(s), %zu missing\n", msg->command, received_count,
+    bm_log_debug("[object_sync] received %s: %" PRIu64 " item(s), %zu missing\n", msg->command, received_count,
             missing_count);
 
     if (missing_count > 0)
@@ -732,7 +732,7 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
         {
             if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
             {
-                bm_log("[object_sync] failed to send getdata\n");
+                bm_log_warn("[object_sync] failed to send getdata\n");
             }
             else
             {
@@ -740,7 +740,7 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
                 /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
                  * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
                  * 受信側の可視化と同種の穴、ユーザー指摘)。 */
-                bm_log("[object_sync] sent getdata: %zu item(s)\n", missing_count);
+                bm_log_debug("[object_sync] sent getdata: %zu item(s)\n", missing_count);
             }
             free(packet);
         }
@@ -753,12 +753,12 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
     struct bm_inventory_message inv_msg;
     if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) != 0)
     {
-        bm_log("[object_sync] malformed getdata\n");
+        bm_log_warn("[object_sync] malformed getdata\n");
         return;
     }
     if (inv_msg.count > BM_MAX_INVENTORY_ITEMS)
     {
-        bm_log("[object_sync] getdata with %" PRIu64 " items exceeds limit, ignoring\n", inv_msg.count);
+        bm_log_warn("[object_sync] getdata with %" PRIu64 " items exceeds limit, ignoring\n", inv_msg.count);
         bm_free_inventory_message(&inv_msg);
         return;
     }
@@ -782,7 +782,7 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         {
             if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
             {
-                bm_log("[object_sync] failed to send object for getdata\n");
+                bm_log_warn("[object_sync] failed to send object for getdata\n");
             }
             else
             {
@@ -797,7 +797,7 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
     /* §11 2026-08-23: inv受信の正常系ログ追加と同じ理由(ユーザーの指摘: 「外部から
      * getdataを1回でも受信したか、ログから確認できない」)。受信件数・実際に送れた件数・
      * 持っていなかった件数を可視化する。 */
-    bm_log("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu sent, %zu not found\n",
+    bm_log_debug("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu sent, %zu not found\n",
             requested_count, sent_count, not_found_count);
 }
 
@@ -888,11 +888,11 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
         {
             if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
             {
-                bm_log("[object_sync] failed to send addr\n");
+                bm_log_warn("[object_sync] failed to send addr\n");
             }
             else
             {
-                bm_log("[object_sync] sent addr (%d entries)\n", n);
+                bm_log_debug("[object_sync] sent addr (%d entries)\n", n);
                 conn->bytes_sent += (uint64_t)packet_len;
             }
             free(packet);
@@ -945,7 +945,7 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
     unsigned char(*plain)[32] = malloc(sizeof(*plain) * hash_count);
     if (plain == NULL)
     {
-        bm_log("[object_sync] send_big_inv: malloc failed for %zu hashes, aborting\n", hash_count);
+        bm_log_error("[object_sync] send_big_inv: malloc failed for %zu hashes, aborting\n", hash_count);
         free(hashes);
         return;
     }
@@ -980,7 +980,7 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
             free(packet);
         }
     }
-    bm_log("[object_sync] sent big inv to new peer: %zu of %zu (excluded %zu still-stemming)\n", plain_count,
+    bm_log_info("[object_sync] sent big inv to new peer: %zu of %zu (excluded %zu still-stemming)\n", plain_count,
             hash_count, hash_count - plain_count);
 
     free(plain);
@@ -994,7 +994,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         struct bm_version_message ver;
         bm_parse_version_message(msg->payload, msg->length, &ver);
-        bm_log("[object_sync] version: v=%u services=%" PRIu64 " ua=%s\n",
+        bm_log_info("[object_sync] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
         /* §11 2026-08-23 backlog項目3: プロトコルバージョン互換性チェック
          * (PyBitmessage network/bmproto.pyのpeerValidityChecks相当)。verackを送らずに
@@ -1002,7 +1002,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
          * network.c側の既存の切断経路(rating失敗記録込み)へ合流させる(network.hのdoc参照)。 */
         if (ver.version < BM_MIN_PROTOCOL_VERSION)
         {
-            bm_log("[object_sync] closing connection: peer protocol version %u is below minimum %d\n",
+            bm_log_warn("[object_sync] closing connection: peer protocol version %u is below minimum %d\n",
                     ver.version, BM_MIN_PROTOCOL_VERSION);
             bm_free_version_message(&ver);
             size_t err_len = 0;
@@ -1029,7 +1029,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         int64_t time_offset = (int64_t)ver.timestamp - (int64_t)time(NULL);
         if (time_offset > BM_MAX_TIME_OFFSET_SECONDS || time_offset < -BM_MAX_TIME_OFFSET_SECONDS)
         {
-            bm_log("[object_sync] closing connection: peer's version timestamp is %" PRId64
+            bm_log_warn("[object_sync] closing connection: peer's version timestamp is %" PRId64
                     "s off from our clock (limit %ds)\n",
                     time_offset, BM_MAX_TIME_OFFSET_SECONDS);
             bm_free_version_message(&ver);
@@ -1063,7 +1063,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         record_outbound_success(ctx, conn);
         if (bm_reply_verack(conn) != 0)
         {
-            bm_log("[object_sync] failed to reply verack\n");
+            bm_log_warn("[object_sync] failed to reply verack\n");
         }
         /* §11 inbound接続(Tor hidden service)対応: outboundは接続直後に
          * peer_connector.cが既に自分のversionを送信済みだが、inbound(BM_FD_SERVER_SOCKET、
@@ -1074,7 +1074,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         {
             if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
             {
-                bm_log("[object_sync] failed to send version to inbound peer\n");
+                bm_log_warn("[object_sync] failed to send version to inbound peer\n");
             }
             else
             {
@@ -1084,7 +1084,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
-        bm_log("[object_sync] verack received\n");
+        bm_log_debug("[object_sync] verack received\n");
         /* §11 2026-08-23: inbound/outbound問わず、verack受信時点で双方向のversion/verack
          * 交換が完了している(相手も既にこちらのversionを受け取っている)。
          * network.cのアイドル/ハンドシェイクタイムアウト判定(bm_network_idle_sweep)が
@@ -1098,7 +1098,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         if (bm_reply_pong(conn) != 0)
         {
-            bm_log("[object_sync] failed to reply pong\n");
+            bm_log_warn("[object_sync] failed to reply pong\n");
         }
     }
     else if (strncmp(msg->command, "addr", 12) == 0)
@@ -1149,7 +1149,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     }
                 }
             }
-            bm_log(
+            bm_log_debug(
                     "[object_sync] addr: %" PRIu64 " entries (%d registered to peers.db, %d filtered)\n",
                     addr_msg.count, registered, filtered);
             bm_free_addr_message(&addr_msg);
@@ -1205,7 +1205,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     consumed = bm_varint_decode(p, remaining, &text_len);
                     if (consumed > 0 && text_len <= remaining - consumed)
                     {
-                        bm_log(
+                        bm_log_warn(
                                 "[object_sync] error message from peer: fatal=%" PRIu64 " banTime=%" PRIu64
                                 " text=\"%.*s\"\n",
                                 fatal, ban_time, (int)text_len, p + consumed);
@@ -1237,7 +1237,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     {
         char command[13] = {0};
         memcpy(command, msg->command, 12);
-        bm_log("[object_sync] unhandled command: %s\n", command);
+        bm_log_warn("[object_sync] unhandled command: %s\n", command);
     }
 
     maybe_run_gc(ctx);
@@ -1265,12 +1265,12 @@ void *bm_object_sync_broadcast_thread(void *arg)
             if (!already_known && args->ctx->registry != NULL)
             {
                 bm_peer_registry_broadcast_inv(args->ctx->registry, &hash, 1, NULL);
-                bm_log("[object_sync] broadcasted locally-originated object to peers\n");
+                bm_log_info("[object_sync] broadcasted locally-originated object to peers\n");
             }
         }
         else
         {
-            bm_log("[object_sync] broadcast_queue item has a malformed object header, dropping\n");
+            bm_log_error("[object_sync] broadcast_queue item has a malformed object header, dropping\n");
         }
 
         free(item->object);

@@ -11,7 +11,7 @@ sqlite3 *bm_db_open(const char *filename)
     int rc = sqlite3_open_v2(filename, &db, flags, NULL);
     if (rc != SQLITE_OK)
     {
-        bm_log("sqlite3_open_v2(%s): %s\n", filename, sqlite3_errmsg(db));
+        bm_log_error("sqlite3_open_v2(%s): %s\n", filename, sqlite3_errmsg(db));
         sqlite3_close(db);
         return NULL;
     }
@@ -20,7 +20,7 @@ sqlite3 *bm_db_open(const char *filename)
     rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK)
     {
-        bm_log("PRAGMA journal_mode=WAL (%s): %s\n", filename, err_msg);
+        bm_log_error("PRAGMA journal_mode=WAL (%s): %s\n", filename, err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return NULL;
@@ -35,7 +35,7 @@ int bm_db_init_schema(sqlite3 *db, const char *schema_sql)
     int rc = sqlite3_exec(db, schema_sql, NULL, NULL, &err_msg);
     if (rc != SQLITE_OK)
     {
-        bm_log("sqlite3_exec(schema): %s\n", err_msg);
+        bm_log_error("sqlite3_exec(schema): %s\n", err_msg);
         sqlite3_free(err_msg);
         return -1;
     }

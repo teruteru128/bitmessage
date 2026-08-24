@@ -3101,7 +3101,77 @@ TTL(`BM_ONIONPEER_ANNOUNCE_TTL_SECONDS`=2日)自体は変更していない。�
 announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字列の場合に
 常にスキップされることを確認した。ctest 37件全通過。
 
-### v1.1以降のbacklog
+### ログレベル(DEBUG/INFO/WARN/ERROR)の導入(backlog項目8、2026-08-24)
+
+**経緯**: 2026-08-23に`common/logging.c`(`bm_log`)を新設した際、時刻付与とあわせて
+検討したがスコープ外としていた項目(backlog項目8参照)。既存の約140箇所の`bm_log`
+呼び出しを1つずつ「どのレベルに当たるか」判断し直す必要があり、時刻付与のような
+機械的な置換とは規模が違うため後回しにしていたが、今回着手した。
+
+**設計**: `enum bm_log_level { BM_LOG_DEBUG, BM_LOG_INFO, BM_LOG_WARN, BM_LOG_ERROR }`を
+新設し、`bm_log_leveled(level, fmt, ...)`を中核に、呼び出し側は`bm_log_debug/info/warn/error`
+マクロ経由で使う。旧`bm_log()`(レベル無し)は廃止し、全呼び出し箇所を置き換えた。
+出力フォーマットは`[TS] [LEVEL] msg`(時刻を付ける場合)/`[LEVEL] msg`(JOURNAL_STREAM
+配下等、付けない場合)。既定の最低レベルは`BM_LOG_INFO`(`DEBUG`を抑制)で、`BM_LOG_LEVEL`
+環境変数(`DEBUG`/`INFO`/`WARN`/`ERROR`、大文字小文字区別しない)で変更できる。認識できない
+値が指定された場合は既定(`BM_LOG_INFO`)のまま(誤指定でログが完全に沈黙する事故を防ぐ、
+安全側の挙動)。journald連携(優先度プレフィックス`<N>`によるSD_ERR等へのマッピング)は
+今回のスコープ外とした(backlog項目8の要求事項は「フィルタリング方式」のみで、
+journald固有の仕組みへの依存を増やすのは過剰と判断)。
+
+**レベル判定基準**(約140箇所を分類する際に採用した目安):
+- `ERROR`: 初期化・セットアップ処理が失敗し、その機能(DBオープン、スキーマ作成、
+  listen、Tor hidden service作成の各ステップ等)が丸ごと使えなくなる場合。OOM
+  (`malloc`/`calloc`失敗)や、自分で生成したはずのobjectが破損しているような内部
+  不変条件違反もここに含めた。
+- `WARN`: 実行時に起きる回復可能な異常(peerからの不正/期限切れ/PoW不足object、
+  malformed message、accept/epoll_ctl等のsyscall失敗、SOCKS5/Torプロキシ経由の
+  接続失敗、設定ファイルの記述ミス等)。単発では致命的でないが運用者が気に留めるべき事象。
+  Tor ControlPort連携(`tor_control.c`)のみ例外的に大半を`ERROR`とした
+  (PROTOCOLINFO/AUTHENTICATE/ADD_ONIONの一連の手順はどのステップで失敗しても
+  hidden service全体が使えなくなるため、`WARN`より`ERROR`が実態に合うと判断)。
+- `INFO`: 意味のあるライフサイクルイベント(daemon起動/終了、DB初期化完了、listen開始、
+  outbound/inbound接続確立、hidden service準備完了、メッセージ受信・送信成功等)。
+  頻度が低く運用上の節目になるもの。
+- `DEBUG`: 高頻度で個々の重要性が低いトレース(inv/getdata/addrの受信件数サマリ、
+  keepalive ping送信、verack受信、pubkey応答のキャッシュ再利用等)。2026-08-23〜24に
+  「正常系ログが無く可視化できない」という指摘を受けて追加した一連のログの多くが該当する
+  (§11「ログ改善」各節参照)。
+
+**テスト**: `tests/test_logging.c`にレベルタグ付与・`BM_LOG_LEVEL`によるフィルタリング
+(既定で`DEBUG`抑制、`BM_LOG_LEVEL=DEBUG`で表示、`BM_LOG_LEVEL=ERROR`で`ERROR`以外を
+抑制、不正値は既定にフォールバック)のシナリオを追加。既存の時刻付与・マルチスレッド
+安全性の検証もレベルタグを含む新フォーマットに合わせて更新した。
+
+実装中に見つけたテスト設計上の注意点: `bm_log_init()`は`BM_LOG_LEVEL`未設定/不正値の
+場合に「前回の値のまま変更しない」という実装にすると、同一プロセス内で`bm_log_init()`を
+複数回呼ぶテスト(env varを変えながら繰り返し呼ぶ)で前のテストケースの設定を引きずり
+非決定的になることが実際に発覚した(不正値のテストケースの直前に`BM_LOG_LEVEL=ERROR`を
+設定するケースがあり、不正値指定時に`ERROR`のままフィルタが効いてしまっていた)。
+実運用では`main()`起動時に1回しか呼ばないため実害は無いが、`bm_log_init()`呼び出しのたび
+`g_min_level`を既定値へ一度リセットしてから環境変数で上書きする実装に変更し、
+呼び出し履歴に依存しない決定的な挙動にした。
+
+ctest 37件全通過(警告ゼロ)。
+
+**副次的に発見・修正したバグ**: 上記の移行後にビルド・テストを流したところ、
+`test_object_sync`のシナリオ16(onionpeer自己announceの定期再送、backlog項目6)が
+数回に1回だけ失敗するflakinessが発覚した。原因は`bm_object_sync_announce_onion_peer`
+(`infra/object_sync.c`)が`expires_time`の計算に関数内部で`time(NULL)`を直接呼んで
+いたこと。シナリオ16は`bm_object_sync_maybe_reannounce_onion_peer`へ合成の`now`
+(1000, 1000+7380)を渡して間隔判定の決定性を検証しているが、内部で呼ばれる
+`bm_object_sync_announce_onion_peer`自体は合成`now`を無視して実時刻を使っていたため、
+テストが実行される実時刻の1秒以内に2回のannounceが発生すると(このテストは瞬時に
+実行されるため通常そうなる)、`expires_time`を含むonionpeer payloadが完全に同一に
+なり、PoW(決定的なnonceのブルートフォース探索)の結果までnonce込みで一致し、
+2回目が`bm_object_store_has`の重複排除に引っかかって announceされない(=定期再送が
+効かない秒がある)という実バグだった。実運用では2回目の呼び出しはTTL(7380秒)後
+なので通常問題化しないが、CLAUDE.mdの「時刻は明示引数で受け取り、関数内部で
+time(NULL)を直接呼ばない」方針に反していたのも事実であり、`bm_object_sync_announce_onion_peer`
+にも`int64_t now`引数を追加し、呼び出し元(`main.c`2箇所、
+`bm_object_sync_maybe_reannounce_onion_peer`、`tests/test_object_sync.c`)を全て
+更新した。修正後、`ctest -R object_sync`を5回連続実行してflakinessが再現しないことを
+確認した。
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。上記セッションで新たに洗い出した
@@ -3129,11 +3199,9 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
    (2日)は意図的に変更していない(既存の安全マージンで十分と判断、上記まとめ参照)。
 7. ~~**LAN内UDP broadcastによるpeer発見が無い**~~: 2026-08-24、ユーザーと相談の上で
    優先度をさらに下げ、末尾の項目10へ移動(詳細は項目10参照)。
-8. **ログレベル(DEBUG/INFO/WARN/ERROR)が無い**: 2026-08-23に`common/logging.c`
-   (`bm_log`)を新設した際、時刻付与とあわせて検討したがスコープ外とした。既存の
-   約120箇所の呼び出しを1つずつ「どのレベルに当たるか」判断し直す作業が必要で、
-   時刻付与のような機械的な置換とは規模が違う。フィルタリング方式(環境変数で
-   最低レベル指定等)も別途設計が要る。優先度低。
+8. ~~**ログレベル(DEBUG/INFO/WARN/ERROR)が無い**~~: 2026-08-24完了(上記まとめ参照)。
+   `BM_LOG_LEVEL`環境変数(既定`INFO`)によるフィルタリングを実装し、約140箇所の
+   呼び出しを全て`bm_log_debug/info/warn/error`へ移行した。
 9. **ASan/UBSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミスの検査体制が
    無い**: 2026-08-24、ユーザーが外部(Google検索)で得た助言をもとに提起。このプロジェクトは
    手動メモリ管理・pthread併用のCコードで、過去にも複数回サイズ不足バッファ(onionアドレス
@@ -3179,9 +3247,9 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
 12. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
-    listConnections API(MVP)・onionpeer自己announceの定期再送はいずれも完了
-    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
-    対象外(引き続き見送り)。
+    listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
+    (DEBUG/INFO/WARN/ERROR)導入はいずれも完了(上記まとめ参照)。GPU/OpenCL PoWは
+    §8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

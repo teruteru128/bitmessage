@@ -1289,14 +1289,14 @@ void *bm_api_server_thread(void *arg)
     int listen_fd = -1;
     if (bm_api_server_listen(config, &listen_fd) != 0)
     {
-        bm_log("[api_server] failed to listen on %s\n", addr_buf);
+        bm_log_error("[api_server] failed to listen on %s\n", addr_buf);
         free(args);
         return NULL;
     }
-    bm_log("[api_server] listening on %s\n", addr_buf);
+    bm_log_info("[api_server] listening on %s\n", addr_buf);
     bm_api_server_serve_forever(listen_fd, config, args->stop_flag);
     close(listen_fd);
-    bm_log("[api_server] stopped\n");
+    bm_log_info("[api_server] stopped\n");
     free(args);
     return NULL;
 }

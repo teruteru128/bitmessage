@@ -255,7 +255,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                                           BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
                     != 0)
                 {
-                    bm_log("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                    bm_log_warn("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
                 }
                 else
                 {
@@ -275,7 +275,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                                           BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
                     != 0)
                 {
-                    bm_log("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
+                    bm_log_warn("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
                 }
                 else
                 {
@@ -295,7 +295,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
      * (pending_count==0)場合は出さない。 */
     if (pending_count > 0)
     {
-        bm_log("[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s)\n", count,
+        bm_log_debug("[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s)\n", count,
                 inv_sent_peers, dinv_sent_peers);
     }
     free(pending);

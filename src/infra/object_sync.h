@@ -122,8 +122,19 @@ void *bm_object_sync_broadcast_thread(void *arg);
  * する。main.cがTor ControlPort連携(Stage 2)でhidden serviceを作成した直後に1回呼ぶ想定。
  * onion_addressは"xxxx.onion"(v3、56文字+".onion")形式であること。stream=1(既定のmother
  * stream)で告知する。成功時0、onion_addressの形式が不正な場合のみ-1(PoW自体は必ず成功する)。
+ *
+ * §11 2026-08-24発覚のバグ修正: 以前はexpires_time計算に関数内部でtime(NULL)を直接呼んで
+ * いたため、bm_object_sync_maybe_reannounce_onion_peer経由で同じ実時刻の1秒以内に2回呼ばれる
+ * (テストのように短時間に連続して呼ぶ場合や、極端に短い間隔設定の場合)とexpires_timeを含む
+ * payloadが完全に同一になり、PoWも決定的(nonceのブルートフォース探索、乱数ではない)なので
+ * objectのhashまで一致してしまう。結果、2回目はbm_object_store_hasによる重複排除に引っかかり
+ * announceされない(=定期再送が実際には効かない秒がある)、という意図しない挙動になっていた
+ * (実際にtests/test_object_sync.cのシナリオ16で秒境界をまたぐかどうかに依存するflaky failure
+ * として発覚)。CLAUDE.mdの「時刻は明示引数で受け取り、関数内部でtime(NULL)を直接呼ばない」
+ * 方針に従い、nowを呼び出し元から受け取るよう変更した。
  */
-int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port);
+int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
+                                        int64_t now);
 
 /*
  * §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(PyBitmessage本家
