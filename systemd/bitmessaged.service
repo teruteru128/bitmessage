@@ -1,0 +1,58 @@
+[Unit]
+Description=bitmessage-c daemon (bitmessaged)
+Documentation=https://github.com/teruteru128/bitmessage
+# outbound P2P接続(mainnet/testnetいずれもTCP、SOCKS5経由のTor利用時はTor自体の起動も
+# 必要。§11 outbound Tor経路参照)のためネットワーク到達性を待ってから起動する。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# §11 2026-08-24 backlog項目10の4/5: 「予期しないクラッシュ(SIGSEGV/OOM-kill等)からは
+# 自動復旧するが、systemctl stopによる意図的な終了(SIGTERM→exit 0)では再起動しない」
+# という、これまでwatchdog_daemon_a.sh(DESIGN.md参照)が担っていた役割をsystemd自身に
+# 移管する。on-failureはexit(0)や正常なシグナル終了では発火しないため、この意図に合う。
+Restart=on-failure
+RestartSec=5
+
+# §11 2026-08-24 backlog項目10の2/5・3/5で追加したBM_DATA_DIR/BM_SEEDS_FILE/
+# BM_CONFIG_FILE環境変数(main.c参照、いずれも未設定時はCWD相対の従来動作にフォールバック
+# する非破壊的な追加)を使い、systemd管理下での標準的な配置に固定する。
+# StateDirectory=bitmessageによりsystemdが/var/lib/bitmessageを自動作成し、
+# DynamicUserの所有権を付与する(手動でのディレクトリ作成・chown・システムユーザー
+# 作成が一切不要)。ConfigurationDirectory=bitmessageも同様に/etc/bitmessageを作成する
+# (bitmessage.confが存在しなくても既定値で起動するため必須ではないが、置き場所を
+# 用意しておく)。
+#
+# ExecStart/BM_SEEDS_FILEのパスは`cmake -S . -B build-Release -DCMAKE_BUILD_TYPE=Release`
+# (既定のCMAKE_INSTALL_PREFIX=/usr/local)を前提にしている。/usr等の別prefixへインストール
+# する場合はこのファイル内の/usr/localをすべて置き換えること。
+ExecStart=/usr/local/bin/bitmessaged
+DynamicUser=yes
+StateDirectory=bitmessage
+ConfigurationDirectory=bitmessage
+WorkingDirectory=/var/lib/bitmessage
+Environment=BM_DATA_DIR=/var/lib/bitmessage
+Environment=BM_CONFIG_FILE=/etc/bitmessage/bitmessage.conf
+Environment=BM_SEEDS_FILE=/usr/local/share/bitmessage/observed_nodes.txt
+
+# §11 2026-08-23実装のJOURNAL_STREAM自動判定(common/logging.c)により、systemd配下では
+# ログ行への時刻付与を自動的に省略する(journaldが受信時刻を別途正確に記録するため)。
+# BM_LOG_TIMESTAMPS/BM_LOG_LEVEL(backlog項目8)で上書きしたい場合はここにEnvironment=を
+# 追加する。
+StandardOutput=journal
+StandardError=journal
+
+# 軽めのセキュリティ強化。ProtectSystem=strict等の強い制限は意図的に入れていない
+# (Tor ControlPort連携が/run/tor/control等、実行時にならないと確定しないパスへ
+# アクセスする機能があり、強い制限をかけると気づかないうちにそこだけ静かに壊れる
+# リスクがあるため。DESIGN.md §11参照)。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

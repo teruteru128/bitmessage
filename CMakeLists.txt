@@ -54,7 +54,7 @@ add_subdirectory(src)
 # ディストリ標準的な相対パスを得る(ハードコードしない)。DBファイル・設定ファイルの
 # 置き場所(BM_DATA_DIR/BM_CONFIG_FILE)はユーザー状態データのためインストール対象に
 # 含めない(backlog項目10の2/5、main.c参照。既定はCWDのまま、systemdユニット
-# ファイル(backlog項目10の4/5、未着手)側でEnvironment=として明示指定する想定)。
+# ファイル(backlog項目10の4/5、下記)側でEnvironment=として明示指定する)。
 include(GNUInstallDirs)
 
 install(TARGETS bitmessaged bitmessage-cli
@@ -68,6 +68,18 @@ install(TARGETS bitmessaged bitmessage-cli
 # を設定する必要がある)。
 install(FILES seeds/observed_nodes.txt
         DESTINATION ${CMAKE_INSTALL_DATADIR}/bitmessage)
+
+# §11 2026-08-24 backlog項目10の4/5: systemdユニットファイル。pkg-config経由で
+# systemdsystemunitdirを問い合わせる方式(pkg_check_modules(systemd))は、ビルド環境に
+# systemdの開発用pkg-configファイルが無い場合に失敗しうるため、多くのCMakeプロジェクトで
+# 使われている${CMAKE_INSTALL_LIBDIR}/systemd/systemへの直接インストールに倣った
+# (prefix=/usr/localなら/usr/local/lib/systemd/system、prefix=/usrなら
+# /usr/lib/systemd/system)。systemdユニットファイル自体(systemd/bitmessaged.service)は
+# ExecStart等のパスをCMAKE_INSTALL_PREFIX既定値(/usr/local)決め打ちで書いてあるため、
+# 別prefixでインストールする場合はユニットファイル側も合わせて書き換える必要がある
+# (ユニットファイル冒頭のコメント参照)。
+install(FILES systemd/bitmessaged.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
 
 enable_testing()
 add_subdirectory(tests)

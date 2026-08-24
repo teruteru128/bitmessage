@@ -3420,6 +3420,52 @@ ${CMAKE_INSTALL_DATADIR}/bitmessage)`(既定`share/bitmessage`)を追加した�
 `build-Debug`/`build-Release`/`build-Sanitize`/`build-TSan`の4種全てクリーンビルドで
 警告ゼロ・ctest 38件全通過を確認(TSan含む)。
 
+### systemdユニットファイル(backlog項目10の4/5、2026-08-24)
+
+**設計判断(ユーザーと相談)**: `ExecStart`等のインストール先パスを`/usr/local`
+(`CMAKE_INSTALL_PREFIX`の既定値、`cmake --install`をそのまま実行した場合の実際の
+インストール先)前提にするか、配布パッケージを想定した`/usr`前提にするか確認し、
+前者で合意した。Ubuntu/Debianパッケージリポジトリへの登録は現実的な目標ではない
+(ユーザー本人の運用が主目的)という位置づけの確認も込み。`/usr`前提にしたい場合は
+ユニットファイル内の`/usr/local`を置換するだけで対応できるようコメントを残した。
+
+**`systemd/bitmessaged.service`の内容**:
+- `Type=simple`・`Restart=on-failure`(ユーザー指定通り)。`on-failure`は`exit(0)`や
+  正常なシグナル終了では発火しないため、「予期しないクラッシュ(SIGSEGV/OOM-kill等)
+  からは自動復旧するが、`systemctl stop`による意図的な終了では再起動しない」という
+  意図に合う。これまで`watchdog_daemon_a.sh`(DESIGN.md参照)が担っていた役割を
+  systemd自身に移管する形になる。
+- `DynamicUser=yes`+`StateDirectory=bitmessage`+`ConfigurationDirectory=bitmessage`:
+  systemdに`/var/lib/bitmessage`(所有権含む)・`/etc/bitmessage`の作成を任せ、専用の
+  システムユーザー作成やディレクトリの手動`chown`が一切不要になる現代的な作法。
+- `Environment=BM_DATA_DIR=/var/lib/bitmessage`・`BM_CONFIG_FILE=/etc/bitmessage/
+  bitmessage.conf`・`BM_SEEDS_FILE=/usr/local/share/bitmessage/observed_nodes.txt`:
+  backlog項目10の2/5・3/5で追加した環境変数を実際に使い、systemd管理下での標準的な
+  配置に固定する。
+- セキュリティ強化は`NoNewPrivileges`/`PrivateTmp`/`ProtectHome`等の軽めのものに留め、
+  `ProtectSystem=strict`のような強い制限は意図的に入れなかった。Tor ControlPort連携
+  (`/run/tor/control`等、実行時の設定次第でパスが変わりうる)が強い制限下で気づかない
+  うちに塞がれるリスクを避けるため。
+- `After=network-online.target`/`Wants=network-online.target`(outbound P2P接続の
+  ためネットワーク到達性を待つ)。
+
+**CMake統合**: `install(FILES systemd/bitmessaged.service DESTINATION
+${CMAKE_INSTALL_LIBDIR}/systemd/system)`を追加。systemdの`pkg-config`経由での
+`systemdsystemunitdir`問い合わせ方式は、ビルド環境にsystemdの開発用pkg-configファイルが
+無いと失敗しうるため、多くのCMakeプロジェクトで使われている
+`${CMAKE_INSTALL_LIBDIR}/systemd/system`への直接インストールに倣った。
+
+**検証**: `systemd-analyze verify`でユニットファイルの構文が正しいことを確認
+(`ExecStart`先を実際のビルド成果物のパスに一時的に差し替えて検証、実運用のパスは
+未インストールのため検証できないのは想定通り)。`DESTDIR`付き`cmake --install`で
+`.service`ファイルが期待通りの相対パスへインストールされることも確認した。
+
+この変更は`CMakeLists.txt`(`install()`追加)と新規ファイル`systemd/bitmessaged.service`
+のみで、Cソースコードは一切変更していないため、`build-Debug`/`build-Release`は
+クリーンビルド+ctest 38件全通過を確認したが、`build-Sanitize`/`build-TSan`は
+再ビルドが警告ゼロで通ることのみ確認し(コード変更が無い以上ctestの結果が変わる
+理由が無いため)、フルの`ctest`再実行は省略した。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3466,9 +3512,10 @@ ${CMAKE_INSTALL_DATADIR}/bitmessage)`(既定`share/bitmessage`)を追加した�
        非破壊的な方式にした(既存のdaemon Aへの影響ゼロ)。
     3. ~~`cmake --install`用の`install()`定義~~ 完了(上記まとめ参照)。GNUInstallDirsで
        `bitmessaged`/`bitmessage-cli`/`seeds/observed_nodes.txt`をインストールできる。
-    4. `.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)作成(未着手、
-       2に依存)。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、
-       まさにこのsystemd化を見越したもの。
+    4. ~~`.service`ユニットファイル作成~~ 完了(上記まとめ参照)。`systemd/bitmessaged.service`、
+       `DynamicUser`+`StateDirectory`/`ConfigurationDirectory`でシステムユーザー・
+       ディレクトリ作成を自動化、`Restart=on-failure`。当日夜に実装した
+       `common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこのsystemd化を見越したもの。
     5. 非Ubuntu環境への軽い手当て(未着手、詳細下記)。
     - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
       ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
