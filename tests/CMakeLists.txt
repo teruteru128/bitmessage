@@ -40,6 +40,10 @@ add_test(NAME cli_integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
 
+add_executable(test_http_client test_http_client.c ../src/cli/http_client.c)
+target_link_libraries(test_http_client PRIVATE OpenSSL::Crypto Threads::Threads)
+add_test(NAME http_client COMMAND test_http_client)
+
 add_test(NAME data_dir
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_data_dir.sh
                  $<TARGET_FILE:bitmessaged>)

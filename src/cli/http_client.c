@@ -55,11 +55,16 @@ char *bm_http_post_json(const char *host, int port, const char *username, const 
         snprintf(auth_header, sizeof(auth_header), "Authorization: Basic %s\r\n", encoded);
     }
 
-    char *request = malloc(strlen(body) + strlen(auth_header) + 256);
-    int req_len = sprintf(request,
-                           "POST / HTTP/1.1\r\nHost: %s\r\n%sContent-Type: application/json\r\n"
-                           "Content-Length: %zu\r\n\r\n%s",
-                           host, auth_header, strlen(body), body);
+    /* セキュリティレビューで発覚: 以前は確保サイズの計算にhost(BM_API_HOST環境変数由来、
+     * 長さ無制限)が含まれておらず、長いBM_API_HOSTを設定するとsprintf()がヒープ確保
+     * 領域をはみ出して書き込むバッファオーバーフローになりえた。strlen(host)を
+     * サイズ計算へ加え、sprintf()もsnprintf()へ置き換えて二重に安全側にした。 */
+    size_t request_cap = strlen(host) + strlen(body) + strlen(auth_header) + 256;
+    char *request = malloc(request_cap);
+    int req_len = snprintf(request, request_cap,
+                            "POST / HTTP/1.1\r\nHost: %s\r\n%sContent-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n\r\n%s",
+                            host, auth_header, strlen(body), body);
     ssize_t written = write(fd, request, (size_t)req_len);
     free(request);
     if (written != req_len)

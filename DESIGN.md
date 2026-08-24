@@ -1227,7 +1227,28 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
     2026-08-24、ユーザーと再度確認し「当分着手しなくてよい」と明示的に合意(単なる
     優先度低ではなく、事実上の凍結扱い。OpenSSLが実際に非推奨APIの削除を予告する等、
     状況が変わるまでは見送る)。
-13. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+13. **系統的なセキュリティレビューが未着手**: 2026-08-24、ユーザーから「脆弱性チェックは
+    終わったと判定していいのか」と問われて発覚。backlog項目9(ASan/UBSan/TSan)は
+    あくまでメモリ安全性(メモリ破壊・UB・データ競合)の検査であり、脆弱性チェック
+    全般ではない。同日、軽くコードを見ただけで`src/cli/http_client.c`の
+    `bm_http_post_json`のリクエストバッファ確保サイズがhostの長さを考慮していない
+    問題(実際には`connect_to`のIPv4形式チェックにより到達不能と判明、念のため
+    防御的に修正・テスト追加済み、DESIGN-LOG.mdの該当セッション参照)が見つかったのが
+    その端緒。系統的なレビューはまだしていない。優先度を検討すべき観点:
+    - **P2Pメッセージパーサ群**(`infra/protocol.c`・`infra/object.c`・
+      `infra/object_sync.c`等)がこのプロジェクトの本来の脅威モデルの中心
+      (untrustedな実ネットワークからの入力を直接パースする)であり、最優先で見るべき
+      箇所。既存のDoS対策(申告lengthの上限チェック等)はあるが、個々のフィールド
+      パース処理(varint/varstr展開、objectヘッダ解析等)の境界値・不正値に対する
+      堅牢性を体系的に確認したことはない
+    - 認証まわり(`core/api_server.c`のBasic認証、既に定数時間比較は実装済み)の
+      再確認
+    - SQLクエリの組み立て方(ざっと見た限り`sqlite3_bind_*`によるパラメータバインドが
+      徹底されており、文字列結合によるSQL構築は見当たらなかったが、全箇所の
+      網羅確認はしていない)
+    - 秘密鍵等の機密情報がログ・エラーメッセージ・core dumpに漏れていないか
+    - 依存ライブラリ(OpenSSL/SQLite3)のバージョン・既知CVEの確認
+14. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
