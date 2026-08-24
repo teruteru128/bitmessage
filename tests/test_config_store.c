@@ -30,6 +30,18 @@
 
 static int failures = 0;
 
+/* §11 2026-08-24 backlog項目9(ASan/UBSan導入)で発覚: bm_peer_connector_connect_initialが
+ * 実際に確立したbm_fd_data(と内部のrecvバッファ)は、registryへ登録されるだけで所有権を
+ * registryへ移さない(close_connection/bm_fd_data_freeを呼ぶのは呼び出し元の責務、
+ * peer_registry.h参照)。テストがbm_peer_registry_destroyで配列を解放するだけでは
+ * 個々の接続自体はリークする(LeakSanitizerが検出)。 */
+static void close_and_free_conn(struct bm_fd_data *conn, void *user_data)
+{
+    (void)user_data;
+    close(conn->fd);
+    bm_fd_data_free(conn);
+}
+
 #define CHECK(cond, msg)                                                     \
     do                                                                       \
     {                                                                        \
@@ -226,6 +238,7 @@ int main(void)
     CHECK(mock_args.saw_correct_connect_request, "mock socks server should observe a CONNECT request "
                                                    "targeting mock-destination.example:12345");
 
+    bm_peer_registry_for_each(&registry, close_and_free_conn, NULL);
     bm_peer_registry_destroy(&registry);
     close(epfd);
     close(listen_fd);

@@ -652,6 +652,12 @@ int main(void)
     CHECK(shutdown_seconds < 3.0, "api_server should stop within a few seconds of stop_flag being set");
     printf("api_server graceful shutdown took %.3f seconds\n", shutdown_seconds);
 
+    /* §11 2026-08-24 backlog項目9(ASan/UBSan導入)で発覚: registryの内部配列(reg->conns)を
+     * 解放しないまま終了しており、AddressSanitizerのLeakSanitizerがリークとして検出した。
+     * 個々の接続(bm_fd_data)自体は上でbm_fd_data_free済みだが、registry自体の後片付けが
+     * 抜けていた。 */
+    bm_peer_registry_destroy(&registry);
+
     bm_keyring_destroy(&kr);
     sqlite3_close(identity_db);
     sqlite3_close(messages_db);

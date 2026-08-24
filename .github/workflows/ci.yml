@@ -26,3 +26,31 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+
+  # §11 2026-08-24 backlog項目9: メモリリーク・バッファオーバーフロー・メモリ管理ミスの
+  # 検査体制。build-and-testとは別ジョブにして並列実行し、Sanitizer特有の失敗(実行時間の
+  # 増加・ASan/UBSanの指摘)を通常ビルドの合否と区別しやすくしている。ThreadSanitizerは
+  # instrumentationがASan/UBSanと競合し同時併用できないため、導入する場合は別ジョブとして
+  # 追加する必要がある(現時点では未導入、DESIGN.md §11参照)。
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libssl-dev libsqlite3-dev
+
+      - name: Configure (ASan+UBSan)
+        run: cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON
+
+      - name: Build
+        run: cmake --build build-sanitize --parallel
+
+      - name: Test
+        working-directory: build-sanitize
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --output-on-failure

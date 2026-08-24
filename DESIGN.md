@@ -3173,6 +3173,69 @@ time(NULL)を直接呼ばない」方針に反していたのも事実であり�
 更新した。修正後、`ctest -R object_sync`を5回連続実行してflakinessが再現しないことを
 確認した。
 
+### ASan/UBSanの導入(backlog項目9、2026-08-24)
+
+**経緯**: 2026-08-24にユーザーが外部(Google検索)で得た助言を踏まえ提起したbacklog項目9。
+「Sanitizeビルドで`ctest`一式を流し、指摘を1件ずつ精査・修正する」「daemon本体もtestnet+
+隔離ディレクトリで短時間動かし、テストでは踏まない実ネットワーク経路も検証する」という
+2点をユーザーと合意した上で着手した。
+
+**CMake実装**: `CMakeLists.txt`へ`BM_ENABLE_ASAN`/`BM_ENABLE_UBSAN`/`BM_ENABLE_TSAN`の
+3オプション(既定OFF)を追加。ON時は`-fsanitize=...,-fno-omit-frame-pointer,-g`を
+コンパイル・リンク両方に付与する。`BM_ENABLE_TSAN`を`BM_ENABLE_ASAN`/`BM_ENABLE_UBSAN`と
+同時にONにすると`FATAL_ERROR`で弾く(instrumentation競合のため)。既存の`build-Debug`とは
+別に`build-Sanitize`ディレクトリ(`cmake -S . -B build-Sanitize -DCMAKE_BUILD_TYPE=Debug
+-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`)を使う運用にして、日常のbuild-Debugサイクル
+(CLAUDE.md「Build」参照)を一切崩さないようにした。
+
+**実装中に踏んだ罠**: 最初`list(APPEND BM_SANITIZE_FLAGS "-fsanitize=address")`のように
+プレフィックス込みの文字列をリストへ積んでから`list(JOIN ... "," ...)`で結合し、それを
+さらに`"-fsanitize=${...}"`で包んでいたため、`-fsanitize=-fsanitize=address,-fsanitize=undefined`
+という二重プレフィックスの壊れた引数になりコンパイルエラーになった。プレフィックス無しの
+値(`address`/`undefined`/`thread`)だけをリストに積み、結合後に1回だけ`-fsanitize=`を
+付ける形に修正した。
+
+**ctestで発見した実リーク2件(いずれもテストハーネス側の後片付け漏れ、本体コードのバグでは
+ない)**:
+- `tests/test_api_server.c`: `struct bm_peer_registry registry`を`bm_peer_registry_init`
+  するだけで、`bm_peer_registry_destroy`を一度も呼ばずにmain()を終えていた。登録した
+  個々の接続(`lc_conn_out`/`lc_conn_in`)自体は`bm_fd_data_free`済みだったが、registry
+  内部の配列(`reg->conns`)がリークしていた(`bm_peer_registry_add`内の`realloc`、64byte)。
+  `bm_peer_registry_destroy(&registry)`をmain()末尾に追加して解消。
+- `tests/test_config_store.c`: `bm_peer_connector_connect_initial`がSOCKS5モックプロキシ
+  経由で実際に1本接続を確立し、その`bm_fd_data`(と内部のrecvバッファ、計131488byte)を
+  registryへ登録するが、registryは接続オブジェクトの所有権を持たない設計
+  (`peer_registry.h`のdocコメント参照、close_connection/`bm_fd_data_free`の呼び出しは
+  常に呼び出し元の責務)なので、テストが自分で個々の接続をfreeしないとリークする。
+  `bm_peer_registry_for_each`で全登録接続を巡回してfd close+`bm_fd_data_free`する
+  コールバックを追加し、`bm_peer_registry_destroy`の前に呼ぶよう修正した。
+
+この2件はいずれも「registryは接続の所有者ではない」という既存設計に対するテスト側の
+理解不足が原因で、本体コード(`peer_registry.c`/`peer_connector.c`)自体にはバグが
+無かった。修正後、`build-Sanitize`でのctest 37件が全通過(ASan/UBSanとも指摘ゼロ)。
+
+**daemon本体の手動smoke test**: `build-Sanitize/src/bitmessaged`をリポジトリ外の隔離
+ディレクトリ(スクラッチ領域、実DBファイルとは完全に別)から`BM_TESTNET=1`・SOCKS5/Tor
+未使用で2回(45秒・150秒)起動し、実testnet peer(5.78.198.100:8444等)への実際の
+outbound接続・version交換・切断(相手からのconnection reset)・SIGTERMによる
+graceful shutdownを複数サイクル踏ませた。`ASAN_OPTIONS=detect_leaks=1:log_path=...`
+`UBSAN_OPTIONS=print_stacktrace=1:log_path=...`を指定したが、レポートファイルは
+一つも生成されず(=指摘ゼロ)。DB初期化・config読み込み・実TCP接続の確立/切断の
+繰り返し・graceful shutdownの経路では問題が見つからなかった。ただしこの smoke test は
+inv/getdata交換までは安定して踏めておらず(テスト用testnet peerがversion直後に切断
+してくることが多かった)、その経路の実ネットワーク検証は今後の課題として残る。
+
+**CI統合**: `.github/workflows/ci.yml`へ`sanitize`ジョブを新設(`build-and-test`とは
+別ジョブ、並列実行)。`-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`でビルドし、
+`ASAN_OPTIONS=detect_leaks=1`/`UBSAN_OPTIONS=print_stacktrace=1`付きで`ctest`を
+走らせる。上記の通りリークを解消済みの状態でCIへ組み込んだため、導入直後からグリーンな
+状態でスタートできる。ThreadSanitizerは別ジョブが必要な上、`peer_registry`等の共有構造体を
+TSanの目で精査する作業自体が別工程になるため、今回はCIに含めず引き続き見送り。
+
+ctest 37件全通過(通常のbuild-Debugビルドでも警告ゼロ・全通過を再確認済み)。
+
+### v1.1以降のbacklog
+
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
 手動peer追加/observed_nodesリスト)は全て完了した。上記セッションで新たに洗い出した
 項目を含め、残るのは以下の通り(優先度順)。
@@ -3202,19 +3265,9 @@ time(NULL)を直接呼ばない」方針に反していたのも事実であり�
 8. ~~**ログレベル(DEBUG/INFO/WARN/ERROR)が無い**~~: 2026-08-24完了(上記まとめ参照)。
    `BM_LOG_LEVEL`環境変数(既定`INFO`)によるフィルタリングを実装し、約140箇所の
    呼び出しを全て`bm_log_debug/info/warn/error`へ移行した。
-9. **ASan/UBSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミスの検査体制が
-   無い**: 2026-08-24、ユーザーが外部(Google検索)で得た助言をもとに提起。このプロジェクトは
-   手動メモリ管理・pthread併用のCコードで、過去にも複数回サイズ不足バッファ(onionアドレス
-   62文字対応漏れによる`logical_peer_ip`破損等、上記まとめ参照)が発覚した実績があり、
-   着手コストの割に効果が大きいと判断。項目10(Releaseビルド化)が既に指摘している
-   「`-O2`最適化によるUB顕在化・タイミング変化の可能性は未検証」という懸念にも直接
-   対応するため、Releaseビルド化に着手する前段として位置づける。実装は`CMakeLists.txt`へ
-   `-fsanitize=address,undefined`を有効化する専用ビルドタイプ(例: `Sanitize`)を追加し、
-   その設定で`ctest`一式を流すだけで着手可能。ThreadSanitizer(データ競合検出、
-   `peer_registry`等mutex保護済み共有構造体の検証に有用)も候補だが、ASan/UBSanとは
-   挿入するinstrumentationが競合するため同時併用不可であり、導入する場合は別ビルド
-   タイプとして分離する必要がある。ASan/UBSan/TSanをどこまで・どう分割して導入するかは
-   着手時に改めて検討する(現時点では候補を挙げるのみで未着手)。
+9. ~~**ASan/UBSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミスの検査体制が
+   無い**~~: 2026-08-24、ASan/UBSanのみ完了(上記まとめ参照)。ThreadSanitizerは
+   instrumentation競合のため引き続き見送り(候補として記録のみ)。
 10. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
     ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
     実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
@@ -3248,8 +3301,9 @@ time(NULL)を直接呼ばない」方針に反していたのも事実であり�
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
-    (DEBUG/INFO/WARN/ERROR)導入はいずれも完了(上記まとめ参照)。GPU/OpenCL PoWは
-    §8で明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+    (DEBUG/INFO/WARN/ERROR)導入・ASan/UBSan導入(CI統合含む)はいずれも完了
+    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
+    対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
