@@ -43,9 +43,15 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
   申告するpeerを即座に切断(受信バッファの無制限確保を防止)
 - **JSON-RPC 2.0 API + CLI**: 上記すべてを`bitmessage-cli`から操作可能
 
-### v1スコープ外(既知の制限、backlog)
+### スコープ外(既知の制限、backlog)
 
-- inbound接続(Tor hidden service実装まで見送り)、Dandelion++のstem機能、GPU PoW — 当初から明示的にスコープ外
+- GPU/OpenCL PoW — §8で明示的にv1スコープ外と決めた項目、引き続き見送り
+- LAN内UDP broadcastによるpeer発見 — 手動peer追加で代替可能なため当分見送り(凍結)
+- `core/crypto.c`のEC_KEY/ECDSA系のEVP_PKEYベースAPIへの移行 — OpenSSLが実際に
+  非推奨API削除を予告するまでは見送り(凍結)
+
+(inbound接続(Tor hidden service)・Dandelion++のstem機能は、当初はv1スコープ外だったが
+v1.1で実装済み)
 
 詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
 
