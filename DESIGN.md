@@ -1248,7 +1248,19 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
       網羅確認はしていない)
     - 秘密鍵等の機密情報がログ・エラーメッセージ・core dumpに漏れていないか
     - 依存ライブラリ(OpenSSL/SQLite3)のバージョン・既知CVEの確認
-14. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+14. **`peers.db`の再シード条件が厳しすぎる**: 2026-08-24〜25、Releaseビルドへ切り替えて
+    長期運用テストを開始した直後、ユーザーから「selfの他に3件しかpeerが残っていない」と
+    報告を受けて発覚。`bm_peer_manager_cleanup`(28日間音信不通、または3時間以上音信不通
+    かつ`rating<=-0.5`のホストを削除)自体は正しく動作しており、daemonが長時間停止していた
+    間にratingの悪いpeerがまとめて削除された結果だった(データ消失やバグではない)。
+    ただし`bm_peer_manager_seed_bootstrap`(ブートストラップシード再投入)は
+    `hosts`テーブルが**完全に空(0件)の時だけ**発動する設計になっており、「self以外に
+    数件しか残っていない」ような実質的にほぼ空の状態を救済できない。残った数件が
+    同時に不通になった場合、自力で回復できなくなるリスクがある。閾値を`==0`から
+    「一定数未満(例: <3〜5)」へ緩める等の対応を検討する。優先度は中程度(実際には
+    addr/onionpeer受信で徐々にpeerが増えていくため即座に詰むわけではないが、
+    レジリエンスの観点で改善余地がある)。
+15. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
