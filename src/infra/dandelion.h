@@ -75,4 +75,22 @@ enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32]
  */
 int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t now);
 
+/*
+ * §11 2026-08-24発覚のバグ修正: object_sync.cのsend_big_inv(自分の保有object全件を
+ * 新規peerへ知らせる、handshake完了時に1回)が、誤ってbm_dandelion_decide経由で
+ * このモジュール本来のstem/fluff判定ロジックを新規に発火させてしまっていた。
+ * 何年も前から公開済みのobjectを、まるで今作られたばかりの新規objectであるかのように
+ * stem対象にしてしまい、10〜40秒後のタイムアウト→300秒後の間引き→次回send_big_inv
+ * 呼び出し時に再度「未知」扱いで作り直され同じサイクルを繰り返す、という実質無限ループで
+ * bm_peer_registry_broadcast_invが大量に空発火し続けていた(実測: 稼働7時間で
+ * object_pool.dbの実件数の50倍superのbroadcast発生)。
+ *
+ * PyBitmessage本家のsendBigInv(`dandelion_ins.hasHash(objHash)`相当)に合わせ、
+ * 「今まさにstem中(まだfluffされていない)hashかどうか」だけを読み取り専用で判定する
+ * 関数を新設した。bm_dandelion_decideと違い、エントリが存在しなければ新規作成せず
+ * 単に「stem中ではない」(0)を返す(副作用が無い、send_big_invはこれで単純に除外判定
+ * するだけで、fluff/stemの判定自体には一切関与しない)。
+ */
+int bm_dandelion_is_stemming(const unsigned char object_hash[32]);
+
 #endif /* BM_INFRA_DANDELION_H */

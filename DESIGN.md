@@ -2984,6 +2984,40 @@ ctest 36件全通過。今夜の時点では次にまた発生するか経過観
 dinv to %zu peer(s)"`という1行のサマリにした(誰にも送るものが無ければ出さない)。
 ctest 36件全通過。
 
+### 重大バグ修正: send_big_invがDandelion++の判定機構を誤って毎回発火させ、自分のobjectを無限ループで再配信していた(2026-08-24)
+
+daemon Aの稼働状況確認中、ユーザーが「`broadcast inv`ログが異常に多い、DoSでは」と
+指摘したことがきっかけで発覚。実測したところ、稼働7時間で`broadcast inv`が
+525,727回発生していたが、その間object_pool.dbの実件数は10,384件(緩やかに増加)
+にとどまっており、**保有件数の50倍以上**の再ブロードキャストが起きていた。
+
+**根本原因**: `send_big_inv`(前日実装、handshake完了時に自分の保有object全件を
+新規peerへ知らせる)が、hashごとに`bm_decide_propagation`(Dandelion++の
+stem/fluff判定・状態管理の本体、DESIGN.md §9.2の差し込み点)を呼んでいた。この
+関数は「今まさに新しく検出したobjectをstemすべきか」を判定するためのもので、
+呼ぶたびに未知のhashへ新規のタイムアウト管理エントリを作ってしまう。何年も前から
+公開済みのobjectを、新規peerが繋がるたび(=1万件のhash全部について)毎回この
+判定に通してしまい、たまたまstem successorが選ばれているタイミングだと
+「stem中」の未確定エントリが大量に作られる。これが10〜40秒後にタイムアウトして
+`bm_dandelion_expire_and_refluff`経由で`broadcast_inv`を発火し、300秒後に
+間引かれ、次回`send_big_inv`が同じhashを処理する時には再び「未知」扱いで
+作り直される——という実質無限ループになっていた。
+
+PyBitmessage本家の実際の`sendBigInv`はstem/fluff判定を一切行わず、
+「今stem中のhashだけ`dandelion_ins.hasHash`で除外し、残りは普通のinvとして送る」
+だけの単純な処理だった。
+
+**修正**: `dandelion.c`に読み取り専用の`bm_dandelion_is_stemming(hash)`を新設
+(エントリが存在しなければ新規作成せず単に「stem中ではない」を返す、副作用無し)。
+`send_big_inv`はこれで単純に除外判定するだけにし、`bm_decide_propagation`の
+呼び出しとdinv送信を完全に廃止した(bigInvは元々「stemを開始する」ための送信では
+なく、既に確定した自分の保有物一覧を知らせるだけなので、dinvという形式を使う
+理由が無い)。
+
+**テスト**: `tests/test_object_sync.c`にシナリオ15を追加。専用のDandelion状態・
+registryで隔離した上で、意図的に1件を「stem中」の状態にしてから`send_big_inv`を
+実行し、stem中のhashが除外され、それ以外は含まれることを確認した。ctest 36件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

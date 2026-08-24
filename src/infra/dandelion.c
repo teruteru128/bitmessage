@@ -369,3 +369,12 @@ int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t n
     }
     return (int)to_fluff_count;
 }
+
+int bm_dandelion_is_stemming(const unsigned char object_hash[32])
+{
+    pthread_mutex_lock(&g_state.lock);
+    size_t idx = index_lookup(object_hash);
+    int stemming = (idx != BM_DANDELION_INDEX_EMPTY) && (g_state.entries[idx].fluffed_at == 0);
+    pthread_mutex_unlock(&g_state.lock);
+    return stemming;
+}

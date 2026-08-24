@@ -20,6 +20,7 @@
 
 #include "../src/common/hash.h"
 #include "../src/core/address.h"
+#include "../src/infra/dandelion.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
 #include "../src/core/message_builder.h"
@@ -1300,6 +1301,100 @@ int main(void)
         close(fds14[0]);
         close(fds14[1]);
         bm_fd_data_free(conn14);
+    }
+
+    /* --- 15. §11 2026-08-24発覚のバグ修正: send_big_invが、今まさにstem中(まだ
+     * fluffされていない)hashを正しく除外することを確認する。以前はbm_decide_propagation
+     * 経由でhashごとに新規のDandelion++判定エントリを作ってしまい、既に公開済みの
+     * objectまでstemタイムアウト→間引き→再作成の無限ループに巻き込んでいた
+     * (broadcast_invの大量空発火として顕在化、ユーザー指摘で発覚)。専用のdandelion
+     * モジュール状態・registryを使って隔離する(他シナリオのdandelion状態と混ざらない
+     * ように、この検証の直前でbm_dandelion_module_initし直す) --- */
+    {
+        bm_dandelion_module_init();
+
+        struct bm_peer_registry dandelion_reg;
+        bm_peer_registry_init(&dandelion_reg);
+
+        int fds_stem[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_stem) == 0, "socketpair for stem-successor fixture");
+        struct bm_fd_data *stem_conn = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds_stem[0]);
+        CHECK(stem_conn != NULL, "bm_fd_data_new for stem-successor fixture");
+        stem_conn->services = BM_SERVICE_NODE_DANDELION;
+        bm_peer_registry_add(&dandelion_reg, stem_conn);
+
+        int64_t now15 = (int64_t)time(NULL);
+        bm_dandelion_maybe_reshuffle(&dandelion_reg, now15); /* 候補が1つだけなので必ずstem_connが選ばれる */
+
+        unsigned char hash_stem[32], hash_normal[32];
+        memset(hash_stem, 0xEE, sizeof(hash_stem));
+        memset(hash_normal, 0xFF, sizeof(hash_normal));
+
+        /* hash_stemを「今まさにstem中」の状態にする(fluffed_at=0のまま、STEM判定される
+         * ことも併せて確認する) */
+        CHECK(bm_dandelion_decide(hash_stem, stem_conn, now15) == BM_PROPAGATE_STEM,
+              "seeding: hash_stem should be decided as STEM for the configured successor");
+        CHECK(bm_dandelion_is_stemming(hash_stem) == 1, "hash_stem should now report as actively stemming");
+        CHECK(bm_dandelion_is_stemming(hash_normal) == 0,
+              "hash_normal (never touched) should not report as stemming");
+
+        sqlite3_exec(object_pool_db, "DELETE FROM objects;", NULL, NULL, NULL);
+        unsigned char dummy_payload15[16] = {0};
+        CHECK(bm_object_store_insert(object_pool_db, hash_stem, BM_OBJECT_MSG, 1, dummy_payload15,
+                                      sizeof(dummy_payload15), now15 + 86400, now15)
+                  == 0,
+              "seed hash_stem into object_pool for send_big_inv exclusion test");
+        CHECK(bm_object_store_insert(object_pool_db, hash_normal, BM_OBJECT_MSG, 1, dummy_payload15,
+                                      sizeof(dummy_payload15), now15 + 86400, now15)
+                  == 0,
+              "seed hash_normal into object_pool for send_big_inv exclusion test");
+
+        int fds15[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds15) == 0, "socketpair for send_big_inv exclusion test");
+        struct bm_fd_data *conn15 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds15[0]);
+        CHECK(conn15 != NULL, "bm_fd_data_new for send_big_inv exclusion test");
+
+        struct bm_message verack_msg15;
+        memset(&verack_msg15, 0, sizeof(verack_msg15));
+        memcpy(verack_msg15.command, "verack", 6);
+        verack_msg15.length = 0;
+        verack_msg15.payload = NULL;
+        bm_object_sync_dispatch(conn15, &verack_msg15, &ctx);
+
+        struct bm_message *inv_reply15 = read_one_message(fds15[1]);
+        CHECK(inv_reply15 != NULL, "an inv message should have been sent right after verack");
+        if (inv_reply15 != NULL)
+        {
+            struct bm_inventory_message parsed15;
+            memset(&parsed15, 0, sizeof(parsed15));
+            CHECK(bm_parse_inventory_message(inv_reply15->payload, inv_reply15->length, &parsed15) == 0,
+                  "the sent big-inv payload should parse back successfully");
+            int saw_stem = 0, saw_normal = 0;
+            for (uint64_t i = 0; i < parsed15.count; i++)
+            {
+                if (memcmp(parsed15.items[i], hash_stem, 32) == 0)
+                {
+                    saw_stem = 1;
+                }
+                if (memcmp(parsed15.items[i], hash_normal, 32) == 0)
+                {
+                    saw_normal = 1;
+                }
+            }
+            CHECK(!saw_stem, "the actively-stemming hash should be EXCLUDED from send_big_inv");
+            CHECK(saw_normal, "the ordinary (non-stemming) hash should still be included");
+            bm_free_inventory_message(&parsed15);
+            bm_free_message(inv_reply15);
+        }
+
+        close(fds15[0]);
+        close(fds15[1]);
+        bm_fd_data_free(conn15);
+        bm_peer_registry_remove(&dandelion_reg, stem_conn);
+        close(fds_stem[0]);
+        close(fds_stem[1]);
+        bm_fd_data_free(stem_conn);
+        bm_peer_registry_destroy(&dandelion_reg);
     }
 
     close(fds[0]);
