@@ -84,3 +84,30 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=0
         run: setarch $(uname -m) -R ctest --output-on-failure
+
+  # §11 2026-08-24 backlog項目10の5/5: 非Ubuntu環境への軽い手当て。infra/network.cが
+  # epoll(Linux固有API)に依存しているためUnix全般への移植性はそもそも視野に入れておらず、
+  # 論点は「Linuxのどのディストリまで」に限られる(DESIGN.md参照)。CIがubuntu-latestのみ
+  # だったため、パッケージ名・デフォルトパス(core/config_file.cのtor_control_socket既定値
+  # "/run/tor/control"はDebian/Ubuntu系Torパッケージの慣習で、Fedora等では異なりうる)が
+  # 暗黙にUbuntu前提になっていないかの最低限の確認として、Fedoraコンテナでのビルド+
+  # テストを追加した(Sanitizer系は既にUbuntu上で十分カバーしているため、Fedora側は
+  # 素のDebugビルドのみでよいと判断)。
+  build-and-test-fedora:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: dnf install -y cmake gcc make openssl-devel sqlite-devel git
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure

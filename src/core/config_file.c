@@ -16,6 +16,8 @@ static void set_defaults(struct bm_config_file *out)
     out->api_port = 8442;
     out->inbound_port = 0;
     out->tor_control = 0;
+    /* §11 2026-08-24 backlog項目10の5/5: Debian/Ubuntu系Torパッケージのデフォルトパス
+     * (詳細はconfig_file.hのtor_control_socketフィールドのdocコメント参照)。 */
     strncpy(out->tor_control_socket, "/run/tor/control", sizeof(out->tor_control_socket) - 1);
     strncpy(out->tor_control_host, "127.0.0.1", sizeof(out->tor_control_host) - 1);
     out->tor_control_port = 9051;

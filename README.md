@@ -95,6 +95,8 @@ cp bitmessage.conf.example bitmessage.conf
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `BM_CONFIG_FILE` | `bitmessage.conf` | 起動時設定ファイルの場所 |
+| `BM_DATA_DIR` | `.`(CWD) | DBファイル(`peers.db`等5種)の置き場所。systemd等での固定パス運用(例`/var/lib/bitmessage`)向け |
+| `BM_SEEDS_FILE` | `seeds/observed_nodes.txt` | 「開発者が確認した身元不明のノード」リストの場所(§11、mainnetのみ・無くても起動には支障ない) |
 | `BM_TESTNET` | (mainnet) | `1`でtestnetへ切り替え |
 | `BM_NO_CONNECT` | (接続する) | `1`で実際のP2P接続を一切行わない(主にテスト用) |
 | `BM_MAX_OUTBOUND` | `3` | 同時に確立する最大outbound接続数 |
@@ -103,7 +105,7 @@ cp bitmessage.conf.example bitmessage.conf
 | `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | 新規アドレス作成時の既定PoW難易度(nonce trials/byte) |
 | `BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES` | `1000` | 同上(payload length extra bytes) |
 | `BM_TOR_CONTROL` | (無効) | `1`でTor ControlPort経由のhidden service自動作成を試みる(`BM_INBOUND_PORT`が前提) |
-| `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | ControlPortのUnixドメインソケットパス |
+| `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | ControlPortのUnixドメインソケットパス(Debian/Ubuntu系torパッケージの既定パス。Fedora/Arch等では異なりうるため、他ディストリで`BM_TOR_CONTROL=1`を使う場合は実際のパスを明示指定すること) |
 | `BM_TOR_CONTROL_HOST` | `127.0.0.1` | 上記に接続できない場合のTCPフォールバック先ホスト |
 | `BM_TOR_CONTROL_PORT` | `9051` | 同上ポート |
 | `BM_TOR_VIRTUAL_PORT` | `8444` | 他peerが自分のonionアドレスへ接続してくるポート番号 |

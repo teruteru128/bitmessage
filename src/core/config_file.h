@@ -32,6 +32,16 @@ struct bm_config_file
     int api_port;
     int inbound_port; /* 0 = 未設定(inbound無効)。BM_INBOUND_PORTのenv var版と同じ意味 */
     int tor_control;
+    /* §11 2026-08-24 backlog項目10の5/5: 既定値"/run/tor/control"はDebian/Ubuntu系の
+     * Torパッケージ(apt install tor)がControlPortのUnixソケットを置く慣習的なパスで、
+     * Fedora/Arch等の他ディストリでは異なりうる(例: Fedoraのtorパッケージは既定で
+     * ControlPort自体が無効、Arch Linuxは/run/tor/control.authcookie等)。このプロジェクトは
+     * epoll依存でそもそもLinux限定だが、その中でもディストリ間のTorパッケージングの違いは
+     * 吸収していないため、Ubuntu以外で`bitmessage.conf`の[tor] control_socketを使わずに
+     * BM_TOR_CONTROL=1(ControlPort連携)を使う場合は、実際のソケットパスを
+     * [tor] control_socket(またはBM_TOR_CONTROL_SOCKET環境変数)で明示的に指定すること。
+     * 静的torrc設定(BM_ONION_ADDRESS/[tor] onion_address)を使う経路はTorへ一切
+     * 接続しないためこの制約を受けない。 */
     char tor_control_socket[BM_CONFIG_FILE_STR_MAX];
     char tor_control_host[BM_CONFIG_FILE_STR_MAX];
     int tor_control_port;

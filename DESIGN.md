@@ -3466,6 +3466,30 @@ ${CMAKE_INSTALL_LIBDIR}/systemd/system)`を追加。systemdの`pkg-config`経由
 再ビルドが警告ゼロで通ることのみ確認し(コード変更が無い以上ctestの結果が変わる
 理由が無いため)、フルの`ctest`再実行は省略した。
 
+### 非Ubuntu環境への軽い手当て(backlog項目10の5/5、2026-08-24)
+
+これでbacklog項目10(Releaseビルドでのテスト・インストール・systemdサービス化)の
+5分割全てに着手完了した。当初DESIGN.mdで結論していた通り「CIにもう1ディストリ追加」
+「Tor control socketの既定値をドキュメントで明記」の2点の軽い手当てで十分と判断し、
+以下を実施した。
+
+**CI**: `.github/workflows/ci.yml`へ`build-and-test-fedora`ジョブを追加(`container:
+fedora:latest`、`dnf install cmake gcc make openssl-devel sqlite-devel git`で
+依存関係を導入)。Sanitizer系は既にUbuntu上で十分カバーしているため、Fedora側は
+素のDebugビルド+ctestのみに絞った(全ジョブをディストリ×Sanitizerの掛け算にすると
+CI時間が過大になるため)。ローカルにdocker/podmanが無くこの場では実行確認できず、
+実際の動作確認は次回pushでのGitHub Actions実行時になる。
+
+**ドキュメント**: `core/config_file.h`(`tor_control_socket`フィールド)・
+`core/config_file.c`(既定値設定箇所)へ、既定値`/run/tor/control`がDebian/Ubuntu系
+Torパッケージの慣習的パスであり他ディストリでは異なりうる旨のコメントを追加。
+`README.md`の環境変数一覧にも同様の注記を追加した。あわせて、backlog項目10の2/5・3/5で
+追加した`BM_DATA_DIR`/`BM_SEEDS_FILE`環境変数が`README.md`の一覧に載っていなかった
+(追加時に見落としていた)ことに気づき、この機会に追記した。
+
+Cソースコードの変更はコメント追加のみ(挙動に影響しない)のため、`build-Debug`で
+クリーンビルド+ctest 38件全通過のみ確認し、他3ビルドの再確認は省略した。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3502,8 +3526,9 @@ ${CMAKE_INSTALL_LIBDIR}/systemd/system)`を追加。systemdの`pkg-config`経由
    テストハーネスのリーク2件、TSanで`stop_flag`のスレッド間可視性問題と
    dandelion/peer_registry間のロック順序逆転(潜在的デッドロック)を発見・修正した。
    いずれもCIへ別ジョブとして統合済み。
-10. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
-    ユーザーと議論。2026-08-24にユーザーと合意の上で5つに分割(依存順):
+10. ~~**Releaseビルドでのテスト・インストール・systemdサービス化が未着手**~~:
+    2026-08-23にユーザーと議論。2026-08-24にユーザーと合意の上で5つに分割し
+    (依存順)、同日中に全て完了した:
     1. ~~Releaseビルド検証~~ 完了(上記まとめ参照)。`-DCMAKE_BUILD_TYPE=Release`で
        初めて顕在化した警告(バグ1件含む)を修正し、`build-Debug`/`build-Release`/
        `build-Sanitize`/`build-TSan`全てクリーンビルドで警告ゼロ・ctest全通過を確認した。
@@ -3516,7 +3541,9 @@ ${CMAKE_INSTALL_LIBDIR}/systemd/system)`を追加。systemdの`pkg-config`経由
        `DynamicUser`+`StateDirectory`/`ConfigurationDirectory`でシステムユーザー・
        ディレクトリ作成を自動化、`Restart=on-failure`。当日夜に実装した
        `common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこのsystemd化を見越したもの。
-    5. 非Ubuntu環境への軽い手当て(未着手、詳細下記)。
+    5. ~~非Ubuntu環境への軽い手当て~~ 完了(上記まとめ参照)。CIへFedoraでのビルド確認
+       ジョブを追加、Tor control socket既定値のディストリ依存性をコメント/READMEへ
+       明記。詳細は元の判断根拠含め下記参照。
     - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
       ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
       視野に入れていない(対応するなら`kqueue`バックエンド追加という別の大仕事になる)。
@@ -3555,9 +3582,10 @@ ${CMAKE_INSTALL_LIBDIR}/systemd/system)`を追加。systemdの`pkg-config`経由
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
-    (DEBUG/INFO/WARN/ERROR)導入・ASan/UBSan/TSan導入(CI統合含む)はいずれも完了
-    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
-    対象外(引き続き見送り)。
+    (DEBUG/INFO/WARN/ERROR)導入・ASan/UBSan/TSan導入(CI統合含む)・Releaseビルド
+    検証/BM_DATA_DIR/cmake --install/systemdユニット/非Ubuntu環境への軽い手当て
+    (計5分割)はいずれも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と
+    決めた項目のため対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
