@@ -572,6 +572,13 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     {
         bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, conn);
     }
+    /* §11 2026-08-25: これまでmsg(複合成功時)/pubkey(cache成功時)以外の型
+     * (getpubkey/broadcast/onionpeer/ack、あるいは自分宛でなかったmsg/pubkey)は
+     * object_pool.dbへ受理・保存されても一切ログが出ておらず、「received inv →
+     * sent getdata」の続き(実際にobjectが届いて保存された)が追えなかった
+     * (ユーザー指摘)。型に関わらず、受理・保存した時点で一律にDEBUGログを出す。 */
+    bm_log_debug("[object_sync] received object: type=%d stream=%d %u bytes, stored to object_pool.db\n",
+                 (int)hdr.object_type, (int)hdr.stream, msg->length);
 
     if (hdr.object_type == BM_OBJECT_MSG)
     {
