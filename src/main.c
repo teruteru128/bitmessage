@@ -161,6 +161,28 @@ int main(void)
      * 済ませる必要があるため、main()の文字通り最初の行にした。 */
     signal(SIGPIPE, SIG_IGN);
 
+    /* §11 2026-08-24 backlog項目9/TSan調査で発覚した重大バグ修正: 以前はこの
+     * SIGINT/SIGTERMのブロック(pthread_sigmask)を、全スレッド(th_trial_decrypt〜
+     * th_peer_connector)をpthread_createした後、sigwait()の直前(旧main()末尾)で
+     * 行っていた。POSIXでは新規スレッドは生成時点の親スレッドのシグナルマスクを
+     * 継承するため、この順序だと全ワーカースレッドは生成された瞬間からずっと
+     * SIGINT/SIGTERMをブロックしないまま動くことになる。プロセス宛のシグナルは
+     * ブロックしていない任意のスレッドへ配送されうるため、SIGINT/SIGTERMが
+     * (mainのsigwait()ではなく)いずれかのワーカースレッドへ配送されると、
+     * デフォルト動作(即座にプロセス終了)でグレースフルシャットダウン処理
+     * (スレッドjoin・DB flush等)を一切経由せずプロセスが死ぬ競合状態がありえた。
+     * signal(SIGPIPE, SIG_IGN)の直後、いかなるスレッドも生成する前に
+     * pthread_sigmaskを済ませることで、全ワーカースレッドがブロック済みマスクを
+     * 継承し、SIGINT/SIGTERMは確実にmain()のsigwait()でのみ捕捉されるようにした。
+     * このバグ自体が過去の「daemon Aが原因不明のまま消えた」系インシデント
+     * (DESIGN-LOG.md参照)に関与していた可能性は否定できないが、直接の再現・
+     * 立証はできていない。 */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
     /* §11 2026-08-23: ログ行に時刻を付けるかどうかの判定(JOURNAL_STREAM/BM_LOG_TIMESTAMPS)を
      * 他のどのbm_log呼び出しよりも前に済ませておく */
     bm_log_init();
@@ -549,12 +571,8 @@ int main(void)
         peer_connector_started = 1;
     }
 
-    /* SIGINT/SIGTERMをブロックしてsigwaitで待つ(全スレッドが実装されればここが本体のライフサイクルになる) */
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    /* SIGINT/SIGTERMのブロック自体はmain()冒頭(全スレッド生成より前)へ移動済み
+     * (理由は同所のコメント参照)。ここではブロック済みのsetに対してsigwaitで待つだけ。 */
     int sig = 0;
     sigwait(&set, &sig);
     bm_log_info("シグナル %d を受信、終了処理を開始します\n", sig);
