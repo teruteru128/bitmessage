@@ -8,8 +8,9 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 [PyBitmessage](https://github.com/Bitmessage/PyBitmessage) と実ネットワーク越しに相互運用できることを目標に、
 暗号層(ECIES/ECDSA)・PoW・全objectワイヤーフォーマット・P2Pネットワーク層・JSON-RPC API・CLIを一から実装した。
 
-設計・実装判断の詳細な経緯は [DESIGN.md](DESIGN.md)、リリースごとの変更点は
-[CHANGELOG.md](CHANGELOG.md) を参照。
+設計(アーキテクチャ・現在のbacklog)は [DESIGN.md](DESIGN.md)、日付入りの開発経緯
+(バグの発覚経緯・議論の顛末等)は [DESIGN-LOG.md](DESIGN-LOG.md)、リリースごとの
+変更点は [CHANGELOG.md](CHANGELOG.md) を参照。
 
 ## 現状: v1完成(2026-08-23)
 
