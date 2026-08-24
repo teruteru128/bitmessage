@@ -411,7 +411,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         bm_log_info("[peer_connector] cleaned up %d stale/low-rating peer(s) from peers.db\n", cleaned);
     }
 
-    bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet);
+    bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet, config->observed_nodes_path);
 
     /* §11 設定変更の動的リロード: 呼ばれるたびconfig.dbから読み直す(スナップショットを
      * 保持しない)ことで、setSocksProxy APIでの変更がdaemon再起動なしで次回呼び出し

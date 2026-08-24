@@ -71,6 +71,11 @@ int main(void)
     config.registry = NULL;
     config.config_db = NULL;
     config.stop_flag = &stop_flag;
+    /* §11 2026-08-24 backlog項目10の3/5: この時点で候補を3件既にpeers.dbへ登録済み
+     * (下記)なのでbm_peer_manager_seed_bootstrapは早期returnしobserved_nodes_pathは
+     * 実際には参照されないが、念のため有効な値を設定しておく(NULLだとfopen(NULL)相当の
+     * 未定義動作になりうるため防御的に)。 */
+    config.observed_nodes_path = "seeds/observed_nodes.txt";
 
     int connected = bm_peer_connector_connect_initial(&config);
     CHECK(connected == 0, "no connections should be attempted once stop_flag is already set");

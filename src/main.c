@@ -540,6 +540,10 @@ int main(void)
         pc_args->config.object_sync_ctx = &object_sync_ctx;
         pc_args->config.self_onion_address = self_onion_address;
         pc_args->config.self_onion_port = virtual_port;
+        /* §11 2026-08-24 backlog項目10の3/5: cmake --installでのインストール後はCWD相対の
+         * "seeds/observed_nodes.txt"が存在しないため、BM_SEEDS_FILEで上書き可能にする
+         * (BM_DATA_DIR/BM_CONFIG_FILEと同じ設計、未設定時は従来通り)。 */
+        pc_args->config.observed_nodes_path = env_or_str("BM_SEEDS_FILE", "seeds/observed_nodes.txt");
         pc_args->stop_flag = &peer_connector_stop;
         pthread_create(&th_peer_connector, NULL, bm_peer_connector_thread, pc_args);
         peer_connector_started = 1;

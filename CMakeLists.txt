@@ -49,5 +49,25 @@ endif()
 
 add_subdirectory(src)
 
+# §11 2026-08-24 backlog項目10の3/5: cmake --install用のinstall()定義。GNUInstallDirsで
+# ${CMAKE_INSTALL_BINDIR}(既定"bin")・${CMAKE_INSTALL_DATADIR}(既定"share")等の
+# ディストリ標準的な相対パスを得る(ハードコードしない)。DBファイル・設定ファイルの
+# 置き場所(BM_DATA_DIR/BM_CONFIG_FILE)はユーザー状態データのためインストール対象に
+# 含めない(backlog項目10の2/5、main.c参照。既定はCWDのまま、systemdユニット
+# ファイル(backlog項目10の4/5、未着手)側でEnvironment=として明示指定する想定)。
+include(GNUInstallDirs)
+
+install(TARGETS bitmessaged bitmessage-cli
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# seeds/observed_nodes.txtは読み取り専用でソースツリーに同梱されるbootstrapシード
+# (ユーザー状態データではない)なので、FHS的にはshareへインストールするのが適切。
+# インストール後のパスはBM_SEEDS_FILE環境変数(main.c、既定"seeds/observed_nodes.txt")で
+# 明示的に指定する(未設定時はCWD相対のままなので、インストール後に使う場合は
+# systemdユニットファイル側でEnvironment=BM_SEEDS_FILE=<この行の実際のインストール先>
+# を設定する必要がある)。
+install(FILES seeds/observed_nodes.txt
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/bitmessage)
+
 enable_testing()
 add_subdirectory(tests)

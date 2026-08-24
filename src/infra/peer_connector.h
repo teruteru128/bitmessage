@@ -49,6 +49,10 @@ struct bm_peer_connector_config
     struct bm_object_sync_ctx *object_sync_ctx;
     const char *self_onion_address;
     int self_onion_port;
+    /* §11 2026-08-24 backlog項目10の3/5: bm_peer_manager_seed_bootstrapへそのまま渡す
+     * observed_nodes.txtのパス。main.cがBM_SEEDS_FILE環境変数(既定は従来通り
+     * "seeds/observed_nodes.txt")で解決した値をここへ設定する(core/peer_manager.h参照)。 */
+    const char *observed_nodes_path;
 };
 
 /*

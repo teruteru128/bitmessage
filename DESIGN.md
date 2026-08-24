@@ -3389,6 +3389,37 @@ DBを持つ)が見つからなくなり、手動移行が必須になる。後�
 警告ゼロ・ctest 38件全通過を確認(TSan含む)。CLAUDE.mdの試験件数表記(37件→38件)も
 更新した。
 
+### `cmake --install`定義(backlog項目10の3/5、2026-08-24)
+
+**実装**: `CMakeLists.txt`へ`include(GNUInstallDirs)`を追加し、
+`install(TARGETS bitmessaged bitmessage-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})`
+(既定`bin`)と`install(FILES seeds/observed_nodes.txt DESTINATION
+${CMAKE_INSTALL_DATADIR}/bitmessage)`(既定`share/bitmessage`)を追加した。パスを
+ハードコードせずGNUInstallDirsのディストリ標準変数を使う一般的な作法に従った。
+
+**`seeds/observed_nodes.txt`のパス解決**: インストール後は`bm_peer_manager_seed_bootstrap`
+内でCWD相対の`"seeds/observed_nodes.txt"`を直接参照できなくなるため、`BM_SEEDS_FILE`
+環境変数(既定は従来通り`"seeds/observed_nodes.txt"`)で上書き可能にした
+(`BM_DATA_DIR`/`BM_CONFIG_FILE`と同じ設計)。実装は`bm_peer_manager_seed_bootstrap`
+(`core/peer_manager.h`/`.c`)に`observed_nodes_path`引数を追加、
+`struct bm_peer_connector_config`(`infra/peer_connector.h`)に`observed_nodes_path`
+フィールドを追加してmain.cから受け渡す形にした(env varの読み取り自体はmain.cのみが
+行う既存方針、core/infra層は直接getenvを呼ばない、main.c参照)。呼び出し元の変更に伴い
+`tests/test_network_testnet.c`・`tests/test_peer_connector_shutdown.c`も
+シグネチャ変更に追従させた(後者はtestnet=0で呼ぶため、`bm_peer_manager_seed_bootstrap`
+内の早期return(peers.dbが空でない)に実際には守られているとはいえ、NULLだと
+`fopen(NULL)`相当の未定義動作になりうるため念のため有効な値を設定した)。
+
+**動作確認**: `DESTDIR`付きで`cmake --install build-Debug`を実行し、
+`bitmessaged`/`bitmessage-cli`/`observed_nodes.txt`が期待通りの相対パスへ
+インストールされることを確認。さらにインストール先のバイナリを、ソースツリーとは
+無関係な隔離ディレクトリから`BM_DATA_DIR`・`BM_SEEDS_FILE`を明示指定して起動し、
+実際にDBファイルが指定先へ作られ、CWD直下には何も作られず、SIGTERMで正常終了する
+ことを確認した。
+
+`build-Debug`/`build-Release`/`build-Sanitize`/`build-TSan`の4種全てクリーンビルドで
+警告ゼロ・ctest 38件全通過を確認(TSan含む)。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3433,7 +3464,8 @@ DBを持つ)が見つからなくなり、手動移行が必須になる。後�
     2. ~~DBファイル置き場をCWD依存から固定パスへ切り替える設計判断~~ 完了(上記まとめ
        参照)。既定はCWDのまま据え置き、`BM_DATA_DIR`環境変数で明示的に上書き可能にする
        非破壊的な方式にした(既存のdaemon Aへの影響ゼロ)。
-    3. `cmake --install`用の`install()`定義(未着手、2に依存)。
+    3. ~~`cmake --install`用の`install()`定義~~ 完了(上記まとめ参照)。GNUInstallDirsで
+       `bitmessaged`/`bitmessage-cli`/`seeds/observed_nodes.txt`をインストールできる。
     4. `.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)作成(未着手、
        2に依存)。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、
        まさにこのsystemd化を見越したもの。

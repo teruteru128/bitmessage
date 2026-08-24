@@ -211,7 +211,7 @@ static void test_bootstrap_seeding(void)
         exit(EXIT_FAILURE);
     }
 
-    CHECK(bm_peer_manager_seed_bootstrap(db, 1) == 0, "seed testnet bootstrap nodes");
+    CHECK(bm_peer_manager_seed_bootstrap(db, 1, "seeds/observed_nodes.txt") == 0, "seed testnet bootstrap nodes");
 
     struct bm_peer_entry results[32];
     int count = 0;
@@ -229,7 +229,7 @@ static void test_bootstrap_seeding(void)
     CHECK(found_578, "known testnet seed node 5.78.198.100:8444 present");
 
     /* 既にデータがある状態で呼んでも増えない(上書きしない) */
-    CHECK(bm_peer_manager_seed_bootstrap(db, 1) == 0, "seed again is a no-op");
+    CHECK(bm_peer_manager_seed_bootstrap(db, 1, "seeds/observed_nodes.txt") == 0, "seed again is a no-op");
     count = 0;
     bm_peer_manager_list_top(db, 1, results, 32, &count);
     CHECK(count == 2, "seeding again does not duplicate entries");

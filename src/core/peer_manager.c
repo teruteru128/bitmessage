@@ -251,7 +251,7 @@ int bm_peer_manager_load_observed_nodes(sqlite3 *db, const char *path)
     return loaded;
 }
 
-int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
+int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet, const char *observed_nodes_path)
 {
     sqlite3_stmt *count_stmt = NULL;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM hosts;", -1, &count_stmt, NULL) != SQLITE_OK)
@@ -296,13 +296,13 @@ int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet)
 
     if (!testnet)
     {
-        int observed = bm_peer_manager_load_observed_nodes(db, "seeds/observed_nodes.txt");
+        int observed = bm_peer_manager_load_observed_nodes(db, observed_nodes_path);
         if (observed > 0)
         {
             bm_log_info(
-                    "[peer_manager] seeded %d observed node(s) from seeds/observed_nodes.txt "
+                    "[peer_manager] seeded %d observed node(s) from %s "
                     "(unverified operators, see DESIGN.md §11)\n",
-                    observed);
+                    observed, observed_nodes_path);
         }
     }
     return 0;

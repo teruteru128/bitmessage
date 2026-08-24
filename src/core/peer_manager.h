@@ -53,8 +53,15 @@ int bm_peer_manager_list_shareable(sqlite3 *db, int stream, int64_t now, struct 
  * hostsテーブルが空ならブートストラップシードノードを投入する(PyBitmessage
  * knownnodes.pyのDEFAULT_NODES/TESTNET_NODES準拠、2026-08-21確認)。既に1件でも
  * あれば何もしない(手動追加・既知情報を上書きしないため)。成功時0(0件挿入でも0)。
+ *
+ * observed_nodes_pathはbm_peer_manager_load_observed_nodes(下記)へそのまま渡す
+ * ファイルパス。§11 2026-08-24 backlog項目10の3/5: cmake --installでのインストール後は
+ * CWD相対の"seeds/observed_nodes.txt"が存在しないため、呼び出し元(main.c)が
+ * BM_SEEDS_FILE環境変数(既定は従来通り"seeds/observed_nodes.txt")で解決した値を渡す。
+ * env varの読み取り自体は他の設定と同じくmain.c側の責務(core/infra層はgetenvを呼ばない
+ * 方針、main.c参照)。
  */
-int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet);
+int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet, const char *observed_nodes_path);
 
 /*
  * §11「開発者が確認した身元不明のつながる可能性のあるノード」リスト(seeds/observed_nodes.txt、
