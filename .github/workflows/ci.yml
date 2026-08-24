@@ -30,8 +30,8 @@ jobs:
   # §11 2026-08-24 backlog項目9: メモリリーク・バッファオーバーフロー・メモリ管理ミスの
   # 検査体制。build-and-testとは別ジョブにして並列実行し、Sanitizer特有の失敗(実行時間の
   # 増加・ASan/UBSanの指摘)を通常ビルドの合否と区別しやすくしている。ThreadSanitizerは
-  # instrumentationがASan/UBSanと競合し同時併用できないため、導入する場合は別ジョブとして
-  # 追加する必要がある(現時点では未導入、DESIGN.md §11参照)。
+  # instrumentationがASan/UBSanと競合し同時併用できないため、別ジョブ(下記sanitize-thread)
+  # として追加した。
   sanitize:
     runs-on: ubuntu-latest
     steps:
@@ -54,3 +54,33 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1
         run: ctest --output-on-failure
+
+  # §11 2026-08-24 backlog項目9(続き): ThreadSanitizer。データ競合検出により、実際に
+  # dandelion.c/peer_registry.cのロック順序逆転(潜在的デッドロック)、およびstop_flag系の
+  # スレッド間可視性問題(volatile sig_atomic_t→_Atomic sig_atomic_tへの変更で解消)を
+  # 発見・修正した実績があるため、通常ビルドとは別ジョブとして継続的に監視する。
+  #
+  # setarch -RでASLRを無効化しているのは、TSanが新しめのLinuxカーネル(高いASLRエントロピー)
+  # の下で"FATAL: ThreadSanitizer: unexpected memory mapping"を起こす既知の非互換のため
+  # (mmap_rnd_bits関連、カーネル側のsysctlは変更せずプロセス単位のpersonalityで回避する)。
+  sanitize-thread:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libssl-dev libsqlite3-dev
+
+      - name: Configure (TSan)
+        run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build-tsan --parallel
+
+      - name: Test
+        working-directory: build-tsan
+        env:
+          TSAN_OPTIONS: halt_on_error=0
+        run: setarch $(uname -m) -R ctest --output-on-failure

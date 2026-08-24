@@ -1243,7 +1243,7 @@ int bm_api_server_listen(const struct bm_api_server_config *config, int *out_lis
 }
 
 void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config,
-                                  volatile sig_atomic_t *stop_flag)
+                                  _Atomic sig_atomic_t *stop_flag)
 {
     struct pollfd pfd;
     pfd.fd = listen_fd;

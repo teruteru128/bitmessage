@@ -3229,10 +3229,79 @@ inv/getdata交換までは安定して踏めておらず(テスト用testnet pee
 別ジョブ、並列実行)。`-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`でビルドし、
 `ASAN_OPTIONS=detect_leaks=1`/`UBSAN_OPTIONS=print_stacktrace=1`付きで`ctest`を
 走らせる。上記の通りリークを解消済みの状態でCIへ組み込んだため、導入直後からグリーンな
-状態でスタートできる。ThreadSanitizerは別ジョブが必要な上、`peer_registry`等の共有構造体を
-TSanの目で精査する作業自体が別工程になるため、今回はCIに含めず引き続き見送り。
+状態でスタートできる。ThreadSanitizerは別ジョブが必要なため、この時点ではCIに含めず
+別途着手することにした(下記「TSanの導入」参照)。
 
 ctest 37件全通過(通常のbuild-Debugビルドでも警告ゼロ・全通過を再確認済み)。
+
+### TSanの導入(backlog項目9続き、2026-08-24)
+
+**経緯**: 上記ASan/UBSan導入に続けて、ユーザーと合意の上でThreadSanitizerにも着手した。
+「`BM_ENABLE_TSAN`ビルドで`ctest`一式を流し、実際に何件・どんな種類の指摘が出るか
+確認してから、1件ずつ修正/意図的な設計として記録するかを判断する」という進め方で
+合意した。事前に「`volatile sig_atomic_t`によるstop_flagのポーリングパターンが
+大量に検出される可能性が高い」と予想を共有していた。
+
+**実行環境の罠**: `build-TSan`(`-DBM_ENABLE_TSAN=ON`)でビルドした`test_json`等
+(スレッドを一切使わないテストも含む)が軒並み`FATAL: ThreadSanitizer: unexpected memory
+mapping`で即死する現象に遭遇。これはTSanと新しめのLinuxカーネルの高ASLRエントロピー
+(`mmap_rnd_bits`)との既知の非互換で、`setarch $(uname -m) -R <command>`(その
+プロセスに対してのみASLRを無効化するpersonality設定、カーネルのsysctl自体は一切変更
+しない)でラップすることで回避できた。`ctest`自体を`setarch -R`配下で実行すれば、
+fork/execで起動される各テストバイナリにも同じpersonalityが引き継がれ、個別にラップし直す
+必要は無かった。
+
+**実際に検出した指摘、2種類**:
+1. **`stop_flag`系のデータレース**(`api_server`/`getpubkey_automation`/`broadcast`の
+   3テストで検出、いずれも同一パターン): `bm_api_server_serve_forever`
+   (`core/api_server.c:1252`)が`*stop_flag`を読み、テスト/main()側が別スレッドから
+   `server_stop = 1`のように書き込む際、`volatile sig_atomic_t`では
+   スレッド間の可視性・順序(happens-before関係)が一切保証されない
+   (`volatile`は同一スレッド内でのシグナルハンドラとの安全な読み書きを保証するだけ)。
+   もっとも、main()は実際には非同期シグナルハンドラの中ではなく`sigwait()`後の通常の
+   スレッドコンテキストでstop_flagを立てており(main.c参照)、そもそも本来欲しかったのは
+   「スレッド間で安全に読み書きできること」の方だった。`_Atomic sig_atomic_t`
+   (C11 `<stdatomic.h>`)へ変更することで、シグナルハンドラからの利用も引き続き安全な
+   ままスレッド間可視性も得られる。読み書き側のコード(`*stop_flag == 0`等)は
+   _Atomic修飾された左辺値への通常の演算がそのままatomicなload/storeになるため
+   変更不要だった。影響箇所: `core/api_server.h`/`.c`、`infra/peer_connector.h`
+   (同じパターンの`stop_flag`を持つが今回のテスト実行では偶然踏まれなかった。放置すると
+   将来同じ理由で再発するため合わせて修正)、`main.c`の2箇所の宣言、および
+   `tests/test_api_server.c`/`test_broadcast.c`/`test_getpubkey_automation.c`/
+   `test_peer_connector_shutdown.c`のローカル宣言。
+2. **`dandelion.c`/`peer_registry.c`間のロック順序逆転(潜在的デッドロック、
+   `dandelion_stage2`テストで検出)**: `bm_dandelion_maybe_reshuffle`
+   (`infra/dandelion.c`、peer_connector_threadの1秒間隔ポーリングから呼ばれる)が
+   dandelionモジュールの内部mutex(`g_state.lock`)を保持したまま
+   `bm_peer_registry_pick_random_dandelion_peer`(`peer_registry.c`)を呼び、
+   registryのmutex(`reg->lock`)を取得していた(dandelion_lock→registry_lockの順)。
+   一方`bm_peer_registry_broadcast_inv`(object_sync_threadから呼ばれる)は
+   `reg->lock`を保持したまま`bm_decide_propagation`→`bm_dandelion_decide`経由で
+   `g_state.lock`を取得していた(registry_lock→dandelion_lockの逆順)。
+   古典的なABBAデッドロックで、実daemonでは`peer_connector_thread`と
+   `object_sync_thread`という別スレッドがそれぞれの経路を実際に踏むため、タイミング次第で
+   本物のデッドロックになりうる潜在バグだった。`bm_dandelion_maybe_reshuffle`は
+   peer_connector_threadからしか呼ばれない(CLAUDE.md方針、他スレッドからの同時呼び出しは
+   無い)ため、`g_state.epoch_started`の更新だけ先に確定させてロックを一旦解放し、
+   `pick_random_dandelion_peer`呼び出しをロック外へ出し、結果(stem_ip/stem_port/has_stem)の
+   反映だけ再度ロックする2段階に分割してサイクルを断ち切った(§11の該当コメント
+   `infra/dandelion.c`参照)。epoch_started更新とstem情報更新の間の一瞬だけ他スレッドが
+   古いstem情報を読む可能性があるが、Dandelion++のepoch選択自体が元々確率的なものであり
+   実害は無いと判断。
+
+**修正後の確認**: `build-TSan`で`ctest`一式(`setarch -R`配下)が37件全通過・TSanの指摘
+ゼロ(393秒、通常ビルドの約7倍)。`build-Debug`・`build-Sanitize`(ASan/UBSan)いずれも
+再ビルド・再テストして100%通過を再確認した(型変更の影響が他ビルドへ波及していないこと
+の確認)。
+
+**CI統合**: `.github/workflows/ci.yml`へ`sanitize-thread`ジョブを新設
+(`build-and-test`/`sanitize`とは別ジョブ、並列実行)。`-DBM_ENABLE_TSAN=ON`でビルドし、
+`TSAN_OPTIONS=halt_on_error=0`・`setarch $(uname -m) -R`付きで`ctest`を走らせる。
+GitHub Actionsのrunnerも同じ理由(モダンなUbuntuカーネルの高ASLRエントロピー)で
+`unexpected memory mapping`を踏む可能性が高いと判断し、ローカルで検証済みの
+`setarch -R`回避策をそのままCIステップにも適用した。
+
+これでbacklog項目9(ASan/UBSan/TSan)は全て着手・CI統合まで完了した。
 
 ### v1.1以降のbacklog
 
@@ -3265,9 +3334,11 @@ ctest 37件全通過(通常のbuild-Debugビルドでも警告ゼロ・全通過
 8. ~~**ログレベル(DEBUG/INFO/WARN/ERROR)が無い**~~: 2026-08-24完了(上記まとめ参照)。
    `BM_LOG_LEVEL`環境変数(既定`INFO`)によるフィルタリングを実装し、約140箇所の
    呼び出しを全て`bm_log_debug/info/warn/error`へ移行した。
-9. ~~**ASan/UBSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミスの検査体制が
-   無い**~~: 2026-08-24、ASan/UBSanのみ完了(上記まとめ参照)。ThreadSanitizerは
-   instrumentation競合のため引き続き見送り(候補として記録のみ)。
+9. ~~**ASan/UBSan/TSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミス・
+   データ競合の検査体制が無い**~~: 2026-08-24完了(上記まとめ参照)。ASan/UBSanで
+   テストハーネスのリーク2件、TSanで`stop_flag`のスレッド間可視性問題と
+   dandelion/peer_registry間のロック順序逆転(潜在的デッドロック)を発見・修正した。
+   いずれもCIへ別ジョブとして統合済み。
 10. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
     ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
     実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
@@ -3301,7 +3372,7 @@ ctest 37件全通過(通常のbuild-Debugビルドでも警告ゼロ・全通過
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル
-    (DEBUG/INFO/WARN/ERROR)導入・ASan/UBSan導入(CI統合含む)はいずれも完了
+    (DEBUG/INFO/WARN/ERROR)導入・ASan/UBSan/TSan導入(CI統合含む)はいずれも完了
     (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
     対象外(引き続き見送り)。
 

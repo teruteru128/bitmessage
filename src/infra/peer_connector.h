@@ -10,6 +10,7 @@
 
 #include <signal.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
@@ -35,8 +36,11 @@ struct bm_peer_connector_config
      * これが無いと、SIGTERM後もmax_outbound件ぶんの候補(1件あたりCONNECT_TIMEOUT_SEC+
      * SOCKS5_HANDSHAKE_TIMEOUT_SEC=最大25秒)を全部試し終えるまでbm_peer_connector_thread
      * がpthread_joinできず、daemonの終了処理が数分単位で長引く原因になっていた
-     * (bm_peer_connector_threadが自動的にこのフィールドへ自身のstop_flagを設定する)。 */
-    volatile sig_atomic_t *stop_flag;
+     * (bm_peer_connector_threadが自動的にこのフィールドへ自身のstop_flagを設定する)。
+     * §11 2026-08-24 backlog項目9(TSan導入)で発覚: `volatile sig_atomic_t`はスレッド間の
+     * 可視性を保証しないため、`_Atomic sig_atomic_t`(C11)へ変更した(api_server.h参照、
+     * 詳細な経緯はそちら)。 */
+    _Atomic sig_atomic_t *stop_flag;
     /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(2時間おきチェック、
      * PyBitmessage本家準拠)を、この既存の1秒間隔ポーリングループに相乗りさせる(Dandelion++の
      * bm_dandelion_maybe_reshuffle/expire_and_refluffと同じ理由、専用スレッドは新設しない)。
@@ -89,7 +93,7 @@ int bm_peer_connector_choose_candidate_index(const struct bm_peer_entry *candida
 struct bm_peer_connector_thread_args
 {
     struct bm_peer_connector_config config;
-    volatile sig_atomic_t *stop_flag;
+    _Atomic sig_atomic_t *stop_flag;
 };
 void *bm_peer_connector_thread(void *arg);
 

@@ -8,6 +8,7 @@
 
 #include <signal.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "../common/queue.h"
@@ -60,9 +61,18 @@ void bm_api_server_handle_connection(int client_fd, const struct bm_api_server_c
  * accept()を直接ブロッキングでは呼ばず、poll()に1秒のタイムアウトを与えて*stop_flagを
  * 定期的に再チェックすることでグレースフルシャットダウンに対応する(peer_connector_thread
  * と同じポーリング方式、§11)。*stop_flagが非0になれば次のタイムアウトで抜ける。
- */
+ *
+ * §11 2026-08-24 backlog項目9(TSan導入)で発覚: 以前は`volatile sig_atomic_t`だったが、
+ * これは「同一スレッド内でのシグナルハンドラとの安全な読み書き」を保証するだけで、
+ * スレッド間の可視性・順序(happens-before関係)は一切保証しない。main()はsigwait経由で
+ * 通常のスレッドコンテキストからstop_flagを立てており、そもそも非同期シグナルハンドラでは
+ * 触っていない(main.c参照)ため、必要なのは「スレッド間で安全に読み書きできること」の方
+ * だった。`_Atomic sig_atomic_t`(C11 stdatomic.h)にすることで、シグナルハンドラからの
+ * 利用も引き続き安全なまま、スレッド間の可視性もTSanが警告しない形で保証できる。読み書き側
+ * (`*stop_flag == 0`等)のコード自体は_Atomic修飾された左辺値への通常の演算がそのまま
+ * atomicなload/storeになるため変更不要。 */
 void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config,
-                                  volatile sig_atomic_t *stop_flag);
+                                  _Atomic sig_atomic_t *stop_flag);
 
 /*
  * pthread_createのarg用にmallocして渡す(スレッド側でfreeする、peer_connector_thread等と
@@ -72,7 +82,7 @@ void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_confi
 struct bm_api_server_thread_args
 {
     const struct bm_api_server_config *config;
-    volatile sig_atomic_t *stop_flag;
+    _Atomic sig_atomic_t *stop_flag;
 };
 void *bm_api_server_thread(void *arg);
 

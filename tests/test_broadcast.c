@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -278,7 +279,7 @@ int main(void)
     CHECK(bm_keyring_unlock(&kr, identity_db, sender_for_http_address, "http sender pass") == 0,
           "unlock sendBroadcast sender");
 
-    volatile sig_atomic_t server_stop = 0;
+    _Atomic sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
     server_args->config = &config;
     server_args->stop_flag = &server_stop;

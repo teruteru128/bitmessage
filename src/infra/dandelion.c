@@ -257,6 +257,20 @@ void bm_dandelion_note_source(const unsigned char object_hash[32], int is_dinv, 
 
 void bm_dandelion_maybe_reshuffle(struct bm_peer_registry *registry, int64_t now)
 {
+    /* §11 2026-08-24 backlog項目9(TSan導入)で発覚: 以前はg_state.lockを保持したまま
+     * bm_peer_registry_pick_random_dandelion_peer(reg->lockを取る)を呼んでいたため、
+     * dandelion_lock→registry_lockの順でロックしていた。一方bm_peer_registry_broadcast_inv
+     * (object_sync_threadから呼ばれる)はreg->lockを持ったままbm_decide_propagation経由で
+     * bm_dandelion_decide(g_state.lockを取る)を呼ぶため、registry_lock→dandelion_lockの
+     * 逆順になっていた。この関数はpeer_connector_threadの1秒間隔ポーリングループからしか
+     * 呼ばれず(CLAUDE.md方針、他スレッドからの同時呼び出しは無い)、g_state.epoch_started
+     * だけ先に確定させてしまえば残りの処理でg_state.lockを保持し続ける必要は無いため、
+     * pick_random_dandelion_peer呼び出しをg_state.lockの外へ出し、結果の反映だけ
+     * 再度ロックする2段階に分割してサイクルを断ち切った(TSanのlock-order-inversion警告
+     * を解消)。epoch_started更新とstem_ip/stem_port/has_stem更新の間はg_state.lockの
+     * 外に出るため、その一瞬(reservoir samplingの計算時間程度)だけ他スレッドが古い
+     * stem情報を読む可能性があるが、Dandelion++のepoch選択自体が元々確率的なものであり
+     * 実害は無い(§9参照)。 */
     pthread_mutex_lock(&g_state.lock);
     if (g_state.epoch_started != 0 && now - g_state.epoch_started < BM_DANDELION_EPOCH_SECONDS)
     {
@@ -264,10 +278,13 @@ void bm_dandelion_maybe_reshuffle(struct bm_peer_registry *registry, int64_t now
         return;
     }
     g_state.epoch_started = now;
+    pthread_mutex_unlock(&g_state.lock);
 
     char ip[BM_PEER_IP_STRLEN];
     int port = 0;
     int found = bm_peer_registry_pick_random_dandelion_peer(registry, ip, sizeof(ip), &port);
+
+    pthread_mutex_lock(&g_state.lock);
     if (found)
     {
         strncpy(g_state.stem_ip, ip, sizeof(g_state.stem_ip) - 1);

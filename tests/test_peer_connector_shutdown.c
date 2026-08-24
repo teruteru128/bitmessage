@@ -6,6 +6,7 @@
  */
 
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,7 +59,7 @@ int main(void)
     int epfd = epoll_create1(0);
     CHECK(epfd >= 0, "epoll_create1 should succeed");
 
-    volatile sig_atomic_t stop_flag = 1; /* 既に停止指示が出ている状態を再現 */
+    _Atomic sig_atomic_t stop_flag = 1; /* 既に停止指示が出ている状態を再現 */
 
     struct bm_peer_connector_config config;
     memset(&config, 0, sizeof(config));

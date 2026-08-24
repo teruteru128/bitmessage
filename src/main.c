@@ -8,6 +8,7 @@
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,8 +277,10 @@ int main(void)
 
     /* §11 api_serverのgraceful shutdown。peer_connector_threadと同じstop flagポーリング方式
      * (poll()に1秒タイムアウトを与えてaccept()の代わりに使う、api_server.c参照)。
-     * api_server_stopもmain()がsigwaitでブロックしている間ずっと生存するスタック変数。 */
-    volatile sig_atomic_t api_server_stop = 0;
+     * api_server_stopもmain()がsigwaitでブロックしている間ずっと生存するスタック変数。
+     * §11 2026-08-24 backlog項目9(TSan導入)で発覚: `volatile sig_atomic_t`はスレッド間の
+     * 可視性を保証しないため`_Atomic sig_atomic_t`へ変更した(api_server.h参照)。 */
+    _Atomic sig_atomic_t api_server_stop = 0;
     struct bm_api_server_thread_args *api_args = malloc(sizeof(*api_args));
     api_args->config = &api_config;
     api_args->stop_flag = &api_server_stop;
@@ -479,7 +482,7 @@ int main(void)
      * 次第で数十秒単位で遅くなる/非決定的になるため)。 */
     pthread_t th_peer_connector;
     int peer_connector_started = 0;
-    volatile sig_atomic_t peer_connector_stop = 0;
+    _Atomic sig_atomic_t peer_connector_stop = 0; /* §11 2026-08-24 backlog項目9、api_server_stopと同じ理由 */
     if (env_flag_or("BM_NO_CONNECT", cfg.no_connect))
     {
         bm_log_info("[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");

@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -206,7 +207,7 @@ int main(void)
     config.default_payload_length_extra_bytes = 1000;
     config.registry = &registry;
 
-    volatile sig_atomic_t server_stop = 0;
+    _Atomic sig_atomic_t server_stop = 0;
     struct bm_api_server_thread_args *server_args = malloc(sizeof(*server_args));
     server_args->config = &config;
     server_args->stop_flag = &server_stop;
