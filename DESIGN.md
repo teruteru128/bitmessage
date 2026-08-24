@@ -3360,6 +3360,35 @@ systemdユニットファイル→非Ubuntu環境への軽い手当て、この�
 (Releaseビルドでの`-O2`最適化によるUB顕在化・タイミング変化は、この時点では
 確認されなかった)。
 
+### DBファイル置き場の固定パス化(backlog項目10の2/5、2026-08-24)
+
+**設計判断**: 既定値(CWD相対パス)自体を`/var/lib/bitmessage/`等へ変更する(破壊的)か、
+既定はCWDのまま据え置いて環境変数で明示的に上書き可能にする(非破壊的)かをユーザーに
+確認し、後者で合意した。理由: 前者だと稼働中のdaemon A(リポジトリ直下に実の秘密鍵入り
+DBを持つ)が見つからなくなり、手動移行が必須になる。後者なら既存挙動を一切変えず、
+次のステップ(systemdユニットファイル)側で明示的に環境変数を設定するだけで済む。
+既に同じ設計の前例(`BM_CONFIG_FILE`、`bitmessage.conf`の場所を上書きする既存の仕組み)が
+あったため、これに合わせた。
+
+**実装**: `main.c`に`BM_DATA_DIR`環境変数を追加。未設定時は従来通り`"."`(CWD)。
+`open_and_init`ヘルパーが`data_dir`引数を受け取り`snprintf`でパスを結合するように変更
+(5つのDBファイル: `peers.db`/`object_pool.db`/`identity.db`/`messages.db`/`config.db`)。
+`DB初期化完了`ログに`data_dir=%s`を追記し、運用者が実際に使われたパスを確認できるように
+した。`seeds/observed_nodes.txt`(読み取り専用のbootstrapシード、ユーザー状態データでは
+ない)は対象外(次のステップ`cmake --install`定義の方で扱う)。
+
+**テスト**: `tests/test_data_dir.sh`を新規追加(`test_cli_integration.sh`と同じ、実際に
+`bitmessaged`を起動するシェルスクリプト統合テスト)。(1) `BM_DATA_DIR`を明示指定した
+場合に指定先にのみ5つのDBファイルが作られCWD直下には何も作られないこと、(2)
+`BM_DATA_DIR`未設定時は従来通りCWD直下に作られること、の両方を確認する。
+`tests/CMakeLists.txt`へ`data_dir`として登録(計38件)。手動でも
+`BM_DATA_DIR=<隔離ディレクトリ> BM_TESTNET=1`で実際に起動し、ログの`data_dir=`表示と
+生成されたファイルの場所を目視確認した。
+
+`build-Debug`/`build-Release`/`build-Sanitize`/`build-TSan`の4種全てクリーンビルドで
+警告ゼロ・ctest 38件全通過を確認(TSan含む)。CLAUDE.mdの試験件数表記(37件→38件)も
+更新した。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3401,8 +3430,9 @@ systemdユニットファイル→非Ubuntu環境への軽い手当て、この�
     1. ~~Releaseビルド検証~~ 完了(上記まとめ参照)。`-DCMAKE_BUILD_TYPE=Release`で
        初めて顕在化した警告(バグ1件含む)を修正し、`build-Debug`/`build-Release`/
        `build-Sanitize`/`build-TSan`全てクリーンビルドで警告ゼロ・ctest全通過を確認した。
-    2. DBファイル置き場をCWD依存から固定パス(`/var/lib/bitmessage/`等)へ切り替える
-       設計判断(未着手)。
+    2. ~~DBファイル置き場をCWD依存から固定パスへ切り替える設計判断~~ 完了(上記まとめ
+       参照)。既定はCWDのまま据え置き、`BM_DATA_DIR`環境変数で明示的に上書き可能にする
+       非破壊的な方式にした(既存のdaemon Aへの影響ゼロ)。
     3. `cmake --install`用の`install()`定義(未着手、2に依存)。
     4. `.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)作成(未着手、
        2に依存)。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、

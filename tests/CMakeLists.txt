@@ -40,6 +40,10 @@ add_test(NAME cli_integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
 
+add_test(NAME data_dir
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_data_dir.sh
+                 $<TARGET_FILE:bitmessaged>)
+
 add_executable(test_network_testnet test_network_testnet.c)
 target_link_libraries(test_network_testnet PRIVATE bm_infra bm_common Threads::Threads)
 add_test(NAME network_testnet COMMAND test_network_testnet)

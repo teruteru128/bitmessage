@@ -91,9 +91,20 @@ static void queues_destroy(struct bm_queues *q)
     bm_queue_destroy(&q->broadcast_queue);
 }
 
-static sqlite3 *open_and_init(const char *filename, int (*init_schema)(sqlite3 *))
+/*
+ * §11 2026-08-24 backlog項目10の2/5: DBファイル置き場をCWD依存から環境変数
+ * BM_DATA_DIRで上書き可能にする(未設定時は従来通りCWD"."、既存ユーザー・既存daemon A
+ * への影響ゼロ)。BM_CONFIG_FILE(bitmessage.confの場所を上書きする既存の仕組み、下記
+ * env_or_str呼び出し参照)と同じ「既定値そのまま+env varで上書き」という設計に揃えた。
+ * systemdユニットファイル(backlog項目10の4/5、未着手)からEnvironment=BM_DATA_DIR=
+ * /var/lib/bitmessage のように明示指定する運用を想定(StateDirectory=でsystemd側が
+ * ディレクトリ自体を作成する前提のため、アプリ側でmkdirはしない)。 */
+static sqlite3 *open_and_init(const char *data_dir, const char *filename, int (*init_schema)(sqlite3 *))
 {
-    sqlite3 *db = bm_db_open(filename);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", data_dir, filename);
+
+    sqlite3 *db = bm_db_open(path);
     if (db == NULL)
     {
         return NULL;
@@ -154,12 +165,19 @@ int main(void)
      * 他のどのbm_log呼び出しよりも前に済ませておく */
     bm_log_init();
 
+    /* §11 2026-08-24 backlog項目10の2/5: BM_DATA_DIR未設定時は従来通り"."(CWD)。 */
+    const char *data_dir = getenv("BM_DATA_DIR");
+    if (data_dir == NULL)
+    {
+        data_dir = ".";
+    }
+
     /* §1.3: DBはスレッドごとに個別接続を開く方針だが、v1では起動時のスキーマ初期化のみ行う */
-    sqlite3 *peers_db = open_and_init("peers.db", bm_peer_manager_init_schema);
-    sqlite3 *object_pool_db = open_and_init("object_pool.db", bm_object_store_init_schema);
-    sqlite3 *identity_db = open_and_init("identity.db", bm_identity_store_init_schema);
-    sqlite3 *messages_db = open_and_init("messages.db", bm_messages_store_init_schema);
-    sqlite3 *config_db = open_and_init("config.db", bm_config_store_init_schema);
+    sqlite3 *peers_db = open_and_init(data_dir, "peers.db", bm_peer_manager_init_schema);
+    sqlite3 *object_pool_db = open_and_init(data_dir, "object_pool.db", bm_object_store_init_schema);
+    sqlite3 *identity_db = open_and_init(data_dir, "identity.db", bm_identity_store_init_schema);
+    sqlite3 *messages_db = open_and_init(data_dir, "messages.db", bm_messages_store_init_schema);
+    sqlite3 *config_db = open_and_init(data_dir, "config.db", bm_config_store_init_schema);
 
     if (peers_db == NULL || object_pool_db == NULL || identity_db == NULL || messages_db == NULL
         || config_db == NULL)
@@ -167,7 +185,8 @@ int main(void)
         bm_log_error("DB初期化に失敗しました\n");
         return EXIT_FAILURE;
     }
-    bm_log_info("DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db\n");
+    bm_log_info("DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db (data_dir=%s)\n",
+                data_dir);
 
     /* §11 起動時設定ファイル(既定"bitmessage.conf"、BM_CONFIG_FILEで別の場所を指定可能)。
      * env var > 設定ファイル > 組み込みの既定値、という優先順位でこの後の各設定に使う
