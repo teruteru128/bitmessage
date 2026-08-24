@@ -3018,6 +3018,54 @@ PyBitmessage本家の実際の`sendBigInv`はstem/fluff判定を一切行わず�
 registryで隔離した上で、意図的に1件を「stem中」の状態にしてから`send_big_inv`を
 実行し、stem中のhashが除外され、それ以外は含まれることを確認した。ctest 36件全通過。
 
+### 調査+改善: rating<0のpeerへの無駄な再接続を緩和するクールダウンを追加(2026-08-24)
+
+ユーザーから「`95.49.240.98:8444`のratingが-1.0のままpeers.dbに残り続けている、
+削除条件がおかしいのでは」との指摘を受け調査。まず削除条件(`bm_peer_manager_cleanup`)
+自体はPyBitmessage本家の`cleanupKnownNodes`と2条件(28日経過は無条件削除/3時間経過かつ
+rating<=-0.5)とも完全一致しており、削除条件そのものにバグは無かった。
+
+**削除しても直らない理由(裏付け)**: `last_seen`が更新され続ける原因を実ログで追跡した
+ところ、2つの独立した経路が判明した。(1) 他peerからのaddrメッセージ経由の伝聞
+(`bm_peer_manager_upsert_learned`はrating/sourceを変えずlast_seenだけ無条件更新する
+設計で、これもPyBitmessage本家の`addKnownNode`と一致)。(2) **うちのdaemon自身が
+このpeerへ13時台〜14時台の1.5時間で少なくとも9回、直接outbound再接続を試みていた**
+(`connected to 95.49.240.98:8444, version sent`のログが繰り返し出現)。`peer_connector.c`の
+候補選定式`prob = 0.05/(1-rating)`はrating=-1.0でも2.5%の確率で選ばれ続ける設計であり、
+かつ`bm_peer_manager_record_result`のsuccess分岐(verack受信時)はrating更新とlast_seen
+更新を同一UPDATE文で行うため、TCP応答はあるがhandshake完了直後にfatal切断してくる
+ような「死んでいないが役に立たない」peerでは、ratingは上がらない(または前述の
+fatal>=1ペナルティで相殺される)一方でlast_seenだけが再接続のたびに更新され続ける。
+つまり**削除条件を厳しくしても、addr伝聞または自分自身の再接続のどちらかで
+すぐ復活する「イタチごっこ」になる**ことが確認できた。
+
+**PyBitmessage本家との比較(裏付け)**: `network/connectionchooser.py`の
+`chooseConnection`を確認したところ、`prob = 0.05 / (1.0 - rating)`という式そのものが
+本家由来で、rating<0を候補から完全排除する仕組みは本家にも無い。さらに`tcp.py`の
+`set_connection_fully_established`(verack受信時)は`increaseRating`と`addKnownNode`
+(lastseen更新)を同時に呼び、`handle_close`側も「fully established後に切断された
+outbound接続」であれば**ratingを一切減らさずlastseenだけ再更新する**設計になっており、
+むしろ本家の方がうちより「一度でも応答した低ratingノードに優しい」動きをする。
+結論として、この挙動は「うちのバグ」ではなく「PyBitmessage本家の設計」であり、
+ユーザーとの相談の結果、`rating`/`last_seen`の意味論自体は本家互換のまま維持し、
+**候補選定側にのみ再接続クールダウンを追加する**方針で合意した。
+
+**実装**: `core/peer_manager.c`の`hosts`テーブルへ`last_attempt`列を追加
+(既存DBへは`is_self`追加時と同じ`ALTER TABLE`後付けパターンで対応)。新設した
+`bm_peer_manager_record_attempt(db, ip, port, stream, now)`は成否を問わず
+「接続を試みた事実」だけを記録する(rating/last_seenには一切触れない、record_resultとは
+完全に独立)。`bm_peer_connector_choose_candidate_index`に`int64_t now`引数を追加し、
+候補のrating<0かつ`now - last_attempt < BM_PEER_LOW_RATING_COOLDOWN_SECONDS`(30分)
+の場合は既に接続済みのpeerと同様に不採用として次の候補を試すようにした。rating>=0の
+候補には一切影響しない(本家互換の挙動をそのまま維持)。`peer_connector.c`の
+`connect_initial`は候補を選ぶたびに`now`をローカルの`candidates[]`配列にも反映してから
+DBへ永続化する(`list_top`は1呼び出しにつき1回しか候補をfetchしないため、ローカル反映を
+怠ると同一サイクル内で即座に再選出されクールダウンが無意味になる)。
+
+**テスト**: `tests/test_peer_reconnect_cooldown.c`を新設。クールダウン中/明けた後の
+選出可否、rating>=0の候補が無影響であること、`record_attempt`→`list_top`のDB往復
+(rating/last_seenを変更しないこと含む)を確認。ctest 37件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・

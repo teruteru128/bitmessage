@@ -18,6 +18,9 @@ struct bm_peer_entry
     int64_t last_seen;
     double rating;
     char source[16];
+    /* §11 2026-08-24: 接続候補選定(peer_connector.c)の再接続クールダウン判定用。
+     * bm_peer_manager_record_attemptが接続試行のたび(成否を問わず)更新する。 */
+    int64_t last_attempt;
 };
 
 /* 成功時0 */
@@ -106,5 +109,17 @@ int bm_peer_manager_mark_self(sqlite3 *db, const char *ip_address, int port, int
  * 削除件数を返す(エラー時-1)。
  */
 int bm_peer_manager_cleanup(sqlite3 *db, int64_t now);
+
+/*
+ * §11 2026-08-24: 接続候補選定の再接続クールダウン用に、接続試行時刻を記録する
+ * (成否を問わず、peer_connector.cが候補を選んで実際にダイヤルする直前に呼ぶ)。
+ * PyBitmessage本家のchooseConnection(connectionchooser.py)はrating<0のノードも
+ * 排除せず確率的に選び続ける設計で、これ自体はPyBitmessageのバグではなく仕様だが、
+ * 「TCP応答はあるが直後にfatal切断してくるノード」に対しては無駄な再接続を招く実害が
+ * あるため、rating/last_seenの意味論(PyBitmessage互換)はそのままに、候補選定側にのみ
+ * クールダウンを追加して緩和する(bm_peer_connector_choose_candidate_index参照)。
+ * 該当行が無ければ何もしない。成功時0。
+ */
+int bm_peer_manager_record_attempt(sqlite3 *db, const char *ip_address, int port, int stream, int64_t now);
 
 #endif /* BM_INFRA_PEER_MANAGER_H */

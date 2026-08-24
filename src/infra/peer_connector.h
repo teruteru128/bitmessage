@@ -10,6 +10,7 @@
 
 #include <signal.h>
 #include <sqlite3.h>
+#include <stdint.h>
 
 struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
 struct bm_peer_entry; /* core/peer_manager.h、同上 */
@@ -56,9 +57,16 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
  * 再度試す(最大max_attempts回)。registryが非NULLなら既に接続済みの相手は無条件で
  * 不採用として次を試す。戻り値: 選ばれた候補のcandidates配列内index、見つからなければ-1
  * (peer_connector.cのテスト、tests/test_peer_connector_choose.c向けに公開している)。
+ *
+ * §11 2026-08-24: rating<0の候補には追加でBM_PEER_LOW_RATING_COOLDOWN_SECONDS(既定30分)の
+ * 再接続クールダウンを課す(candidates[].last_attempt基準、nowから経過していなければ
+ * registry済みと同様に不採用として次を試す)。PyBitmessage本家のchooseConnection自体は
+ * rating<0を排除しない設計(候補選定と接続結果の意味論はPyBitmessage互換のまま維持する
+ * 方針、DESIGN.md §11参照)だが、「TCP応答はあるが直後にfatal切断してくるノード」への
+ * 無駄な再接続頻度だけをうちの実装側で緩和する。rating>=0の候補には一切影響しない。
  */
 int bm_peer_connector_choose_candidate_index(const struct bm_peer_entry *candidates, int candidate_count,
-                                              struct bm_peer_registry *registry, int max_attempts);
+                                              struct bm_peer_registry *registry, int max_attempts, int64_t now);
 
 /*
  * 常駐スレッド本体。起動直後にbm_peer_connector_connect_initial相当を1回実行し、以後

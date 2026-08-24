@@ -61,7 +61,9 @@ int main(void)
     long picked_high = 0, picked_low = 0, picked_mid = 0, gave_up = 0;
     for (int t = 0; t < N_TRIALS; t++)
     {
-        int chosen = bm_peer_connector_choose_candidate_index(candidates, N_TOTAL, NULL, 50);
+        /* candidates[].last_attempt はmemsetで0(=未接続)なので、クールダウン
+         * (last_attempt基準の相対値)に引っかからないよう十分大きいnowを渡す */
+        int chosen = bm_peer_connector_choose_candidate_index(candidates, N_TOTAL, NULL, 50, 1000000000);
         if (chosen < 0)
         {
             gave_up++;

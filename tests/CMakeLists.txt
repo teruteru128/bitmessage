@@ -124,6 +124,10 @@ add_executable(test_peer_connector_choose test_peer_connector_choose.c)
 target_link_libraries(test_peer_connector_choose PRIVATE bm_core bm_infra)
 add_test(NAME peer_connector_choose COMMAND test_peer_connector_choose)
 
+add_executable(test_peer_reconnect_cooldown test_peer_reconnect_cooldown.c)
+target_link_libraries(test_peer_reconnect_cooldown PRIVATE bm_core bm_infra)
+add_test(NAME peer_reconnect_cooldown COMMAND test_peer_reconnect_cooldown)
+
 add_executable(test_network_format_host_port test_network_format_host_port.c)
 target_link_libraries(test_network_format_host_port PRIVATE bm_infra)
 add_test(NAME network_format_host_port COMMAND test_network_format_host_port)

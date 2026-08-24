@@ -59,6 +59,7 @@ static const char *SCHEMA_SQL =
      * bm_peer_manager_mark_selfでこの列に立て、bm_peer_manager_list_top(接続候補選定)
      * から除外することで、そもそも自分自身へ接続を試みないようにする。 */
     "is_self INTEGER NOT NULL DEFAULT 0, "
+    "last_attempt INTEGER NOT NULL DEFAULT 0, "
     "PRIMARY KEY (ip_address, port, stream)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_hosts_stream_rating ON hosts(stream, rating DESC);";
@@ -75,6 +76,8 @@ int bm_peer_manager_init_schema(sqlite3 *db)
      * 新規DB(SCHEMA_SQLのCREATE TABLE時点で既にis_self列を含む)では必ず発生する
      * "duplicate column name"エラーは無視する(戻り値を見ないのはこのため)。 */
     sqlite3_exec(db, "ALTER TABLE hosts ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+    /* §11 2026-08-24: last_attempt列も同様に既存DBへ後付けする(is_self追加時と同じ理由)。 */
+    sqlite3_exec(db, "ALTER TABLE hosts ADD COLUMN last_attempt INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
     return 0;
 }
 
@@ -112,7 +115,7 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
      * 接続候補から常に除外する。自分自身へ接続しようとする(自分のonionpeer自己announceが
      * gossip経由で自分のpeers.dbへ戻ってくるケース等)のを未然に防ぐ。 */
     static const char *SQL =
-        "SELECT ip_address, port, stream, services, last_seen, rating, source "
+        "SELECT ip_address, port, stream, services, last_seen, rating, source, last_attempt "
         "FROM hosts WHERE stream = ?1 AND is_self = 0 ORDER BY rating DESC LIMIT ?2;";
 
     sqlite3_stmt *stmt = NULL;
@@ -140,6 +143,7 @@ int bm_peer_manager_list_top(sqlite3 *db, int stream, struct bm_peer_entry *resu
         {
             strncpy(e->source, (const char *)source, sizeof(e->source) - 1);
         }
+        e->last_attempt = sqlite3_column_int64(stmt, 7);
         count++;
     }
     sqlite3_finalize(stmt);
@@ -399,6 +403,25 @@ int bm_peer_manager_record_result(sqlite3 *db, const char *ip_address, int port,
     {
         sqlite3_bind_int64(stmt, 4, (sqlite3_int64)time(NULL));
     }
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_peer_manager_record_attempt(sqlite3 *db, const char *ip_address, int port, int stream, int64_t now)
+{
+    static const char *SQL = "UPDATE hosts SET last_attempt = ?4 WHERE ip_address = ?1 AND port = ?2 AND stream = ?3;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, ip_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, port);
+    sqlite3_bind_int(stmt, 3, stream);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)now);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

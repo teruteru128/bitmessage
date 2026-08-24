@@ -337,6 +337,9 @@ static int open_peer_connection(const char *ip, int port, int timeout_sec,
  * serverモード用cooldown・onion rating強制ブーストは対象外、DESIGN.md参照)。 */
 #define CHOOSE_CANDIDATE_MAX_ATTEMPTS 50
 #define CHOOSE_CANDIDATE_BASE_PROB 0.05
+/* §11 2026-08-24: rating<0の候補向け再接続クールダウン。詳細はpeer_connector.hの
+ * bm_peer_connector_choose_candidate_indexのdocコメント参照。 */
+#define BM_PEER_LOW_RATING_COOLDOWN_SECONDS 1800
 
 /* [0,1)の一様乱数(PyBitmessageのrandom.random()相当)。dandelion.cのexponential_randomと
  * 同じRAND_bytesベースの正規化手法を使う(暗号強度は不要、他のnonce生成箇所と手段を揃える) */
@@ -355,7 +358,7 @@ static double uniform_random(void)
  * (呼び出し側は今回のサイクルでの接続をこれ以上試みない)。
  */
 int bm_peer_connector_choose_candidate_index(const struct bm_peer_entry *candidates, int candidate_count,
-                                              struct bm_peer_registry *registry, int max_attempts)
+                                              struct bm_peer_registry *registry, int max_attempts, int64_t now)
 {
     if (candidate_count <= 0)
     {
@@ -373,6 +376,12 @@ int bm_peer_connector_choose_candidate_index(const struct bm_peer_entry *candida
             && bm_peer_registry_has_peer(registry, candidates[idx].ip_address, candidates[idx].port))
         {
             continue; /* 既に接続済みの相手には二重接続しない */
+        }
+
+        if (candidates[idx].rating < 0.0
+            && now - candidates[idx].last_attempt < BM_PEER_LOW_RATING_COOLDOWN_SECONDS)
+        {
+            continue; /* §11 2026-08-24: 低rating peerの再接続クールダウン中は不採用 */
         }
 
         double rating = candidates[idx].rating;
@@ -435,12 +444,20 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             break; /* §11 2026-08-23発覚のバグ修正: shutdown中は残り候補を試さず速やかに戻る */
         }
 
+        int64_t now = (int64_t)time(NULL);
         int i = bm_peer_connector_choose_candidate_index(candidates, candidate_count, config->registry,
-                                                          CHOOSE_CANDIDATE_MAX_ATTEMPTS);
+                                                          CHOOSE_CANDIDATE_MAX_ATTEMPTS, now);
         if (i < 0)
         {
             break; /* 今回のサイクルではこれ以上の候補が見つからない(PyBitmessageのValueError相当) */
         }
+
+        /* §11 2026-08-24: DBへ永続化するだけでなくcandidates[i]のローカルコピーも
+         * その場で更新する。list_topは呼び出し1回につき候補を1度しかfetchしないため、
+         * これをしないと同一connect_initial呼び出し内(=同一want充足ループ)で低rating
+         * candidateが即座に再選出されてしまい、クールダウンの意味が無くなる。 */
+        candidates[i].last_attempt = now;
+        bm_peer_manager_record_attempt(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, now);
 
         char addr_buf[80];
         bm_network_format_host_port(candidates[i].ip_address, candidates[i].port, addr_buf, sizeof(addr_buf));
