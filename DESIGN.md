@@ -3134,26 +3134,39 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
    約120箇所の呼び出しを1つずつ「どのレベルに当たるか」判断し直す作業が必要で、
    時刻付与のような機械的な置換とは規模が違う。フィルタリング方式(環境変数で
    最低レベル指定等)も別途設計が要る。優先度低。
-9. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
-   ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
-   実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
-   (最適化によるUB顕在化・タイミング変化の可能性は未検証)。`cmake --install`用の
-   `install()`定義、DBファイル置き場をCWD依存から固定パス(`/var/lib/bitmessage/`等)へ
-   切り替える設計判断、`.service`ユニットファイル(`Type=simple`、`Restart=on-failure`)が
-   必要。当日夜に実装した`common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこの
-   systemd化を見越したもの。
-   - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
-     ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
-     視野に入れていない(対応するなら`kqueue`バックエンド追加という別の大仕事になる)。
-     現実的な論点は「Linuxのどのディストリまで」に限られる。実質Ubuntu前提になっている
-     箇所: (a) CIが`ubuntu-latest`のみ(`.github/workflows/ci.yml`)、(b)
-     `core/config_file.c`の既定値`tor_control_socket = "/run/tor/control"`
-     (Debian/Ubuntu系のTorパッケージのデフォルトパスで、Fedora/Arch等は異なる可能性)。
-     ビルド依存(OpenSSL/SQLite3/pthread)自体はどのディストリでもパッケージ名が違うだけで
-     標準的に入手可能なため、大掛かりな対応は不要。CIにもう1ディストリ(Fedora等)を
-     追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
-     十分と判断。
-10. **LAN内UDP broadcastによるpeer発見が無い**(旧項目7、2026-08-24に優先順位を下げて
+9. **ASan/UBSanによるメモリリーク・バッファオーバーフロー・メモリ管理ミスの検査体制が
+   無い**: 2026-08-24、ユーザーが外部(Google検索)で得た助言をもとに提起。このプロジェクトは
+   手動メモリ管理・pthread併用のCコードで、過去にも複数回サイズ不足バッファ(onionアドレス
+   62文字対応漏れによる`logical_peer_ip`破損等、上記まとめ参照)が発覚した実績があり、
+   着手コストの割に効果が大きいと判断。項目10(Releaseビルド化)が既に指摘している
+   「`-O2`最適化によるUB顕在化・タイミング変化の可能性は未検証」という懸念にも直接
+   対応するため、Releaseビルド化に着手する前段として位置づける。実装は`CMakeLists.txt`へ
+   `-fsanitize=address,undefined`を有効化する専用ビルドタイプ(例: `Sanitize`)を追加し、
+   その設定で`ctest`一式を流すだけで着手可能。ThreadSanitizer(データ競合検出、
+   `peer_registry`等mutex保護済み共有構造体の検証に有用)も候補だが、ASan/UBSanとは
+   挿入するinstrumentationが競合するため同時併用不可であり、導入する場合は別ビルド
+   タイプとして分離する必要がある。ASan/UBSan/TSanをどこまで・どう分割して導入するかは
+   着手時に改めて検討する(現時点では候補を挙げるのみで未着手)。
+10. **Releaseビルドでのテスト・インストール・systemdサービス化が未着手**: 2026-08-23に
+    ユーザーと議論。現状`CMakeLists.txt`は`CMAKE_BUILD_TYPE`未指定時`Debug`固定で、
+    実運用で使うべき`Release`(`-O2`)でのビルド・ctest実行がまだ一度も行われていない
+    (最適化によるUB顕在化・タイミング変化の可能性は未検証、項目9のASan/UBSan導入で
+    先に洗い出す方針)。`cmake --install`用の`install()`定義、DBファイル置き場をCWD依存
+    から固定パス(`/var/lib/bitmessage/`等)へ切り替える設計判断、`.service`ユニット
+    ファイル(`Type=simple`、`Restart=on-failure`)が必要。当日夜に実装した
+    `common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこのsystemd化を見越したもの。
+    - **非Ubuntu環境への対応について**: `infra/network.c`が`epoll`(Linux固有API、POSIXでは
+      ない)に依存しているため、macOS/BSDを含む「Unix全般への移植性」はそもそも設計上
+      視野に入れていない(対応するなら`kqueue`バックエンド追加という別の大仕事になる)。
+      現実的な論点は「Linuxのどのディストリまで」に限られる。実質Ubuntu前提になっている
+      箇所: (a) CIが`ubuntu-latest`のみ(`.github/workflows/ci.yml`)、(b)
+      `core/config_file.c`の既定値`tor_control_socket = "/run/tor/control"`
+      (Debian/Ubuntu系のTorパッケージのデフォルトパスで、Fedora/Arch等は異なる可能性)。
+      ビルド依存(OpenSSL/SQLite3/pthread)自体はどのディストリでもパッケージ名が違うだけで
+      標準的に入手可能なため、大掛かりな対応は不要。CIにもう1ディストリ(Fedora等)を
+      追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
+      十分と判断。
+11. **LAN内UDP broadcastによるpeer発見が無い**(旧項目7、2026-08-24に優先順位を下げて
     ここへ移動): 2026-08-23にPyBitmessage本家を調査していて判明。`network/udp.py`の
     UDPSocketは実際に`connectionpool.py`から起動される機能で、死んだコードではない。
     同一LAN上のノードをUDPブロードキャストで発見する。以前ユーザーと「LAN discoveryは
@@ -3163,7 +3176,7 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
     再度確認し、この訂正は優先度を上げる根拠にはならない(Tor onion peer運用が主軸の
     このプロジェクトではLAN discoveryはそもそもユースケース外)と判断、backlog内で
     さらに優先度を下げて末尾へ移動した。
-11. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+12. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送はいずれも完了
