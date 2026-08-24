@@ -3127,13 +3127,8 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
 6. ~~**onionpeer自己announceの定期再送・TTL見直し**~~: 2026-08-24完了(上記まとめ参照)。
    定期再送(peer_connector_threadへの相乗り、7380秒間隔)のみ実装し、TTL自体
    (2日)は意図的に変更していない(既存の安全マージンで十分と判断、上記まとめ参照)。
-7. **LAN内UDP broadcastによるpeer発見が無い**: 2026-08-23にPyBitmessage本家を調査していて
-   判明。`network/udp.py`のUDPSocketは実際に`connectionpool.py`から起動される機能で、死んだ
-   コードではない。同一LAN上のノードをUDPブロードキャストで発見する。以前ユーザーと
-   「LAN discoveryは優先度低い」と合意していたが、それは「あなたの具体的なユースケース
-   (自分のノード同士をLANで繋ぐ用途)には手動peer追加で十分」という判断であり、
-   「PyBitmessage自体に存在しない」という前提ではなかった点を訂正。優先度は低いままで
-   良いと思われるが、記録として残す。
+7. ~~**LAN内UDP broadcastによるpeer発見が無い**~~: 2026-08-24、ユーザーと相談の上で
+   優先度をさらに下げ、末尾の項目10へ移動(詳細は項目10参照)。
 8. **ログレベル(DEBUG/INFO/WARN/ERROR)が無い**: 2026-08-23に`common/logging.c`
    (`bm_log`)を新設した際、時刻付与とあわせて検討したがスコープ外とした。既存の
    約120箇所の呼び出しを1つずつ「どのレベルに当たるか」判断し直す作業が必要で、
@@ -3158,7 +3153,17 @@ announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字
      標準的に入手可能なため、大掛かりな対応は不要。CIにもう1ディストリ(Fedora等)を
      追加する、Tor control socketの既定値をドキュメントで明記する、程度の軽い手当てで
      十分と判断。
-10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+10. **LAN内UDP broadcastによるpeer発見が無い**(旧項目7、2026-08-24に優先順位を下げて
+    ここへ移動): 2026-08-23にPyBitmessage本家を調査していて判明。`network/udp.py`の
+    UDPSocketは実際に`connectionpool.py`から起動される機能で、死んだコードではない。
+    同一LAN上のノードをUDPブロードキャストで発見する。以前ユーザーと「LAN discoveryは
+    優先度低い」と合意していたが、それは「あなたの具体的なユースケース(自分のノード
+    同士をLANで繋ぐ用途)には手動peer追加で十分」という判断であり、「PyBitmessage自体に
+    存在しない」という前提ではなかった点を訂正(2026-08-23)。2026-08-24にユーザーと
+    再度確認し、この訂正は優先度を上げる根拠にはならない(Tor onion peer運用が主軸の
+    このプロジェクトではLAN discoveryはそもそもユースケース外)と判断、backlog内で
+    さらに優先度を下げて末尾へ移動した。
+11. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送はいずれも完了
