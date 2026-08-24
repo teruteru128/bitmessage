@@ -1149,8 +1149,12 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     }
                 }
             }
+            /* §11 2026-08-25: 兄弟の受信ログ(inv/dinvは"received %s:..."、getdataは
+             * "received getdata:...")と違い、この行だけ"received"を含んでいなかった。
+             * ユーザーが"recv"でgrepしていて実際にこの行を見逃した実例があったため、
+             * 文言を揃えた。 */
             bm_log_debug(
-                    "[object_sync] addr: %" PRIu64 " entries (%d registered to peers.db, %d filtered)\n",
+                    "[object_sync] received addr: %" PRIu64 " entries (%d registered to peers.db, %d filtered)\n",
                     addr_msg.count, registered, filtered);
             bm_free_addr_message(&addr_msg);
         }
