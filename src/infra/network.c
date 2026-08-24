@@ -237,8 +237,18 @@ int bm_post_version(int sock, const char *user_agent_str, int version,
     return rc;
 }
 
-/* 既定のコマンドディスパッチ。DESIGN.md §1.1 command_worker_thread の初版実装。
- * object/getdataはTODO(§5, §9): infra/object.c 実装後にキュー経由へ差し替える。 */
+/* 既定のコマンドディスパッチ。DESIGN.md §1.1 command_worker_thread の初版実装で、
+ * 実運用(main.c)では使われない。main.cは常に本命の`bm_object_sync_dispatch`
+ * (infra/object_sync.c、peers.db永続化・inv/getdata/object処理等を実装済み)を
+ * handlerとして明示的に渡すため、この関数(handler=NULL時のフォールバック)が
+ * 呼ばれることはない。version/verack/ping程度の最小限のやり取りだけできれば十分な
+ * 一部のテスト(struct bm_object_sync_ctx一式を用意したくないテスト、
+ * tests/test_peer_rating_on_disconnect.c・tests/test_network_stats.c)が
+ * 意図的にhandler=NULLを渡して使う軽量スタブとして残している。
+ * §11 2026-08-25: このファイル内のコメントが古いまま「TODO: 未実装」と書かれていた
+ * ため、実際には別ファイル(object_sync.c)で実装済みの機能が未配線に見える混乱を
+ * 招いた(ユーザー指摘)。addr/inv/object いずれもこのスタブでは処理を省略している
+ * だけであり、production側で未実装というわけではない。 */
 static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
 {
     (void)user_data;
@@ -273,7 +283,9 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_addr_message addr_msg;
         if (bm_parse_addr_message(msg->payload, msg->length, &addr_msg) == 0)
         {
-            bm_log_debug("[network] addr: %" PRIu64 " entries (TODO: peer_manager未実装)\n", addr_msg.count);
+            bm_log_debug("[network] addr: %" PRIu64 " entries (テスト用スタブのため保存はしない、"
+                                                    "production側の処理はobject_sync.c参照)\n",
+                    addr_msg.count);
             bm_free_addr_message(&addr_msg);
         }
     }
@@ -282,13 +294,17 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_inventory_message inv_msg;
         if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) == 0)
         {
-            bm_log_debug("[network] inv: %" PRIu64 " items (TODO: object_store未実装、getdata未送信)\n", inv_msg.count);
+            bm_log_debug("[network] inv: %" PRIu64 " items (テスト用スタブのためgetdataは送らない、"
+                                                   "production側の処理はobject_sync.c参照)\n",
+                    inv_msg.count);
             bm_free_inventory_message(&inv_msg);
         }
     }
     else if (strncmp(msg->command, "object", 12) == 0)
     {
-        bm_log_debug("[network] object received, %u bytes (TODO: object_store/decrypt_worker未実装)\n", msg->length);
+        bm_log_debug("[network] object received, %u bytes (テスト用スタブのため保存・復号はしない、"
+                                                 "production側の処理はobject_sync.c参照)\n",
+                msg->length);
     }
     else
     {
