@@ -75,6 +75,10 @@ struct bm_object_sync_ctx
     time_t last_gc; /* GC間引き用。network_epoll_threadという単一スレッドからのみ呼ばれる
                       * 前提で排他制御はしない */
     time_t last_resend_check; /* §11再送チェックの間引き用。last_gcと同じ理由で排他制御はしない */
+    /* §11 2026-08-24: onionpeer自己announceの定期再送間引き用。peer_connector_threadという
+     * 単一スレッドからのみ呼ばれる前提で排他制御はしない(last_gc/last_resend_checkと同じ理由。
+     * ただしそれらとは別のスレッドから触られるフィールドである点に注意)。 */
+    time_t last_onion_announce;
 };
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
@@ -120,5 +124,20 @@ void *bm_object_sync_broadcast_thread(void *arg);
  * stream)で告知する。成功時0、onion_addressの形式が不正な場合のみ-1(PoW自体は必ず成功する)。
  */
 int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port);
+
+/*
+ * §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(PyBitmessage本家
+ * class_singleCleaner.pyの約2時間おきの周期処理に相当)。以前は起動時に1回
+ * bm_object_sync_announce_onion_peerを呼ぶだけで、TTL(BM_ONIONPEER_ANNOUNCE_TTL_SECONDS、
+ * 2日)経過後は再起動しない限り誰からも発見されなくなっていた。ctx->last_onion_announceを
+ * 基準に、BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS未満の間隔での呼び出しは即returnする
+ * (呼び出し元は間引き無しで毎回呼んでよい、peer_connector.cの1秒間隔ポーリングループ
+ * からの利用を想定)。onion_addressがNULLまたは空文字列なら何もしない(Tor未使用の
+ * 構成向け)。main.cが起動時に直接announce_onion_peerを呼んだ直後は、呼び出し側が
+ * ctx->last_onion_announceを現在時刻にセットしておくことで、この関数の初回呼び出しでの
+ * 二重announceを避ける想定(main.c参照)。
+ */
+void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
+                                                 int64_t now);
 
 #endif /* BM_INFRA_OBJECT_SYNC_H */

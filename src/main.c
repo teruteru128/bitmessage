@@ -350,6 +350,13 @@ int main(void)
      * そのアドレスをそのままonionpeer objectで告知する。BM_TOR_CONTROLより優先する
      * (PyBitmessageもonionhostname設定時はstemによる自動作成を試みない、同じ優先順位)。 */
     int tor_control_fd = -1;
+    /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(peer_connector_threadの
+     * 1秒間隔ループに相乗り)のため、実際に使われたonionアドレスをmain()のスタック上に
+     * 保持しておく(sigwaitで待つ間ずっと生存する、object_sync_ctx等と同じ扱い)。
+     * 下記いずれの経路でも成功しなければ空文字列のまま=reannounceはスキップされる
+     * (bm_object_sync_maybe_reannounce_onion_peer参照)。 */
+    char self_onion_address[BM_PEER_IP_STRLEN];
+    self_onion_address[0] = '\0';
     const char *onion_address_from_file = (cfg.onion_address[0] != '\0') ? cfg.onion_address : NULL;
     const char *onion_address_source = (getenv("BM_ONION_ADDRESS") != NULL) ? "BM_ONION_ADDRESS"
                                                                              : "bitmessage.conf [tor] onion_address";
@@ -371,6 +378,11 @@ int main(void)
              * 長さ検証に落ちる、まさにそのケース)。実害は無い(list_topはis_self=0でしか
              * 選ばないため接続候補には影響しない)が、announce成功時のみ呼ぶよう修正した。 */
             bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
+            /* §11 2026-08-24 backlog項目6: 上でannounce済みなので、peer_connector_threadの
+             * 定期reannounceゲートが起動直後の1回目で即座に二重announceしないよう、
+             * last_onion_announceを今セットしておく。 */
+            strncpy(self_onion_address, manual_onion_address, sizeof(self_onion_address) - 1);
+            object_sync_ctx.last_onion_announce = time(NULL);
         }
     }
     /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
@@ -431,6 +443,10 @@ int main(void)
                 /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
                  * 接続候補選定から除外する(peer_manager.h参照)。 */
                 bm_peer_manager_mark_self(peers_db, onion_address, virtual_port, 1);
+                /* §11 2026-08-24 backlog項目6: manual_onion_address分岐と同じ理由で、
+                 * onion_addressはこの直後freeされるため生存する自前バッファへ控えておく。 */
+                strncpy(self_onion_address, onion_address, sizeof(self_onion_address) - 1);
+                object_sync_ctx.last_onion_announce = time(NULL);
             }
             free(onion_address);
             free(new_private_key);
@@ -478,6 +494,12 @@ int main(void)
         pc_args->config.user_agent = BM_USER_AGENT;
         pc_args->config.registry = &peer_registry;
         pc_args->config.config_db = config_db;
+        /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送。
+         * self_onion_addressが空文字列(Tor未使用構成、または自己announceに失敗した場合)
+         * ならbm_object_sync_maybe_reannounce_onion_peerが内部で何もしない。 */
+        pc_args->config.object_sync_ctx = &object_sync_ctx;
+        pc_args->config.self_onion_address = self_onion_address;
+        pc_args->config.self_onion_port = virtual_port;
         pc_args->stop_flag = &peer_connector_stop;
         pthread_create(&th_peer_connector, NULL, bm_peer_connector_thread, pc_args);
         peer_connector_started = 1;

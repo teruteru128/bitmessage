@@ -19,6 +19,7 @@
 #include "../core/peer_manager.h"
 #include "dandelion.h"
 #include "network.h"
+#include "object_sync.h"
 #include "peer_registry.h"
 
 /* §11 2026-08-23発覚のバグ修正: 以前は32件(=rating上位32件)しか候補として取得しておらず、
@@ -560,11 +561,23 @@ void *bm_peer_connector_thread(void *arg)
              * PyBitmessageのInvThread.expire()相当の頻度に合わせた)。registryが無ければ
              * (テスト等)何もしない。bm_dandelion_maybe_reshuffleは内部で10分間隔かどうかを
              * 判定するため、1秒ごとに呼んでも大半は即returnするだけで軽い。 */
+            int64_t now = (int64_t)time(NULL);
             if (args->config.registry != NULL)
             {
-                int64_t now = (int64_t)time(NULL);
                 bm_dandelion_maybe_reshuffle(args->config.registry, now);
                 bm_dandelion_expire_and_refluff(args->config.registry, now);
+            }
+            /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送も同じくこの
+             * 1秒間隔ループに相乗りさせる。registryの有無とは無関係(§9のDandelion++とは
+             * 独立した機能)のためif (args->config.registry != NULL)の外に置く。
+             * bm_object_sync_maybe_reannounce_onion_peerは内部で2時間強の間隔かどうかを
+             * 判定するため、1秒ごとに呼んでも大半は即returnするだけで軽い
+             * (object_sync_ctxがNULLなら何もしない)。 */
+            if (args->config.object_sync_ctx != NULL)
+            {
+                bm_object_sync_maybe_reannounce_onion_peer(args->config.object_sync_ctx,
+                                                            args->config.self_onion_address,
+                                                            args->config.self_onion_port, now);
             }
             sleep(STOP_POLL_INTERVAL_SECONDS);
         }

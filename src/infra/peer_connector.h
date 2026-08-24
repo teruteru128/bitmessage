@@ -14,6 +14,7 @@
 
 struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
 struct bm_peer_entry; /* core/peer_manager.h、同上 */
+struct bm_object_sync_ctx; /* object_sync.h、同上 */
 
 struct bm_peer_connector_config
 {
@@ -36,6 +37,14 @@ struct bm_peer_connector_config
      * がpthread_joinできず、daemonの終了処理が数分単位で長引く原因になっていた
      * (bm_peer_connector_threadが自動的にこのフィールドへ自身のstop_flagを設定する)。 */
     volatile sig_atomic_t *stop_flag;
+    /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(2時間おきチェック、
+     * PyBitmessage本家準拠)を、この既存の1秒間隔ポーリングループに相乗りさせる(Dandelion++の
+     * bm_dandelion_maybe_reshuffle/expire_and_refluffと同じ理由、専用スレッドは新設しない)。
+     * object_sync_ctxがNULLか、self_onion_addressがNULL/空文字列ならreannounceはスキップする
+     * (Tor未使用の構成、またはonionアドレスがまだ確立していない起動直後を想定)。 */
+    struct bm_object_sync_ctx *object_sync_ctx;
+    const char *self_onion_address;
+    int self_onion_port;
 };
 
 /*

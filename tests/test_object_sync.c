@@ -1397,6 +1397,55 @@ int main(void)
         bm_peer_registry_destroy(&dandelion_reg);
     }
 
+    /* --- 16. onionpeer自己announceの定期再送(bm_object_sync_maybe_reannounce_onion_peer、
+     * §11 2026-08-24 backlog項目6)。PyBitmessage本家(class_singleCleaner.pyの約2時間おき
+     * チェック)に合わせ、BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS(7380秒)未満の間隔での
+     * 呼び出しは実際にはannounceしないこと、間隔が明ければ実際にannounceされること、
+     * onion_addressがNULL/空文字列なら常にスキップされることを確認する --- */
+    {
+        const char *reannounce_onion = "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion";
+
+        sqlite3_stmt *count_stmt16 = NULL;
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects WHERE object_type = ?1;", -1,
+                            &count_stmt16, NULL);
+        sqlite3_bind_int(count_stmt16, 1, (int)BM_OBJECT_ONIONPEER);
+#define ONIONPEER_COUNT16()                                                                    \
+    (sqlite3_reset(count_stmt16), sqlite3_step(count_stmt16) == SQLITE_ROW                      \
+                                       ? sqlite3_column_int(count_stmt16, 0)                     \
+                                       : -1)
+
+        ctx.last_onion_announce = 0;
+        int before16 = ONIONPEER_COUNT16();
+
+        /* last_onion_announce==0(未announce)なので即座にannounceされるはず */
+        bm_object_sync_maybe_reannounce_onion_peer(&ctx, reannounce_onion, 8444, 1000);
+        CHECK(ONIONPEER_COUNT16() == before16 + 1,
+              "the first call (last_onion_announce==0) should announce immediately");
+        CHECK(ctx.last_onion_announce == 1000, "last_onion_announce should be updated to the given now");
+
+        /* 間隔未満(interval-1秒後)なら何もしない */
+        bm_object_sync_maybe_reannounce_onion_peer(&ctx, reannounce_onion, 8444, 1000 + 7380 - 1);
+        CHECK(ONIONPEER_COUNT16() == before16 + 1,
+              "a call within the reannounce interval should not create another object");
+        CHECK(ctx.last_onion_announce == 1000, "last_onion_announce should not change when skipped");
+
+        /* 間隔が明ければ(interval秒後ちょうど)再度announceする */
+        bm_object_sync_maybe_reannounce_onion_peer(&ctx, reannounce_onion, 8444, 1000 + 7380);
+        CHECK(ONIONPEER_COUNT16() == before16 + 2,
+              "a call once the reannounce interval has elapsed should announce again");
+        CHECK(ctx.last_onion_announce == 1000 + 7380, "last_onion_announce should advance to the new now");
+
+        /* onion_addressがNULL/空文字列なら、間隔に関わらず常にスキップする */
+        int before_null16 = ONIONPEER_COUNT16();
+        bm_object_sync_maybe_reannounce_onion_peer(&ctx, NULL, 8444, 1000 + 7380 * 100);
+        bm_object_sync_maybe_reannounce_onion_peer(&ctx, "", 8444, 1000 + 7380 * 100);
+        CHECK(ONIONPEER_COUNT16() == before_null16,
+              "NULL/empty onion_address should always be a no-op regardless of elapsed time");
+
+#undef ONIONPEER_COUNT16
+        sqlite3_finalize(count_stmt16);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);

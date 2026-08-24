@@ -3066,6 +3066,41 @@ DBへ永続化する(`list_top`は1呼び出しにつき1回しか候補をfetch
 選出可否、rating>=0の候補が無影響であること、`record_attempt`→`list_top`のDB往復
 (rating/last_seenを変更しないこと含む)を確認。ctest 37件全通過。
 
+### onionpeer自己announceの定期再送(backlog項目6、2026-08-24)
+
+PyBitmessage本家(`class_singleCleaner.py`)を再確認したところ、`sendOnionPeerObj`は
+起動時1回に加え、メインループの`timeWeLastClearedInventoryAndPubkeysTables < tick -
+7380`という条件(約2時間3分おき)でも呼ばれていた。うちは起動時1回・TTL2日固定で、
+再起動しない限り2日でannounceが失効し誰からも発見されなくなる問題があった。
+
+**実装**: 専用スレッドは新設せず、Dandelion++の`bm_dandelion_maybe_reshuffle`/
+`bm_dandelion_expire_and_refluff`と同じ方針で、既存の`peer_connector_thread`の1秒間隔
+ポーリングループに相乗りさせた。新設した`bm_object_sync_maybe_reannounce_onion_peer`
+(`infra/object_sync.c`)は`ctx->last_onion_announce`(新設フィールド、単一スレッド
+専有につき排他制御無し)を基準に`BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS`
+(=7380秒、PyBitmessage本家準拠)未満の呼び出しは即returnし、間隔が明けていれば
+`bm_object_sync_announce_onion_peer`を実際に呼ぶ。1秒ごとに呼んでも大半は軽い
+即returnで終わる。
+
+onionアドレスは`main.c`が静的torrc設定(`manual_onion_address`)/Tor ControlPort
+(`onion_address`、announce直後にfreeされる一時変数)のどちらの経路で判明しても、
+`main()`のスタック上の`self_onion_address[BM_PEER_IP_STRLEN]`へ控えてから
+`peer_connector_config`経由でスレッドへ渡す(`object_sync_ctx`等と同じ「main()の
+スタック変数のアドレスを複数スレッドへ渡す」既存パターン)。起動時の直接announce
+呼び出し直後に`ctx->last_onion_announce`をその場でセットしておくことで、
+`peer_connector_thread`側のゲートが起動直後の1回目で二重announceしないようにした。
+Tor未使用構成(`self_onion_address`が空文字列のまま)では`maybe_reannounce`が
+常に即returnし何もしない。
+
+TTL(`BM_ONIONPEER_ANNOUNCE_TTL_SECONDS`=2日)自体は変更していない。今回の再送間隔
+(2時間強)に対して約23倍の安全マージンがあり、意図的に選んだ短めのTTL(pubkeyほど
+長生きする必要が無い一時的な情報という判断、既存コメント参照)を維持したまま
+定期再送だけを追加すれば元の問題は解決するため。
+
+**テスト**: `tests/test_object_sync.c`にシナリオ16を追加。間隔未満/間隔経過後の
+announce有無、`last_onion_announce`の更新、onion_addressがNULL/空文字列の場合に
+常にスキップされることを確認した。ctest 37件全通過。
+
 ### v1.1以降のbacklog
 
 2026-08-21に洗い出した項目(優先順位付けした6項目・peers.dbクリーンアップ・
@@ -3089,11 +3124,9 @@ DBへ永続化する(`list_top`は1呼び出しにつき1回しか候補をfetch
    での全体累積)とも2026-08-23完了(上記まとめ参照)。PyBitmessage自体には無い機能
    (本家の`self.sentBytes`/`self.receivedBytes`は実質デッドなフィールドで、どこからも
    参照・表示されていなかった)を一歩進めて実装した形になる。
-6. **onionpeer自己announceの定期再送・TTL見直し**: 2026-08-23にPyBitmessage本家を調査して
-   判明。うちは起動時1回・TTL2日固定で、再起動しない限り2日でannounceが切れて誰からも
-   見つけられなくなる。本家は起動時1回に加え`class_singleCleaner.py`の約2時間おきの周期
-   処理でも再送しており、TTLも7日(±5分jitter)。addr送信とは別件のため次セッションで
-   別プランとして着手予定。
+6. ~~**onionpeer自己announceの定期再送・TTL見直し**~~: 2026-08-24完了(上記まとめ参照)。
+   定期再送(peer_connector_threadへの相乗り、7380秒間隔)のみ実装し、TTL自体
+   (2日)は意図的に変更していない(既存の安全マージンで十分と判断、上記まとめ参照)。
 7. **LAN内UDP broadcastによるpeer発見が無い**: 2026-08-23にPyBitmessage本家を調査していて
    判明。`network/udp.py`のUDPSocketは実際に`connectionpool.py`から起動される機能で、死んだ
    コードではない。同一LAN上のノードをUDPブロードキャストで発見する。以前ユーザーと
@@ -3128,8 +3161,9 @@ DBへ永続化する(`list_top`は1呼び出しにつき1回しか候補をfetch
 10. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
-    listConnections API(MVP)はいずれも完了(上記まとめ参照)。GPU/OpenCL PoWは§8で
-    明示的にv1スコープ外と決めた項目のため対象外(引き続き見送り)。
+    listConnections API(MVP)・onionpeer自己announceの定期再送はいずれも完了
+    (上記まとめ参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と決めた項目のため
+    対象外(引き続き見送り)。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

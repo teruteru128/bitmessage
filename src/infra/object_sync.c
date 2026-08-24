@@ -62,6 +62,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->user_agent = user_agent;
     ctx->last_gc = 0;
     ctx->last_resend_check = 0;
+    ctx->last_onion_announce = 0;
 }
 
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now)
@@ -496,6 +497,26 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
     }
     free(object);
     return 0;
+}
+
+/* §11 2026-08-24: PyBitmessage本家(class_singleCleaner.pyの
+ * `timeWeLastClearedInventoryAndPubkeysTables < tick - 7380`)準拠の再送チェック間隔。 */
+#define BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS 7380
+
+void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
+                                                 int64_t now)
+{
+    if (onion_address == NULL || onion_address[0] == '\0')
+    {
+        return;
+    }
+    if (ctx->last_onion_announce != 0
+        && now - (int64_t)ctx->last_onion_announce < BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS)
+    {
+        return;
+    }
+    ctx->last_onion_announce = (time_t)now;
+    bm_object_sync_announce_onion_peer(ctx, onion_address, port);
 }
 
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
