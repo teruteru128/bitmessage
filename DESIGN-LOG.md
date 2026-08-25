@@ -2583,3 +2583,60 @@ DESIGN-LOG.mdを検索しても過去にbacklog化・議論された跡が無く
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 39件全通過を確認。
+
+### outbound SOCKS5設定をonion peer専用/クリアネットIP専用に分離(2026-08-26)
+
+**経緯**: ユーザーから「外のノードに繋がりが悪い」という体感報告があり、まず「verack後の
+addr/inv送信はサーバー側からクライアント側への一方向が正しく、outbound側(クライアント)
+から送るのは誤りではないか」という仮説が出た。PyBitmessage本家の実ソース
+(`network/bmproto.py`の`bm_command_verack`/`bm_command_version`、`network/tcp.py`の
+`set_connection_fully_established`)を確認したところ、これは誤りで、verackを受信した側が
+inbound/outbound問わず自分から`sendAddr`/`sendBigInv`を送る対称設計であり、この実装
+(`object_sync.c`のverackハンドラ)は本家と一致していることを確認した。
+
+次に実際の原因を`journalctl -u bitmessaged`(直近3000行)と`peers.db`を突き合わせて調査:
+- outboundのversion交換自体は587件成功していたが、直後に`peer closed (EOF)`でほぼ全て
+  切断されていた。一部は`"Too many connections from your IP."` /
+  `"Server full, please try again later."`という明示的なerrorメッセージ付きだった。
+- `peers.db`の候補62件のうち、rating 0.8〜0.9の「使える」候補はわずか13件、49件は
+  negative rating。この少数のIPへ再接続が集中し、繋いでは即切られるループになっていた。
+- `config.db`の`socks_proxy`を確認したところ、SOCKS5(Tor、127.0.0.1:9050)が有効になって
+  おり、`peer_connector.c`の`open_peer_connection`は接続先が`.onion`かどうかを一切見ず、
+  有効なら**クリアネットIP宛の接続まで無条件でTor経由**にしていた。
+
+PyBitmessage本家の`network/connectionpool.py`(`socksproxytype`/`onionsocksproxytype`の
+分離、`chosen.host.endswith(".onion")`での分岐)を確認したところ、本家はonion peer専用の
+プロキシ設定とクリアネットIP用の設定(既定は空=直結)を分離しており、クリアネットIPまで
+Tor経由にするのはユーザーが明示的に選択した場合のみだった。クリアネットIPまでTor出口
+ノード経由にすると、出口ノードは多数のTorユーザーで共有されるIPのため相手ノードから
+"Too many connections from your IP"のようなレート制限を受けやすく、また多くのノード
+運営者がTor出口ノードを意図的にブロックしているため、これが接続性悪化の主因だったと
+判断した(このプロジェクトの過去のonion peer到達目的でのSOCKS5有効化が、意図せず
+クリアネットIPまで巻き込んでいた副作用)。ユーザーと相談し、「設定を分離し、クリアネットは
+既定で直結」の方針で合意した。
+
+**対応**:
+- `core/config_store.h`/`.c`: `bm_config_store_get/set_socks_proxy`を
+  `_onion`(テーブル名`socks_proxy`のまま、既存ユーザーの設定はそのまま引き継がれる)に
+  リネームし、新たに`_clearnet`(新規テーブル`socks_proxy_clearnet`、既定disabled=直結)を
+  追加。
+- `infra/peer_connector.c`: `is_onion_host`(`.onion`サフィックス判定、PyBitmessage本家の
+  `endswith(".onion")`相当)を追加し、`bm_peer_connector_connect_initial`が候補ごとに
+  onion用/クリアネット用のどちらのSOCKS5設定を使うか選択するようにした。
+- `core/api_server.c`: `getSocksProxy`/`setSocksProxy`を`getSocksProxyOnion`/
+  `setSocksProxyOnion`と`getSocksProxyClearnet`/`setSocksProxyClearnet`の4メソッドに分離
+  (共通ロジックはgetter/setter関数ポインタを取るヘルパーへ集約)。
+- `cli/main.c`: `get/set-socks-proxy`を`get/set-socks-proxy-onion`と
+  `get/set-socks-proxy-clearnet`に分離。`src/main.c`の起動時ログも両方を出力するよう変更。
+- `README.md`のクイックスタート例・機能一覧を更新。
+
+**テスト**: `tests/test_config_store.c`を更新。既存のonion/roundtrip/upsertテストを
+`_onion`関数向けに書き換え、クリアネット用の既定値テストを追加。モックSOCKS5サーバー
+経由のテスト(4番目のケース)は接続先を`.onion`ホスト名に変更し、onion proxyだけを
+有効化した状態で正しくSOCKS5経由になることを確認。新たに5番目のケースとして、
+plain TCPサーバー(SOCKS5ハンドシェイクを一切行わない)を立て、クリアネットIP宛の候補が
+onion proxy有効時でも直結される(受信した最初の1byteがSOCKS5グリーティングのVER=0x05
+ではないこと)ことを確認するテストを追加した。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+39件全通過を確認。

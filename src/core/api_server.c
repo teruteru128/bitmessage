@@ -677,13 +677,18 @@ static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *c
 }
 
 /*
- * getSocksProxy: [] -> {enabled, host, port}
- * §11 outbound接続用SOCKS5プロキシ設定(config.db、core/config_store.c)の参照。
+ * §11 2026-08-26: onionピア向け/クリアネットIP向けでSOCKS5設定を分離した
+ * (config_store.hのdoc参照。以前は単一設定を全outbound接続に適用しており、これが
+ * クリアネットIPまでTor出口ノード経由にしてしまい外部ノードへの接続性を悪化させて
+ * いた)。get/setどちらもgetter/setter関数を引数に取るだけの共通ロジックにまとめ、
+ * Onion/Clearnetの2つのAPIハンドラから呼ぶ。
  */
-static bm_json_value_t *h_getSocksProxy(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+typedef int (*socks_proxy_getter_t)(sqlite3 *, struct bm_socks_proxy_config *);
+typedef int (*socks_proxy_setter_t)(sqlite3 *, const struct bm_socks_proxy_config *);
+
+static bm_json_value_t *get_socks_proxy_common(const struct bm_api_server_config *config,
+                                                socks_proxy_getter_t getter, char **out_error)
 {
-    (void)params;
     if (config->config_db == NULL)
     {
         *out_error = dup_cstr("config store is not available");
@@ -691,7 +696,7 @@ static bm_json_value_t *h_getSocksProxy(const struct bm_api_server_config *confi
     }
 
     struct bm_socks_proxy_config proxy;
-    if (bm_config_store_get_socks_proxy(config->config_db, &proxy) != 0)
+    if (getter(config->config_db, &proxy) != 0)
     {
         *out_error = dup_cstr("failed to read socks proxy config");
         return NULL;
@@ -704,14 +709,9 @@ static bm_json_value_t *h_getSocksProxy(const struct bm_api_server_config *confi
     return result;
 }
 
-/*
- * setSocksProxy: [enabled, host, port]
- * 変更はconfig.dbへ即座に永続化される。稼働中のpeer_connector_threadは再接続サイクルの
- * たびconfig.dbを読み直すため(§11設定変更の動的リロード)、daemon再起動なしで次の
- * 再接続サイクル(既定30秒以内)から反映される。
- */
-static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static bm_json_value_t *set_socks_proxy_common(const struct bm_api_server_config *config,
+                                                const bm_json_value_t *params, socks_proxy_setter_t setter,
+                                                const char *usage_error, char **out_error)
 {
     if (config->config_db == NULL)
     {
@@ -724,7 +724,7 @@ static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *confi
     const bm_json_value_t *port_v = bm_json_array_get(params, 2);
     if (enabled_v == NULL || host == NULL || port_v == NULL)
     {
-        *out_error = dup_cstr("setSocksProxy requires [enabled, host, port]");
+        *out_error = dup_cstr(usage_error);
         return NULL;
     }
 
@@ -744,12 +744,49 @@ static bm_json_value_t *h_setSocksProxy(const struct bm_api_server_config *confi
         return NULL;
     }
 
-    if (bm_config_store_set_socks_proxy(config->config_db, &proxy) != 0)
+    if (setter(config->config_db, &proxy) != 0)
     {
         *out_error = dup_cstr("failed to store socks proxy config");
         return NULL;
     }
     return bm_json_new_bool(1);
+}
+
+/* getSocksProxyOnion: [] -> {enabled, host, port}(onion peer(.onion宛)専用) */
+static bm_json_value_t *h_getSocksProxyOnion(const struct bm_api_server_config *config,
+                                              const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    return get_socks_proxy_common(config, bm_config_store_get_socks_proxy_onion, out_error);
+}
+
+/*
+ * setSocksProxyOnion: [enabled, host, port](onion peer(.onion宛)専用)
+ * 変更はconfig.dbへ即座に永続化される。稼働中のpeer_connector_threadは再接続サイクルの
+ * たびconfig.dbを読み直すため(§11設定変更の動的リロード)、daemon再起動なしで次の
+ * 再接続サイクル(既定30秒以内)から反映される。
+ */
+static bm_json_value_t *h_setSocksProxyOnion(const struct bm_api_server_config *config,
+                                              const bm_json_value_t *params, char **out_error)
+{
+    return set_socks_proxy_common(config, params, bm_config_store_set_socks_proxy_onion,
+                                   "setSocksProxyOnion requires [enabled, host, port]", out_error);
+}
+
+/* getSocksProxyClearnet: [] -> {enabled, host, port}(クリアネットIP宛専用、既定disabled=直結) */
+static bm_json_value_t *h_getSocksProxyClearnet(const struct bm_api_server_config *config,
+                                                 const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+    return get_socks_proxy_common(config, bm_config_store_get_socks_proxy_clearnet, out_error);
+}
+
+/* setSocksProxyClearnet: [enabled, host, port](クリアネットIP宛専用) */
+static bm_json_value_t *h_setSocksProxyClearnet(const struct bm_api_server_config *config,
+                                                 const bm_json_value_t *params, char **out_error)
+{
+    return set_socks_proxy_common(config, params, bm_config_store_set_socks_proxy_clearnet,
+                                   "setSocksProxyClearnet requires [enabled, host, port]", out_error);
 }
 
 /*
@@ -985,8 +1022,10 @@ static const struct bm_api_method METHODS[] = {
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
     {"listSubscriptions", h_listSubscriptions},
-    {"getSocksProxy", h_getSocksProxy},
-    {"setSocksProxy", h_setSocksProxy},
+    {"getSocksProxyOnion", h_getSocksProxyOnion},
+    {"setSocksProxyOnion", h_setSocksProxyOnion},
+    {"getSocksProxyClearnet", h_getSocksProxyClearnet},
+    {"setSocksProxyClearnet", h_setSocksProxyClearnet},
     {"addPeer", h_addPeer},
     {"listConnections", h_listConnections},
     {"getNetworkStats", h_getNetworkStats},

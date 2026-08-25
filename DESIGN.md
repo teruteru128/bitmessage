@@ -1375,6 +1375,18 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
     - 「機能的にimportとexportはペアであるべき」とユーザーと合意。未実装・未着手、
       §7/§6.2の設計反映も含めて別途着手が必要。
 
+**2026-08-26完了: outbound SOCKS5設定をonion peer専用/クリアネットIP専用に分離**。
+以前は単一のsocks_proxy設定(config.db)を全outbound接続に適用しており、有効化すると
+クリアネットIP宛の接続まで無条件でTor出口ノード経由になっていた。これがTor出口ノードの
+共有IPゆえのレート制限("Too many connections from your IP"等)を招き、外部ノードへの
+接続性を悪化させていた原因だった。PyBitmessage本家(`network/connectionpool.py`の
+`socksproxytype`/`onionsocksproxytype`分離)に合わせ、`config_store.c`の
+`socks_proxy`(onion専用に意味を絞った、既存設定はそのまま引き継がれる)と新設の
+`socks_proxy_clearnet`(既定disabled=直結)へ分離。`peer_connector.c`が接続先の
+`.onion`サフィックスで使う設定を選択する。API(`getSocksProxyOnion`/`Clearnet`等)・
+CLI(`get/set-socks-proxy-onion`/`-clearnet`)も追随。詳細な調査経緯はDESIGN-LOG.md
+「outbound SOCKS5設定をonion peer専用/クリアネットIP専用に分離」参照。
+
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
 DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage

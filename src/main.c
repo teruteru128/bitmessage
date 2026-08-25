@@ -225,15 +225,25 @@ int main(void)
 
     /* §11 outbound接続用SOCKS5プロキシ設定。起動時ログ用に一度読むだけで、実際に
      * peer_connector_threadが使う値は再接続サイクルのたびconfig_dbから読み直される
-     * (§11設定変更の動的リロード、peer_connector.c参照)。CLIのset-socks-proxyでの変更は
-     * daemon再起動なしで次の再接続サイクル(既定30秒間隔)から反映される。 */
-    struct bm_socks_proxy_config socks_proxy_config;
-    bm_config_store_get_socks_proxy(config_db, &socks_proxy_config);
-    char socks_proxy_addr_buf[80];
-    bm_network_format_host_port(socks_proxy_config.host, socks_proxy_config.port, socks_proxy_addr_buf,
-                                 sizeof(socks_proxy_addr_buf));
-    bm_log_info("[config] socks proxy: %s (%s)\n", socks_proxy_config.enabled ? "enabled" : "disabled",
-            socks_proxy_addr_buf);
+     * (§11設定変更の動的リロード、peer_connector.c参照)。CLIのset-socks-proxy-onion/
+     * clearnetでの変更はdaemon再起動なしで次の再接続サイクル(既定30秒間隔)から反映される。
+     * §11 2026-08-26: onion peer(.onion宛)専用/クリアネットIP宛専用に分離した
+     * (config_store.hのdoc参照)ため、両方を起動時ログに出す。 */
+    struct bm_socks_proxy_config socks_proxy_onion;
+    bm_config_store_get_socks_proxy_onion(config_db, &socks_proxy_onion);
+    char socks_proxy_onion_addr_buf[80];
+    bm_network_format_host_port(socks_proxy_onion.host, socks_proxy_onion.port, socks_proxy_onion_addr_buf,
+                                 sizeof(socks_proxy_onion_addr_buf));
+    bm_log_info("[config] socks proxy (onion): %s (%s)\n", socks_proxy_onion.enabled ? "enabled" : "disabled",
+            socks_proxy_onion_addr_buf);
+
+    struct bm_socks_proxy_config socks_proxy_clearnet;
+    bm_config_store_get_socks_proxy_clearnet(config_db, &socks_proxy_clearnet);
+    char socks_proxy_clearnet_addr_buf[80];
+    bm_network_format_host_port(socks_proxy_clearnet.host, socks_proxy_clearnet.port,
+                                 socks_proxy_clearnet_addr_buf, sizeof(socks_proxy_clearnet_addr_buf));
+    bm_log_info("[config] socks proxy (clearnet): %s (%s)\n",
+            socks_proxy_clearnet.enabled ? "enabled" : "disabled", socks_proxy_clearnet_addr_buf);
 
     struct bm_queues queues;
     queues_init(&queues);

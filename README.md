@@ -28,9 +28,12 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **chan(私設グループチャンネル)**: 共有passphraseから同じアドレス・鍵を導出して複数人が
   参加(`joinChan`)、自分自身宛のsendMessageで投稿、他メンバーはtrial_decryptで自動復号
 - **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
-- **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化(`set-socks-proxy`)。
-  mainnetシード全滅時の代替経路確保が主な動機。設定変更はdaemon再起動なしで次の再接続
-  サイクル(既定30秒以内)から反映される
+- **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化。onion peer
+  (`.onion`宛)専用設定(`set-socks-proxy-onion`)とクリアネットIP宛専用設定
+  (`set-socks-proxy-clearnet`、既定disabled=直結)を分離しており、onionだけ有効化しても
+  クリアネットIPへの接続は直結のまま維持される(PyBitmessage本家のsocksproxytype/
+  onionsocksproxytype分離に合わせた設計、DESIGN.md §11参照)。設定変更はdaemon再起動
+  なしで次の再接続サイクル(既定30秒以内)から反映される
 - **v3 onionピア探索**: PyBitmessage準拠の`OBJECT_ONIONPEER`(専用object type)を受信し、
   ネットワーク上で生存しているv3 onionピアを`peers.db`へ自動登録(受信のみ、自身のonion
   hidden serviceの運用・announceはinbound Tor同様スコープ外)
@@ -171,10 +174,15 @@ CHAN=$($CLI join-chan "my chan passphrase" "my chan" "store passphrase" | tr -d 
 $CLI unlock "$CHAN" "store passphrase"
 $CLI send-message "$CHAN" "$CHAN" - "subject" "body" 3600 1
 
-# outbound接続をSOCKS5プロキシ(Tor等)経由にする。次の再接続サイクル(既定30秒以内)で
-# daemon再起動なしに反映される
-$CLI set-socks-proxy 1 127.0.0.1 9050
-$CLI get-socks-proxy
+# onion peer(.onion宛)向けのoutbound接続をSOCKS5プロキシ(Tor等)経由にする。クリアネットIP
+# 宛は既定disabled(直結)のまま維持される。次の再接続サイクル(既定30秒以内)でdaemon
+# 再起動なしに反映される
+$CLI set-socks-proxy-onion 1 127.0.0.1 9050
+$CLI get-socks-proxy-onion
+# クリアネットIP宛も匿名化したい場合のみ明示的に有効化する(Tor出口ノード経由になり
+# 外部ノードへの接続性が悪化しうる、README上記参照)
+$CLI set-socks-proxy-clearnet 1 127.0.0.1 9050
+$CLI get-socks-proxy-clearnet
 
 # 個人的に存在を確認したノードを手動で追加する(mainnetシード全滅時の最後の手段)
 $CLI add-peer 203.0.113.1 8444

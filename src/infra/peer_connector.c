@@ -294,6 +294,17 @@ static int socks5_connect(int sock, const char *dest_host, int dest_port, int ti
     return 0;
 }
 
+/* §11 2026-08-26: 接続先が.onionかどうかでどちらのSOCKS5設定(onion用/クリアネット用)を
+ * 適用するか分岐するための判定(config_store.hのdoc参照)。PyBitmessage本家の
+ * chosen.host.endswith(".onion")(connectionpool.py)相当。 */
+static int is_onion_host(const char *host)
+{
+    size_t len = strlen(host);
+    static const char SUFFIX[] = ".onion";
+    size_t suffix_len = sizeof(SUFFIX) - 1;
+    return len > suffix_len && strcmp(host + len - suffix_len, SUFFIX) == 0;
+}
+
 /*
  * socks_proxyが有効ならproxy経由でSOCKS5 CONNECTして接続し、そうでなければ従来通り直結する。
  * 戻り値はconnect_with_timeoutと同じ(成功時fd、失敗時-1)。
@@ -414,13 +425,18 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
     bm_peer_manager_seed_bootstrap(config->peers_db, config->testnet, config->observed_nodes_path);
 
     /* §11 設定変更の動的リロード: 呼ばれるたびconfig.dbから読み直す(スナップショットを
-     * 保持しない)ことで、setSocksProxy APIでの変更がdaemon再起動なしで次回呼び出し
-     * (=次の再接続サイクル、既定30秒間隔)から反映されるようにする */
-    struct bm_socks_proxy_config socks_proxy;
-    memset(&socks_proxy, 0, sizeof(socks_proxy));
+     * 保持しない)ことで、setSocksProxyOnion/Clearnet APIでの変更がdaemon再起動なしで
+     * 次回呼び出し(=次の再接続サイクル、既定30秒間隔)から反映されるようにする。
+     * §11 2026-08-26: onion宛とクリアネットIP宛で別々の設定を使う(config_store.hのdoc
+     * 参照)ため、両方読み込んでおき、候補ごとにis_onion_hostで選択する。 */
+    struct bm_socks_proxy_config socks_proxy_onion;
+    struct bm_socks_proxy_config socks_proxy_clearnet;
+    memset(&socks_proxy_onion, 0, sizeof(socks_proxy_onion));
+    memset(&socks_proxy_clearnet, 0, sizeof(socks_proxy_clearnet));
     if (config->config_db != NULL)
     {
-        bm_config_store_get_socks_proxy(config->config_db, &socks_proxy);
+        bm_config_store_get_socks_proxy_onion(config->config_db, &socks_proxy_onion);
+        bm_config_store_get_socks_proxy_clearnet(config->config_db, &socks_proxy_clearnet);
     }
 
     size_t already_connected = config->registry != NULL ? bm_peer_registry_count(config->registry) : 0;
@@ -463,10 +479,12 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         char addr_buf[80];
         bm_network_format_host_port(candidates[i].ip_address, candidates[i].port, addr_buf, sizeof(addr_buf));
 
+        const struct bm_socks_proxy_config *socks_proxy =
+                is_onion_host(candidates[i].ip_address) ? &socks_proxy_onion : &socks_proxy_clearnet;
         bm_log_debug("[peer_connector] connecting to %s%s...\n", addr_buf,
-                socks_proxy.enabled ? " (via SOCKS5)" : "");
+                socks_proxy->enabled ? " (via SOCKS5)" : "");
         int sock = open_peer_connection(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC,
-                                         &socks_proxy);
+                                         socks_proxy);
         if (sock < 0)
         {
             bm_log_warn("[peer_connector] failed to connect to %s\n", addr_buf);

@@ -58,10 +58,17 @@ static void print_usage(const char *prog)
             "      受信したらinboxへ保存する\n"
             "  remove-subscription <address>\n"
             "  list-subscriptions\n"
-            "  get-socks-proxy\n"
-            "  set-socks-proxy <enabled:0|1> <host> <port>\n"
-            "      outbound接続用SOCKS5プロキシ(Tor等)の設定。config.dbへ永続化され、稼働中の\n"
-            "      bitmessagedにも次の再接続サイクル(既定30秒以内)で反映される(再起動不要)\n"
+            "  get-socks-proxy-onion\n"
+            "  set-socks-proxy-onion <enabled:0|1> <host> <port>\n"
+            "      onion peer(.onion宛)専用のoutbound SOCKS5プロキシ(Tor等)設定。config.dbへ\n"
+            "      永続化され、稼働中のbitmessagedにも次の再接続サイクル(既定30秒以内)で\n"
+            "      反映される(再起動不要)\n"
+            "  get-socks-proxy-clearnet\n"
+            "  set-socks-proxy-clearnet <enabled:0|1> <host> <port>\n"
+            "      クリアネットIP宛専用のoutbound SOCKS5プロキシ設定。既定disabled(直結)。\n"
+            "      onion用と分離しているのは、有効にするとクリアネットIP宛の接続まで\n"
+            "      Tor出口ノード経由になり、共有IPゆえのレート制限で外部ノードへの接続性が\n"
+            "      悪化するため(DESIGN.md §11参照)\n"
             "  add-peer <ipAddress> <port> [stream]\n"
             "      個人的に存在を確認した(掲示板等の匿名リストではなく実際に運用者と面識のある\n"
             "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n"
@@ -358,23 +365,42 @@ int main(int argc, char **argv)
         return call_rpc(&env, "listSubscriptions", params);
     }
 
-    if (strcmp(cmd, "get-socks-proxy") == 0)
+    if (strcmp(cmd, "get-socks-proxy-onion") == 0)
     {
-        return call_rpc(&env, "getSocksProxy", params);
+        return call_rpc(&env, "getSocksProxyOnion", params);
     }
 
-    if (strcmp(cmd, "set-socks-proxy") == 0)
+    if (strcmp(cmd, "set-socks-proxy-onion") == 0)
     {
         if (argc != 5)
         {
-            fprintf(stderr, "使い方: %s set-socks-proxy <enabled:0|1> <host> <port>\n", argv[0]);
+            fprintf(stderr, "使い方: %s set-socks-proxy-onion <enabled:0|1> <host> <port>\n", argv[0]);
             bm_json_free(params);
             return EXIT_FAILURE;
         }
         bm_json_array_append(params, bm_json_new_number(atof(argv[2])));
         bm_json_array_append(params, bm_json_new_string(argv[3]));
         bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
-        return call_rpc(&env, "setSocksProxy", params);
+        return call_rpc(&env, "setSocksProxyOnion", params);
+    }
+
+    if (strcmp(cmd, "get-socks-proxy-clearnet") == 0)
+    {
+        return call_rpc(&env, "getSocksProxyClearnet", params);
+    }
+
+    if (strcmp(cmd, "set-socks-proxy-clearnet") == 0)
+    {
+        if (argc != 5)
+        {
+            fprintf(stderr, "使い方: %s set-socks-proxy-clearnet <enabled:0|1> <host> <port>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_number(atof(argv[2])));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_number(atof(argv[4])));
+        return call_rpc(&env, "setSocksProxyClearnet", params);
     }
 
     if (strcmp(cmd, "add-peer") == 0)
