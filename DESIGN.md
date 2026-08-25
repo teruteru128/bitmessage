@@ -1360,6 +1360,21 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
       許容できない遅さであれば2段階KDF方式へ切り替える、という段階的な進め方を提案した。
       どちらで進めるかはユーザーとの合意待ち。
 
+    **2026-08-25追記(exportAddressの欠落)**: ユーザーから「importということはexportも
+    ですね」と指摘され発覚。§6.2の表には`importAddress`があるがexport側は表にもコードにも
+    存在しない、という完全な抜けだった。`importAddress`と対称な設計にするのが自然:
+    - `exportAddress(address, passphrase)`: passphraseでその行のKEKを導出しGCM復号、
+      `signingWIF`/`encryptionWIF`を返す。`unlockAddress`とは独立させ、既存keyringには
+      触らずその場限りで復号して返すだけの一回性操作にする(呼び出し元へ渡したら
+      プロセス側では即破棄、keyring常駐はさせない)
+    - 数千件の一括インポートと対になる「一括export(バックアップ用途)」も同じ理由で
+      必要になるはずで、上記の一括unlock案(単一passphraseで各行のsaltを使って復号)と
+      ほぼ同じロジックを流用できる
+    - 注意点: WIFという平文の秘密鍵そのものを返す設計なので、ログ・エラーメッセージに
+      絶対載せない配慮がpassphrase同様に必須
+    - 「機能的にimportとexportはペアであるべき」とユーザーと合意。未実装・未着手、
+      §7/§6.2の設計反映も含めて別途着手が必要。
+
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
 DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage
