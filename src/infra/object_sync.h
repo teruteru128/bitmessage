@@ -151,4 +151,22 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
 void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
                                                  int64_t now);
 
+/*
+ * §11 2026-08-25 join-chan後にchan宛の過去メッセージが読めない問題の対応。
+ * 通常の受信フロー(bm_object_sync_dispatch)はobjectを新規受信した瞬間に一度しか
+ * trial_decryptを試みないため、その宛先の鍵をunlockする「前」に既にobject_pool.dbへ
+ * 保存されていたBM_OBJECT_MSGオブジェクト(chan参加前に他メンバーが投稿した分、あるいは
+ * 単に後からunlockした通常identity宛の過去メッセージ)は、鍵をunlockしても自動では
+ * inboxに現れない(ユーザー指摘)。
+ * kr(呼び出し時点でunlockされている全identity)でobject_pool_db中の全MSGオブジェクトを
+ * 再走査し、復号できたものをmessages_db inboxへ挿入する(bm_trial_decrypt_and_store委譲、
+ * msg_idユニーク制約によりinbox側は複数回呼んでも重複挿入されない)。
+ * core/api_server.cのunlockAddress成功直後から、生きたpeer接続やregistryを持たない文脈で
+ * 呼ばれることを想定するため、埋め込みack_payloadの検証・再送(§5.5)はここでは行わない
+ * (受信直後の通常経路とは異なり、送信元へのack配送が遅れる/届かない可能性があるが、
+ * v1では「chan参加前の過去ログが読めるようになる」ことを優先し許容する)。
+ * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙に失敗した場合のみ-1。
+ */
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr);
+
 #endif /* BM_INFRA_OBJECT_SYNC_H */

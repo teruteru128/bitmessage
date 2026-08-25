@@ -1291,3 +1291,37 @@ void *bm_object_sync_broadcast_thread(void *arg)
     free(args);
     return NULL;
 }
+
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr)
+{
+    unsigned char(*hashes)[32] = NULL;
+    size_t count = 0;
+    if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
+    {
+        return -1;
+    }
+
+    int decrypted_count = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        unsigned char *payload = NULL;
+        size_t payload_len = 0;
+        if (bm_object_store_get(object_pool_db, hashes[i], &payload, &payload_len) != 0)
+        {
+            continue;
+        }
+        if (bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL) == 0)
+        {
+            decrypted_count++;
+        }
+        free(payload);
+    }
+    free(hashes);
+
+    if (decrypted_count > 0)
+    {
+        bm_log_info("[object_sync] backfill trial_decrypt: %d message(s) newly decrypted from object_pool.db\n",
+                    decrypted_count);
+    }
+    return decrypted_count;
+}

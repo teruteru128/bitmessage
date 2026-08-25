@@ -25,6 +25,11 @@ struct bm_api_server_config
     bm_keyring_t *keyring;
     sqlite3 *identity_db;
     sqlite3 *messages_db;
+    /* §11 2026-08-25 unlockAddress時のtrial_decryptバックフィル(infra/object_sync.cの
+     * bm_object_sync_backfill_trial_decrypt)で使う。NULL可(その場合unlockAddressは
+     * バックフィルをスキップし、従来通りキーをkeyringへ載せるだけになる。testやCLI
+     * 単体動作用)。 */
+    sqlite3 *object_pool_db;
     /* sendMessageが生成したobjectの投入先(DESIGN.md §1.2)。NULL可(その場合はネットワークへ
      * 流さず、objectはinventoryHashの計算にのみ使われて破棄される。testやCLI単体動作用)。
      * infra/object_sync.cのbm_object_sync_broadcast_threadが消費する。 */

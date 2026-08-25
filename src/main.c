@@ -279,6 +279,7 @@ int main(void)
     api_config.keyring = &keyring;
     api_config.identity_db = identity_db;
     api_config.messages_db = messages_db;
+    api_config.object_pool_db = object_pool_db;
     api_config.broadcast_queue = &queues.broadcast_queue;
     api_config.config_db = config_db;
     api_config.peers_db = peers_db;

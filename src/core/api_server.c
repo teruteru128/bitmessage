@@ -18,6 +18,7 @@
 #include "../common/json.h"
 #include "../common/logging.h"
 #include "../infra/network.h"
+#include "../infra/object_sync.h"
 #include "../infra/peer_registry.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
@@ -175,6 +176,15 @@ static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *confi
         return NULL;
     }
     int rc = bm_keyring_unlock(config->keyring, config->identity_db, address, passphrase);
+    if (rc == 0 && config->object_pool_db != NULL)
+    {
+        /* §11 2026-08-25 join-chan後にchan宛の過去メッセージが読めない問題の対応
+         * (bm_object_sync_backfill_trial_decryptのコメント参照)。unlock成功直後、
+         * その鍵がkeyringに載った状態でobject_pool.db中の未復号MSGオブジェクトを
+         * 再走査する。joinChan自体はDBへidentityを保存するだけでkeyringには載せない
+         * ため、trial_decryptが意味を持つのはこのunlockAddressのタイミングになる。 */
+        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring);
+    }
     return bm_json_new_bool(rc == 0);
 }
 

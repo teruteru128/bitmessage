@@ -1260,7 +1260,40 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
     「一定数未満(例: <3〜5)」へ緩める等の対応を検討する。優先度は中程度(実際には
     addr/onionpeer受信で徐々にpeerが増えていくため即座に詰むわけではないが、
     レジリエンスの観点で改善余地がある)。
-15. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
+16. ~~**join-chan(=unlock)する前に既にobject_pool.dbへ届いていたchan宛msgオブジェクト
+    (過去ログ)が、unlock後も自動でinboxに現れない**~~: 2026-08-25完了。ユーザーから
+    「`join-chan`したときに`object_pool`から対象chan宛のメッセージをルックアップする
+    処理を作っていたか」と問われて発覚。調査の結果、通常の受信フロー
+    (`infra/object_sync.c`の`handle_object`)はBM_OBJECT_MSGオブジェクトを**新規受信した
+    瞬間に一度だけ**`bm_trial_decrypt_and_store`(`core/trial_decrypt.c`)を試す設計で、
+    keyring中の全unlocked identityを順に試すため以後届く投稿は自動的に拾えるが、
+    「そのchan鍵をunlockする前から既にobject_pool.dbに保存されていた(復号できずに
+    残っている)msgオブジェクト」を後から再走査する経路が存在しなかった。加えて
+    `joinChan` API(`core/api_server.c`の`h_joinChan`)自体はDBへidentityを保存する
+    だけでkeyring(メモリ上のunlocked list)には載せないため、trial_decryptが意味を
+    持つのは実際には`unlockAddress`のタイミングだと判明した(DESIGN-LOG.mdの
+    2026-08-21付chan仕様セッション時点でも「chan用の鍵をunlockしてさえいれば新規の
+    受信処理は不要」と書かれていた通り、"新規"受信のみを想定した設計だった)。
+    対応として、`infra/object_store.c`に`bm_object_store_list_hashes_by_type`
+    (指定object_typeのhashを期限切れ含め全件列挙、既存の`list_hashes_by_stream`と
+    同型)を追加、`infra/object_sync.c`に`bm_object_sync_backfill_trial_decrypt`
+    (object_pool_db中の全MSGオブジェクトをkrの現在unlocked全identityで再トライアル
+    復号し、成功分をmessages_db inboxへ挿入。`bm_messages_store_insert_inbox`が
+    msg_idユニーク制約でIGNORE済みのため複数回呼んでも重複挿入されない)を新設し、
+    `core/api_server.c`の`h_unlockAddress`がunlock成功直後に呼ぶよう配線した
+    (`bm_api_server_config`へ`object_pool_db`フィールドを追加、NULL可でtest/CLI単体
+    動作には影響しない)。専用スレッドは新設していない(CLAUDE.mdの方針通り、
+    unlockAddressという既存の同期APIハンドラ内で完結する処理のため、そもそも周期
+    ポーリングの対象ではない)。埋め込みack_payload(§5.5)の検証・再送はスコープ外とした
+    (api_server.cからの呼び出しには生きたpeer接続/peer_registryが無いため。送信元への
+    ack配送が遅れる可能性はあるが、「chan参加前の過去ログが読めるようになる」ことを
+    優先し許容)。`tests/test_chan.c`にシナリオ5として、Bがunlockする前にAが投稿した
+    msgオブジェクトを直接object_pool_db_bへ挿入し、unlock後の`bm_object_sync_backfill_
+    trial_decrypt`で1件だけ復号されinboxに正しい内容(subject/body)で現れること、
+    再実行しても重複挿入されないことを確認するテストを追加。なお本項目は`join-chan`
+    という通常identityでも起きうる一般的な問題への対応であり、chan専用の修正では
+    ない(unlockAddress全般に対して効く)。ctest 39件全通過。
+17. Dandelion++・inbound接続・outbound addrメッセージ送信・inbound接続のアイドル/
     ハンドシェイクタイムアウト+keepalive ping・inbound接続のレート制限・
     プロトコルバージョン互換性チェック・version messageのtimestamp検証・
     listConnections API(MVP)・onionpeer自己announceの定期再送・ログレベル

@@ -8,6 +8,10 @@
  * 2. メンバーAがchanアドレス宛(=自分自身宛)にsendMessageできること(toPubEncryptionHex省略、
  *    §11の直接pubkey自動再送修正で追加したself-send fallbackの検証)
  * 3. メンバーBがその投稿をtrial_decryptで復号できること(共有鍵によるグループチャット動作)
+ * 4. §11 2026-08-25: join-chan(=unlock)する「前」に既にobject_pool.dbへ届いていた
+ *    chan宛msgオブジェクト(過去ログ)を、unlock後にbm_object_sync_backfill_trial_decrypt
+ *    で拾えること(通常の受信フローはobjectを新規受信した瞬間にしかtrial_decryptを試みない
+ *    ため、そのままではchan参加前の投稿がinboxに現れない問題への対応)
  * を確認する。
  */
 
@@ -17,16 +21,22 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../src/common/hash.h"
 #include "../src/core/address.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
 #include "../src/core/messages_store.h"
 #include "../src/core/send_pipeline.h"
 #include "../src/core/trial_decrypt.h"
+#include "../src/infra/object.h"
+#include "../src/infra/object_store.h"
+#include "../src/infra/object_sync.h"
 
 #define TEST_IDENTITY_DB_A "test_chan_identity_a.db"
 #define TEST_MESSAGES_DB_A "test_chan_messages_a.db"
 #define TEST_IDENTITY_DB_B "test_chan_identity_b.db"
+#define TEST_MESSAGES_DB_B "test_chan_messages_b.db"
+#define TEST_OBJECT_POOL_DB_B "test_chan_object_pool_b.db"
 
 static int failures = 0;
 
@@ -137,6 +147,66 @@ int main(void)
         }
     }
     free(object);
+
+    /* --- 5. join-chan(unlock)前に届いていた過去ログのバックフィル --- */
+    sqlite3 *messages_db_b = open_fresh_db(TEST_MESSAGES_DB_B, bm_messages_store_init_schema);
+    sqlite3 *object_pool_db_b = open_fresh_db(TEST_OBJECT_POOL_DB_B, bm_object_store_init_schema);
+
+    unsigned char *object2 = NULL;
+    size_t object2_len = 0;
+    int64_t now2 = (int64_t)time(NULL);
+    int rc2 = bm_send_pipeline_send_message(&kr_a, identity_db_a, messages_db_a, chan_address_a, chan_address_a,
+                                             NULL, "before B joined", "backlog message", 3600, 1,
+                                             NULL, now2 + BM_RESEND_INITIAL_INTERVAL_SECONDS,
+                                             &object2, &object2_len);
+    CHECK(rc2 == 0, "member A posts a second chan message (backlog, before B joins)");
+
+    if (rc2 == 0)
+    {
+        /* まだBがchanをunlockしていない間に通常の受信フロー(object_sync.c)がobject_pool.dbへ
+         * 保存だけしてtrial_decryptに失敗する状況を再現する(該当鍵がkeyringに無い) */
+        unsigned char hash2[32];
+        bm_inventory_hash(object2, object2_len, hash2);
+        CHECK(bm_object_store_insert(object_pool_db_b, hash2, (int)BM_OBJECT_MSG, 1, object2, object2_len,
+                                      now2 + 3600, now2) == 0,
+              "backlog object is stored in member B's object_pool.db while B is still locked");
+
+        bm_keyring_t kr_b_late;
+        bm_keyring_init(&kr_b_late);
+        CHECK(bm_trial_decrypt_and_store(&kr_b_late, messages_db_b, object2, object2_len, NULL, NULL) != 0,
+              "sanity: before unlocking, trial_decrypt still fails for member B");
+
+        CHECK(bm_keyring_unlock(&kr_b_late, identity_db_b, chan_address_b, "storepass-b") == 0,
+              "member B joins/unlocks the chan identity after the backlog message was received");
+
+        int decrypted = bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late);
+        CHECK(decrypted == 1, "backfill decrypts exactly the 1 backlog message after unlock");
+
+        struct bm_inbox_message *inbox_list = NULL;
+        size_t inbox_count = 0;
+        CHECK(bm_messages_store_list_inbox(messages_db_b, NULL, &inbox_list, &inbox_count) == 0,
+              "list member B's inbox after backfill");
+        CHECK(inbox_count == 1 && strcmp(inbox_list[0].subject, "before B joined") == 0
+                  && strcmp(inbox_list[0].body, "backlog message") == 0,
+              "backfilled message appears in member B's inbox with correct content");
+        bm_inbox_message_list_free(inbox_list, inbox_count);
+
+        /* 再実行してもinbox側はmsg_idユニーク制約でIGNOREされ、重複挿入されないこと */
+        CHECK(bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late) == 1,
+              "re-running backfill still trial-decrypts successfully (idempotent at this layer)");
+        CHECK(bm_messages_store_list_inbox(messages_db_b, NULL, &inbox_list, &inbox_count) == 0
+                  && inbox_count == 1,
+              "re-running backfill does not duplicate the inbox entry");
+        bm_inbox_message_list_free(inbox_list, inbox_count);
+
+        bm_keyring_destroy(&kr_b_late);
+    }
+    free(object2);
+
+    sqlite3_close(messages_db_b);
+    sqlite3_close(object_pool_db_b);
+    unlink(TEST_MESSAGES_DB_B);
+    unlink(TEST_OBJECT_POOL_DB_B);
 
     free(chan_address_a);
     free(chan_address_b);

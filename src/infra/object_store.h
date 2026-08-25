@@ -36,4 +36,15 @@ int bm_object_store_delete_expired(sqlite3 *db, int64_t now);
 int bm_object_store_list_hashes_by_stream(sqlite3 *db, int stream, int64_t now,
                                            unsigned char (**out_hashes)[32], size_t *out_count);
 
+/*
+ * §11 2026-08-25 unlockAddress時のtrial_decryptバックフィル(object_sync.cの
+ * bm_object_sync_backfill_trial_decrypt)で使う。指定object_type(通常はBM_OBJECT_MSG)の
+ * objectのhashを、期限切れかどうかに関わらず全件取得する(受信済みだが復号できずに
+ * 残っているobjectを後から拾うための処理のため、expires_timeでは絞り込まない)。
+ * 成功時0で*out_hashesをmalloc(呼び出し側でfree、0件でも同様)、*out_countへ件数を設定。
+ * エラー時-1。
+ */
+int bm_object_store_list_hashes_by_type(sqlite3 *db, int object_type,
+                                         unsigned char (**out_hashes)[32], size_t *out_count);
+
 #endif /* BM_INFRA_OBJECT_STORE_H */
