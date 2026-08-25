@@ -5,6 +5,12 @@ Documentation=https://github.com/teruteru128/bitmessage
 # 必要。§11 outbound Tor経路参照)のためネットワーク到達性を待ってから起動する。
 After=network-online.target
 Wants=network-online.target
+# §11 2026-08-25: BM_TOR_CONTROL=1(Tor ControlPort連携によるhidden service自動作成)や
+# outbound SOCKS5経由のTor利用時、tor.serviceが起動済みでないと接続に失敗しうるため。
+# Requiresではなくソフト依存のWantsにしているのは、Tor連携を使わない運用(tor.serviceが
+# 未インストール/無効でも構わない)を壊さないため。
+After=tor.service
+Wants=tor.service
 
 [Service]
 Type=simple
@@ -35,6 +41,18 @@ WorkingDirectory=/var/lib/bitmessage
 Environment=BM_DATA_DIR=/var/lib/bitmessage
 Environment=BM_CONFIG_FILE=/etc/bitmessage/bitmessage.conf
 Environment=BM_SEEDS_FILE=/usr/local/share/bitmessage/observed_nodes.txt
+
+# §11 2026-08-25: BM_TOR_CONTROL=1利用時、Tor ControlPortのUnixドメインソケット
+# (既定/run/tor/control)はDebian/Ubuntu系torパッケージでは`debian-tor`グループ所有・
+# グループ読み書き権限で作成される。DynamicUser=yesが生成するサービス専用ユーザーは
+# 既定でどのグループにも属さないため、SupplementaryGroupsで明示的にdebian-torへ
+# 参加させないとControlPort接続がPermission deniedになる(このコメントを書く前は
+# ドキュメント化されておらず、DynamicUser前提の記述だけがREADME/systemdユニットに
+# あったため見落とされていた)。DynamicUser+SupplementaryGroupsは併用可能(systemd
+# 235以降)で、既存グループへの参加を指定するだけなら/var/lib/tor自体の所有権や
+# ACLには一切触れない。BM_TOR_CONTROLを使わない運用ではこの行があっても実害は無い
+# (単に未使用のグループへ属すだけ)ため、既定で有効にしている。
+SupplementaryGroups=debian-tor
 
 # §11 2026-08-23実装のJOURNAL_STREAM自動判定(common/logging.c)により、systemd配下では
 # ログ行への時刻付与を自動的に省略する(journaldが受信時刻を別途正確に記録するため)。

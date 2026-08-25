@@ -2488,3 +2488,44 @@ DB flush等)を一切経由せずプロセスが死ぬ競合状態がありえ�
 
 **修正後の確認**: `build-Debug`/`build-Release`/`build-Sanitize`/`build-TSan`の4種
 全てクリーンビルドで警告ゼロ・ctest 39件全通過を確認(TSanは325秒、通常範囲内)。
+
+### systemdユニットファイルのTor連携不足を修正(backlog項目10の4/5への追加修正、2026-08-25)
+
+**経緯**: `watchdog_daemon_a.sh`(ループ+`sleep 5`による自前の再起動監視)をsystemdへ
+実際に移行する検討をユーザーと行った際、2026-08-24に作成済みの`systemd/bitmessaged.service`
+に2点未対応の問題があることに気づいた。
+
+1. **`debian-tor`グループ未付与**: `BM_TOR_CONTROL=1`(Tor ControlPort経由のhidden
+   service自動作成、`infra/tor_control.c`)利用時、ControlPortのUnixドメインソケット
+   (既定`/run/tor/control`)はDebian/Ubuntu系torパッケージでは`debian-tor:debian-tor`
+   所有・グループ読み書き権限で作成される。ところが`.service`は`DynamicUser=yes`で
+   サービス専用ユーザーを都度生成しており、このユーザーは既定でどのグループにも
+   属さない。結果、`BM_TOR_CONTROL=1`をsystemd配下で使うとControlPort接続が
+   `Permission denied`で失敗するはずだが、この前提がREADME.md/DESIGN-LOG.md
+   (2026-08-24のsystemdユニット作成セッション)のどちらにも書かれておらず、
+   ドキュメント化の抜けだった。
+2. **`tor.service`への依存が無い**: `.service`は`After=network-online.target`/
+   `Wants=network-online.target`のみで、Tor自体の起動順序を考慮していなかった。
+   `BM_TOR_CONTROL=1`やoutbound SOCKS5経由のTor利用時、`tor.service`がまだ起動して
+   いないタイミングでbitmessagedが起動すると、ControlPort/SOCKS5接続の初回試行が
+   失敗しうる。
+
+**対応**:
+- `[Service]`に`SupplementaryGroups=debian-tor`を追加。`DynamicUser=yes`と
+  `SupplementaryGroups`は併用可能(systemd 235以降)で、既存グループへの参加を
+  指定するだけであり`/var/lib/tor/`自体の所有権・パーミッション・ACLには一切
+  触れない(CLAUDE.mdの「Tor管理ファイルの権限を変更しない」制約とは無関係)。
+  `BM_TOR_CONTROL`を使わない運用でもこの行があるだけでは実害が無い(未使用の
+  グループに属すだけ)ため、条件分岐せず既定で有効にした。他ディストリで
+  ControlPortソケットの所有グループが異なる場合は利用者側でグループ名を
+  書き換える前提とし、その旨をコメントとREADME.mdに明記した。
+- `[Unit]`に`After=tor.service`/`Wants=tor.service`を追加。`Requires=`ではなく
+  `Wants=`(ソフト依存)にしたのは、Tor連携を一切使わない運用(`tor.service`が
+  未インストール/無効)でも本体の起動を失敗させたくないため。
+- README.mdの`BM_TOR_CONTROL`行に注記を追加し、新設した「systemdサービス化」節に
+  上記2点の背景と対応を記載。DESIGN.md §11 項目10の4/5にも追記日と要約を残した。
+
+**検証**: `systemd-analyze verify --recursive-errors=yes`で、`ExecStart`を実際の
+ビルド成果物(`build-Debug/src/bitmessaged`)のパスへ一時的に差し替えた検証用コピー
+に対して構文エラーが無いことを確認(2026-08-24のユニットファイル作成時と同じ手法)。
+Cソースコードの変更は無いため、ctest等の再実行は不要と判断した。

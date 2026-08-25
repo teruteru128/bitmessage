@@ -112,12 +112,27 @@ cp bitmessage.conf.example bitmessage.conf
 | `BM_INBOUND_PORT` | (無効) | Tor hidden service等からのinbound接続を受け付けるport。0または未設定で無効 |
 | `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | 新規アドレス作成時の既定PoW難易度(nonce trials/byte) |
 | `BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES` | `1000` | 同上(payload length extra bytes) |
-| `BM_TOR_CONTROL` | (無効) | `1`でTor ControlPort経由のhidden service自動作成を試みる(`BM_INBOUND_PORT`が前提) |
+| `BM_TOR_CONTROL` | (無効) | `1`でTor ControlPort経由のhidden service自動作成を試みる(`BM_INBOUND_PORT`が前提。systemd配下での実行時はTorのControlPortソケットへアクセスできるグループ権限が必要、下記systemd節参照) |
 | `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | ControlPortのUnixドメインソケットパス(Debian/Ubuntu系torパッケージの既定パス。Fedora/Arch等では異なりうるため、他ディストリで`BM_TOR_CONTROL=1`を使う場合は実際のパスを明示指定すること) |
 | `BM_TOR_CONTROL_HOST` | `127.0.0.1` | 上記に接続できない場合のTCPフォールバック先ホスト |
 | `BM_TOR_CONTROL_PORT` | `9051` | 同上ポート |
 | `BM_TOR_VIRTUAL_PORT` | `8444` | 他peerが自分のonionアドレスへ接続してくるポート番号 |
 | `BM_ONION_ADDRESS` | (未設定) | 静的torrc設定を使う場合、自分のonionアドレスを直接指定(`BM_TOR_CONTROL`より優先) |
+
+### systemdサービス化(`systemd/bitmessaged.service`)
+
+`cmake --install`後、生成される`.service`ファイルは`DynamicUser=yes`でサービス専用ユーザーを
+自動生成する。`BM_TOR_CONTROL=1`でTor ControlPortのUnixドメインソケット(既定
+`/run/tor/control`、Debian/Ubuntu系torパッケージでは`debian-tor`グループ所有)へ接続する
+場合、`DynamicUser`が生成するユーザーは既定でどのグループにも属さないため、ユニットファイル
+側で`SupplementaryGroups=debian-tor`を指定してグループ参加させる必要がある(同梱の
+`.service`ファイルには既に記載済み)。他ディストリでTorのControlPortソケットの所有グループが
+異なる場合は、ここを実際のグループ名に置き換えること。BM_TOR_CONTROLを使わない
+(SOCKS5 outboundのみ、またはTor自体を使わない)運用では不要だが、既定で入れておいても
+実害は無い。
+
+`.service`ファイルは`After=tor.service`/`Wants=tor.service`でTorの起動を待つ(Torを使わない
+運用でも`tor.service`が無効/未インストールなら本体の起動を妨げないソフト依存)。
 
 `bitmessage-cli`向け:
 

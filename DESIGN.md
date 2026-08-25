@@ -1186,6 +1186,11 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
        `DynamicUser`+`StateDirectory`/`ConfigurationDirectory`でシステムユーザー・
        ディレクトリ作成を自動化、`Restart=on-failure`。当日夜に実装した
        `common/logging.c`の`JOURNAL_STREAM`自動判定は、まさにこのsystemd化を見越したもの。
+       2026-08-25追記: `watchdog_daemon_a.sh`からの実移行検討時に、Tor ControlPort連携
+       (`BM_TOR_CONTROL=1`)利用時は`DynamicUser`ユーザーが`debian-tor`グループに
+       属さずControlPortソケットへアクセスできない問題と、`tor.service`への起動順序
+       依存が無い問題が未対応だったことが判明、修正した(詳細はDESIGN-LOG.mdの
+       該当セッション参照)。
     5. ~~非Ubuntu環境への軽い手当て~~ 完了(DESIGN-LOG.mdの該当セッション参照)。CIへFedoraでのビルド確認
        ジョブを追加、Tor control socket既定値のディストリ依存性をコメント/READMEへ
        明記。詳細は元の判断根拠含め下記参照。
