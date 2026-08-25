@@ -2529,3 +2529,57 @@ DB flush等)を一切経由せずプロセスが死ぬ競合状態がありえ�
 ビルド成果物(`build-Debug/src/bitmessaged`)のパスへ一時的に差し替えた検証用コピー
 に対して構文エラーが無いことを確認(2026-08-24のユニットファイル作成時と同じ手法)。
 Cソースコードの変更は無いため、ctest等の再実行は不要と判断した。
+
+**その後の実際の本番移行**: 同日、上記ユニットファイルを実際に本番daemon Aへ適用した。
+`sudo ninja -C build-Release install`でバイナリ/`.service`/`observed_nodes.txt`を
+インストールし、`sudo systemctl daemon-reload`で反映。`BM_DATA_DIR=/var/lib/bitmessage`/
+`BM_CONFIG_FILE=/etc/bitmessage/bitmessage.conf`が旧来のCWD相対パスと異なるため、
+移行手順は「daemon Aを`pgrep -fa`で特定した実PIDに対して個別`kill`で正常停止(監視ループ
+`watchdog_daemon_a.sh`側を先に止めてからbitmessaged本体を止める順序、CLAUDE.mdの
+`pkill -f`禁止方針通り)→稼働中DB(`config.db`/`identity.db`/`messages.db`/
+`object_pool.db`/`peers.db`)とTLD`bitmessage.conf`を`/var/lib/bitmessage`・
+`/etc/bitmessage`へコピー→`systemctl enable --now`」とした。ユーザーから
+「DBのコピーはdaemonを止めてからの方がいいのでは」と指摘があり、その通りに順序を
+確定させた(稼働中のSQLite WALファイルを生きたまま`cp`すると、チェックポイント未反映や
+コピー中の書き込み競合で不整合なスナップショットになるリスクがあるため)。
+起動後、`journalctl -u bitmessaged`で`DB初期化完了: peers.db, object_pool.db,
+identity.db, messages.db, config.db (data_dir=/var/lib/bitmessage)`・
+`object_sync sent big inv ... 10330 of 10330`(`object_pool.db`のデータが欠損なく
+引き継がれている)・onion peerへのoutbound接続成功を確認し、移行完了とした。
+`DynamicUser=yes`環境が既存の`/var/lib/bitmessage`ディレクトリを検出して
+`/var/lib/private/bitmessage`へ移行するログ(`Found pre-existing public
+StateDirectory= directory ..., migrating to ...`)も想定通り出力された。
+
+### 送信済みボックス(getSentMessages/get-sent)の追加(2026-08-25)
+
+**経緯**: 上記systemd移行のやり取りの最中、ユーザーから「そういえば送信済みボックスって
+無いですよね」と指摘され発覚。`messages.db`の`sent`テーブル自体は§2.4の設計時から
+存在し、`bm_messages_store_insert_sent`で送信のたびに書き込まれていたが、実際の
+読み出し経路は`bm_messages_store_list_resend_candidates`(ack追跡・再送判定専用、
+`object_sync_thread`から内部的に呼ばれるのみ)しか無く、`get-inbox`/
+`getInboxMessages`に相当するユーザー向けの一覧手段が丸ごと欠けていた。DESIGN.md/
+DESIGN-LOG.mdを検索しても過去にbacklog化・議論された跡が無く、意図的な先送りでは
+なく単純な実装漏れだったと判断した。
+
+**対応**: `getInboxMessages`まわりの3層(store/API/CLI)をそのまま踏襲する形で追加した。
+- `core/messages_store.h`/`.c`: `struct bm_sent_message`(msg_id/to_address/
+  from_address/subject/body/status/sent_time/ttl/resend_count)と
+  `bm_messages_store_list_sent`(`sent`テーブルを`sent_time DESC`で全件、`list_inbox`の
+  folder_filterに相当する絞り込みは無し、sentにfolder概念自体が無いため)、
+  `bm_sent_message_list_free`を追加。
+- `core/api_server.c`: `h_getSentMessages`(`h_getInboxMessages`と同型)を追加し、
+  `METHODS`テーブルへ`getSentMessages`として登録。
+- `cli/main.c`: `get-sent`サブコマンド(引数無し、`get-inbox`と違いsentにfolder概念が
+  無いため引数を取らない)を追加、ヘルプ文言にも追記。
+- `README.md`のクイックスタート例に`$CLI get-sent`を追記。
+
+**テスト**: `tests/test_api_server.c`に`getSentMessages`のテストを追加。当初
+「`sent`テーブルへ1件差し込み、返り値が1件であること」を検証する形で書いたが、
+同じテストファイル内で先行する`sendMessage`テストが2件、実際の送信パイプライン
+(`send_pipeline.c`)経由で同一`messages_db`の`sent`テーブルへ既に行を挿入済みだったため、
+件数が3件になり`ctest -R api_server`が`FAIL: getSentMessages returns 1 entry`で
+失敗した。件数を決め打ちせず、返ってきた配列から自分が挿入したmsg_id
+(`0xcd`で埋めたテスト用ID)を持つ要素を探して検証する形に修正し、通過を確認した。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+39件全通過を確認。

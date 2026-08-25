@@ -48,6 +48,10 @@ static void print_usage(const char *prog)
             "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex)。\"-\"を指定するとcache-pubkeyで\n"
             "      登録済みの鍵を使う\n"
             "  get-inbox [folder]\n"
+            "  get-sent\n"
+            "      送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
+            "      fromAddress/subject/body/status(encoding|doingpow|broadcasted|\n"
+            "      ackreceived)/sentTime/ttl/resendCount\n"
             "  send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n"
             "  add-subscription <address> [label]\n"
             "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
@@ -293,6 +297,17 @@ int main(int argc, char **argv)
             bm_json_array_append(params, bm_json_new_string(argv[2]));
         }
         return call_rpc(&env, "getInboxMessages", params);
+    }
+
+    if (strcmp(cmd, "get-sent") == 0)
+    {
+        if (argc != 2)
+        {
+            fprintf(stderr, "使い方: %s get-sent\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        return call_rpc(&env, "getSentMessages", params);
     }
 
     if (strcmp(cmd, "send-broadcast") == 0)

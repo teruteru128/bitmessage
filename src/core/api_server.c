@@ -931,6 +931,44 @@ static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *co
     return arr;
 }
 
+/* §11 2026-08-25: getSentMessages: [] -> [{msgId,toAddress,fromAddress,subject,body,status,
+ * sentTime,ttl,resendCount}, ...]。sentテーブルはこれまでack追跡専用でユーザー向けの一覧
+ * 手段が無かった(getInboxMessagesに相当するものが未実装だった)ため追加。 */
+static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *config,
+                                           const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+
+    struct bm_sent_message *list = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_sent(config->messages_db, &list, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list sent");
+        return NULL;
+    }
+
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        char msg_id_hex[65];
+        hex_encode(list[i].msg_id, sizeof(list[i].msg_id), msg_id_hex);
+
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "msgId", bm_json_new_string(msg_id_hex));
+        bm_json_object_set(entry, "toAddress", bm_json_new_string(list[i].to_address));
+        bm_json_object_set(entry, "fromAddress", bm_json_new_string(list[i].from_address));
+        bm_json_object_set(entry, "subject", bm_json_new_string(list[i].subject));
+        bm_json_object_set(entry, "body", bm_json_new_string(list[i].body));
+        bm_json_object_set(entry, "status", bm_json_new_string(list[i].status));
+        bm_json_object_set(entry, "sentTime", bm_json_new_number((double)list[i].sent_time));
+        bm_json_object_set(entry, "ttl", bm_json_new_number((double)list[i].ttl));
+        bm_json_object_set(entry, "resendCount", bm_json_new_number((double)list[i].resend_count));
+        bm_json_array_append(arr, entry);
+    }
+    bm_sent_message_list_free(list, count);
+    return arr;
+}
+
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
     {"lockAddress", h_lockAddress},
@@ -943,6 +981,7 @@ static const struct bm_api_method METHODS[] = {
     {"sendMessage", h_sendMessage},
     {"sendBroadcast", h_sendBroadcast},
     {"getInboxMessages", h_getInboxMessages},
+    {"getSentMessages", h_getSentMessages},
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
     {"listSubscriptions", h_listSubscriptions},

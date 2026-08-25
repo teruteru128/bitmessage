@@ -160,6 +160,7 @@ $CLI list-addresses
 # pubkeyが届いてから再送する)
 $CLI send-message BM-fromAddress BM-toAddress - "subject" "body" 3600 1
 $CLI get-inbox
+$CLI get-sent
 
 # broadcast購読・送信
 $CLI add-subscription BM-someAddress "label"

@@ -489,6 +489,62 @@ int main(void)
 
     free(sender_address);
 
+    /* §11 2026-08-25 getSentMessages: sentテーブルへ1件差し込み、API経由で正しく読めることを
+     * 確認する(sendMessageの実際の送信パイプラインはtest_send_pipeline.cで既に検証済みなので、
+     * ここではAPI層のクエリ・JSONシリアライズだけを対象にする)。ただしこの時点で、上の
+     * sendMessageテスト2件が実際の送信パイプライン経由で既にsentへ行を挿入済みなので、
+     * 件数を決め打ちせず自分の挿入したmsgIdを配列内から探す */
+    {
+        unsigned char msg_id[32];
+        memset(msg_id, 0xcd, sizeof(msg_id));
+        unsigned char ack_data[4] = {1, 2, 3, 4};
+        CHECK(bm_messages_store_insert_sent(messages_db, msg_id, ack_data, sizeof(ack_data),
+                                             "BM-senttoaddress", "BM-sentfromaddress",
+                                             "sent test subject", "sent test body",
+                                             "broadcasted", 1, 1234567890, 2419200, 0) == 0,
+              "seed one sent row directly");
+
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getSentMessages\",\"params\":[],\"id\":17}",
+                           "testuser", "testpass");
+        CHECK(resp != NULL, "getSentMessages HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_ARRAY && result->item_count >= 1,
+                  "getSentMessages returns at least 1 entry");
+
+            bm_json_value_t *entry = NULL;
+            if (result != NULL)
+            {
+                for (size_t i = 0; i < result->item_count; i++)
+                {
+                    bm_json_value_t *e = bm_json_array_get(result, i);
+                    const char *msg_id_hex = bm_json_as_string(bm_json_object_get(e, "msgId"));
+                    if (msg_id_hex != NULL && strncmp(msg_id_hex, "cdcdcdcd", 8) == 0)
+                    {
+                        entry = e;
+                        break;
+                    }
+                }
+            }
+            CHECK(entry != NULL, "getSentMessages contains the seeded row");
+            if (entry != NULL)
+            {
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "toAddress")), "BM-senttoaddress") == 0,
+                      "getSentMessages toAddress");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "subject")), "sent test subject") == 0,
+                      "getSentMessages subject");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "body")), "sent test body") == 0,
+                      "getSentMessages body");
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "status")), "broadcasted") == 0,
+                      "getSentMessages status");
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+    }
+
     /* §11 addPeer: [ipAddress, port, stream?]。手動でpeers.dbへ登録できることを確認する */
     resp = do_request(
         "{\"jsonrpc\":\"2.0\",\"method\":\"addPeer\",\"params\":[\"203.0.113.99\",8444,1],\"id\":16}",

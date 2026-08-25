@@ -1306,6 +1306,19 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
     検証/BM_DATA_DIR/cmake --install/systemdユニット/非Ubuntu環境への軽い手当て
     (計5分割)はいずれも完了(DESIGN-LOG.mdの該当セッション参照)。GPU/OpenCL PoWは§8で明示的にv1スコープ外と
     決めた項目のため対象外(引き続き見送り)。
+18. ~~**送信済みボックス(sentテーブル)を一覧する手段が無い**~~: 2026-08-25完了
+    (DESIGN-LOG.mdの該当セッション参照)。watchdog_daemon_a.shからsystemdへの移行作業を
+    やり取りしていた流れでユーザーから「そういえば送信済みボックスが無い」と指摘され
+    発覚。`messages.db`の`sent`テーブル自体は§2.4の設計時から存在したが、実際の用途は
+    ack追跡・再送判定(`bm_messages_store_list_resend_candidates`)専用で、
+    `get-inbox`/`getInboxMessages`に相当するユーザー向けの一覧経路が丸ごと無かった
+    (過去の議論・backlog化の跡も無く、意図的な先送りではなく単純な実装漏れと判断)。
+    `bm_messages_store_list_sent`(`core/messages_store.c`、`list_inbox`と同型、送信時刻降順)・
+    `getSentMessages` API(`core/api_server.c`、`getInboxMessages`と同型)・`get-sent`
+    CLIサブコマンド(`cli/main.c`)の3点を追加。`tests/test_api_server.c`に
+    `getSentMessages`のテストを追加(既存の`sendMessage`テスト2件が同一`messages_db`へ
+    実際の送信パイプライン経由で`sent`行を挿入済みのため、件数を決め打ちせず自分が
+    挿入したmsgIdを配列内から探す形にした)。ctest 39件全通過。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

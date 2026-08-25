@@ -93,6 +93,30 @@ int bm_messages_store_list_inbox(sqlite3 *db, const char *folder_filter,
                                   struct bm_inbox_message **out_list, size_t *out_count);
 void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count);
 
+struct bm_sent_message
+{
+    unsigned char msg_id[32];
+    char to_address[BM_MESSAGES_ADDRESS_MAX];
+    char from_address[BM_MESSAGES_ADDRESS_MAX];
+    char *subject; /* malloc */
+    char *body;    /* malloc */
+    char status[16]; /* 'encoding'|'doingpow'|'broadcasted'|'ackreceived' */
+    int64_t sent_time;
+    int64_t ttl;
+    int resend_count;
+};
+
+/*
+ * §11 2026-08-25: 送信済みボックス。sentテーブルはこれまでack追跡・再送判定
+ * (bm_messages_store_list_resend_candidates)専用で、ユーザー向けの一覧手段が無かった
+ * (get-inbox/getInboxMessagesに相当するものが未実装だった)ため追加。
+ * 送信時刻降順で全件返す(inboxのfolder_filterに相当する絞り込みは、sentには
+ * folder概念自体が無いため用意していない)。成功時0、*out_listはmalloc済み配列
+ * (bm_sent_message_list_freeで解放)。
+ */
+int bm_messages_store_list_sent(sqlite3 *db, struct bm_sent_message **out_list, size_t *out_count);
+void bm_sent_message_list_free(struct bm_sent_message *list, size_t count);
+
 /* --- §5.4 broadcast購読(subscriptions) --- */
 
 /* 既存行があればlabelのみ更新(UPSERT)。成功時0 */
