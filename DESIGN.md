@@ -252,9 +252,9 @@ pubkeyオブジェクト(v2/v3/v4)のパーサ・検証を実装(`bm_parse_pubke
 構築処理の逆)。v3は埋め込みECDSA署名を検証、v4は`bm_address_derive_secret_and_tag`(§3.4相当、
 `address.c`に共通化)でtagを算出して候補と突き合わせてから復号・署名検証・ripe一致まで確認する。
 `message_builder.c`で構築したオブジェクトとのラウンドトリップ、改ざん検知、候補違い時の拒否、DB
-upsert/lookupを`tests/test_pubkey_cache.c`で検証済み(2026-08-21)。現状は手動登録(`cachePubkey` API/
-`cache-pubkey` CLI)またはテスト経由のみで、実ネットワークから受信した`pubkey`オブジェクトをこの
-パーサへ流し込む配線は未実装(§9 TODO参照)。
+upsert/lookupを`tests/test_pubkey_cache.c`で検証済み(2026-08-21)。手動登録(`cachePubkey` API/
+`cache-pubkey` CLI)に加え、実ネットワークから受信した`pubkey`オブジェクトをこのパーサへ流し込み
+自動でDB登録する配線(`infra/object_sync.c`)も実装済み(§5.0「getpubkey要求の自動化」参照)。
 
 ### 2.4 `messages.db` (コア・暗号層、新規) — 受信/送信ボックス
 
@@ -493,7 +493,7 @@ fromアドレスの鍵を引き、ack object(§5.5)とmsgオブジェクトを�
 pubkey_cacheに宛先のnonce_trials_per_byte/payload_length_extra_bytesがあれば送信元既定値との
 大きい方を採用する。`tests/test_send_pipeline.c`でNULL指定時のフォールバック(未登録で失敗
 →upsert後は成功)まで検証済み(2026-08-21)。getpubkey要求による自動取得(未登録時に能動的に
-取りに行く経路)は引き続きTODO。**
+取りに行く経路)も実装済み(§5.0「getpubkey要求の自動化」参照、2026-08-23)。**
 
 出典: PyBitmessage `src/protocol.py`, `src/class_singleWorker.py`, `src/helper_ackPayload.py`
 

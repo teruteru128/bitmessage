@@ -364,8 +364,9 @@ static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
  *               subject, body, ttlSeconds?, ackStealthLevel?]
  *
  * toPubEncryptionHexはnull(またはJSON上省略)可。その場合pubkey_cache(§2.3、cachePubkeyメソッド
- * 参照)をto_addressのripeで検索する。見つからなければ送信失敗(getpubkey要求による自動取得は
- * 未実装、TODO)。
+ * 参照)をto_addressのripeで検索する。見つからなければ、能動的にgetpubkey要求を自動broadcastした
+ * うえで送信失敗を返す(§5.0「getpubkey要求の自動化」参照)。応答が届き自動キャッシュされ次第、
+ * 改めてsendMessageを呼び直せば送信できる。
  */
 
 /*
