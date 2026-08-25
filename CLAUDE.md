@@ -9,12 +9,14 @@
 ## Build
 
 ```
-cmake -S . -B build-Debug -DCMAKE_BUILD_TYPE=Debug   # build-Debugが無い初回のみ
+cmake -S . -B build-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug   # build-Debugが無い初回のみ
 cmake --build build-Debug --parallel
 ```
 
 `build-Debug`がこのプロジェクトでのローカル開発時の既定ディレクトリ名(CIは別途`build`を使うが、
-ローカルでは`build-Debug`に統一している)。
+ローカルでは`build-Debug`に統一している)。ジェネレーターはREADME.mdと合わせてNinja固定
+(既存の`build-Debug`が別ジェネレーター(Unix Makefiles等)で生成済みの場合は、そのままでは
+`-G`が効かないため`rm -rf build-Debug`してから上記コマンドで再生成すること)。
 
 ## Test
 
