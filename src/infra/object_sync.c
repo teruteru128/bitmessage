@@ -4,6 +4,8 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -987,6 +989,55 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
     bm_network_begin_big_inv(conn, plain, plain_count, (int64_t)time(NULL));
 }
 
+/* §11 2026-08-26: verack交換完了(=fully established)時に実際にaddr/big invを送る。
+ * verackハンドラから即座には呼ばれず、bm_object_sync_flush_pending_verack_replies
+ * (BM_VERACK_REPLY_DELAY_SECONDS秒後)からのみ呼ばれる(直後に送ると相手から即時切断
+ * されることが判明したため、送信タイミング自体を遅らせている経緯はverackハンドラの
+ * doc・DESIGN-LOG.md参照)。 */
+static void send_verack_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn)
+{
+    send_addr_reply(ctx, conn);
+    send_big_inv(ctx, conn);
+}
+
+/* §11 2026-08-26診断実験: bm_peer_registry_for_eachのコールバックはconnとuser_dataしか
+ * 受け取れないため、ctx/nowを一緒に運ぶための一時的なラッパー構造体。 */
+struct flush_verack_reply_ctx
+{
+    struct bm_object_sync_ctx *ctx;
+    int64_t now;
+};
+
+static void flush_verack_reply_one(struct bm_fd_data *conn, void *user_data)
+{
+    struct flush_verack_reply_ctx *f = user_data;
+    if (conn->pending_verack_reply_at != 0 && f->now >= conn->pending_verack_reply_at)
+    {
+        bm_log_debug("[object_sync] flushing deferred verack reply after BM_VERACK_REPLY_DELAY_SECONDS\n");
+        send_verack_reply(f->ctx, conn);
+        conn->pending_verack_reply_at = 0;
+    }
+}
+
+void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx, struct bm_peer_registry *registry,
+                                                  int64_t now)
+{
+    if (registry == NULL)
+    {
+        return;
+    }
+    /* §11 2026-08-26: この関数はpeer_connector_thread(network_epoll_threadとは別スレッド)
+     * から呼ばれる。bm_peer_registry_for_eachは「ロックを早期解放し、callbackはロック
+     * 解放後に呼ぶ」設計で、これはnetwork_epoll_threadという単一スレッドの中でのみ
+     * 呼ばれる前提(peer_registry.hのdoc参照)。別スレッドから使うと、callback実行中に
+     * network_epoll_thread側でconnがclose_connection経由でfree()されるuse-after-freeを
+     * 起こしうるため、代わりにロックを保持したまま呼ぶbm_peer_registry_for_each_locked
+     * を使う(flush_verack_reply_oneはregistryの他の関数を一切呼ばないため安全、
+     * peer_registry.hのdoc参照)。 */
+    struct flush_verack_reply_ctx fctx = {ctx, now};
+    bm_peer_registry_for_each_locked(registry, flush_verack_reply_one, &fctx);
+}
+
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
 {
     struct bm_object_sync_ctx *ctx = user_data;
@@ -1092,8 +1143,20 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
          * 使う「fully established」フラグをここで立てる。 */
         conn->handshake_complete = 1;
         record_outbound_success(ctx, conn);
-        send_addr_reply(ctx, conn);
-        send_big_inv(ctx, conn);
+
+        /* §11 2026-08-26発覚: verack交換完了直後にこちらからaddr/big invを即座に
+         * 送り返すと、相手(実測: PyBitmessage 0.6.3.2)からほぼ確実に即時切断(RST/EOF)
+         * されることが、tcpdumpと診断用の切り替え実験(内容・量を変えても改善せず、
+         * 送信タイミングを数秒ずらすと大幅に改善した)で判明した。詳細な調査経緯・
+         * 実験結果はDESIGN-LOG.md参照。相手側がverack送信直後の内部状態遷移を終える前に
+         * 追加データが届くことを嫌っていると見られるため、実際の送信は即座に行わず
+         * BM_VERACK_REPLY_DELAY_SECONDS秒後に回す。
+         * CLAUDE.mdの「時刻は明示引数で受け取り、関数内部でtime(NULL)を直接呼ばない」
+         * 方針に従い、time(NULL)ではなくconn->last_activity(bm_network_handle_readableが
+         * このメッセージの受信成功時点で既に更新済みの時刻、network.h参照)を基準にする。
+         * 実際の送信はbm_object_sync_flush_pending_verack_replies(peer_connector_threadの
+         * 既存1秒間隔ポーリングに相乗り、専用スレッドを新設しない既存方針)が行う。 */
+        conn->pending_verack_reply_at = conn->last_activity + BM_VERACK_REPLY_DELAY_SECONDS;
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {

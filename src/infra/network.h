@@ -115,6 +115,12 @@ struct bm_fd_data
     size_t pending_inv_total;
     size_t pending_inv_sent;
     int64_t pending_inv_last_chunk_time;
+    /* §11 2026-08-26発覚: verack交換完了直後にaddr/big invを即座に送り返すと、相手から
+     * ほぼ確実に即時切断されることが判明した(DESIGN-LOG.md参照、内容や量ではなく
+     * タイミングが原因)。object_sync.cのverackハンドラは即座に送らずここへ「いつ送るか」
+     * を記録するだけにし、実際の送信はbm_object_sync_flush_pending_verack_replies
+     * (peer_connector_threadの既存1秒間隔ポーリングに相乗り)が行う。0なら保留無し。 */
+    int64_t pending_verack_reply_at;
 };
 
 /*

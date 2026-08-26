@@ -2705,3 +2705,92 @@ onion proxy有効時でも直結される(受信した最初の1byteがSOCKS5グ
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 39件全通過を確認。
+
+### verack直後のaddr/big inv送信を遅延させる(2026-08-26、big invペーシングの続き)
+
+**経緯**: big invのチャンク分割+ペーシングをdaemon Aへ反映・再起動しても、即切断率は
+ほぼ改善しなかった(SOCKS5分離のみ: 219件中即切断率100% → +ペーシング: 189件中99%)。
+ユーザーから「studyのbm.c(未完成のPoCクライアント、libstudy由来)は同じ相手
+(185.158.248.216)に接続してもverack後は何も送り返さないが、切られたことが無い」との
+指摘があり、これを端緒に「送る内容や量ではなく、verack交換完了直後に能動的に何か
+送り返すこと自体が引き金では」という仮説を立てた。
+
+検証のため、`object_sync.c`のverackハンドラに`BM_VERACK_REPLY_MODE`環境変数による
+診断用の切り替えを実装し、daemon Aで実際にA/Bテストを繰り返した(各モードとも
+5分程度、`journalctl`でconnected/EOF/RST/error件数を集計):
+
+| モード | 内容 | connected | 即切断率 |
+|---|---|---|---|
+| full(既定) | addr全部+big inv全部 | 189 | 99% |
+| minimal | addr全部+inv1件のみ | 53 | 98% |
+| addr_only | addrのみ(big invは送らない) | 46 | 91% |
+| inv_only | big inv全部のみ(addrは送らない) | 40 | 98% |
+| none | 何も送らない(study/bm.c相当) | 9 | 11〜22% |
+
+addr単体・inv単体・1件のみ、いずれも高い即切断率のまま(91〜98%)だったのに対し、
+`none`(何も送らない)だけが劇的に低かった。これで「内容・量の問題ではない」ことが
+実証された。
+
+次に、タイミング仮説(相手がverack送信直後の内部状態遷移を終える前に追加データが
+届くのを嫌っているのでは)を検証するため、`BM_VERACK_REPLY_DELAY_SECONDS`環境変数を
+追加し、verackハンドラでは`conn->pending_verack_reply_at`へ「いつ送るか」を記録する
+だけにして、実際の送信を`peer_connector_thread`の既存1秒間隔ポーリング
+(`bm_object_sync_flush_pending_verack_replies`)へ回した。結果:
+
+| 条件 | connected | 即切断率 |
+|---|---|---|
+| full(即座、max_outbound=8) | 189 | 99% |
+| none(即座、max_outbound=8) | 9 | 11〜22% |
+| full + 5秒遅延(max_outbound=8) | 9 | 22% |
+| full + 5秒遅延(max_outbound=40に一時拡大) | 16 | **6%** |
+
+内容は`full`のままなのに、5秒待ってから送るだけで`none`と同水準まで改善した。
+これで「verack直後の早すぎる送信タイミングが引き金」という仮説がほぼ確定した
+(`BM_MAX_OUTBOUND`を一時的に40へ拡大したのは、`max_outbound`充足後は新規接続
+イベントが発生せずサンプルが増えないというユーザーの指摘を受け、1回のバーストで
+多くの異なるpeerに対するサンプルを得るため。検証後は既定の8へ戻した)。
+
+**対応**: 診断用の切り替え機構(`BM_VERACK_REPLY_MODE`の5モード)は役目を終えたため
+削除し、`BM_VERACK_REPLY_DELAY_SECONDS`も環境変数ではなく`#define BM_VERACK_REPLY_
+DELAY_SECONDS 5`(`object_sync.h`)の固定値としてコード化した。
+- `network.h`: `struct bm_fd_data`の`pending_verack_reply_mode`(診断用、モード名を
+  保持していた)を削除、`pending_verack_reply_at`のみ残す。
+- `object_sync.c`: verackハンドラは`conn->pending_verack_reply_at = conn->
+  last_activity + BM_VERACK_REPLY_DELAY_SECONDS;`とセットするだけに単純化(CLAUDE.md
+  の「時刻は明示引数で受け取り関数内部でtime(NULL)を直接呼ばない」方針に従い、
+  `time(NULL)`ではなく直前の`bm_network_handle_readable`が既に更新済みの
+  `conn->last_activity`を基準にした)。`send_big_inv_capped`(診断用のmax_items引数)は
+  元の`send_big_inv`に戻し、`apply_verack_reply_mode`は`send_verack_reply`
+  (常にaddr+big invを送るだけ)に単純化した。
+- `peer_connector.c`: `bm_peer_connector_thread`の既存1秒間隔ループ(Dandelion
+  reshuffle・onionpeer再announceと同じ場所)に`bm_object_sync_flush_pending_verack_
+  replies`呼び出しを追加。
+- 設計上の注意点: `bm_object_sync_flush_pending_verack_replies`は
+  `peer_connector_thread`(`network_epoll_thread`とは別スレッド)から呼ばれるため、
+  「ロックを早期解放しcallbackはロック解放後に呼ぶ」設計の`bm_peer_registry_for_each`
+  ではなく、ロックを保持したまま呼ぶ`bm_peer_registry_for_each_locked`を使う必要が
+  あった(`for_each`は単一スレッド前提、別スレッドから使うとcallback実行中に
+  `network_epoll_thread`側でconnがfree()されるuse-after-freeを起こしうる、
+  `peer_registry.h`の既存doc参照)。
+
+調査の過程で、こちらのuser agent(`/bitmessage-c:x.y.z/`)が本家(`bmproto.py`)の
+検証正規表現`^/[a-zA-Z]+:[0-9]+...`にハイフンのせいでマッチせず`/INVALID:0/`扱い
+されること、servicesに本家が常に立てる`NODE_NETWORK`が無いことも発覚した。診断実験
+(`BM_USER_AGENT_OVERRIDE`/`BM_SERVICES_OVERRIDE`)では両方とも「原因ではない」と
+確認できたため実験用コードは削除したが、user agentは今後の相互運用性診断のため
+`/BitmessageC:x.y.z/`(ハイフン無し)へ恒久的に変更した。services(`NODE_NETWORK`
+非対応)は実害未確認のためbacklog化した(DESIGN.md §11参照)。同じ調査中、`pong`受信が
+専用ハンドラを持たず"unhandled command"としてログに出ることにも気づいた(実害無し、
+本家も無視するだけ)が、これもbacklog化に留めた。
+
+**テスト**: `tests/test_object_sync.c`の既存のverack即時応答テスト(ケース10/13/14/15、
+addr送信・outbound/inbound big inv送信・Dandelion stem除外)は、遅延実装により
+`bm_object_sync_dispatch`呼び出し直後にブロッキングreadで応答を待つと永久にハング
+するようになったため、`flush_pending_verack_reply`ヘルパー(connを一時的にregistryへ
+登録して`bm_object_sync_flush_pending_verack_replies`を呼び、終わったら登録解除する)
+を追加して「verack送信→pending状態を明示的にflush→応答を読む」という2段階の検証に
+書き換えた。さらにケース13には、flushする前は何も送られていないこと(遅延が実際に
+効いていること)をノンブロッキングreadで確認する手順を追加した。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+39件全通過を確認。daemon Aへの本反映・実ネットワークでの継続確認は次のステップ。

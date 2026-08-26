@@ -151,6 +151,25 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
 void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
                                                  int64_t now);
 
+/* §11 2026-08-26発覚: verack交換完了直後にaddr/big invを即座に送り返すと、相手
+ * (実測: PyBitmessage 0.6.3.2)からほぼ確実に即時切断(RST/EOF)されることが、tcpdumpと
+ * 診断用の切り替え実験(内容・量を変えても改善せず、送信タイミングを数秒ずらすと
+ * 即切断率が99%→6%程度まで劇的に改善した)で判明した。詳細な調査経緯・実験結果は
+ * DESIGN-LOG.md参照。ヘッダで公開しているのは、テストが実値で境界を検証できるように
+ * するため(他の*_SECONDS定数と同じ慣習)。 */
+#define BM_VERACK_REPLY_DELAY_SECONDS 5
+
+/*
+ * §11 2026-08-26: bm_object_sync_dispatchのverackハンドラは、BM_VERACK_REPLY_DELAY_
+ * SECONDS秒待ってから送るべく即座にはaddr/big invを送らず、conn->pending_verack_
+ * reply_at(network.hのdoc参照)へ「いつ送るか」を記録するだけにする。この関数は
+ * registry内の全connを走査し、保留時刻に達したものだけ実際にaddr/big inv送信を
+ * 実行する。peer_connector_threadの既存1秒間隔ポーリングループから、onionpeer
+ * 再announceと同じ場所で毎回(間引き無しで)呼ばれる想定。registryがNULLなら何もしない。
+ */
+void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx, struct bm_peer_registry *registry,
+                                                  int64_t now);
+
 /*
  * §11 2026-08-25 join-chan後にchan宛の過去メッセージが読めない問題の対応。
  * 通常の受信フロー(bm_object_sync_dispatch)はobjectを新規受信した瞬間に一度しか

@@ -1400,6 +1400,29 @@ RSTで強制切断される(受信は完了しているのでフォーマット�
 INTERVAL_SECONDS`=1秒)に変更した。詳細はDESIGN-LOG.md「big invのチャンク分割+
 ペーシング」参照。
 
+**2026-08-26完了: verack交換完了直後のaddr/big inv送信をBM_VERACK_REPLY_DELAY_
+SECONDS(5秒)遅らせるよう変更**。上記のペーシングを反映してもdaemon Aの即切断率が
+ほぼ改善しなかったため、内容(addr単体/inv単体/1件のみ等)を変えて切り分ける診断実験を
+行った結果、送信する内容や量ではなく「verack交換完了直後という早すぎるタイミングで
+能動的に何か送り返すこと自体」が相手からの即時切断を誘発していると判明した(即切断率
+99%→5秒遅延で6%まで改善、study/src/bm.cが同じ相手に対し何も送り返さず切られたことが
+無かった観察が調査の端緒)。`bm_object_sync_dispatch`のverackハンドラは実際の送信を
+即座に行わず`conn->pending_verack_reply_at`(`network.h`)へ記録するだけにし、
+`bm_object_sync_flush_pending_verack_replies`(peer_connector_threadの既存1秒間隔
+ポーリングに相乗り)が期限到来後に実際の送信を行う。詳細な調査経緯(tcpdump解析・
+診断実験の全結果)はDESIGN-LOG.md「verack直後のaddr/big inv送信を遅延させる」参照。
+
+調査の過程で判明した副次的な既知差分(今回の主要因ではないと確認済み、backlog):
+- こちらのversion messageのservicesが`BM_SERVICE_NODE_DANDELION`のみで、本家が
+  常に立てる`NODE_NETWORK`(=1)を立てていない(`protocol.c`の`bm_create_version_
+  payload`)。実害未確認だが本家準拠に寄せる余地がある。
+- こちらのuser agentは`/BitmessageC:x.y.z/`に修正済み(旧`/bitmessage-c:x.y.z/`は
+  ハイフンのせいで本家のuser agent検証正規表現にマッチせず`/INVALID:0/`扱いされて
+  いた、2026-08-26修正)。
+- `pong`受信が`bm_object_sync_dispatch`で専用ハンドラを持たず"unhandled command"
+  ログに落ちている(実害無し、PyBitmessage本家も`bm_command_pong`は無視するだけ)。
+  ログノイズ削減のため専用の空ハンドラを追加する余地がある。
+
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
 DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage

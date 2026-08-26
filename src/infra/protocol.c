@@ -228,7 +228,11 @@ unsigned char *bm_create_version_payload(unsigned char *out, const char *user_ag
     /* §9.6 Dandelion++完成: 自分もstemの受信側になれるようBM_SERVICE_NODE_DANDELIONを
      * 表明する(dinv受信→自分のstem successorへの中継はStage 3で既に実装済み、
      * DESIGN.md §9.5参照。表明していなかった間は、他の実peerがこちらをstem successor
-     * として選んでくれず一方通行だった)。NODE_NETWORK等の他のservicesビットは未対応。 */
+     * として選んでくれず一方通行だった)。NODE_NETWORK等の他のservicesビットは未対応。
+     * §11 2026-08-26調査: 外部ノードから即座に切断される問題の調査時、本家が常に立てる
+     * NODE_NETWORK(=1)をこちらが立てていない点を疑い一時的に検証したが、原因はverack
+     * 直後の送信タイミングであってservicesの値ではなかった(DESIGN-LOG.md参照)。
+     * NODE_NETWORK非対応自体は残存する既知差分としてDESIGN.md §11のbacklogへ記録した。 */
     write_be64(out + offset, BM_SERVICE_NODE_DANDELION);
     offset += 8;
     write_be64(out + offset, (uint64_t)time(NULL));

@@ -11,6 +11,8 @@
 
 #include <arpa/inet.h>
 #include <endian.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,6 +115,23 @@ static struct bm_message *read_one_message(int fd)
             return msg;
         }
     }
+}
+
+/*
+ * §11 2026-08-26: verack受信直後の即時addr/big inv送信が相手からの即時切断を誘発する
+ * ことが判明し、実際の送信をBM_VERACK_REPLY_DELAY_SECONDS秒後に遅らせる実装に変わった
+ * (object_sync.hのdoc・DESIGN-LOG.md参照)。テストでは「verack送信→
+ * conn->pending_verack_reply_atが立つ→この関数でflushさせて即座に実行させる」という
+ * 2段階で検証する。connを一時的にregistryへ登録してbm_object_sync_flush_pending_
+ * verack_repliesを呼び、呼び終えたら登録を解除する(呼び出し元のregistryの状態を
+ * 変えないため)。
+ */
+static void flush_pending_verack_reply(struct bm_object_sync_ctx *ctx, struct bm_peer_registry *registry,
+                                        struct bm_fd_data *conn)
+{
+    bm_peer_registry_add(registry, conn);
+    bm_object_sync_flush_pending_verack_replies(ctx, registry, conn->pending_verack_reply_at);
+    bm_peer_registry_remove(registry, conn);
 }
 
 /*
@@ -862,6 +881,7 @@ int main(void)
         verack_msg.length = 0;
         verack_msg.payload = NULL;
         bm_object_sync_dispatch(conn10, &verack_msg, &ctx);
+        flush_pending_verack_reply(&ctx, &registry, conn10);
 
         unsigned char addr_buf[65536];
         size_t addr_total = 0;
@@ -1190,6 +1210,21 @@ int main(void)
         verack_msg13.payload = NULL;
         bm_object_sync_dispatch(conn13, &verack_msg13, &ctx);
 
+        /* §11 2026-08-26: verack直後の即時addr/big inv送信が相手からの即時切断を誘発する
+         * ことが判明し、実際の送信をBM_VERACK_REPLY_DELAY_SECONDS秒後に遅らせる実装に
+         * 変わった。flushする前は何も送られていないこと(遅延が実際に効いていること)を
+         * 確認してから、flushして実際に送信させる。 */
+        CHECK(conn13->pending_verack_reply_at != 0, "verack handling should defer the addr/big-inv reply");
+        int fds13_1_flags = fcntl(fds13[1], F_GETFL, 0);
+        fcntl(fds13[1], F_SETFL, fds13_1_flags | O_NONBLOCK);
+        unsigned char discard13[16];
+        ssize_t n_before_flush13 = read(fds13[1], discard13, sizeof(discard13));
+        CHECK(n_before_flush13 < 0 && errno == EAGAIN,
+              "nothing should be sent before the deferred verack reply is flushed");
+        fcntl(fds13[1], F_SETFL, fds13_1_flags); /* read_one_messageはブロッキング前提のため元に戻す */
+
+        flush_pending_verack_reply(&ctx, &registry, conn13);
+
         struct bm_message *inv_reply = read_one_message(fds13[1]);
         CHECK(inv_reply != NULL, "an inv message should have been sent right after verack (sendBigInv)");
         if (inv_reply != NULL)
@@ -1263,6 +1298,7 @@ int main(void)
         verack_msg14.length = 0;
         verack_msg14.payload = NULL;
         bm_object_sync_dispatch(conn14, &verack_msg14, &ctx);
+        flush_pending_verack_reply(&ctx, &registry, conn14);
 
         CHECK(conn14->handshake_complete == 1, "inbound connection should also become fully established on verack");
 
@@ -1360,6 +1396,7 @@ int main(void)
         verack_msg15.length = 0;
         verack_msg15.payload = NULL;
         bm_object_sync_dispatch(conn15, &verack_msg15, &ctx);
+        flush_pending_verack_reply(&ctx, &dandelion_reg, conn15);
 
         struct bm_message *inv_reply15 = read_one_message(fds15[1]);
         CHECK(inv_reply15 != NULL, "an inv message should have been sent right after verack");

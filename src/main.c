@@ -44,7 +44,13 @@
 #ifndef BM_PROJECT_VERSION
 #define BM_PROJECT_VERSION "0.0.0"
 #endif
-#define BM_USER_AGENT "/bitmessage-c:" BM_PROJECT_VERSION "/"
+/* §11 2026-08-26発覚: 以前は"/bitmessage-c:x.y.z/"だったが、本家(bmproto.py)の
+ * user agent検証正規表現"^/[a-zA-Z]+:[0-9]+..."は名前部分が[a-zA-Z]+のみ(ハイフン不可)
+ * のため、これにマッチせず"/INVALID:0/"扱いされていた(実害の有無は未確認、外部ノード
+ * からの即時切断の原因はverack直後の送信タイミングだと判明済み、DESIGN-LOG.md参照)。
+ * 正規表現にマッチする名前にしておく方が今後の相互運用性診断がしやすいため、
+ * ハイフンを除いた"BitmessageC"へ変更した。 */
+#define BM_USER_AGENT "/BitmessageC:" BM_PROJECT_VERSION "/"
 
 /* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */
 struct bm_queues
