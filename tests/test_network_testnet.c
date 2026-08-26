@@ -170,7 +170,7 @@ static void test_network_write_all(void)
     pthread_t drain_thread;
     CHECK(pthread_create(&drain_thread, NULL, drain_thread_fn, &drain_args) == 0, "start drain thread");
 
-    int rc = bm_network_write_all(fds[0], payload, payload_len, 30);
+    int rc = bm_network_write_all(fds[0], payload, payload_len, 30, NULL, 0);
     CHECK(rc == 0, "bm_network_write_all should eventually send the entire 1MiB payload");
 
     pthread_join(drain_thread, NULL);
@@ -192,8 +192,10 @@ static void test_network_write_all(void)
     fcntl(fds2[0], F_SETFL, flags2 | O_NONBLOCK);
     unsigned char big_payload[1024 * 1024];
     memset(big_payload, 0, sizeof(big_payload));
-    int rc2 = bm_network_write_all(fds2[0], big_payload, sizeof(big_payload), 1);
+    char reason[64] = {0};
+    int rc2 = bm_network_write_all(fds2[0], big_payload, sizeof(big_payload), 1, reason, sizeof(reason));
     CHECK(rc2 != 0, "bm_network_write_all should give up (not hang forever) when the peer never reads");
+    CHECK(strstr(reason, "timeout") != NULL, "reason_buf should report a timeout when the peer never reads");
     close(fds2[0]);
     close(fds2[1]);
 

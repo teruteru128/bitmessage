@@ -1216,10 +1216,10 @@ static void write_http_response(int fd, int status, const char *status_text,
      * レスポンス送信の失敗自体はこの後すぐclose(client_fd)するだけなので、戻り値は
      * 意図的に無視する(bm_network_write_all自体にはwarn_unused_result属性が無い)。 */
     bm_network_write_all(fd, (const unsigned char *)header, (size_t)header_len,
-                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
     if (body_len > 0)
     {
-        bm_network_write_all(fd, (const unsigned char *)body, body_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+        bm_network_write_all(fd, (const unsigned char *)body, body_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
     }
 }
 

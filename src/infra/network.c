@@ -166,7 +166,8 @@ int bm_network_listen(const char *bind_address, int port)
     return sock;
 }
 
-int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec)
+int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec, char *reason_buf,
+        size_t reason_buf_len)
 {
     size_t sent = 0;
     while (sent < len)
@@ -189,11 +190,35 @@ int bm_network_write_all(int fd, const unsigned char *data, size_t len, int time
             struct timeval tv;
             tv.tv_sec = timeout_sec;
             tv.tv_usec = 0;
-            if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0)
+            int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+            if (rc == 0)
             {
-                return -1; /* タイムアウトまたはselect()自体のエラー */
+                if (reason_buf != NULL)
+                {
+                    snprintf(reason_buf, reason_buf_len, "timeout (%ds)", timeout_sec);
+                }
+                return -1; /* タイムアウト */
+            }
+            if (rc < 0)
+            {
+                if (reason_buf != NULL)
+                {
+                    snprintf(reason_buf, reason_buf_len, "select: %s", strerror(errno));
+                }
+                return -1; /* select()自体のエラー */
             }
             continue;
+        }
+        if (reason_buf != NULL)
+        {
+            if (n == 0)
+            {
+                snprintf(reason_buf, reason_buf_len, "peer closed (EOF)");
+            }
+            else
+            {
+                snprintf(reason_buf, reason_buf_len, "write: %s", strerror(errno));
+            }
         }
         return -1; /* 相手が切断した(n==0)、またはその他のエラー */
     }
@@ -208,7 +233,7 @@ static int send_header_only(struct bm_fd_data *conn, const char *command)
 {
     size_t len = 0;
     unsigned char *packet = bm_create_packet(command, NULL, 0, &len);
-    int rc = bm_network_write_all(conn->fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS);
+    int rc = bm_network_write_all(conn->fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
     if (rc == 0)
     {
         conn->bytes_sent += (uint64_t)len;
@@ -233,7 +258,7 @@ int bm_post_version(int sock, const char *user_agent_str, int version,
 {
     size_t len = 0;
     unsigned char *msg = bm_new_version_message(user_agent_str, version, peer_addr, local_addr, &len);
-    int rc = bm_network_write_all(sock, msg, len, BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS);
+    int rc = bm_network_write_all(sock, msg, len, BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS, NULL, 0);
     free(msg);
     return rc;
 }
@@ -588,6 +613,14 @@ static void close_connection(struct bm_epoll_thread_args *args, struct bm_fd_dat
  * するまで待った末の失敗を含む)は、残り全部を諦めて破棄する。もし諦めずに次回また
  * 同じchunkから再試行すると、詰まったままの接続に対して毎回BM_NETWORK_WRITE_TIMEOUT_
  * SHORT_SECONDS分だけこの単一スレッドを専有し続け、他の全接続の処理を妨げてしまう。
+ *
+ * §11 2026-08-26追記: 実運用ログを調べたところ、この失敗は直後(同秒〜数秒以内)に
+ * その接続がEOF/RSTで切断されるケースとほぼ常に相関しており、「相手が既に切断済み/
+ * 切断中の接続へペーシング中の後続チャンクを送ろうとして空振りする」自然な現象である
+ * 可能性が高いと分かった。ただし従来はfailed reason(タイムアウトか、EOFか、その他の
+ * write()エラーか)もどのpeerかも記録しておらず、ログの前後relationからの推測の域を
+ * 出なかったため、bm_network_write_allにreason_buf引数を追加し、どのpeer(host:port)への
+ * どの理由の失敗かを直接ログへ残すようにした。
  */
 static void send_inv_chunk(struct bm_fd_data *conn, int64_t now)
 {
@@ -604,9 +637,15 @@ static void send_inv_chunk(struct bm_fd_data *conn, int64_t now)
         conn->pending_inv_hashes = NULL;
         return;
     }
-    if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
+    char reason[64] = {0};
+    if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason,
+                sizeof(reason)) != 0)
     {
-        bm_log_warn("[network] failed to send big-inv chunk, dropping remaining %zu hash(es)\n", remaining);
+        char ip[BM_PEER_IP_STRLEN];
+        int port = 0;
+        bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+        bm_log_warn("[network] failed to send big-inv chunk to %s:%d (fd=%d): %s, dropping remaining %zu hash(es)\n",
+                ip, port, conn->fd, reason, remaining);
         free(packet);
         free(conn->pending_inv_hashes);
         conn->pending_inv_hashes = NULL;

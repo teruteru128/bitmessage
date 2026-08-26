@@ -217,10 +217,18 @@ int bm_network_listen(const char *bind_address, int port);
  *   - peer_connector_thread自身のスレッド上で呼ばれるもの(bm_post_version)は、他接続の
  *     処理を巻き込まないため、BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS(接続確立自体の
  *     タイムアウト、CONNECT_TIMEOUT_SEC@peer_connector.cと同程度)を渡してよい
+ *
+ * §11 2026-08-26: reason_buf!=NULLの場合、失敗時(戻り値-1)に理由(タイムアウト/
+ * select()エラー/相手切断EOF/write()エラーの4種、write()エラーはstrerror(errno)を含む)
+ * をNUL終端で書き込む(reason_buf_lenで切り詰め)。呼び出し直後にログへ出す用途を想定した
+ * その場限りの利用のみ想定(内部でerrnoを保存しないため、resolve系の他のsyscallを挟むと
+ * write()自体のerrno文言は失われるが、reason_buf自体には既に整形済みの文字列が入って
+ * いるので影響しない)。理由が不要な呼び出し元はNULL, 0を渡してよい。
  */
 #define BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS 2
 #define BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS 5
-int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec);
+int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec, char *reason_buf,
+        size_t reason_buf_len);
 
 /*
  * §11 2026-08-23 backlog項目5: プロセス起動時からの送受信バイト数の全体累積

@@ -116,7 +116,7 @@ int main(void)
         bm_network_get_stats(&sent_before, &received_before);
 
         const unsigned char data[] = "hello";
-        CHECK(bm_network_write_all(fds[0], data, sizeof(data), BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0,
+        CHECK(bm_network_write_all(fds[0], data, sizeof(data), BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) == 0,
               "bm_network_write_all should succeed");
 
         uint64_t sent_after = 0, received_after = 0;

@@ -1427,6 +1427,34 @@ SECONDS(5秒)遅らせるよう変更**。上記のペーシングを反映し�
   「pongが実際に返ってきたか」で生死判定して切断するロジックは持たない(生死判定は
   TCPレベルの読み取りエラーRST/EOFにのみ依存する)ことを確認した。
 
+**2026-08-26調査: big invチャンク送信失敗(`failed to send big-inv chunk`警告)の原因**。
+v1.3.0リリース後にdaemon Aのログを見ていて、上記のチャンク分割+ペーシング送信
+導入後もこの警告が散発している(過去複数プロセスの起動を通じて計12回)ことに気付いた。
+journalctlで各発生の前後ログを個別に確認した結果、12件全てで`failed to send
+big-inv chunk`の直後(同秒〜数秒以内)に同じ接続(または同時にqueueされていた別の
+接続)が`closing outbound connection: peer closed (EOF)`または`read error`
+(`Connection reset by peer`)で切断されているという相関が確認できた。これは新設した
+チャンク分割機能固有のバグというより、「相手が既に切断済み/切断中の接続へ、1秒間隔の
+ペーシングループが後続チャンクを送ろうとして空振りする」自然な現象である可能性が高いと
+判断した。残りhashを相手に伝えられないだけで、相手はその後addr/inv経由で自然に
+補完できる範囲のため実害は小さいと見ている。
+
+ただし従来の`bm_network_write_all`(`infra/network.c`)は失敗理由(タイムアウトか、
+相手切断EOFか、その他のwrite()エラーか)を呼び出し元に返しておらず、`send_inv_chunk`の
+ログにもどのpeer(host:port/fd)への送信だったかが含まれていなかったため、上記の判断は
+あくまでログの前後relationからの推測にとどまっていた。原因究明の確度を上げるため、
+`bm_network_write_all`に`reason_buf`/`reason_buf_len`引数を追加し(不要な呼び出し元は
+`NULL, 0`を渡せばよい後方互換な拡張)、失敗時に「timeout (Ns)」「select: <strerror>」
+「peer closed (EOF)」「write: <strerror>」のいずれかをNUL終端で書き込むようにした。
+`send_inv_chunk`はこれと`bm_network_resolve_peer_ip_port`を使い、
+`failed to send big-inv chunk to <host>:<port> (fd=<fd>): <reason>, dropping
+remaining N hash(es)`という形でどのpeerへのどの理由の失敗かを直接ログへ残すよう
+変更した。`tests/test_network_testnet.c`の`test_network_write_all`(タイムアウトで
+諦めるケース)にも、`reason_buf`が実際に"timeout"を含むことを確認するアサーションを
+追加した。次に発生した際はログから直接原因が分かるはずなので、実際に相手切断以外の
+理由(例えばselect()エラーやEAGAIN以外のwrite()エラー)が頻発するようなら、その時点で
+改めて対応を検討する。ctest 39件全通過。
+
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
 DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage

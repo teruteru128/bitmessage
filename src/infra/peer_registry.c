@@ -252,7 +252,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
             if (packet != NULL)
             {
                 if (bm_network_write_all(pending[i].fd, packet, packet_len,
-                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
+                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0)
                     != 0)
                 {
                     bm_log_warn("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
@@ -272,7 +272,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
             if (packet != NULL)
             {
                 if (bm_network_write_all(pending[i].fd, packet, packet_len,
-                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)
+                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0)
                     != 0)
                 {
                     bm_log_warn("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
