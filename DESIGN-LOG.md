@@ -2794,3 +2794,33 @@ addr送信・outbound/inbound big inv送信・Dandelion stem除外)は、遅延�
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 39件全通過を確認。daemon Aへの本反映・実ネットワークでの継続確認は次のステップ。
+
+**その後の実際の反映(2026-08-26)**: 上記の恒久実装をdaemon Aへ反映・再起動して
+最終確認したところ、即切断率22%(9接続中2件)を維持しており、実験時と同水準だった
+ことを確認した。SOCKS5分離・big invペーシング・verack遅延送信の3点が今回の
+「外部ノードへの接続性が悪い」調査の全修正内容となる。
+
+### pong受信の専用ハンドラ追加(2026-08-26、verack遅延送信調査の副産物)
+
+**経緯**: 上記の一連の調査中、ユーザーが`journalctl`のログで`pong`受信が
+"unhandled command: pong"として記録されているのに気づいて指摘した。実害は無い
+(受信自体はできており、ただの分岐漏れでログに落ちているだけ)が、ログノイズになる
+ため対応した。
+
+ついでにユーザーから「ping/pongはTCPのタイムアウト回避のための機構では」という
+質問があり、`network.c`の`idle_sweep_one`を確認して回答した: 正確には
+TCP自体のタイムアウトではなく、経路上のNAT/ファイアウォールが無通信の接続を
+勝手に切るのを防ぐためのキープアライブであること、またこのプロジェクト・
+PyBitmessage本家とも「pongが実際に返ってきたか」を検証して切断するロジックは
+実装していない(`idle_sweep_one`はpingを送るだけで、応答の有無で切断判断はしない。
+実際の生死判定はTCPレベルの読み取りエラーRST/EOFにのみ依存する)ことを確認した。
+
+**対応**: `object_sync.c`の`bm_object_sync_dispatch`に`pong`の分岐を追加(NOP、
+PyBitmessage本家の`bm_command_pong`も"Ignore it"とコメントされたNOPと同じ)。
+
+**テスト**: `tests/test_object_sync.c`にケース17を追加。pongメッセージを送っても
+`conn->should_disconnect`が立たず、何も送り返されない(ノンブロッキングreadで
+`EAGAIN`)ことを確認する。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+39件全通過を確認。

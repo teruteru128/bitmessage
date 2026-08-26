@@ -1165,6 +1165,15 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             bm_log_warn("[object_sync] failed to reply pong\n");
         }
     }
+    else if (strncmp(msg->command, "pong", 12) == 0)
+    {
+        /* §11 2026-08-26発覚: 専用の分岐が無く"unhandled command"としてログに落ちて
+         * いた(実害無し、ユーザー指摘で発覚)。PyBitmessage本家のbm_command_pongも
+         * "Ignore it"とだけコメントされたNOPで、こちらから送ったpingへの応答である
+         * ことを確認する以上の処理は不要(keepaliveの生存確認自体は、受信そのものが
+         * bm_network_handle_readable内でconn->last_activityを更新することで既に
+         * 完結している)。ログノイズ削減のためだけの分岐。 */
+    }
     else if (strncmp(msg->command, "addr", 12) == 0)
     {
         struct bm_addr_message addr_msg;

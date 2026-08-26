@@ -1419,9 +1419,13 @@ SECONDS(5秒)遅らせるよう変更**。上記のペーシングを反映し�
 - こちらのuser agentは`/BitmessageC:x.y.z/`に修正済み(旧`/bitmessage-c:x.y.z/`は
   ハイフンのせいで本家のuser agent検証正規表現にマッチせず`/INVALID:0/`扱いされて
   いた、2026-08-26修正)。
-- `pong`受信が`bm_object_sync_dispatch`で専用ハンドラを持たず"unhandled command"
-  ログに落ちている(実害無し、PyBitmessage本家も`bm_command_pong`は無視するだけ)。
-  ログノイズ削減のため専用の空ハンドラを追加する余地がある。
+- ~~`pong`受信が`bm_object_sync_dispatch`で専用ハンドラを持たず"unhandled command"
+  ログに落ちている~~: 2026-08-26完了。専用の空ハンドラ(NOP)を追加した
+  (PyBitmessage本家の`bm_command_pong`も無視するだけ)。ついでに調査した結果、
+  ping/pongはTCP自体のタイムアウト回避ではなく、経路上のNAT/ファイアウォールが
+  無通信の接続を勝手に切るのを防ぐキープアライブであり、このプロジェクト・本家とも
+  「pongが実際に返ってきたか」で生死判定して切断するロジックは持たない(生死判定は
+  TCPレベルの読み取りエラーRST/EOFにのみ依存する)ことを確認した。
 
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という

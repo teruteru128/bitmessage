@@ -1483,6 +1483,35 @@ int main(void)
         sqlite3_finalize(count_stmt16);
     }
 
+    /* --- 17. §11 2026-08-26: pong受信は何もせず無視するだけであること(専用の分岐が
+     * 無く"unhandled command"としてログに落ちていた点をユーザーが指摘して発覚)。
+     * クラッシュしない・切断要求を立てない・何も送り返さないことを確認する --- */
+    {
+        int fds17[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds17) == 0, "socketpair for pong scenario");
+        struct bm_fd_data *conn17 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds17[0]);
+        CHECK(conn17 != NULL, "bm_fd_data_new for pong scenario");
+
+        struct bm_message pong_msg;
+        memset(&pong_msg, 0, sizeof(pong_msg));
+        memcpy(pong_msg.command, "pong", 4);
+        pong_msg.length = 0;
+        pong_msg.payload = NULL;
+        bm_object_sync_dispatch(conn17, &pong_msg, &ctx);
+
+        CHECK(conn17->should_disconnect == 0, "receiving pong should not request a disconnect");
+
+        int fds17_1_flags = fcntl(fds17[1], F_GETFL, 0);
+        fcntl(fds17[1], F_SETFL, fds17_1_flags | O_NONBLOCK);
+        unsigned char discard17[16];
+        ssize_t n17 = read(fds17[1], discard17, sizeof(discard17));
+        CHECK(n17 < 0 && errno == EAGAIN, "receiving pong should not trigger any reply");
+
+        close(fds17[0]);
+        close(fds17[1]);
+        bm_fd_data_free(conn17);
+    }
+
     close(fds[0]);
     close(fds[1]);
     bm_fd_data_free(conn);
