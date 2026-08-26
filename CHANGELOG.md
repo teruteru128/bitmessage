@@ -3,6 +3,33 @@
 このプロジェクトの利用者向けリリースノート。[Keep a Changelog](https://keepachangelog.com/ja/1.0.0/)
 に緩く準拠する。開発の詳しい経緯・設計判断の背景(「なぜ」)は [DESIGN.md](DESIGN.md) を参照。
 
+## [1.3.0] - 2026-08-26
+
+### 追加
+
+- 送信済みボックス一覧: `getSentMessages` API・`bitmessage-cli get-sent`
+- outbound SOCKS5プロキシ設定をonion peer専用(`socks_proxy`)/クリアネットIP専用
+  (`socks_proxy_clearnet`)に分離。`getSocksProxyOnion`/`Clearnet`等のAPI・
+  `get/set-socks-proxy-onion`/`-clearnet` CLIサブコマンドを追加
+
+### 修正
+
+- **重大**: verack交換完了直後という早すぎるタイミングで能動的にaddr/big invを
+  送り返すこと自体が、相手からの即時切断(RST/EOF)を誘発していた問題。送信を
+  5秒遅延させることで即切断率が99%から6%まで改善した
+- **重大**: `send_big_inv`が1万件超のhashを無間隔で一括送信すると、相手のTCP
+  受信ウィンドウが数秒でゼロまで埋まりRSTで強制切断されていた問題。チャンク
+  分割(1000件ずつ)+ペーシング(1秒間隔)送信に変更
+- **重大**: outbound SOCKS5設定が単一だったため、有効化するとクリアネットIP宛の
+  接続まで無条件でTor出口ノード経由になり、共有IPゆえのレート制限を招いていた
+  問題(上記のonion/クリアネット分離で解消)
+- `pong`受信が専用ハンドラを持たず"unhandled command"ログに落ちていた問題
+  (実害は無いが、専用の空ハンドラを追加)
+- `join-chan`(=unlockAddress)する前に既に`object_pool.db`へ届いていたchan宛
+  msgオブジェクト(過去ログ)が、unlock後も自動でinboxに現れない問題
+- systemdユニットがTor ControlPort用グループ(`debian-tor`)に属さず、
+  `tor.service`への起動順序依存も無かった問題(`BM_TOR_CONTROL=1`利用時)
+
 ## [1.2.0] - 2026-08-24
 
 ### 追加
