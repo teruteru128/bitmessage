@@ -117,6 +117,7 @@ void bm_fd_data_free(struct bm_fd_data *data)
     }
     free(data->recv_buffer);
     free(data->user_agent);
+    free(data->pending_inv_hashes);
     free(data);
 }
 
@@ -581,6 +582,55 @@ static void close_connection(struct bm_epoll_thread_args *args, struct bm_fd_dat
     bm_fd_data_free(conn);
 }
 
+/*
+ * §11 2026-08-26: big invの1chunk分をconn->fdへ送る(struct bm_fd_dataのdoc、
+ * bm_network_begin_big_invのdoc参照)。書き込みに失敗した場合(詰まった接続へタイムアウト
+ * するまで待った末の失敗を含む)は、残り全部を諦めて破棄する。もし諦めずに次回また
+ * 同じchunkから再試行すると、詰まったままの接続に対して毎回BM_NETWORK_WRITE_TIMEOUT_
+ * SHORT_SECONDS分だけこの単一スレッドを専有し続け、他の全接続の処理を妨げてしまう。
+ */
+static void send_inv_chunk(struct bm_fd_data *conn, int64_t now)
+{
+    size_t remaining = conn->pending_inv_total - conn->pending_inv_sent;
+    size_t n = (remaining < BM_BIG_INV_CHUNK_SIZE) ? remaining : BM_BIG_INV_CHUNK_SIZE;
+
+    size_t packet_len = 0;
+    unsigned char *packet =
+            bm_create_inventory_message("inv", conn->pending_inv_hashes + conn->pending_inv_sent, n, &packet_len);
+    conn->pending_inv_last_chunk_time = now;
+    if (packet == NULL)
+    {
+        free(conn->pending_inv_hashes);
+        conn->pending_inv_hashes = NULL;
+        return;
+    }
+    if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) != 0)
+    {
+        bm_log_warn("[network] failed to send big-inv chunk, dropping remaining %zu hash(es)\n", remaining);
+        free(packet);
+        free(conn->pending_inv_hashes);
+        conn->pending_inv_hashes = NULL;
+        return;
+    }
+    conn->bytes_sent += (uint64_t)packet_len;
+    free(packet);
+
+    conn->pending_inv_sent += n;
+    if (conn->pending_inv_sent >= conn->pending_inv_total)
+    {
+        free(conn->pending_inv_hashes);
+        conn->pending_inv_hashes = NULL;
+    }
+}
+
+void bm_network_begin_big_inv(struct bm_fd_data *conn, unsigned char (*hashes)[32], size_t count, int64_t now)
+{
+    conn->pending_inv_hashes = hashes;
+    conn->pending_inv_total = count;
+    conn->pending_inv_sent = 0;
+    send_inv_chunk(conn, now);
+}
+
 struct idle_sweep_ctx
 {
     struct bm_epoll_thread_args *args;
@@ -592,7 +642,15 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
     struct idle_sweep_ctx *ctx = user_data;
     if (conn->type == BM_FD_LISTEN_SOCKET)
     {
-        return; /* listenソケット自体は対象外 */
+        return;
+    }
+    /* §11 2026-08-26: big invの後続チャンク送信(bm_network_begin_big_inv参照)。
+     * handshake_completeやidle timeoutの判定より先に行うことで、詰まったコネクションの
+     * 判定と無関係に独立して動く(pending_inv_hashesはverack受信後にしか立たないため
+     * 通常はhandshake_complete==1のconnにしか発生しない)。 */
+    if (conn->pending_inv_hashes != NULL && ctx->now - conn->pending_inv_last_chunk_time >= BM_BIG_INV_CHUNK_INTERVAL_SECONDS)
+    {
+        send_inv_chunk(conn, ctx->now);
     }
     int64_t idle_seconds = ctx->now - conn->last_activity;
 

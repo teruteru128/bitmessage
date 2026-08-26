@@ -967,30 +967,24 @@ static void send_big_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn
     }
     free(hashes);
 
-    /* §11: 単一メッセージあたりBM_MAX_INVENTORY_ITEMS件まで(本家のMAX_OBJECT_COUNTと
-     * 同じ50000。相手側もこの上限で受信するため超過分は複数メッセージに分ける) */
-    for (size_t sent = 0; sent < plain_count; sent += BM_MAX_INVENTORY_ITEMS)
-    {
-        size_t chunk = plain_count - sent;
-        if (chunk > BM_MAX_INVENTORY_ITEMS)
-        {
-            chunk = BM_MAX_INVENTORY_ITEMS;
-        }
-        size_t packet_len = 0;
-        unsigned char *packet = bm_create_inventory_message("inv", plain + sent, chunk, &packet_len);
-        if (packet != NULL)
-        {
-            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS) == 0)
-            {
-                conn->bytes_sent += (uint64_t)packet_len;
-            }
-            free(packet);
-        }
-    }
-    bm_log_info("[object_sync] sent big inv to new peer: %zu of %zu (excluded %zu still-stemming)\n", plain_count,
+    bm_log_info("[object_sync] queued big inv for new peer: %zu of %zu (excluded %zu still-stemming)\n", plain_count,
             hash_count, hash_count - plain_count);
 
-    free(plain);
+    if (plain_count == 0)
+    {
+        free(plain);
+        return;
+    }
+
+    /* §11 2026-08-26発覚: 以前はここでBM_MAX_INVENTORY_ITEMS(50000)件ずつの
+     * メッセージへ分けるだけで、間隔を空けず一気に全部書き込んでいた。実測で
+     * 1万件超(260KB超)を無間隔送信すると、相手(実測: PyBitmessage 0.6.3.2)の受信処理が
+     * 追いつかずTCP受信ウィンドウがゼロまで埋まり、最終的に相手からRSTで強制切断される
+     * ことをtcpdumpで確認した(DESIGN-LOG.md参照)。bm_network_begin_big_inv(network.c)へ
+     * plainの所有権を渡し、最初の1chunkだけ即座に送って残りはnetwork_epoll_threadの
+     * 既存の1秒間隔ポーリング(bm_network_idle_sweep)でペーシングしながら送らせる
+     * (専用スレッドを新設しない既存方針、DESIGN.md参照)。 */
+    bm_network_begin_big_inv(conn, plain, plain_count, (int64_t)time(NULL));
 }
 
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)

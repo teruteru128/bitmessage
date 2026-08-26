@@ -2584,6 +2584,71 @@ DESIGN-LOG.mdを検索しても過去にbacklog化・議論された跡が無く
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 39件全通過を確認。
 
+### big invのチャンク分割+ペーシング(2026-08-26、SOCKS5分離の続き)
+
+**経緯**: 上記のSOCKS5分離をdaemon Aへ反映・再起動した後も、ユーザーから「相変わらず
+エラーで切られまくっている」と報告があり、journalctlで再測定したところ即切断率は
+ほぼ変わらず(むしろ`read error`(RST)の比率が増加)だった。エラーメッセージ
+("Too many connections from your IP"等)は0件になっており、SOCKS5分離自体は
+正しく効いていたが、別の根本原因が残っていることが判明した。
+
+ユーザーの許可を得てtcpdump(`sudo timeout 30 tcpdump -i any -w /tmp/bm_capture.pcap
+'tcp port 8444 or tcp port 9050'`、実行はユーザーがtmuxで担当)でoutbound接続を
+1本キャプチャし解析したところ、以下が判明した:
+- こちらが送ったversion/addr/big inv(合計263,277byte、うちbig inv本体が26万byte超・
+  1万件超のhash)を相手は**全部受信し終えている**(ackが最後まで到達)
+- しかし相手(全て`PyBitmessage:0.6.3.2`)のTCP受信ウィンドウ(win)は、受信が進むにつれ
+  1039→873→389→268→125→70→5→0と段階的に縮小し、ゼロウィンドウ(win=0)に達した
+  約0.9秒後に相手からRSTが送られてきていた
+- 別の3本の接続(いずれも`PyBitmessage:0.6.3.2`)でも完全に同じパターン
+  (win漸減→0→RST)が再現した
+
+これは送信フォーマットの破損ではなく(壊れていればもっと早い段階でパースエラーとして
+切断されるはず)、「新規に確立した接続に対し、handshake直後にTCPの許す限りの速度で
+1万件超・260KB超のinvを一括送信する」という送信パターンが、シングルスレッド
+(asyncoreベース)で動く相手の受信処理能力を超えてしまい、相手のアプリ層が
+`recv()`を消費しきれずカーネルの受信バッファが埋まり、最終的に強制切断されている
+と判断した。`send_big_inv`(object_sync.c)は元々`BM_MAX_INVENTORY_ITEMS`(50000)件
+ごとにメッセージを分けてはいたが、間隔を空けず全部連続で書き込んでいた点が原因。
+
+**対応**: 単純に`sleep()`でチャンク間隔を空けると、このプロジェクトの
+`network_epoll_thread`が単一スレッドで全接続を処理する設計(DESIGN.md §1)のため、
+1本のpeerへの配慮のために他の全接続の処理まで止めてしまう。これを避けるため、
+既存の「専用スレッドを新設せず1秒間隔ポーリングに相乗りさせる」方針
+(Dandelion++のreshuffle/expire、onionpeer再announceと同じ)に倣い、非同期の
+チャンク送信に変更した:
+- `infra/network.h`: `struct bm_fd_data`に`pending_inv_hashes`/`pending_inv_total`/
+  `pending_inv_sent`/`pending_inv_last_chunk_time`を追加。`BM_BIG_INV_CHUNK_SIZE`
+  (1000件、約32KB)・`BM_BIG_INV_CHUNK_INTERVAL_SECONDS`(1秒)を新設。
+  `bm_network_begin_big_inv(conn, hashes, count, now)`を追加(hashesの所有権を
+  受け取り、最初の1chunkだけ即座に送って残りをconnへ保持する)。
+- `infra/network.c`: `send_inv_chunk`(1chunk分の送信、書き込み失敗時は残り全部を
+  諦めて破棄する。詰まった接続への再試行で単一スレッドを専有し続けないため)と
+  `bm_network_begin_big_inv`を実装。既存の`idle_sweep_one`(`bm_network_idle_sweep`
+  から1秒未満の間隔で頻繁に呼ばれる)に、pending中のinvがあり前回チャンク送信から
+  `BM_BIG_INV_CHUNK_INTERVAL_SECONDS`以上経過していれば次のchunkを送るチェックを追加。
+  `bm_fd_data_free`で`pending_inv_hashes`をfreeするよう追加。
+- `infra/object_sync.c`: `send_big_inv`を、hash一覧を計算した後
+  `bm_network_begin_big_inv`へ丸ごと委譲する形に簡略化(以前の同期chunkループを削除)。
+
+**テスト**: `tests/test_idle_sweep.c`にシナリオ3を追加。`BM_BIG_INV_CHUNK_SIZE*2+500`
+(=2500)件のダミーhashで`bm_network_begin_big_inv`を呼び、(1)最初の1000件が即座に
+送られる、(2)`BM_BIG_INV_CHUNK_INTERVAL_SECONDS`未経過では追加送信されない、
+(3)経過後に次の1000件が送られる、(4)最後の半端な500件も正しく送られ`pending_inv_hashes`
+がNULLに戻る、ことを`bm_network_idle_sweep`への複数回呼び出しで検証。ノンブロッキング
+ソケットで「まだ何も届いていないこと」を確認する`try_read_one_message`ヘルパーを追加した
+(既存の`read_one_message`はブロッキング前提で「来ないこと」の検証に使えないため)。
+テスト作成時、`last_activity`をt0近辺に合わせ忘れて`idle_sweep`のkeepalive ping送信
+条件に誤ってヒットし、pingパケットの混入で「間隔未経過では届かない」の検証が偽陽性に
+なる不具合を作り込んだが、`conn->last_activity = t0;`を明示することで解消した。
+
+既存の`test_object_sync.c`のケース13/14/15(big inv関連)はいずれもオブジェクト数が
+2〜3件と`BM_BIG_INV_CHUNK_SIZE`未満のため、1回のverack処理でそのまま即座に全部
+送られる(挙動は変更前と同一)ことを確認済み、変更不要だった。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+39件全通過を確認。daemon Aへの反映・実ネットワークでの改善確認は次のステップ。
+
 ### outbound SOCKS5設定をonion peer専用/クリアネットIP専用に分離(2026-08-26)
 
 **経緯**: ユーザーから「外のノードに繋がりが悪い」という体感報告があり、まず「verack後の

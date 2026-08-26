@@ -101,6 +101,20 @@ struct bm_fd_data
      * 受信側はbm_network_handle_readableが読み取り成功のたびに一箇所で更新する。 */
     uint64_t bytes_sent;
     uint64_t bytes_received;
+    /* §11 2026-08-26発覚: big inv(相手が知らない全objectのhash一覧)をverack受信直後に
+     * 一括送信すると、相手(実測: PyBitmessage 0.6.3.2)の受信処理が追いつかずTCP受信
+     * ウィンドウがゼロまで埋まり、最終的に相手からRSTで強制切断されることをtcpdumpで
+     * 確認した(DESIGN-LOG.md参照)。object_sync.cのsend_big_invはbm_network_begin_big_inv
+     * (このファイル参照)へ全hashの所有権を渡して最初の1chunkだけ即座に送り、残りは
+     * ここへ保持したまま、bm_network_idle_sweepの巡回(既存の1秒間隔ポーリングに相乗り、
+     * DandelionのreshuffleやPingのidle keepaliveと同じ方式)で少しずつ追加送信する。
+     * pending_inv_hashes==NULLなら送信中の分割invなし。network_epoll_threadという
+     * 単一スレッドの中でのみ触られるため排他制御はしない(peer_registry.cの既存コメントと
+     * 同じ前提)。 */
+    unsigned char (*pending_inv_hashes)[32]; /* malloc済み、全部送り終える/破棄時にfree */
+    size_t pending_inv_total;
+    size_t pending_inv_sent;
+    int64_t pending_inv_last_chunk_time;
 };
 
 /*
@@ -253,6 +267,13 @@ void *bm_network_epoll_thread(void *arg);
  * できるようにするため(bm_network_idle_sweepのdocも参照)。 */
 #define BM_HANDSHAKE_TIMEOUT_SECONDS 20
 #define BM_IDLE_PING_TIMEOUT_SECONDS 300
+/* §11 2026-08-26: big invのペーシング用(struct bm_fd_dataのdoc参照)。1chunkあたり
+ * BM_BIG_INV_CHUNK_SIZE件(32byte/件、1000件で約32KB)、chunk間はBM_BIG_INV_CHUNK_
+ * INTERVAL_SECONDS秒空ける。tcpdumpの実測(DESIGN-LOG.md)では260KB超を無間隔で送ると
+ * 相手のTCP受信ウィンドウが数秒でゼロまで埋まっていたため、それより十分小さい単位・
+ * 間隔にしている。 */
+#define BM_BIG_INV_CHUNK_SIZE 1000
+#define BM_BIG_INV_CHUNK_INTERVAL_SECONDS 1
 
 /*
  * §11 2026-08-23: inbound接続のアイドル/ハンドシェイクタイムアウト+keepalive ping送信
@@ -264,6 +285,16 @@ void *bm_network_epoll_thread(void *arg);
  * bm_network_epoll_threadが自身のepoll_waitタイムアウトのたびに呼ぶ。
  */
 void bm_network_idle_sweep(struct bm_epoll_thread_args *args, int64_t now);
+
+/*
+ * §11 2026-08-26: object_sync.cのsend_big_invから呼ぶ。hashes(malloc済み、count件)の
+ * 所有権はこの関数へ渡り(呼び出し元は以後freeしない)、conn->pending_inv_*へ保存される。
+ * 最初の1chunk(BM_BIG_INV_CHUNK_SIZE件まで)だけこの場でconn->fdへ即座に送り、count が
+ * それ以下ならその場で送り切ってhashesもfreeする。残りがあればbm_network_idle_sweepが
+ * 後続チャンクを1秒間隔で送る(struct bm_fd_dataのdoc参照)。書き込み失敗時は残りを諦めて
+ * 破棄する(詰まった接続への再試行で単一スレッドの他接続処理を妨げないため)。
+ */
+void bm_network_begin_big_inv(struct bm_fd_data *conn, unsigned char (*hashes)[32], size_t count, int64_t now);
 
 /*
  * §11 inbound接続(Tor hidden service)対応。listenソケットがreadable(=accept可能)になった際に

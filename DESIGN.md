@@ -1387,6 +1387,19 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
 CLI(`get/set-socks-proxy-onion`/`-clearnet`)も追随。詳細な調査経緯はDESIGN-LOG.md
 「outbound SOCKS5設定をonion peer専用/クリアネットIP専用に分離」参照。
 
+**2026-08-26完了: big invのチャンク分割+ペーシング**。上記のSOCKS5分離後もdaemon Aの
+接続性が改善せず、tcpdumpで調査した結果、`send_big_inv`(handshake直後に自分が保有する
+全objectのhashを一括送信)が原因と判明した。1万件超(260KB超)を無間隔で送ると、相手
+(実測: `PyBitmessage:0.6.3.2`)のTCP受信ウィンドウが数秒でゼロまで埋まり、相手から
+RSTで強制切断される(受信は完了しているのでフォーマット破損ではなく、相手のアプリ層の
+処理待ちバッファ枯渇)ことを複数接続で確認した。`sleep()`でチャンク間隔を空けると
+`network_epoll_thread`(単一スレッドで全接続を処理)が丸ごと止まってしまうため、
+専用スレッドを新設せず既存の1秒間隔ポーリング(`bm_network_idle_sweep`)に相乗りさせる
+既存方針に倣い、`struct bm_fd_data`へ送信途中状態を保持させる非同期チャンク送信
+(`bm_network_begin_big_inv`、`BM_BIG_INV_CHUNK_SIZE`=1000件・`BM_BIG_INV_CHUNK_
+INTERVAL_SECONDS`=1秒)に変更した。詳細はDESIGN-LOG.md「big invのチャンク分割+
+ペーシング」参照。
+
 **2026-08-23調査時に「あるように見えて実は無い」と判明したもの(参考、backlog対象外)**:
 `protocol.py`の`OBJECT_I2P`/`OBJECT_ADDR`というobject type定数、`knownnodes.dns()`という
 DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義はあるがPyBitmessage
