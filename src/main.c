@@ -154,8 +154,43 @@ static uint64_t env_or_u64(const char *env_name, uint64_t file_value)
     return (env_value != NULL) ? strtoull(env_value, NULL, 10) : file_value;
 }
 
-int main(void)
+static void print_usage(const char *prog)
 {
+    printf("使い方: %s [--version|-v] [--help|-h]\n"
+           "\n"
+           "bitmessagedはコマンドライン引数を取らず、環境変数と設定ファイル\n"
+           "(既定bitmessage.conf、BM_CONFIG_FILEで変更可)で動作を設定するdaemonです。\n"
+           "引数無しで起動するとdaemonとして動き続けます。主な環境変数はREADME.mdの\n"
+           "「環境変数一覧」を参照してください(BM_DATA_DIR/BM_TESTNET/BM_MAX_OUTBOUND/\n"
+           "BM_API_PORT/BM_INBOUND_PORT/BM_TOR_CONTROL等)。\n",
+            prog);
+}
+
+int main(int argc, char **argv)
+{
+    /* §11 2026-08-27発覚: --version/--helpを含め一切の引数を見ずに常時daemonとして
+     * 起動していたため、`bitmessaged --version`のつもりの誤操作がそのまま通常起動して
+     * しまい、既存daemon Aと同じポート/DBファイルへ二重に触れる事故が実際に起きた
+     * (経緯はDESIGN-LOG.md参照)。daemonループへ入る前に最優先で引数を判定し、
+     * --version/--helpはその場でexitする。認識できない引数を渡された場合も
+     * (誤操作でdaemon化してしまうよりは)エラー終了する方が安全なので早期リターンする。 */
+    if (argc >= 2)
+    {
+        if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0)
+        {
+            printf("bitmessaged %s\n", BM_PROJECT_VERSION);
+            return EXIT_SUCCESS;
+        }
+        if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)
+        {
+            print_usage(argv[0]);
+            return EXIT_SUCCESS;
+        }
+        fprintf(stderr, "不明な引数: %s\n\n", argv[1]);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
     /* §11 2026-08-24発覚の重大バグ修正: SIGPIPEを無視する。デフォルトのままだと、
      * 相手が既に閉じたソケットへwrite()した瞬間にプロセス全体が即座に終了する
      * (デフォルト動作が「終了」でコアダンプ対象でもないため、シグナルハンドラ・

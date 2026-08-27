@@ -157,6 +157,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* §11 2026-08-27: bitmessaged側への--version/--help追加(DESIGN-LOG.md参照)とセットで
+     * こちらにも追加した。他のRPCコマンドと違いdaemonへの接続を必要としないため、
+     * BM_API_USER/PASS未設定でも使える(call_rpc呼び出しより前でreturnする)。 */
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0)
+    {
+        printf("bitmessage-cli %s\n", BM_PROJECT_VERSION);
+        return EXIT_SUCCESS;
+    }
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)
+    {
+        print_usage(argv[0]);
+        return EXIT_SUCCESS;
+    }
+
     const char *cmd = argv[1];
     bm_json_value_t *params = bm_json_new_array();
 

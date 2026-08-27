@@ -30,6 +30,15 @@ fail() {
     exit 1
 }
 
+# §11 2026-08-27発覚: bitmessagedは以前argvを一切見ずに常時daemon化していたため、
+# `bitmessaged --version`のつもりの誤操作がそのまま通常起動してしまい、既存daemon Aと
+# 同じポート/DBファイルへ二重に触れる事故が実際に起きた(経緯はDESIGN-LOG.md参照)。
+# daemon起動より前に、--version/--helpがその場でexitしdaemon化しないことを確認する。
+[[ "$("$BITMESSAGED" --version)" == "bitmessaged "* ]] || fail "bitmessaged --version should print a version string"
+"$BITMESSAGED" --help >/dev/null || fail "bitmessaged --help should exit successfully"
+[[ "$("$CLI" --version)" == "bitmessage-cli "* ]] || fail "bitmessage-cli --version should print a version string"
+"$CLI" --help >/dev/null || fail "bitmessage-cli --help should exit successfully"
+
 # §11 ポート衝突対策: 既定の8442は他の目的(手元でのpeer bootstrap用daemon等)で使われている
 # ことがあるため、ctest実行を邪魔しないようtest_api_server.c等と同じ流儀でscratchポートを使う
 # (BM_API_PORTはCLI・daemon双方が読む環境変数、main.c参照)。

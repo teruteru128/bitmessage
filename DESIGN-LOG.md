@@ -2874,3 +2874,43 @@ outbound数自体がmax_outbound未満のうちに成立してしまい、以降
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 40件全通過を確認。daemon Aへの反映・再起動はユーザー確認後に別途行う。
+
+**その後の反映確認(2026-08-27)**: push後、ユーザーに`sudo cmake --install build-Release`と
+`sudo systemctl restart bitmessaged`を実行してもらいdaemon Aへ反映した(このセッションの
+sandboxからは`sudo`が対話パスワード入力不可のため実行できず、ユーザーに委譲した)。
+再起動から31分後の`journalctl -u bitmessaged`で、outbound接続確立12件・切断4件(生存8件で
+安定)、inbound接続accept2件・close1件(1件生存)を確認。inbound接続が生きている状態でも
+outbound切断のたび(20:15/20:28/20:31/20:35)に再接続が行われ8件を維持し続けており、
+修正が実環境でも機能していることを確認した。
+
+### bitmessaged/bitmessage-cliへの--version/--help追加(2026-08-27、上記調査の副産物)
+
+**経緯**: 上記のoutbound頭打ちバグの調査中、`bitmessaged --version`で挙動を確認しようと
+したところ、`src/main.c`の`main(void)`が引数を一切見ておらず、`--version`ごと無視して
+通常のdaemonとして起動してしまう事故が発生した(このセッションのCWD、リポジトリ直下の
+開発用DBファイルを掴んだだけで実害は無かったが、一つ間違えば稼働中のdaemon Aと同じ
+ポート/DBに二重アクセスしうる危険な状態だった)。ユーザーからの提案で、この調査が
+終わり次第`bitmessaged`/`bitmessage-cli`双方に`--version`/`--help`を作り込むことにした。
+
+**対応**:
+- `src/main.c`: `main(void)`を`main(int argc, char **argv)`に変更し、daemonループへ入る
+  前(SIGPIPE無視より前)に引数を判定するよう変更。`--version`/`-v`はバージョン
+  (既存の`BM_PROJECT_VERSION`マクロ、user agent文字列と同じ単一の情報源)を表示して
+  即終了、`--help`/`-h`は使い方を表示して即終了。**認識できない引数は今回の事故と同じ
+  誤操作を繰り返さないよう、daemon化せずエラー終了(EXIT_FAILURE)するようにした**
+  (単に無視して起動を続けるより安全側に倒す判断)。
+- `src/cli/main.c`: 既存の`print_usage`はそのまま流用し、`--version`/`-v`・`--help`/`-h`を
+  他のRPCコマンドより前(daemonへの接続が発生する`call_rpc`より前)に判定するよう追加。
+  `BM_API_USER`/`PASS`未設定でも使える。
+- `src/cli/CMakeLists.txt`: `bitmessage-cli`ターゲットにも`BM_PROJECT_VERSION`を注入
+  (`src/CMakeLists.txt`の`bitmessaged`向けと同じ`project()`の`VERSION`を単一の情報源とする
+  仕組みをそのまま踏襲)。
+
+**テスト**: `tests/test_cli_integration.sh`のdaemon起動より前に、`bitmessaged --version`が
+バージョン文字列を返すこと・`bitmessaged --help`が正常終了すること・`bitmessage-cli`側も
+同様であることを追加した(daemon化しないことの確認も兼ねる)。専用のテストファイルを
+新設せず既存の統合テストへ追記したのは、この機能自体がdaemon起動を必要としない
+軽量な分岐であり、既存スクリプトの冒頭に数行足すだけで十分だったため。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+40件全通過を確認。
