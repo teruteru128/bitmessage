@@ -2824,3 +2824,53 @@ PyBitmessage本家の`bm_command_pong`も"Ignore it"とコメントされたNOP�
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 39件全通過を確認。
+
+### outbound接続数がmax_outbound未満で頭打ちになるバグ修正(2026-08-27)
+
+**経緯**: ユーザーから「`bitmessage-cli list-connections`のoutbound接続数が7のまま
+`max_outbound_connections`(daemon Aの設定は8)まで増えなくなった、接続のリークでは」
+という報告があった。journalが直近で再起動されていたため`/var/log/syslog`を見てほしい
+との依頼だったが、調査の過程で実際には`journalctl -u bitmessaged`が
+`--list-boots`上のboot(2026-08-27 00:12:20開始)以降のログを保持していることが分かり、
+そちらで足りた(journaldのvacuum/ローテートで00:12:20より前だけ失われていたとみられる。
+daemon A自体は2026-08-26 21:21起動でそれより前のため、起動直後〜00:12台のログだけは
+今回参照できなかったが、原因特定には影響しなかった)。
+
+`journalctl`でdaemon A(PID 1753465)のログを追ったところ、直近の新規outbound確立は
+`13:51:47`が最後で、その後`17:41:35`にoutbound1件が切断されて以降(調査時点で6時間
+以上)一切再接続されていなかった。一方で同時間帯にinbound接続のaccept/closeは継続的に
+発生しており(00:00以降だけでaccept19件・close17件、差し引き2件以上が生存中と推定)、
+「inbound接続が生きているとoutboundが増えなくなる」という仮説が立った。
+
+**原因**: `infra/peer_connector.c`の`bm_peer_connector_connect_initial`が、outbound
+接続の空き枠判定に`bm_peer_registry_count()`(`peer_registry.c`のdoc通りinbound/outbound
+合算)を使い、それを`config->max_outbound`とそのまま比較していた。
+
+```c
+size_t already_connected = bm_peer_registry_count(config->registry); /* 合算 */
+if ((int)already_connected >= config->max_outbound) { return 0; }
+```
+
+inbound接続が1件以上生きている環境では、`outbound数 + inbound数 >= max_outbound`が
+outbound数自体がmax_outbound未満のうちに成立してしまい、以降の再接続サイクル
+(`RECONNECT_INTERVAL_SECONDS`=30秒間隔)は毎回`already_connected >= max_outbound`で
+即`return 0`し、候補選定にすら入らなくなる。「リーク」ではなく、outbound専用であるべき
+上限判定にinbound接続数まで巻き込んでいた比較ロジックのバグだった。
+
+**修正**: `bm_peer_registry_count_by_type(config->registry, BM_FD_CLIENT_SOCKET)`
+(outboundのみ)へ変更した。`bm_peer_registry_count_by_type`自体は既に
+`network.c`のinbound同時接続数上限チェック(`BM_MAX_INBOUND_CONNECTIONS`判定)で
+使われている既存関数で、新規実装ではない。
+
+**テスト**: `tests/test_peer_connector_inbound_headroom.c`を追加。registryへinbound
+(`BM_FD_SERVER_SOCKET`)接続を1件だけ登録した状態(`fd=-1`のダミー、`test_peer_registry_proxy.c`
+と同じくfdに触れない検証のため実socket不要)で`max_outbound=1`にし、
+127.0.0.1の未listenポート宛の候補1件に対して`connect_initial`を呼ぶ。outbound枠自体は
+空いているはず(inbound1件はoutbound枠を消費しない)なので、接続が試行され失敗して
+候補のratingが減点されることを確認する(修正前はinbound込みの合算がmax_outbound以上と
+誤判定され、候補に一切触れずratingが不変のまま)。修正箇所を一時的に旧ロジック
+(`bm_peer_registry_count`合算)へ戻して再ビルドし、このテストが実際に失敗する
+(＝有効な回帰テストである)ことを確認してから元に戻した。
+
+**検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
+40件全通過を確認。daemon Aへの反映・再起動はユーザー確認後に別途行う。

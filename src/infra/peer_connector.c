@@ -439,7 +439,14 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         bm_config_store_get_socks_proxy_clearnet(config->config_db, &socks_proxy_clearnet);
     }
 
-    size_t already_connected = config->registry != NULL ? bm_peer_registry_count(config->registry) : 0;
+    /* §11 2026-08-27発覚のバグ修正: 以前はbm_peer_registry_count(inbound/outbound合算)を
+     * max_outboundと比較していたため、inbound接続が生きている環境ではoutbound接続数が
+     * max_outbound未満でも「already_connected(合算) >= max_outbound」が真になり、
+     * 新規outbound接続を一切試みなくなっていた(list-connectionsのoutbound数がmax未満で
+     * 頭打ちになり進まなくなる不具合として発覚)。outboundの空き枠判定にはoutbound
+     * (BM_FD_CLIENT_SOCKET)のみを数える必要がある。 */
+    size_t already_connected =
+            config->registry != NULL ? bm_peer_registry_count_by_type(config->registry, BM_FD_CLIENT_SOCKET) : 0;
     if ((int)already_connected >= config->max_outbound)
     {
         return 0;
