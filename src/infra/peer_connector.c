@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netdb.h>
 #include <openssl/rand.h>
 #include <stdio.h>
@@ -496,6 +497,19 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         {
             bm_log_warn("[peer_connector] failed to connect to %s\n", addr_buf);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
+            /* §11 2026-08-28発覚のバグ修正: DB上のratingはbm_peer_manager_record_resultで
+             * 下がるが、candidates[]はwhileループの最初にlist_topで1回fetchしたローカル
+             * コピーのままrecord_result後も同期されていなかった。このためcandidate_countが
+             * 少ない(特に1件しかない)状況で、常に失敗する候補のrating>=0.95付近(prob=
+             * 0.05/(1-rating)>=1.0で無条件採用)だとbm_peer_connector_choose_candidate_index
+             * が毎回同じ候補を確定的に選び続け、下のcooldown判定(rating<0)も発火しないため
+             * このwhileループがconnect失敗を繰り返すだけの実質無限ループになっていた
+             * (tests/test_peer_connector_inbound_headroom.cでrating=1.0の候補を使うよう
+             * 直してみたところ実際に検出、CIのsanitizeジョブでは逆にrating=0.5の低確率な
+             * 乱数が偏った1回がテスト失敗として顕在化していた)。record_resultと同じ
+             * MAX(-1.0, rating-0.1)をローカルコピーにも反映し、次のchoose_candidate_index
+             * 呼び出しで正しくcooldown/確率判定に反映されるようにする。 */
+            candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1);
             continue;
         }
 
@@ -505,6 +519,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_log_error("[peer_connector] bm_fd_data_new failed for %s\n", addr_buf);
             close(sock);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
+            candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1); /* §11 2026-08-28、上記コメント参照 */
             continue;
         }
         /* §11 2026-08-22発覚のバグ修正: SOCKS5(Tor)経由の場合、conn->peer_addr(getpeername)は
@@ -523,6 +538,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_fd_data_free(conn);
             close(sock);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
+            candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1); /* §11 2026-08-28、上記コメント参照 */
             continue;
         }
 
@@ -533,6 +549,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             bm_fd_data_free(conn);
             close(sock);
             bm_peer_manager_record_result(config->peers_db, candidates[i].ip_address, candidates[i].port, 1, 0);
+            candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1); /* §11 2026-08-28、上記コメント参照 */
             continue;
         }
         /* §11 2026-08-23 backlog項目5: bm_post_versionはfdだけを取りconnを持たないため、

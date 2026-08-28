@@ -54,7 +54,14 @@ int main(void)
     entry.stream = 1;
     entry.services = 1;
     entry.last_seen = (int64_t)time(NULL);
-    entry.rating = 0.5;
+    /* §11 2026-08-28発覚: 以前はrating=0.5で登録していたが、bm_peer_connector_choose_candidate_index
+     * は確率的サンプリング(rating=0.5ならprob=0.05/(1-0.5)=10%、CHOOSE_CANDIDATE_MAX_ATTEMPTS=50回
+     * 試行してもどれも不採用になる確率が(0.9)^50≈0.5%残る)を使うため、まれにcandidateが一度も
+     * 選ばれずrating不変のままCHECKに失敗するflaky testになっていた(GitHub Actions CI sanitize
+     * ジョブで実際に再現、他ジョブは同じ乱数の偏りに当たらず通過していた)。rating=1.0にすると
+     * `rating >= 1.0`の分岐で無条件・確定的に採用されるため(PyBitmessage本家のZeroDivisionError
+     * ->即採用相当、peer_connector.c参照)、乱数に依存しない決定的なテストになる。 */
+    entry.rating = 1.0;
     strncpy(entry.source, "test", sizeof(entry.source) - 1);
     CHECK(bm_peer_manager_upsert(peers_db, &entry) == 0, "seed candidate row");
 
@@ -96,8 +103,8 @@ int main(void)
             found = 1;
             /* 接続が試行され失敗したのでratingが減点されているはず。もしバグが残っていれば
              * (inbound1件込みの合算がmax_outbound(1)以上と誤判定され)候補に一切触れず
-             * rating==0.5のまま変化しない */
-            CHECK(results[j].rating < 0.5,
+             * rating==1.0のまま変化しない */
+            CHECK(results[j].rating < 1.0,
                   "candidate should have been attempted (rating penalized) even with 1 inbound "
                   "connection already registered, since the outbound slot itself was still free");
         }

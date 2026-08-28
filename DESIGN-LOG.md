@@ -2914,3 +2914,60 @@ outbound切断のたび(20:15/20:28/20:31/20:35)に再接続が行われ8件を�
 
 **検証**: `cmake --build build-Debug --parallel`で警告ゼロ、`ctest --output-on-failure`で
 40件全通過を確認。
+
+### CI sanitizeジョブでのflaky test発覚と、実は本物だったハングバグの修正(2026-08-28)
+
+**経緯**: GitHub Actions CIで直前のコミット(`--version`/`--help`追加)のsanitizeジョブ
+(`build-sanitize`、ASan+UBSan)のみが`peer_connector_inbound_headroom`テストで失敗した
+(他3ジョブ=通常Debug/TSan/Fedoraは全通過)。`gh run view --log-failed`で確認したところ、
+`FAIL: candidate should have been attempted (rating penalized) ...`、すなわち候補への
+接続が一度も試みられずrating(0.5)が変化しなかった、という失敗内容だった。
+
+**原因1(flaky testの直接原因)**: このテストはseed済み候補1件(rating=0.5)に対して
+`bm_peer_connector_connect_initial`を1回呼ぶだけだが、候補選定
+(`bm_peer_connector_choose_candidate_index`)は確率的(rating=0.5なら
+`prob=CHOOSE_CANDIDATE_BASE_PROB/(1-rating)=0.05/0.5=10%`)で、`CHOOSE_CANDIDATE_MAX_ATTEMPTS`
+(50)回試行してもどの試行も採用されない確率が`0.9^50≈0.515%`残る。CIで偶然この約0.5%を
+引いた1回が今回の失敗であり、テスト自体の乱数依存によるflakinessが原因と判明した。
+
+**原因2(調査中に発見した本物のバグ)**: 「候補が確実に選ばれるようentry.rating=1.0に
+すればflakinessは消える」と考え修正してみたところ、今度は逆にテストが**5分以上ハング**
+した(手元で直接実行し確認、`build-Debug/tests/test_peer_connector_inbound_headroom`が
+同一秒内に"failed to connect"ログを大量に吐き続けるビジーループ状態)。原因は
+`bm_peer_connector_connect_initial`内の`while (connected < want)`ループにあった。接続に
+失敗するたび`bm_peer_manager_record_result(..., 0)`でDB上のrating(`hosts`テーブル)は
+`MAX(-1.0, rating-0.1)`で下がるが、同じループが参照している`candidates[]`配列は
+ループ突入前に`bm_peer_manager_list_top`で1回fetchしたローカルコピーのままで、
+record_result後もrating値が同期されていなかった。候補が1件(または少数)しかなく、その
+ratingが0.95以上(=`prob=0.05/(1-rating)>=1.0`で無条件採用の領域)だった場合、
+`choose_candidate_index`はローカルコピーの高いratingを見て**毎回確定的に同じ候補を
+選び続け**、下がるはずのcooldown判定(`rating<0.0 && 経過時間<1800秒`)もローカルrating
+が下がらないため一切発火しない。この結果、接続が成功するかshutdown flagが立つまで
+`while`ループが実質無限に(または少なくとも極めて長時間)接続失敗を繰り返す**実プロダクト
+コードのハングバグ**であることが分かった。テスト環境(127.0.0.1の未listenポート)では
+connect()が即座に失敗するためCPU busy-loopとして顕在化したが、本番環境でも「peers.db中
+の生きた候補が実質1件だけで、それが一時的に到達不能」という状況(あり得なくはない、
+特に起動直後でseedがまだ少ない場合)で`peer_connector_thread`の1秒間隔ポーリングを長時間
+ブロックしうる。
+
+**修正**: `src/infra/peer_connector.c`の接続失敗4箇所(TCP connect失敗・`bm_fd_data_new`
+失敗・`epoll_ctl`失敗・`bm_post_version`失敗)全てで、`bm_peer_manager_record_result`
+呼び出し直後に`candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1);`を追加し、
+DBと同じ減衰をローカルコピーにも反映するようにした(`<math.h>`を追加、`fmax`は
+`src/infra/CMakeLists.txt`が`dandelion.c`の`log()`用に既にPUBLICでlibmをリンク済みなので
+追加のリンク設定は不要)。これにより同一`connect_initial`呼び出し内でも、常に失敗する
+候補は約11回の試行(rating 1.0→-0.1)でcooldown条件に入り、`choose_candidate_index`が
+`-1`を返してループを抜けるようになった(候補1件のみのワーストケースでも手元で実測
+0.03〜0.10秒で確実に終了、20回連続実行で安定を確認)。
+
+**テスト側の修正**: `tests/test_peer_connector_inbound_headroom.c`の候補ratingを0.5から
+1.0に変更(`rating>=1.0`は無条件採用の決定的分岐、PyBitmessage本家のZeroDivisionError→
+即採用相当)し、乱数に依存しない決定的なテストにした。CHECKの閾値も`rating<0.5`から
+`rating<1.0`に合わせて変更。
+
+**検証**: 修正後の`test_peer_connector_inbound_headroom`を単体で20回連続実行し全て
+0.03〜0.10秒で`ALL OK`(flakinessもハングも再発しないことを確認)。`cmake --build
+build-Debug --parallel`警告ゼロ、`ctest --output-on-failure`で40件全通過。さらに
+CIの`sanitize`ジョブと同じ設定(`-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`、
+`ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1`)の`build-Sanitize`で
+`ctest --output-on-failure`を実行し、40件全通過・sanitizerのエラー検出なしを確認した。
