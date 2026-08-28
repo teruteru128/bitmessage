@@ -62,4 +62,45 @@ struct bm_identity_summary
  */
 int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count);
 
+/*
+ * §7.4 2026-08-29 数千件規模の一括unlock向け2段階KDF方式(DESIGN.md §11-19)。
+ * kdf_vaultは単一行のみ(id=0固定)。全identityで共有するvault_saltを保持し、
+ * ここからpassphrase→master KEKの重いKDF(scrypt)を1回だけ行う。各identity行の
+ * 実ラップ鍵はmaster KEK + その行のkdf_saltをHKDF-Expandした軽量な派生で導出する
+ * (identities.kdf_algo='vault-hkdf'の行がこの方式、'scrypt'は従来の個別KDF方式)。
+ */
+#define BM_IDENTITY_VAULT_SALT_LEN BM_IDENTITY_KDF_SALT_LEN
+
+/*
+ * kdf_vaultを読む。まだ作られていなければ非0を返す(vault未作成、旧方式のみの状態)。
+ * out_canaryは「master KEKが正しいか」を呼び出し側(keyring.c)が検証するための
+ * 既知平文のラップ値(§7.4、下記コメント参照)。
+ */
+int bm_identity_store_load_vault(sqlite3 *db, unsigned char out_vault_salt[BM_IDENTITY_VAULT_SALT_LEN],
+                                  char out_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX],
+                                  unsigned char out_canary[BM_IDENTITY_WRAPPED_KEY_LEN]);
+
+/*
+ * kdf_vaultを新規作成する(既に存在する場合は失敗させる、INSERT)。成功時0。
+ *
+ * §7.4 2026-08-29 canaryを持たせる理由: scryptは誤ったpassphraseでも必ず何らかの
+ * 32byte値を返すため、「vaultは既にあるが異なるpassphraseでunlockAllAddressesを
+ * 呼んだ」場合にmaster KEKの正誤を判定する手段が無いと、たまたま旧方式(個別scrypt)の
+ * 行がその誤ったpassphraseと一致した際、誤ったmaster KEKでre-wrapしてvault全体を
+ * 破壊しかねない(以後正しいpassphraseでも復号不能になる)。vault作成時に既知の固定
+ * 平文をmaster KEKでラップしたcanaryを保存しておき、以後の呼び出しでは必ずこの
+ * canaryを復号できることを確認してからmaster KEKを使う。
+ */
+int bm_identity_store_create_vault(sqlite3 *db, const unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN],
+                                    const char *kdf_params, const unsigned char canary[BM_IDENTITY_WRAPPED_KEY_LEN]);
+
+/*
+ * 既存行のKDF方式・salt・ラップ済み鍵を書き換える(旧scrypt方式からvault-hkdf方式へのre-wrap用)。
+ * 成功時0。
+ */
+int bm_identity_store_update_wrapped_keys(sqlite3 *db, const char *address, const char *kdf_algo,
+                                           const unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN],
+                                           const unsigned char wrapped_priv_signing_key[BM_IDENTITY_WRAPPED_KEY_LEN],
+                                           const unsigned char wrapped_priv_encryption_key[BM_IDENTITY_WRAPPED_KEY_LEN]);
+
 #endif /* BM_CORE_IDENTITY_STORE_H */

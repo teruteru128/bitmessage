@@ -188,6 +188,54 @@ static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *confi
     return bm_json_new_bool(rc == 0);
 }
 
+/*
+ * §11 2026-08-29 数千件規模の一括インポート運用向け(DESIGN.md §11-19)。単一passphraseで
+ * 全identityの一括unlockを試みる。各行のkdf_saltは個別のままなので、行ごとに独立して
+ * passphraseの一致/不一致が判定される(bm_keyring_unlock_all参照)。戻り値はlistAddresses同様
+ * [{address, unlocked}]の配列にし、呼び出し側が「どのアドレスが別passphraseだったか」を
+ * 判別できるようにしてある。
+ */
+static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *config,
+                                              const bm_json_value_t *params, char **out_error)
+{
+    const char *passphrase = param_str(params, 0);
+    if (passphrase == NULL)
+    {
+        *out_error = dup_cstr("unlockAllAddresses requires [passphrase]");
+        return NULL;
+    }
+
+    struct bm_unlock_all_entry *results = NULL;
+    size_t count = 0;
+    if (bm_keyring_unlock_all(config->keyring, config->identity_db, passphrase, &results, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list identities");
+        return NULL;
+    }
+
+    int any_unlocked = 0;
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        if (results[i].unlocked)
+        {
+            any_unlocked = 1;
+        }
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "address", bm_json_new_string(results[i].address));
+        bm_json_object_set(entry, "unlocked", bm_json_new_bool(results[i].unlocked));
+        bm_json_array_append(arr, entry);
+    }
+    free(results);
+
+    if (any_unlocked && config->object_pool_db != NULL)
+    {
+        /* h_unlockAddressと同じ理由(上記コメント参照)。個別に何度も呼ばず1回だけ再走査する */
+        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring);
+    }
+    return arr;
+}
+
 static bm_json_value_t *h_lockAddress(const struct bm_api_server_config *config,
                                        const bm_json_value_t *params, char **out_error)
 {
@@ -1008,6 +1056,7 @@ static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *con
 
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
+    {"unlockAllAddresses", h_unlockAllAddresses},
     {"lockAddress", h_lockAddress},
     {"lockAllAddresses", h_lockAllAddresses},
     {"deleteAddress", h_deleteAddress},

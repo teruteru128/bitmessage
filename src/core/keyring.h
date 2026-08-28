@@ -93,4 +93,23 @@ bool bm_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32],
 bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
                                  struct bm_unlocked_identity *out);
 
+struct bm_unlock_all_entry
+{
+    char address[BM_KEYRING_MAX_ADDRESS_LEN];
+    int unlocked; /* 成功(または既にunlock済みでスキップ)なら1、passphrase不一致等なら0 */
+};
+
+/*
+ * §11 2026-08-29 数千件規模の一括インポート運用向け(DESIGN.md §11-19)。
+ * identity.dbの全行に対し、共通のpassphraseで順にbm_keyring_unlock相当の処理を試みる。
+ * 各行のkdf_saltは個別のまま(スキーマ変更なし)なので、行ごとにAEADタグ検証が走り、
+ * 「全アドレスが同一passphrase」という前提を強制しない設計にしてある
+ * (不一致の行は黙ってunlocked=0として結果に含めるだけで処理を中断しない)。
+ * 既にkeyringにunlock済みのアドレスは再試行せずunlocked=1として扱う。
+ * 成功時0、*out_countに全identity数(結果配列の要素数)を設定する。
+ * *out_resultsはmalloc(呼び出し側でfreeすること)。
+ */
+int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
+                           struct bm_unlock_all_entry **out_results, size_t *out_count);
+
 #endif /* BM_CORE_KEYRING_H */

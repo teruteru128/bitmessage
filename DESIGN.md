@@ -874,6 +874,65 @@ struct unlocked_identity {
 しておくと、PyBitmessageの「keyが見つからないまま延々retryする」挙動より扱いやすい(要検討、初版では
 単純にエラー即返却でも良い)。
 
+### 7.4 vault方式(2段階KDF)による一括unlock — §11-19の解決(2026-08-29)
+
+**実装済み(`src/core/keyring.c`, `src/core/identity_store.c`)。** §11-19で「keys.datバックアップから
+5000件規模のアドレスを一括インポートする予定があり、現行の1アドレス1passphrase・個別scrypt方式では
+運用が非現実的」という課題が持ち上がった際の解決策。実測でscrypt(N=2^15,r=8,p=1)は1回あたり約161ms
+かかり(2026-08-29計測、Ryzen系CPU)、5000件を直列に個別scryptすると約13.4分かかる計算になり、
+起動のたびに許容できる待ち時間ではないと判断した。
+
+**方式**: passphraseからscryptで導出する重いKDFを「vault全体で1回だけ」に抑える2段階構成にする。
+
+```
+master_kek = scrypt(passphrase, vault_salt, N, r, p)              -- 重い、1回だけ
+per_row_kek = HKDF-Expand(SHA256, ikm=master_kek, salt=row.kdf_salt, info=address)  -- 軽い、行ごと
+wrapped = AES-256-GCM-Encrypt(per_row_kek, nonce, AAD=address, plaintext=priv_key)   -- §7.1と同じ
+```
+
+- `identities.kdf_algo`列の値で行ごとの方式を判別する。既存の`'scrypt'`(個別KDF、§7.1のまま)と
+  新設の`'vault-hkdf'`(この方式)が同一DB内に混在してよい設計にした
+- `vault_salt`は新設した`kdf_vault`テーブル(単一行、`id=0`固定)にidentity.db全体で共有する形で保存する
+- HKDFの`info`にaddress文字列を混ぜるのは、AES-256-GCMラップのAAD=addressと同じ意図(ある行のkekを
+  別の行に転用するような取り違えの防止)
+
+**lazy migration方針(ユーザー相談、2026-08-29)**: 既にidentity.dbには旧方式(個別scrypt)で登録済みの
+アドレスが一部あり、かつそれらは「全部同一passphraseで運用していた」("たくさんあるアドレスに
+それぞれpassphraseを割り振るのが非効率的だった"とのこと)ため、新規にvault方式へ統一しても運用上の
+制約にはならないと確認した。移行は別途migrationツールを作るのではなく、`unlockAllAddresses`の
+ループ内で「旧方式の行をpassphraseで復号できたら、その場でvault方式へre-wrapする」lazy migration方式を
+採用した(ユーザー提案)。理由: ①master KEKの導出はどのみち呼び出し1回につき1回だけキャッシュする設計に
+なるためre-wrap対象が何件あっても追加のscryptコストが発生しない、②2回目以降の呼び出しでは前回
+re-wrapされた行が高速パスに乗るため「使うたびに勝手に速くなる」自然な挙動になる、③別APIや別CLIコマンドを
+新設する必要がない。
+
+**vault canaryによるpassphrase誤り保護(重要、2026-08-29発覚)**: 実装レビュー中に気付いた設計上の
+落とし穴として、「vaultは既に存在するが、渡されたpassphraseがvaultの正しいものと異なる」場合の
+挙動がある。scryptは誤ったpassphraseでも必ず何らかの32byte値を返すため、これだけでは
+`derive_master_kek`の成否から正誤を判定できない。もし何も対策しなければ、たまたま「旧方式(個別scrypt)の
+行の一つ」が渡された誤ったpassphraseと一致してunlockに成功した場合、その誤ったmaster KEKで
+re-wrapが実行されてしまい、vault全体が汚染される(以後、正しいpassphraseでもvault方式の行が
+一切復号できなくなる)という重大なバグになりうる。対策として、vault作成時に既知の固定平文
+(`VAULT_CANARY_PLAINTEXT`、秘匿性は無い)をmaster KEKでAES-256-GCMラップした`canary`を
+`kdf_vault`テーブルに保存しておき、以後`unlockAllAddresses`はmaster KEK導出の直後に必ずこの
+canaryを復号できることを確認してから使う(`verify_vault_canary`)。canary検証に失敗した場合は
+「master KEKを導出できなかった」ものとして扱い、以後のループでも新規vault作成を試みない
+(`vault_exists`と`have_master_kek`を分けて管理し、「vaultは存在するが渡されたpassphraseが違う」
+場合に誤って上書きしないようにしている)。この場合、旧方式の行のうち渡されたpassphraseと
+一致するものは個別unlockはできるが、re-wrap(vaultへの統合)はスキップされる、という安全側の
+挙動になる。`tests/test_keyring.c`にこの保護が実際に効くことを検証するテストケースを追加した
+(2つ目のpassphraseで一括unlockした際、対象の行のkdf_algoが'scrypt'のまま変化しないことを確認)。
+
+**今後の課題(未着手、バックログ化)**: 実装後にユーザーから「マスターパスフレーズの変更ができない」
+「変更できるなら対称的にvault方式自体を無効化(個別管理方式へ戻す)する手段も無いと筋が通らない」との
+指摘があった。もっともな指摘であり、現行実装には以下が一切無い:
+- `changeMasterPassphrase(oldPassphrase, newPassphrase)`: 全vault-hkdf行を旧passphraseで
+  unlockし直し、新しい`vault_salt`/`canary`を作成し、全行を新master KEKでre-wrapする
+- vault方式の無効化(全vault-hkdf行を個別scrypt方式へ戻す、または`kdf_vault`行自体の削除)
+
+いずれも「vault管理系ライフサイクルAPI群」としてまとめて別セッションで着手する方針(2026-08-29、
+ユーザーと合意)。今回の`unlockAllAddresses`自体の機能には影響しない。
+
 ## 8. PyBitmessageとの差分・独自追加要件(随時追記)
 
 グランドデザイン本体との混同を避けるため、PyBitmessage標準仕様から意図的に外れる/追加する決定はここに集約する。
@@ -1320,7 +1379,11 @@ DESIGN-LOG.md参照)で新たに洗い出した項目を含め、残るのは以
     実際の送信パイプライン経由で`sent`行を挿入済みのため、件数を決め打ちせず自分が
     挿入したmsgIdを配列内から探す形にした)。ctest 39件全通過。
 
-19. **アドレスロック形式(§7)が数千件規模の一括インポート運用に対して非現実的**:
+19. ~~**アドレスロック形式(§7)が数千件規模の一括インポート運用に対して非現実的**~~:
+    2026-08-29完了。vault方式(2段階KDF)による`unlockAllAddresses`を実装した。詳細は§7.4参照。
+    以下は解決までの経緯(検討過程の記録として残す)。
+
+    **アドレスロック形式(§7)が数千件規模の一括インポート運用に対して非現実的**:
     2026-08-25、ユーザーから「後々アドレスを数千件オーダーでインポートする予定が
     あるのにこの形式は面倒くさくてしょうがない」「インポートした後にも起動のたびに
     一つ一つunlockするのが面倒くさい」との指摘で発覚。現行設計(§7.1/§7.2)は
@@ -1475,6 +1538,26 @@ DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義�
   自己認証になるTorを使ってくれ」というスタンスの方が一貫しており、TLSハンドシェイク・
   証明書生成まわりの実装/保守コストも避けられる。outbound SOCKS5・inbound onion対応が
   既にあるため、この判断でも実用上のデメリットは小さい。
+
+**2026-08-29着手中: keys.datインポート・API経由の秘密鍵インポート(WIF)・アドレス帳操作、いずれも未実装**。
+ユーザーからの質問で発覚。PyBitmessageの`keys.dat`(INI形式)を読み込んでアドレスをインポートする機能は
+コード上どこにも無く、`bitmessage.conf`(本実装独自の起動設定ファイル)とは別物。§6.2の表にある
+`importAddress`(signingWIF, encryptionWIF, storePassphrase)もコード未実装で、土台となるWIF文字列→
+秘密鍵のデコード関数自体が無い(`src/core/address.c`にあるのはエクスポート方向の`bm_address_encode_wif`
+のみ)。`address_book`テーブル(`messages_store.c`)もCREATE TABLEのスキーマ定義のみで、追加・削除・
+一覧のCRUD関数もAPIハンドラも一切無い(同型の`subscriptions`は`addSubscription`等まで完成済みなのと対照的)。
+この調査の過程で「keys.datバックアップ(1.5MB、5000件規模のアドレス)が見つかった」という話になり、
+まず一括unlockの性能問題(§7.4、上記19番で解決)を先に片付けた。keys.datパーサ・importAddress・
+アドレス帳CRUD自体は本セッションでは未着手。
+
+**vault管理系ライフサイクルAPI群(未着手、2026-08-29バックログ化)**: §7.4のvault方式実装後、
+ユーザーから「マスターパスフレーズの変更ができない」「変更できるなら対称的に無効化(個別管理方式へ
+戻す)もできないと筋が通らない」との指摘があり、いずれも現行実装に無いことを確認した。具体的には:
+- `changeMasterPassphrase(oldPassphrase, newPassphrase)`: 全`vault-hkdf`行を旧passphraseで
+  unlockし直し、新しい`vault_salt`/`canary`を作成、全行を新master KEKでre-wrapする
+- vault方式の無効化: 全`vault-hkdf`行を個別scrypt方式へ戻す、または`kdf_vault`行自体を削除する手段
+
+いずれも既存の`unlockAllAddresses`の機能には影響しないため、別セッションで着手する方針。
 
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

@@ -48,6 +48,15 @@ static const char *SCHEMA_SQL =
     "ripe BLOB PRIMARY KEY, "
     "object_hash BLOB NOT NULL, "
     "expires_time INTEGER NOT NULL"
+    ");"
+    /* §7.4 2026-08-29 単一行(id=0固定)。DESIGN.md §11-19の2段階KDF方式で全identityが
+     * 共有するvault_saltを保持する。canaryはmaster KEKの正誤検証用(identity_store.h参照)。 */
+    "CREATE TABLE IF NOT EXISTS kdf_vault ("
+    "id INTEGER PRIMARY KEY CHECK (id = 0), "
+    "kdf_algo TEXT NOT NULL DEFAULT 'scrypt', "
+    "vault_salt BLOB NOT NULL, "
+    "kdf_params TEXT NOT NULL, "
+    "canary BLOB NOT NULL"
     ");";
 
 int bm_identity_store_init_schema(sqlite3 *db)
@@ -244,4 +253,82 @@ int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, s
     *out_list = list;
     *out_count = count;
     return 0;
+}
+
+int bm_identity_store_load_vault(sqlite3 *db, unsigned char out_vault_salt[BM_IDENTITY_VAULT_SALT_LEN],
+                                  char out_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX],
+                                  unsigned char out_canary[BM_IDENTITY_WRAPPED_KEY_LEN])
+{
+    static const char *SQL = "SELECT vault_salt, kdf_params, canary FROM kdf_vault WHERE id = 0;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW)
+    {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    const void *salt = sqlite3_column_blob(stmt, 0);
+    int salt_len = sqlite3_column_bytes(stmt, 0);
+    const void *canary = sqlite3_column_blob(stmt, 2);
+    int canary_len = sqlite3_column_bytes(stmt, 2);
+    if (salt_len != BM_IDENTITY_VAULT_SALT_LEN || canary_len != BM_IDENTITY_WRAPPED_KEY_LEN)
+    {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    memcpy(out_vault_salt, salt, BM_IDENTITY_VAULT_SALT_LEN);
+    memcpy(out_canary, canary, BM_IDENTITY_WRAPPED_KEY_LEN);
+    const unsigned char *params = sqlite3_column_text(stmt, 1);
+    memset(out_kdf_params, 0, BM_IDENTITY_KDF_PARAMS_MAX);
+    if (params != NULL)
+    {
+        strncpy(out_kdf_params, (const char *)params, BM_IDENTITY_KDF_PARAMS_MAX - 1);
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int bm_identity_store_create_vault(sqlite3 *db, const unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN],
+                                    const char *kdf_params, const unsigned char canary[BM_IDENTITY_WRAPPED_KEY_LEN])
+{
+    static const char *SQL =
+        "INSERT INTO kdf_vault (id, vault_salt, kdf_params, canary) VALUES (0, ?1, ?2, ?3);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, vault_salt, BM_IDENTITY_VAULT_SALT_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, kdf_params, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 3, canary, BM_IDENTITY_WRAPPED_KEY_LEN, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_identity_store_update_wrapped_keys(sqlite3 *db, const char *address, const char *kdf_algo,
+                                           const unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN],
+                                           const unsigned char wrapped_priv_signing_key[BM_IDENTITY_WRAPPED_KEY_LEN],
+                                           const unsigned char wrapped_priv_encryption_key[BM_IDENTITY_WRAPPED_KEY_LEN])
+{
+    static const char *SQL =
+        "UPDATE identities SET kdf_algo = ?1, kdf_salt = ?2, kdf_params = '', "
+        "wrapped_priv_signing_key = ?3, wrapped_priv_encryption_key = ?4 WHERE address = ?5;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, kdf_algo, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, kdf_salt, BM_IDENTITY_KDF_SALT_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 3, wrapped_priv_signing_key, BM_IDENTITY_WRAPPED_KEY_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 4, wrapped_priv_encryption_key, BM_IDENTITY_WRAPPED_KEY_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, address, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
 }

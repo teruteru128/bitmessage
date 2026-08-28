@@ -35,6 +35,10 @@ static void print_usage(const char *prog)
             "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
             "      (自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める\n"
             "  unlock <address> <passphrase>\n"
+            "  unlock-all <passphrase>\n"
+            "      identity.db全件に対し共通passphraseでunlockを試みる。行ごとのkdf_saltは\n"
+            "      個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
+            "      戻り値は[{address, unlocked}]の配列で、どの行が不一致だったか判別できる\n"
             "  lock <address>\n"
             "  lock-all\n"
             "  delete <address>\n"
@@ -224,6 +228,18 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         bm_json_array_append(params, bm_json_new_string(argv[3]));
         return call_rpc(&env, "unlockAddress", params);
+    }
+
+    if (strcmp(cmd, "unlock-all") == 0)
+    {
+        if (argc != 3)
+        {
+            fprintf(stderr, "使い方: %s unlock-all <passphrase>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        return call_rpc(&env, "unlockAllAddresses", params);
     }
 
     if (strcmp(cmd, "lock") == 0)
