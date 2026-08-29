@@ -37,7 +37,7 @@ static void print_usage(const char *prog)
             "  import-keys-dat <keys.datのパス> <storePassphrase>\n"
             "      keys.dat(PyBitmessage本家、INI形式)を丸ごと一括インポートする。全アドレスへ\n"
             "      共通のstorePassphraseを使う(§7.4のvault方式による一括unlockを前提)。\n"
-            "      1件ずつimportAddressをHTTP経由で呼ぶため、数千件規模では数十秒〜数分かかる\n"
+            "      importAddressesBulkでKEYS_DAT_BATCH_SIZE件ずつまとめて送信する\n"
             "  join-chan <passphrase> <label> <storePassphrase>\n"
             "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
             "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
@@ -210,9 +210,18 @@ static char *trim_inplace(char *s)
 
 /*
  * §11 2026-08-29 keys.dat(PyBitmessage本家、INI/configparser形式)からの一括インポート。
- * DESIGN.md §11参照: daemonのHTTPリクエストボディには1MiBのDoS対策上限があり、1.5MB規模の
- * keys.datをAPI越しに丸ごと送る方式は取れないため、CLI側でINIをパースしてアドレスごとに
- * importAddressを個別に呼ぶ方式にした(ユーザーと合意、2026-08-29)。
+ * DESIGN.md §11/§7.4参照: daemonのHTTPリクエストボディには1MiBのDoS対策上限があり、1.5MB
+ * 規模のkeys.datをAPI越しに丸ごと送る方式は取れないため、CLI側でINIをパースする方式にした
+ * (ユーザーと合意、2026-08-29)。
+ *
+ * 【重要】当初はimportAddressをアドレスごとに個別のHTTPリクエストで呼んでいたが、実測で
+ * 5143件規模のkeys.iniを使って検証した結果、importAddressを個別に呼ぶとリクエストのたびに
+ * vaultのmaster KEK導出(scrypt)が再実行されてしまい、vault方式(§7.4)にした高速化の効果が
+ * 全く出ない(5000件で約15分)ことが判明した。そのため、entriesを`KEYS_DAT_BATCH_SIZE`件ずつ
+ * まとめてimportAddressesBulk(1回の呼び出し内でmaster KEKを1回だけ計算する)に渡す方式へ
+ * 変更した(ユーザーと合意、2026-08-29)。バッチサイズは、1エントリの平均JSONサイズ
+ * (address+WIF2つ+label等で概算600byte)から、1MiB上限に安全マージンを持って収まる件数として
+ * 決めた。
  *
  * [bitmessagesettings]等の特殊セクションは無視し、セクション名が"BM-"で始まるものだけを
  * アドレスとして扱う(PyBitmessage本家bmconfigparser.pyのaddresses()と同じ判定)。
@@ -224,6 +233,7 @@ static char *trim_inplace(char *s)
 #define KEYS_DAT_LINE_MAX 4096
 #define KEYS_DAT_FIELD_MAX 256
 #define KEYS_DAT_ADDRESS_MAX 64
+#define KEYS_DAT_BATCH_SIZE 300
 
 struct keys_dat_entry
 {
@@ -235,37 +245,80 @@ struct keys_dat_entry
     long payload_length_extra_bytes;
     int has_signing;
     int has_encryption;
+    int is_chan; /* §11 2026-08-29 keys.datの"chan = true"キー(§11 chan仕様)を再現する */
 };
 
-static void import_keys_dat_entry(const struct bm_cli_env *env, const struct keys_dat_entry *e,
-                                   const char *store_passphrase, int *imported, int *failed)
+/* batch[0..batch_count)をimportAddressesBulkで一括送信し、成否をimported/failedへ集計する */
+static void flush_keys_dat_batch(const struct bm_cli_env *env, const struct keys_dat_entry *batch,
+                                  size_t batch_count, const char *store_passphrase, int *imported, int *failed)
 {
-    bm_json_value_t *params = bm_json_new_array();
-    bm_json_array_append(params, bm_json_new_string(e->address));
-    bm_json_array_append(params, bm_json_new_string(e->signing_wif));
-    bm_json_array_append(params, bm_json_new_string(e->encryption_wif));
-    bm_json_array_append(params, bm_json_new_string(e->label));
-    bm_json_array_append(params, bm_json_new_string(store_passphrase));
-    if (e->nonce_trials_per_byte > 0)
+    if (batch_count == 0)
     {
-        bm_json_array_append(params, bm_json_new_number((double)e->nonce_trials_per_byte));
-        if (e->payload_length_extra_bytes > 0)
-        {
-            bm_json_array_append(params, bm_json_new_number((double)e->payload_length_extra_bytes));
-        }
+        return;
     }
+
+    bm_json_value_t *entries = bm_json_new_array();
+    for (size_t i = 0; i < batch_count; i++)
+    {
+        const struct keys_dat_entry *e = &batch[i];
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "address", bm_json_new_string(e->address));
+        bm_json_object_set(entry, "signingWIF", bm_json_new_string(e->signing_wif));
+        bm_json_object_set(entry, "encryptionWIF", bm_json_new_string(e->encryption_wif));
+        bm_json_object_set(entry, "label", bm_json_new_string(e->label));
+        bm_json_object_set(entry, "nonceTrialsPerByte",
+                            bm_json_new_number((double)(e->nonce_trials_per_byte > 0 ? e->nonce_trials_per_byte : 1000)));
+        bm_json_object_set(
+            entry, "payloadLengthExtraBytes",
+            bm_json_new_number((double)(e->payload_length_extra_bytes > 0 ? e->payload_length_extra_bytes : 1000)));
+        if (e->is_chan)
+        {
+            bm_json_object_set(entry, "isChan", bm_json_new_bool(1));
+        }
+        bm_json_array_append(entries, entry);
+    }
+
+    bm_json_value_t *params = bm_json_new_array();
+    bm_json_array_append(params, entries);
+    bm_json_array_append(params, bm_json_new_string(store_passphrase));
 
     char *error_msg = NULL;
     bm_json_value_t *response = NULL;
-    if (!call_rpc_raw(env, "importAddress", params, &response, &error_msg))
+    if (!call_rpc_raw(env, "importAddressesBulk", params, &response, &error_msg))
     {
-        fprintf(stderr, "スキップ: %s (%s)\n", e->address, error_msg);
+        fprintf(stderr, "バッチ全体が失敗しました(%zu件): %s\n", batch_count, error_msg);
         free(error_msg);
-        (*failed)++;
+        *failed += (int)batch_count;
         return;
     }
+
+    bm_json_value_t *result = bm_json_object_get(response, "result");
+    if (result == NULL || result->type != BM_JSON_ARRAY)
+    {
+        fprintf(stderr, "バッチ応答の形式が不正です(%zu件をスキップ扱いにします)\n", batch_count);
+        *failed += (int)batch_count;
+        bm_json_free(response);
+        return;
+    }
+
+    for (size_t i = 0; i < result->item_count; i++)
+    {
+        bm_json_value_t *item = bm_json_array_get(result, i);
+        bm_json_value_t *success_v = bm_json_object_get(item, "success");
+        if (success_v != NULL && success_v->type == BM_JSON_BOOL && success_v->boolean)
+        {
+            (*imported)++;
+        }
+        else
+        {
+            const char *addr = bm_json_as_string(bm_json_object_get(item, "address"));
+            const char *err = bm_json_as_string(bm_json_object_get(item, "error"));
+            fprintf(stderr, "スキップ: %s (%s)\n", addr != NULL ? addr : "?",
+                    err != NULL ? err : "不明なエラー");
+            (*failed)++;
+        }
+    }
     bm_json_free(response);
-    (*imported)++;
 }
 
 static int import_keys_dat(const struct bm_cli_env *env, const char *path, const char *store_passphrase)
@@ -284,6 +337,9 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
     int failed = 0;
     int skipped_no_keys = 0;
     char line[KEYS_DAT_LINE_MAX];
+
+    struct keys_dat_entry *batch = malloc(sizeof(*batch) * KEYS_DAT_BATCH_SIZE);
+    size_t batch_count = 0;
 
     while (fgets(line, sizeof(line), f) != NULL)
     {
@@ -304,7 +360,12 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
             {
                 if (cur.has_signing && cur.has_encryption)
                 {
-                    import_keys_dat_entry(env, &cur, store_passphrase, &imported, &failed);
+                    batch[batch_count++] = cur;
+                    if (batch_count >= KEYS_DAT_BATCH_SIZE)
+                    {
+                        flush_keys_dat_batch(env, batch, batch_count, store_passphrase, &imported, &failed);
+                        batch_count = 0;
+                    }
                 }
                 else
                 {
@@ -364,6 +425,10 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
         {
             cur.payload_length_extra_bytes = atol(value);
         }
+        else if (strcasecmp(key, "chan") == 0)
+        {
+            cur.is_chan = (strcasecmp(value, "true") == 0);
+        }
     }
 
     /* ファイル末尾が別セクションの見出しで終わらない場合、最後のセクションはループ内の
@@ -372,13 +437,15 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
     {
         if (cur.has_signing && cur.has_encryption)
         {
-            import_keys_dat_entry(env, &cur, store_passphrase, &imported, &failed);
+            batch[batch_count++] = cur;
         }
         else
         {
             skipped_no_keys++;
         }
     }
+    flush_keys_dat_batch(env, batch, batch_count, store_passphrase, &imported, &failed);
+    free(batch);
 
     fclose(f);
 

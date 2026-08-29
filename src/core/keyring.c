@@ -319,15 +319,21 @@ static int rewrap_to_vault(sqlite3 *db, bm_keyring_t *kr, const char *address,
                                                   wrapped_signing, wrapped_encryption);
 }
 
-int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *label,
-                                int address_version, int stream,
-                                const unsigned char pub_signing[65],
-                                const unsigned char pub_encryption[65],
-                                const unsigned char priv_signing[32],
-                                const unsigned char priv_encryption[32],
-                                const char *passphrase,
-                                uint64_t nonce_trials_per_byte,
-                                uint64_t payload_length_extra_bytes)
+/*
+ * §11 2026-08-29 KEKが既に分かっている状態でidentities行を組み立てて保存する共通部分
+ * (bm_keyring_create_identity(scrypt方式)/bm_keyring_import_identity(vault方式)の
+ * 重複を統合するため抽出した)。kdf_paramsはvault-hkdf方式では使わないので空文字列でよい。
+ */
+static int store_new_identity_with_kek(sqlite3 *db, const char *address, const char *label,
+                                        int address_version, int stream,
+                                        const unsigned char pub_signing[65],
+                                        const unsigned char pub_encryption[65],
+                                        const unsigned char priv_signing[32],
+                                        const unsigned char priv_encryption[32],
+                                        const char *kdf_algo,
+                                        const unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN],
+                                        const char *kdf_params, const unsigned char kek[32],
+                                        uint64_t nonce_trials_per_byte, uint64_t payload_length_extra_bytes)
 {
     struct bm_identity_row row;
     memset(&row, 0, sizeof(row));
@@ -339,25 +345,13 @@ int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *lab
     row.stream = stream;
     memcpy(row.signing_pubkey, pub_signing, 65);
     memcpy(row.encryption_pubkey, pub_encryption, 65);
-    strncpy(row.kdf_algo, "scrypt", BM_IDENTITY_KDF_ALGO_MAX - 1);
-
-    if (RAND_bytes(row.kdf_salt, BM_IDENTITY_KDF_SALT_LEN) != 1)
-    {
-        return -1;
-    }
-    snprintf(row.kdf_params, BM_IDENTITY_KDF_PARAMS_MAX, "{\"N\":%llu,\"r\":%u,\"p\":%u}",
-             (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
-
-    unsigned char kek[32];
-    if (derive_kek(passphrase, row.kdf_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P, kek) != 0)
-    {
-        return -1;
-    }
+    strncpy(row.kdf_algo, kdf_algo, BM_IDENTITY_KDF_ALGO_MAX - 1);
+    memcpy(row.kdf_salt, kdf_salt, BM_IDENTITY_KDF_SALT_LEN);
+    strncpy(row.kdf_params, kdf_params, BM_IDENTITY_KDF_PARAMS_MAX - 1);
 
     size_t addr_len = strlen(address);
     int rc1 = aes256gcm_wrap(kek, (const unsigned char *)address, addr_len, priv_signing, row.wrapped_priv_signing_key);
     int rc2 = aes256gcm_wrap(kek, (const unsigned char *)address, addr_len, priv_encryption, row.wrapped_priv_encryption_key);
-    OPENSSL_cleanse(kek, sizeof(kek));
     if (rc1 != 0 || rc2 != 0)
     {
         return -1;
@@ -370,6 +364,177 @@ int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *lab
     return bm_identity_store_insert(db, &row);
 }
 
+int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *label,
+                                int address_version, int stream,
+                                const unsigned char pub_signing[65],
+                                const unsigned char pub_encryption[65],
+                                const unsigned char priv_signing[32],
+                                const unsigned char priv_encryption[32],
+                                const char *passphrase,
+                                uint64_t nonce_trials_per_byte,
+                                uint64_t payload_length_extra_bytes)
+{
+    unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN];
+    if (RAND_bytes(kdf_salt, sizeof(kdf_salt)) != 1)
+    {
+        return -1;
+    }
+    char kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+    snprintf(kdf_params, sizeof(kdf_params), "{\"N\":%llu,\"r\":%u,\"p\":%u}",
+             (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
+
+    unsigned char kek[32];
+    if (derive_kek(passphrase, kdf_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P, kek) != 0)
+    {
+        return -1;
+    }
+    int rc = store_new_identity_with_kek(db, address, label, address_version, stream, pub_signing, pub_encryption,
+                                          priv_signing, priv_encryption, "scrypt", kdf_salt, kdf_params, kek,
+                                          nonce_trials_per_byte, payload_length_extra_bytes);
+    OPENSSL_cleanse(kek, sizeof(kek));
+    return rc;
+}
+
+/*
+ * §11 2026-08-29 vaultのmaster KEKを解決する(importAddress/importAddressesBulk共通)。
+ * vaultが既にあればpassphraseから導出してcanary検証、無ければこの呼び出しで新規vault作成
+ * (1回だけscrypt)する。passphraseがvaultの既存passphraseと一致しない場合(canary検証失敗)は
+ * 非0を返す(誤ったmaster KEKでの保存は行わない、unlockAllAddressesのvault保護と同じ理由)。
+ * 成功時0、*out_master_kekに32byteのmaster KEKを設定する(呼び出し側で使い終わったら
+ * OPENSSL_cleanseすること)。
+ */
+int bm_keyring_resolve_or_create_vault_master_kek(sqlite3 *db, const char *passphrase,
+                                                   unsigned char out_master_kek[32])
+{
+    unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+    char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+    unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+    int vault_exists = (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) == 0);
+
+    if (vault_exists)
+    {
+        return (derive_master_kek(passphrase, vault_salt, vault_kdf_params, out_master_kek) == 0
+                && verify_vault_canary(out_master_kek, vault_canary) == 0) ? 0 : -1;
+    }
+
+    if (RAND_bytes(vault_salt, sizeof(vault_salt)) != 1)
+    {
+        return -1;
+    }
+    snprintf(vault_kdf_params, sizeof(vault_kdf_params), "{\"N\":%llu,\"r\":%u,\"p\":%u}",
+             (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
+    unsigned char canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+    if (derive_kek(passphrase, vault_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P,
+                    out_master_kek) != 0
+        || aes256gcm_wrap(out_master_kek, VAULT_CANARY_AAD, sizeof(VAULT_CANARY_AAD) - 1, VAULT_CANARY_PLAINTEXT,
+                           canary) != 0
+        || bm_identity_store_create_vault(db, vault_salt, vault_kdf_params, canary) != 0)
+    {
+        OPENSSL_cleanse(out_master_kek, 32);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * §11 2026-08-29 既に分かっているmaster KEKを使い、1件のidentityをvault方式で保存する
+ * (scryptを伴わない軽量パス)。importAddressesBulkがループの中でmaster KEKを1回だけ計算して
+ * 使い回すために分離した(実測: importAddressを個別のHTTPリクエストで1件ずつ呼ぶと、
+ * リクエストのたびにvaultのmaster KEK導出が再実行され、vault方式にした効果が出ない
+ * ことが判明したため)。成功時0。
+ */
+int bm_keyring_import_identity_with_master_kek(sqlite3 *db, const char *address, const char *label,
+                                                int address_version, int stream,
+                                                const unsigned char pub_signing[65],
+                                                const unsigned char pub_encryption[65],
+                                                const unsigned char priv_signing[32],
+                                                const unsigned char priv_encryption[32],
+                                                const unsigned char master_kek[32],
+                                                uint64_t nonce_trials_per_byte,
+                                                uint64_t payload_length_extra_bytes)
+{
+    unsigned char row_salt[BM_IDENTITY_KDF_SALT_LEN];
+    if (RAND_bytes(row_salt, sizeof(row_salt)) != 1)
+    {
+        return -1;
+    }
+    unsigned char kek[32];
+    if (hkdf_expand_wrap_key(master_kek, row_salt, address, kek) != 0)
+    {
+        return -1;
+    }
+
+    int rc = store_new_identity_with_kek(db, address, label, address_version, stream, pub_signing, pub_encryption,
+                                          priv_signing, priv_encryption, "vault-hkdf", row_salt, "", kek,
+                                          nonce_trials_per_byte, payload_length_extra_bytes);
+    OPENSSL_cleanse(kek, sizeof(kek));
+    return rc;
+}
+
+/*
+ * §11 2026-08-29 importAddress専用(単発呼び出し向け)。DESIGN.md §7.4参照。5000件規模の
+ * 一括インポートではimportAddressesBulk(master KEKをループ全体で1回だけ計算)を使うこと
+ * (このAPIを1件ずつ個別に呼ぶと、呼び出しのたびにmaster KEK導出=scryptが再実行される)。
+ */
+int bm_keyring_import_identity(sqlite3 *db, const char *address, const char *label,
+                                int address_version, int stream,
+                                const unsigned char pub_signing[65],
+                                const unsigned char pub_encryption[65],
+                                const unsigned char priv_signing[32],
+                                const unsigned char priv_encryption[32],
+                                const char *passphrase,
+                                uint64_t nonce_trials_per_byte,
+                                uint64_t payload_length_extra_bytes)
+{
+    unsigned char master_kek[32];
+    if (bm_keyring_resolve_or_create_vault_master_kek(db, passphrase, master_kek) != 0)
+    {
+        return -1;
+    }
+    int rc = bm_keyring_import_identity_with_master_kek(db, address, label, address_version, stream, pub_signing,
+                                                          pub_encryption, priv_signing, priv_encryption, master_kek,
+                                                          nonce_trials_per_byte, payload_length_extra_bytes);
+    OPENSSL_cleanse(master_kek, sizeof(master_kek));
+    return rc;
+}
+
+/*
+ * §11 2026-08-29 identities行のkdf_algoに応じてKEKを解決する共通処理
+ * (bm_keyring_unlock/bm_keyring_exportの重複を統合、importAddressのvault方式対応で
+ * bm_keyring_unlockもvault-hkdf行を扱えるようにする必要が生じたため抽出した)。
+ * 'vault-hkdf'ならvaultをロード・canary検証してからHKDF-Expand、それ以外('scrypt')は
+ * 従来通り行固有のsalt+kdf_paramsで直接scrypt。成功時0。
+ */
+static int resolve_kek_for_row(sqlite3 *db, const struct bm_identity_row *row, const char *passphrase,
+                                unsigned char out_kek[32])
+{
+    if (strcmp(row->kdf_algo, "vault-hkdf") == 0)
+    {
+        unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+        char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+        unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+        unsigned char master_kek[32];
+        if (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) != 0
+            || derive_master_kek(passphrase, vault_salt, vault_kdf_params, master_kek) != 0
+            || verify_vault_canary(master_kek, vault_canary) != 0)
+        {
+            return -1;
+        }
+        int rc = hkdf_expand_wrap_key(master_kek, row->kdf_salt, row->address, out_kek);
+        OPENSSL_cleanse(master_kek, sizeof(master_kek));
+        return rc;
+    }
+
+    uint64_t n = 0;
+    unsigned int r = 0;
+    unsigned int p = 0;
+    if (parse_kdf_params(row->kdf_params, &n, &r, &p) != 0)
+    {
+        return -1;
+    }
+    return derive_kek(passphrase, row->kdf_salt, n, r, p, out_kek);
+}
+
 int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const char *passphrase)
 {
     struct bm_identity_row row;
@@ -378,16 +543,8 @@ int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const 
         return -1;
     }
 
-    uint64_t n = 0;
-    unsigned int r = 0;
-    unsigned int p = 0;
-    if (parse_kdf_params(row.kdf_params, &n, &r, &p) != 0)
-    {
-        return -1;
-    }
-
     unsigned char kek[32];
-    if (derive_kek(passphrase, row.kdf_salt, n, r, p, kek) != 0)
+    if (resolve_kek_for_row(db, &row, passphrase, kek) != 0)
     {
         return -1;
     }
@@ -406,35 +563,9 @@ int bm_keyring_export(sqlite3 *db, const char *address, const char *passphrase,
     }
 
     unsigned char kek[32];
-    if (strcmp(row.kdf_algo, "vault-hkdf") == 0)
+    if (resolve_kek_for_row(db, &row, passphrase, kek) != 0)
     {
-        unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
-        char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
-        unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
-        unsigned char master_kek[32];
-        if (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) != 0
-            || derive_master_kek(passphrase, vault_salt, vault_kdf_params, master_kek) != 0
-            || verify_vault_canary(master_kek, vault_canary) != 0)
-        {
-            return -1;
-        }
-        int rc = hkdf_expand_wrap_key(master_kek, row.kdf_salt, address, kek);
-        OPENSSL_cleanse(master_kek, sizeof(master_kek));
-        if (rc != 0)
-        {
-            return -1;
-        }
-    }
-    else
-    {
-        uint64_t n = 0;
-        unsigned int r = 0;
-        unsigned int p = 0;
-        if (parse_kdf_params(row.kdf_params, &n, &r, &p) != 0
-            || derive_kek(passphrase, row.kdf_salt, n, r, p, kek) != 0)
-        {
-            return -1;
-        }
+        return -1;
     }
 
     size_t addr_len = strlen(address);

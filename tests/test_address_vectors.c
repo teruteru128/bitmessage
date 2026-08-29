@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../src/common/base58.h"
+#include "../src/common/hash.h"
 #include "../src/core/address.h"
 
 static void hex_encode(const unsigned char *data, size_t len, char *out)
@@ -86,6 +88,55 @@ int main(void)
     }
     printf("OK: v4 address decode round-trip matched (%s)\n", addr4);
     free(addr4);
+
+    /*
+     * §11 2026-08-29 5143件規模のkeys.datインポート実地検証で発見した非正規アドレスの
+     * decode救済を確認する。本家PyBitmessage・このプロジェクトのbm_address_encodeは共に
+     * version2/3で先頭ゼロを最大2byteまでしか圧縮しない仕様だが、実際には4byte分のゼロを
+     * 圧縮した非正規のversion3アドレス(チェックサムは正常な実在のアドレス)が見つかった。
+     * bm_address_encodeでは(常に20byte入力かつ最大2byte圧縮の)正規アドレスしか作れないため、
+     * ここではvarint+ripe(16byte、4byte圧縮相当)+checksumを手動で組み立てて非正規アドレスを
+     * 合成し、decode側が(20-16)=4byte分のゼロを正しく補って復元することを確認する。
+     */
+    {
+        unsigned char nonstandard_ripe[BM_RIPE_LEN];
+        memset(nonstandard_ripe, 0, 4);
+        memcpy(nonstandard_ripe + 4, addr.ripe + 4, BM_RIPE_LEN - 4);
+
+        unsigned char payload[32];
+        size_t off = 0;
+        payload[off++] = 3; /* varint(3): 1byte(値<0xfd) */
+        payload[off++] = 1; /* varint(1): 1byte */
+        memcpy(payload + off, nonstandard_ripe + 4, BM_RIPE_LEN - 4);
+        off += BM_RIPE_LEN - 4;
+
+        unsigned char checksum[64];
+        bm_double_sha512(payload, off, checksum);
+        memcpy(payload + off, checksum, 4);
+        off += 4;
+
+        char *b58 = bm_base58_encode(payload, off);
+        if (b58 == NULL)
+        {
+            fprintf(stderr, "FAIL: base58 encode of synthetic non-standard address\n");
+            return EXIT_FAILURE;
+        }
+        char nonstandard_addr[128];
+        snprintf(nonstandard_addr, sizeof(nonstandard_addr), "BM-%s", b58);
+        free(b58);
+
+        uint64_t v = 0, s = 0;
+        unsigned char decoded_ripe[BM_RIPE_LEN];
+        if (bm_address_decode(nonstandard_addr, &v, &s, decoded_ripe) != 0 || v != 3 || s != 1
+            || memcmp(decoded_ripe, nonstandard_ripe, BM_RIPE_LEN) != 0)
+        {
+            fprintf(stderr, "FAIL: non-standard v3 address (4+ leading zero bytes) should decode "
+                            "with zero-padding (%s)\n",
+                    nonstandard_addr);
+            return EXIT_FAILURE;
+        }
+        printf("OK: non-standard v3 address with 4+ leading zero bytes decodes correctly\n");
+    }
 
     /* 不正な入力の拒否も確認(base58として不正な文字、checksum改竄) */
     if (bm_address_decode("BM-not_valid_base58!!!", &dec_version, &dec_stream, dec_ripe) == 0)

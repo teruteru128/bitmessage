@@ -169,10 +169,38 @@ privsigningkey = $SIGNING_WIF
 privencryptionkey = $ENCRYPTION_WIF
 EOF
 
-IMPORT_KEYS_DAT_OUTPUT=$("$CLI" import-keys-dat test_keys.dat "keysdatpass")
+# §7.4のvault方式ではimportAddressは共有vaultへ保存するため、最初のimport-address
+# (上記、"newpass5")でvaultのpassphraseが確定している。以後のimport-keys-datも同じ
+# passphraseでないとvault canary検証に落ちて失敗する(誤ったmaster KEKでの保存を防ぐ
+# ための意図した挙動、DESIGN.md §7.4参照)ため、ここでも"newpass5"を使う。
+IMPORT_KEYS_DAT_OUTPUT=$("$CLI" import-keys-dat test_keys.dat "newpass5")
 echo "$IMPORT_KEYS_DAT_OUTPUT" | grep -q "成功1件, 失敗0件" \
     || fail "import-keys-dat should report 1 success (got: $IMPORT_KEYS_DAT_OUTPUT)"
-[ "$("$CLI" unlock "$ADDR5" "keysdatpass")" = "true" ] || fail "unlock after import-keys-dat should succeed"
+[ "$("$CLI" unlock "$ADDR5" "newpass5")" = "true" ] || fail "unlock after import-keys-dat should succeed"
+
+# import-keys-datの"chan = true"キー(§11 chan仕様)がisChanとして再現されること
+LIST_AFTER_IMPORT=$("$CLI" list-addresses)
+echo "$LIST_AFTER_IMPORT" | grep -q "\"isChan\":false" \
+    || fail "non-chan entry should have isChan:false (got: $LIST_AFTER_IMPORT)"
+"$CLI" delete "$ADDR5" >/dev/null
+
+cat > test_keys_chan.dat <<EOF
+[$ADDR5]
+label = reimported chan via keys.dat
+enabled = true
+chan = true
+noncetrialsperbyte = 1000
+payloadlengthextrabytes = 1000
+privsigningkey = $SIGNING_WIF
+privencryptionkey = $ENCRYPTION_WIF
+EOF
+
+IMPORT_CHAN_OUTPUT=$("$CLI" import-keys-dat test_keys_chan.dat "newpass5")
+echo "$IMPORT_CHAN_OUTPUT" | grep -q "成功1件, 失敗0件" \
+    || fail "import-keys-dat (chan) should report 1 success (got: $IMPORT_CHAN_OUTPUT)"
+LIST_AFTER_CHAN_IMPORT=$("$CLI" list-addresses)
+echo "$LIST_AFTER_CHAN_IMPORT" | grep -q "\"isChan\":true" \
+    || fail "chan = true entry should be imported with isChan:true (got: $LIST_AFTER_CHAN_IMPORT)"
 "$CLI" delete "$ADDR5" >/dev/null
 
 # アドレス帳(address_book) CRUD

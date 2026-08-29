@@ -408,7 +408,7 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
 
 /*
  * §11 2026-08-29 importAddress: [address, signingWIF, encryptionWIF, label, storePassphrase,
- * nonceTrialsPerByte?, payloadLengthExtraBytes?]
+ * nonceTrialsPerByte?, payloadLengthExtraBytes?, isChan?]
  *
  * DESIGN.md §6.2の当初案は[signingWIF, encryptionWIF, storePassphrase]だったが、WIFは秘密鍵の
  * みでaddressVersion/streamを含まないため、addressそのものを引数に取る形に確定した(keys.dat
@@ -416,6 +416,10 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
  * 直接インポートするAPI/UIが存在しない(決定論的/ランダム生成経由の保存のみ、2026-08-29調査)ため
  * 本実装独自の拡張。addressから復元したripeとWIFから導出した公開鍵のripeが一致するかを
  * 検証することで、address文字列とWIFの組み合わせ誤りを検出する。
+ *
+ * isChan(2026-08-29追記): ユーザーの指摘で発覚。keys.datインポート対象にchanアドレスが
+ * 含まれる場合、is_chanフラグ(§11 chan仕様、暗号的には無意味だがUI/listAddressesの表示用
+ * 識別フラグ)を再現できないと片手落ちになるため追加した。省略時false(通常アドレス扱い)。
  */
 static bm_json_value_t *h_importAddress(const struct bm_api_server_config *config,
                                          const bm_json_value_t *params, char **out_error)
@@ -427,6 +431,7 @@ static bm_json_value_t *h_importAddress(const struct bm_api_server_config *confi
     const char *store_passphrase = param_str(params, 4);
     const bm_json_value_t *nonce_trials_v = bm_json_array_get(params, 5);
     const bm_json_value_t *payload_extra_v = bm_json_array_get(params, 6);
+    const bm_json_value_t *is_chan_v = bm_json_array_get(params, 7);
 
     if (address == NULL || signing_wif == NULL || encryption_wif == NULL || store_passphrase == NULL)
     {
@@ -475,16 +480,139 @@ static bm_json_value_t *h_importAddress(const struct bm_api_server_config *confi
     uint64_t payload_extra = (payload_extra_v != NULL)
         ? (uint64_t)bm_json_as_number(payload_extra_v) : config->default_payload_length_extra_bytes;
 
-    int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
+    /* §11 2026-08-29 実測でscrypt(N=2^15)は1回161msかかり、5000件規模のkeys.datインポートを
+     * bm_keyring_create_identity(個別scrypt)で行うと約17分かかることが判明したため、
+     * importAddressはvault方式(§7.4)で保存する(bm_keyring_import_identity)。 */
+    int rc = bm_keyring_import_identity(config->identity_db, address, label != NULL ? label : "",
                                          (int)version, (int)stream, pub_signing, pub_encryption,
                                          priv_signing, priv_encryption, store_passphrase,
                                          nonce_trials, payload_extra);
     if (rc != 0)
     {
-        *out_error = dup_cstr("failed to store identity (duplicate address?)");
+        *out_error = dup_cstr("failed to store identity (duplicate address, or storePassphrase "
+                              "does not match the existing vault passphrase?)");
         return NULL;
     }
+    if (is_chan_v != NULL && is_chan_v->type == BM_JSON_BOOL && is_chan_v->boolean)
+    {
+        bm_keyring_mark_as_chan(config->identity_db, address);
+    }
     return bm_json_new_bool(1);
+}
+
+/*
+ * §11 2026-08-29 importAddressesBulk: [entries, storePassphrase]
+ * entries = [{address, signingWIF, encryptionWIF, label?, nonceTrialsPerByte?,
+ *             payloadLengthExtraBytes?, isChan?}, ...]
+ *
+ * 実測で判明した問題への対応: importAddressを1件ずつ個別のHTTPリクエストで呼ぶと、
+ * リクエストごとにvaultのmaster KEK導出(scrypt、約161ms)が再実行されてしまい、
+ * vault方式にした高速化の効果が全く出ない(5000件で約15分、単純ループ版と大差ない)。
+ * このAPIは1回の呼び出し内でmaster KEKを1回だけ導出し、全entriesのHKDF-Expandに使い回す。
+ * 戻り値は各entryの成否配列[{address, success, error?}]。1件の失敗(WIF不正・アドレス
+ * 重複等)は他のentryの処理を中断しない。CLI(import-keys-dat)はHTTPリクエストボディの
+ * 1MiB上限(MAX_REQUEST_SIZE)に収まるようentriesを数百件単位のチャンクに分けて
+ * このAPIを複数回呼ぶ想定。
+ */
+static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config *config,
+                                               const bm_json_value_t *params, char **out_error)
+{
+    const bm_json_value_t *entries = bm_json_array_get(params, 0);
+    const char *store_passphrase = param_str(params, 1);
+    if (entries == NULL || entries->type != BM_JSON_ARRAY || store_passphrase == NULL)
+    {
+        *out_error = dup_cstr("importAddressesBulk requires [entries, storePassphrase]");
+        return NULL;
+    }
+
+    unsigned char master_kek[32];
+    if (bm_keyring_resolve_or_create_vault_master_kek(config->identity_db, store_passphrase, master_kek) != 0)
+    {
+        *out_error = dup_cstr("storePassphrase does not match the existing vault passphrase");
+        return NULL;
+    }
+
+    bm_json_value_t *results = bm_json_new_array();
+    for (size_t i = 0; i < entries->item_count; i++)
+    {
+        const bm_json_value_t *entry = bm_json_array_get(entries, i);
+        const char *address = bm_json_as_string(bm_json_object_get(entry, "address"));
+        const char *signing_wif = bm_json_as_string(bm_json_object_get(entry, "signingWIF"));
+        const char *encryption_wif = bm_json_as_string(bm_json_object_get(entry, "encryptionWIF"));
+        const char *label = bm_json_as_string(bm_json_object_get(entry, "label"));
+        const bm_json_value_t *nonce_v = bm_json_object_get(entry, "nonceTrialsPerByte");
+        const bm_json_value_t *payload_v = bm_json_object_get(entry, "payloadLengthExtraBytes");
+        const bm_json_value_t *is_chan_v = bm_json_object_get(entry, "isChan");
+
+        bm_json_value_t *result_entry = bm_json_new_object();
+        bm_json_object_set(result_entry, "address", bm_json_new_string(address != NULL ? address : "(missing)"));
+
+        const char *err = NULL;
+        uint64_t version = 0;
+        uint64_t stream = 0;
+        unsigned char ripe_from_address[BM_RIPE_LEN];
+        unsigned char priv_signing[BM_PRIVATE_KEY_LEN];
+        unsigned char priv_encryption[BM_PRIVATE_KEY_LEN];
+        unsigned char pub_signing[BM_PUBLIC_KEY_LEN];
+        unsigned char pub_encryption[BM_PUBLIC_KEY_LEN];
+
+        if (address == NULL || signing_wif == NULL || encryption_wif == NULL)
+        {
+            err = "missing address/signingWIF/encryptionWIF";
+        }
+        else if (bm_address_decode(address, &version, &stream, ripe_from_address) != 0)
+        {
+            err = "invalid address";
+        }
+        else if (bm_address_decode_wif(signing_wif, priv_signing) != 0
+                 || bm_address_decode_wif(encryption_wif, priv_encryption) != 0)
+        {
+            err = "invalid WIF";
+        }
+        else if (bm_address_get_public_key(priv_signing, pub_signing) != 0
+                 || bm_address_get_public_key(priv_encryption, pub_encryption) != 0)
+        {
+            err = "failed to derive public key from WIF";
+        }
+        else
+        {
+            unsigned char ripe_computed[BM_RIPE_LEN];
+            bm_address_calc_ripe(pub_signing, pub_encryption, ripe_computed);
+            if (memcmp(ripe_computed, ripe_from_address, BM_RIPE_LEN) != 0)
+            {
+                err = "WIF keys do not match the given address";
+            }
+        }
+
+        if (err == NULL)
+        {
+            uint64_t nonce_trials = (nonce_v != NULL) ? (uint64_t)bm_json_as_number(nonce_v)
+                                                        : config->default_nonce_trials_per_byte;
+            uint64_t payload_extra = (payload_v != NULL) ? (uint64_t)bm_json_as_number(payload_v)
+                                                            : config->default_payload_length_extra_bytes;
+            int rc = bm_keyring_import_identity_with_master_kek(
+                config->identity_db, address, label != NULL ? label : "", (int)version, (int)stream, pub_signing,
+                pub_encryption, priv_signing, priv_encryption, master_kek, nonce_trials, payload_extra);
+            if (rc != 0)
+            {
+                err = "failed to store identity (duplicate address?)";
+            }
+            else if (is_chan_v != NULL && is_chan_v->type == BM_JSON_BOOL && is_chan_v->boolean)
+            {
+                bm_keyring_mark_as_chan(config->identity_db, address);
+            }
+        }
+
+        bm_json_object_set(result_entry, "success", bm_json_new_bool(err == NULL));
+        if (err != NULL)
+        {
+            bm_json_object_set(result_entry, "error", bm_json_new_string(err));
+        }
+        bm_json_array_append(results, result_entry);
+    }
+
+    OPENSSL_cleanse(master_kek, sizeof(master_kek));
+    return results;
 }
 
 /*
@@ -1265,6 +1393,7 @@ static const struct bm_api_method METHODS[] = {
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
     {"importAddress", h_importAddress},
+    {"importAddressesBulk", h_importAddressesBulk},
     {"joinChan", h_joinChan},
     {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},

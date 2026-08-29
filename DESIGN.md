@@ -382,6 +382,35 @@ checksum = double_sha512(storedBinaryData)[0:4]
 address = "BM-" + base58encode(storedBinaryData || checksum)
 ```
 
+**2026-08-29追記: version2/3アドレスのdecode時ゼロパディングを2byte固定から可変長に一般化**。
+5143件規模の実keys.dat(ユーザーの実データ)を`importAddress`経由でインポートする実地検証中に、
+`bm_address_decode`(旧実装、`ripe_data_len`が18/19/20の3ケースのみ許容)で3件が
+"invalid address"/"WIF keys do not match"エラーになった。原因を調査した結果、そのうち2件
+(チェックサムは正常、実在の本物のアドレス)は**version=3・ripe_data_len=16(4byte分のゼロを
+圧縮)という非正規のアドレス**だった。上記encodeAddressの規則が示す通り、本家PyBitmessage・
+このプロジェクトのbm_address_encodeは共にversion2/3で先頭ゼロを最大2byteまでしか圧縮しない
+仕様であり、本家`decodeAddress`(`addresses.py`)も`len(embeddedRipeData) < 18`を明示的に
+`'ripetooshort'`エラーにしている。つまりこれは本家の標準的な生成経路(GUIの「もっと短い
+アドレス」オプションはnull_bytes=2までしか選べない)では作られないはずのアドレスだが、
+ユーザーが実験的に(`class_addressGenerator.py`を直接操作する等で)4byte分のゼロを持つripeを
+探索して意図的に生成していたことが判明した(確率1/2^32、探索に相当な計算時間を要したはず)。
+
+実害のある実在アドレスのため、生成側(`bm_address_encode`)は本家仕様のまま変更せず、
+decode側だけ寛容にして救済する方針にした(ユーザーと合意)。`bm_address_decode`の
+version2/3分岐を、18/19/20の3ケース限定から「`ripe_data_len`が0〜20byteの任意の長さでも
+先頭に`(20-ripe_data_len)`byte分のゼロを補って復元する」という一般化された処理に変更した
+(v4の「先頭ゼロを全て除去/復元」ロジックと同じ考え方)。`tests/test_address_vectors.c`に、
+varint+ripe(16byte)+checksumを手動で組み立てて非正規アドレスを合成し、正しくdecodeできる
+ことを確認するテストを追加した。
+
+なお、この検証で同時に見つかった別の1件("BM-GtE4KjZbHfpvD3pRVpzKFJwbeGPdJWNZ"、version3・
+ripe_data_len=18=正規範囲内)は、上記の4byte圧縮版と全く同じripeにdecodeされるにも関わらず、
+対応するWIF鍵から計算した公開鍵のripeとは一致しなかった。ユーザーへの確認の結果、これは
+同じripeに対してversion4・正規圧縮version3・非正規圧縮version3の3種類の表現を実験的に
+作っていた際の、既に使われていない重複エントリと判明した(「今回に限って」無視することで
+合意、2026-08-29)。実害(到達不能になるアドレス)は無い(version4・非正規圧縮version3の
+2つは正常にインポートできている)。
+
 ### 3.4 ハッシュ関数まとめ
 
 | 用途 | アルゴリズム |
@@ -934,6 +963,40 @@ canaryを復号できることを確認してから使う(`verify_vault_canary`)
 
 いずれも「vault管理系ライフサイクルAPI群」としてまとめて別セッションで着手する方針(2026-08-29、
 ユーザーと合意)。今回の`unlockAllAddresses`自体の機能には影響しない。
+
+### 7.5 importAddressesBulk — importAddressの一括呼び出しでvault化の効果が出ない問題の解決(2026-08-29)
+
+**実装済み(`src/core/keyring.c`の`bm_keyring_resolve_or_create_vault_master_kek`/
+`bm_keyring_import_identity_with_master_kek`、`src/core/api_server.c`の
+`importAddressesBulk`、CLIの`import-keys-dat`)。**
+
+ユーザーの実keys.dat(5143件、1.5MB)を使った実地検証で発覚した問題。§7.4でimportAddressを
+vault方式に切り替えたにも関わらず、CLIの`import-keys-dat`が`importAddress`を1件ずつ個別の
+HTTPリクエストで呼ぶ実装のままだったため、**リクエストのたびにvaultのmaster KEK導出
+(scrypt、実測161ms)が再実行されてしまい**、vault化の効果が全く出ていなかった(実測: 10件で
+1.77秒、5143件では単純ループ版とほぼ同じ約15分の見積もりになった)。これは§11-19で
+`unlockAllAddresses`について既に解決したのと全く同じ問題(「ループの各要素ごとに独立して
+重いKDFを再実行してしまう」)が、importAddressの文脈で再発したもの。
+
+対策として`unlockAllAddresses`と同じパターンを踏襲し、複数エントリをまとめて1回のAPI呼び出しで
+処理する`importAddressesBulk(entries, storePassphrase)`を新設した。1回の呼び出し内でmaster KEKを
+`bm_keyring_resolve_or_create_vault_master_kek`で1回だけ計算し、各entryは
+`bm_keyring_import_identity_with_master_kek`(scryptを伴わない軽量パス)で処理する。CLIの
+`import-keys-dat`は、daemonのHTTPリクエストボディ1MiB上限(§11参照)に収まるよう、
+`KEYS_DAT_BATCH_SIZE`(300件、1エントリの概算JSONサイズ600byteから安全マージンを見て決定)
+件ずつバッチに分けて呼び出す方式に変更した。既存の単発`importAddress`はそのまま残し
+(1件だけインポートする場合はこちらでよい、内部は`bm_keyring_resolve_or_create_vault_master_kek`
+→`bm_keyring_import_identity_with_master_kek`の組み合わせとして再実装)、複数件をこれで
+個別に何度も呼んではいけない旨をヘッダコメントに明記した。
+
+**実測結果(2026-08-29、ユーザー提供の実keys.dat 5143件で検証)**:
+- `import-keys-dat`(バッチ化後): 約15秒(5140〜5142件成功、失敗はアドレスデータ自体の
+  問題2〜3件、§3.3のdecode寛容化とは別途参照)
+- `unlock-all`(vault方式、5142件全件が最初からvault-hkdfで保存済みの状態): **0.6秒**
+  (2回目の呼び出しは既にunlock済みのためさらに高速、0.3秒)
+
+これで§11-19発端の「5000件規模のkeys.datインポート・一括unlock」という目標が実測でも
+達成されたことを確認した。
 
 ## 8. PyBitmessageとの差分・独自追加要件(随時追記)
 
@@ -1571,11 +1634,28 @@ DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義�
   (§7.4のvault方式が単一passphraseでの一括unlockを前提にしているため)
 - `call_rpc`(CLI)の内部実装を`call_rpc_raw`(HTTP送受信+エラー判定のみ、結果printfはしない)
   へ抽出し、5000件規模のループから静かに呼べるようにした
+- `isChan`(`importAddress`/keys.datの`chan = true`キー): ユーザーの指摘で発覚。当初の
+  `import-keys-dat`実装はkeys.datの`chan`キーを読んでおらず、chanアドレスも`is_chan=0`の
+  通常アドレスとしてインポートされていた。`importAddress`に`isChan`引数を追加し
+  (成功後`bm_keyring_mark_as_chan`を呼ぶ)、CLIのINIパーサに`chan`キー認識を追加した
+- `importAddressesBulk`(§7.5参照): importAddressを1件ずつ個別のHTTPリクエストで呼ぶと
+  リクエストのたびにvaultのmaster KEK導出(scrypt)が再実行されてしまいvault化の効果が
+  出ない問題への対応。CLIの`import-keys-dat`はこちらを`KEYS_DAT_BATCH_SIZE`(300)件ずつ
+  呼ぶ方式に変更した
+- version2/3アドレスのdecode寛容化(§3.3追記参照): 5143件規模の実keys.datを使った実地検証で、
+  4byte分のゼロを圧縮した非正規のversion3アドレスが実在すると判明し、`bm_address_decode`の
+  ゼロパディングを2byte固定の3ケース限定から可変長(0〜20byte)に一般化した
 
 いずれも`tests/test_api_server.c`(importAddress/exportAddress のend-to-end検証、WIF不一致の
 拒否含む)・`tests/test_address_book.c`(新設、CRUD単体テスト)・`tests/test_cli_integration.sh`
 (export→delete→import-address→unlockの往復、import-keys-datのファイル経由インポート、
-アドレス帳CRUDのCLI配線)でカバーした。ctest 41件全通過。
+chan=trueの再現、アドレス帳CRUDのCLI配線)・`tests/test_address_vectors.c`(非正規version3
+アドレスのdecode救済)でカバーした。ctest 41件全通過。
+
+**実地検証(2026-08-29、ユーザー提供の実keys.dat、5143件・1.5MB)**: `import-keys-dat`で
+約15秒(5142件成功、1件は既知の重複エントリとして意図的にスキップ対象、§3.3追記参照)、
+続く`unlock-all`で0.6秒(vault方式、全件が最初からvault-hkdfで保存されているため)。
+§11-19発端の「5000件規模のkeys.datインポート・一括unlock」という当初目標を実測で達成した。
 
 以下、調査時点(2026-08-29着手前)の記録:
 ユーザーからの質問で発覚。PyBitmessageの`keys.dat`(INI形式)を読み込んでアドレスをインポートする機能は

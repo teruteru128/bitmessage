@@ -256,26 +256,28 @@ int bm_address_decode(const char *address, uint64_t *out_version, uint64_t *out_
 
     if (version == 2 || version == 3)
     {
-        if (ripe_data_len == 20)
-        {
-            memcpy(out_ripe, ripe_data, 20);
-        }
-        else if (ripe_data_len == 19)
-        {
-            out_ripe[0] = 0;
-            memcpy(out_ripe + 1, ripe_data, 19);
-        }
-        else if (ripe_data_len == 18)
-        {
-            out_ripe[0] = 0;
-            out_ripe[1] = 0;
-            memcpy(out_ripe + 2, ripe_data, 18);
-        }
-        else
+        /*
+         * §11 2026-08-29 本家PyBitmessage(addresses.py encodeAddress)・このプロジェクトの
+         * bm_address_encodeは共にversion2/3で先頭ゼロを最大2byteまでしか圧縮しない
+         * (ripe[:2]=='\x00\x00'ならripe[2:]、ripe[:1]=='\x00'ならripe[1:])。本家decodeAddressも
+         * len(embeddedRipeData) < 18を明示的に'ripetooshort'エラーにしており、18/19/20byteのみが
+         * 「正規」に生成されうる範囲(以前の実装もこの3ケースのみを許容していた)。
+         *
+         * しかし実際のkeys.datインポート検証(5143件規模)で、version=3・ripe_data_len=16
+         * (4byteのゼロ圧縮)という、本家の標準的な生成経路では作られないはずの非正規アドレスが
+         * 2件見つかった(チェックサムは正常、意図的に生成された実在のアドレス)。生成側の仕様は
+         * 本家に合わせたまま(bm_address_encodeは引き続き最大2byteしか圧縮しない)、decode側だけ
+         * 寛容にして救済する(v4の「先頭ゼロを全て除去/復元」ロジックと同じ考え方をversion2/3にも
+         * 一般化する形)。
+         */
+        if (ripe_data_len > BM_RIPE_LEN)
         {
             free(data);
             return -1;
         }
+        size_t zero_pad = BM_RIPE_LEN - ripe_data_len;
+        memset(out_ripe, 0, zero_pad);
+        memcpy(out_ripe + zero_pad, ripe_data, ripe_data_len);
     }
     else /* version == 4 */
     {

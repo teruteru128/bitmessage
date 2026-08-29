@@ -57,6 +57,52 @@ int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *lab
                                 uint64_t payload_length_extra_bytes);
 
 /*
+ * §11 2026-08-29 importAddress専用(DESIGN.md §7.4参照)。bm_keyring_create_identityと違い
+ * vault方式(§7.4の2段階KDF)でラップして保存する。5000件規模のkeys.datインポートで
+ * 個別scryptを繰り返すと数十分オーダーになる問題への対応。vaultが既にあればHKDFで軽量に
+ * ラップするが、渡したpassphraseがvaultの既存passphraseと異なる場合(canary検証失敗)は
+ * 非0を返す(誤ったmaster KEKでの保存はしない)。成功時0。
+ *
+ * 【重要】単発の1件だけをインポートする場合はこの関数でよいが、複数件をまとめてインポート
+ * する場合はこの関数を個別に何度も呼んではいけない(呼び出しのたびにmaster KEK導出=scryptが
+ * 再実行され、vault方式にした意味が無くなる)。複数件の場合は
+ * bm_keyring_resolve_or_create_vault_master_kekでmaster KEKを1回だけ計算し、
+ * bm_keyring_import_identity_with_master_kekをループで呼ぶこと(importAddressesBulk参照)。
+ */
+int bm_keyring_import_identity(sqlite3 *db, const char *address, const char *label,
+                                int address_version, int stream,
+                                const unsigned char pub_signing[65],
+                                const unsigned char pub_encryption[65],
+                                const unsigned char priv_signing[32],
+                                const unsigned char priv_encryption[32],
+                                const char *passphrase,
+                                uint64_t nonce_trials_per_byte,
+                                uint64_t payload_length_extra_bytes);
+
+/*
+ * §11 2026-08-29 vaultのmaster KEKを解決する(importAddressesBulk向け)。vaultが既にあれば
+ * passphraseから導出してcanary検証、無ければこの呼び出しで新規vault作成(1回だけscrypt)する。
+ * 成功時0、*out_master_kekに32byteを設定する(呼び出し側で使い終わったらOPENSSL_cleanseすること)。
+ */
+int bm_keyring_resolve_or_create_vault_master_kek(sqlite3 *db, const char *passphrase,
+                                                   unsigned char out_master_kek[32]);
+
+/*
+ * §11 2026-08-29 既に分かっているmaster KEK(bm_keyring_resolve_or_create_vault_master_kekで
+ * 取得したもの)を使い、1件のidentityをvault方式で保存する(scryptを伴わない軽量パス)。
+ * ループの中で複数件呼んでもmaster KEK導出は発生しない。成功時0。
+ */
+int bm_keyring_import_identity_with_master_kek(sqlite3 *db, const char *address, const char *label,
+                                                int address_version, int stream,
+                                                const unsigned char pub_signing[65],
+                                                const unsigned char pub_encryption[65],
+                                                const unsigned char priv_signing[32],
+                                                const unsigned char priv_encryption[32],
+                                                const unsigned char master_kek[32],
+                                                uint64_t nonce_trials_per_byte,
+                                                uint64_t payload_length_extra_bytes);
+
+/*
  * identity.dbからラップ済み鍵を読み、passphraseから導出したKEKで復号してkeyringへ追加する。
  * passphrase誤り・改竄検出(AEAD tag不一致)・address不在は全て非0を返す。
  */
