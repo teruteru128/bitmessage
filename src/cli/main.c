@@ -38,6 +38,12 @@ static void print_usage(const char *prog)
             "      keys.dat(PyBitmessage本家、INI形式)を丸ごと一括インポートする。全アドレスへ\n"
             "      共通のstorePassphraseを使う(§7.4のvault方式による一括unlockを前提)。\n"
             "      importAddressesBulkでKEYS_DAT_BATCH_SIZE件ずつまとめて送信する\n"
+            "  set-label <address> <label>\n"
+            "      アドレスのラベルのみ変更する(秘密鍵には触れない、PyBitmessage本家のGUI相当の\n"
+            "      機能を本実装独自にAPI経由で提供)\n"
+            "  fix-labels-from-keys-dat <keys.datのパス>\n"
+            "      keys.datを再パースし、既存アドレスのラベルだけを一括で正しい値に更新する。\n"
+            "      import-keys-datで文字化けしたラベルを後から修正する用途を想定\n"
             "  join-chan <passphrase> <label> <storePassphrase>\n"
             "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
             "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
@@ -453,6 +459,116 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+static void set_address_label(const struct bm_cli_env *env, const char *address, const char *label,
+                               int *fixed, int *failed)
+{
+    bm_json_value_t *params = bm_json_new_array();
+    bm_json_array_append(params, bm_json_new_string(address));
+    bm_json_array_append(params, bm_json_new_string(label));
+
+    char *error_msg = NULL;
+    bm_json_value_t *response = NULL;
+    if (!call_rpc_raw(env, "setAddressLabel", params, &response, &error_msg))
+    {
+        fprintf(stderr, "スキップ: %s (%s)\n", address, error_msg);
+        free(error_msg);
+        (*failed)++;
+        return;
+    }
+    bm_json_free(response);
+    (*fixed)++;
+}
+
+/*
+ * §11 2026-08-29 keys.datインポート時のUTF-8文字化けバグ(§11参照)修正後、既にインポート
+ * 済みのラベルを正しい値へ再設定するための専用コマンド。import-keys-datと同じINIパース
+ * ロジックだが、WIF/nonce等は扱わずlabelキーだけを読み、setAddressLabelで1件ずつ更新する
+ * (秘密鍵に触れないラベル更新はscryptを伴わない軽量な処理のため、importAddressesBulkの
+ * ようなバッチAPIは不要)。
+ */
+static int fix_labels_from_keys_dat(const struct bm_cli_env *env, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+    {
+        fprintf(stderr, "エラー: %s を開けません\n", path);
+        return EXIT_FAILURE;
+    }
+
+    char address[KEYS_DAT_ADDRESS_MAX] = {0};
+    char label[KEYS_DAT_FIELD_MAX] = {0};
+    int in_address_section = 0;
+    int fixed = 0;
+    int failed = 0;
+    char line[KEYS_DAT_LINE_MAX];
+
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        char *nl = strchr(line, '\n');
+        if (nl != NULL)
+        {
+            *nl = '\0';
+        }
+        char *trimmed = trim_inplace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#' || trimmed[0] == ';')
+        {
+            continue;
+        }
+
+        if (trimmed[0] == '[')
+        {
+            if (in_address_section && label[0] != '\0')
+            {
+                set_address_label(env, address, label, &fixed, &failed);
+            }
+            address[0] = '\0';
+            label[0] = '\0';
+            in_address_section = 0;
+
+            char *end = strchr(trimmed, ']');
+            if (end != NULL)
+            {
+                *end = '\0';
+                const char *section_name = trimmed + 1;
+                if (strncmp(section_name, "BM-", 3) == 0)
+                {
+                    in_address_section = 1;
+                    strncpy(address, section_name, sizeof(address) - 1);
+                }
+            }
+            continue;
+        }
+
+        if (!in_address_section)
+        {
+            continue;
+        }
+
+        char *eq = strchr(trimmed, '=');
+        if (eq == NULL)
+        {
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim_inplace(trimmed);
+        char *value = trim_inplace(eq + 1);
+        if (strcasecmp(key, "label") == 0)
+        {
+            strncpy(label, value, sizeof(label) - 1);
+        }
+    }
+
+    if (in_address_section && label[0] != '\0')
+    {
+        set_address_label(env, address, label, &fixed, &failed);
+    }
+
+    fclose(f);
+
+    printf("ラベル修正完了: 成功%d件, 失敗%d件\n", fixed, failed);
+    return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int main(int argc, char **argv)
 {
     struct bm_cli_env env;
@@ -551,6 +667,31 @@ int main(int argc, char **argv)
         }
         bm_json_free(params);
         return import_keys_dat(&env, argv[2], argv[3]);
+    }
+
+    if (strcmp(cmd, "set-label") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "使い方: %s set-label <address> <label>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        return call_rpc(&env, "setAddressLabel", params);
+    }
+
+    if (strcmp(cmd, "fix-labels-from-keys-dat") == 0)
+    {
+        if (argc != 3)
+        {
+            fprintf(stderr, "使い方: %s fix-labels-from-keys-dat <keys.datのパス>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_free(params);
+        return fix_labels_from_keys_dat(&env, argv[2]);
     }
 
     if (strcmp(cmd, "join-chan") == 0)

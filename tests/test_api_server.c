@@ -274,8 +274,58 @@ int main(void)
             free(resp);
         }
 
-        /* unlockAddress: 間違ったpassphraseではfalse */
+        /*
+         * §11 2026-08-29 setAddressLabel: PyBitmessage本家にはJSON-RPC API経由のラベル変更が
+         * 無いが、GUI相当の機能を本実装独自に追加した。日本語ラベルで検証することで、
+         * 同時に修正したJSON非ASCII文字パースバグ(§11参照、"Ã£ÂÂ"文字化け)の回帰も兼ねる。
+         */
         char req[512];
+        char label_req[512];
+        snprintf(label_req, sizeof(label_req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"setAddressLabel\",\"params\":[\"%s\",\"でじこ\"],\"id\":21}",
+                 created_address);
+        resp = do_request(label_req, "testuser", "testpass");
+        CHECK(resp != NULL, "setAddressLabel HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1,
+                  "setAddressLabel returns true");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"listAddresses\",\"params\":[],\"id\":22}",
+                           "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            const char *updated_label = (result != NULL && result->item_count == 1)
+                ? bm_json_as_string(bm_json_object_get(bm_json_array_get(result, 0), "label"))
+                : NULL;
+            CHECK(updated_label != NULL && strcmp(updated_label, "でじこ") == 0,
+                  "setAddressLabel round-trips the Japanese label byte-for-byte via listAddresses");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* 存在しないaddressへのsetAddressLabelはエラーになること */
+        resp = do_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"setAddressLabel\","
+            "\"params\":[\"BM-2cWzSnwjJ7yRP3nLEWUV5LisTZyREWSzUK\",\"x\"],\"id\":23}",
+            "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *error = v != NULL ? bm_json_object_get(v, "error") : NULL;
+            CHECK(error != NULL, "setAddressLabel on unknown address returns an error");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* unlockAddress: 間違ったpassphraseではfalse */
         snprintf(req, sizeof(req),
                  "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddress\",\"params\":[\"%s\",\"wrong pass\"],\"id\":3}",
                  created_address);

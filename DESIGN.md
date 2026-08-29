@@ -1053,6 +1053,25 @@ JSON文字列全般(ラベル・アドレス帳のlabel・メッセージのsubj
 (`serialize→parse`往復、および生UTF-8バイト列を直接埋め込んだJSON文字列リテラルの
 直接パース)がバイト単位で完全に復元されることを確認した。ctest 41件全通過。
 
+**2026-08-29追記: setAddressLabel API・set-label/fix-labels-from-keys-dat CLIコマンドの新設**。
+上記JSON文字化けバグの影響で、既にインポート済みの5142件のうち非ASCII文字(日本語等)を含む
+ラベルが文字化けした状態でidentity.dbに保存されてしまっていたため、修復手段としてユーザーから
+依頼された。PyBitmessage本家にはJSON-RPC API経由でidentityのラベルを変更する手段が無いが、
+GUI(`bitmessageqt`)は`config.set(address, 'label', newLabel)`で直接keys.datを書き換えられる
+ことをソースで確認した(`bitmessageqt/foldertree.py`等)。つまり本家もGUI上ではラベルだけの
+変更が可能だが、API経由では公開されていない、という状況だった。
+
+これを踏まえ、`setAddressLabel(address, label)`(`src/core/api_server.c`、秘密鍵には一切触れず
+`identities.label`列のみ更新)を本実装独自のAPI拡張として新設した。あわせてCLIに`set-label
+<address> <label>`(単発)と`fix-labels-from-keys-dat <path>`(keys.datを再パースしてlabelキー
+だけを読み、既存アドレスのラベルを一括で正しい値へ修正する)を追加した。ラベル更新は秘密鍵の
+KEKラッピング(scrypt)を伴わない軽量な処理のため、`importAddressesBulk`のようなバッチAPIは
+不要と判断し、1件ずつの`setAddressLabel`呼び出しで十分と判断した。
+
+`tests/test_api_server.c`に日本語ラベルでのend-to-end検証(上記JSON文字化けバグの回帰確認を
+兼ねる)、`tests/test_cli_integration.sh`に`set-label`/`fix-labels-from-keys-dat`のCLI配線
+テストを追加した。ctest 41件全通過。
+
 ## 8. PyBitmessageとの差分・独自追加要件(随時追記)
 
 グランドデザイン本体との混同を避けるため、PyBitmessage標準仕様から意図的に外れる/追加する決定はここに集約する。

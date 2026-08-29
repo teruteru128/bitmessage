@@ -409,6 +409,31 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
 }
 
 /*
+ * §11 2026-08-29 setAddressLabel: [address, label]。PyBitmessage本家にはJSON-RPC API経由の
+ * ラベル変更は存在しないが、GUI(bitmessageqt)は直接config.set(address, 'label', ...)で
+ * 変更できているため、本実装独自の拡張としてAPI経由で提供する。秘密鍵には一切触れない
+ * (identities.labelカラムのみ更新)。keys.datインポート時のUTF-8文字化けバグ修正後、
+ * 既にインポート済みのラベルを正しい値へ再設定する用途を主に想定している。
+ */
+static bm_json_value_t *h_setAddressLabel(const struct bm_api_server_config *config,
+                                           const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *label = param_str(params, 1);
+    if (address == NULL || label == NULL)
+    {
+        *out_error = dup_cstr("setAddressLabel requires [address, label]");
+        return NULL;
+    }
+    if (bm_identity_store_update_label(config->identity_db, address, label) != 0)
+    {
+        *out_error = dup_cstr("address not found");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
+/*
  * §11 2026-08-29 importAddress: [address, signingWIF, encryptionWIF, label, storePassphrase,
  * nonceTrialsPerByte?, payloadLengthExtraBytes?, isChan?]
  *
@@ -1394,6 +1419,7 @@ static const struct bm_api_method METHODS[] = {
     {"deleteAddress", h_deleteAddress},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
+    {"setAddressLabel", h_setAddressLabel},
     {"importAddress", h_importAddress},
     {"importAddressesBulk", h_importAddressesBulk},
     {"joinChan", h_joinChan},

@@ -48,6 +48,15 @@ int bm_identity_store_delete(sqlite3 *db, const char *address);
 /* §11 chan仕様: is_chanフラグを更新する。該当行が無くてもエラーにしない。成功時0 */
 int bm_identity_store_set_is_chan(sqlite3 *db, const char *address, int is_chan);
 
+/*
+ * §11 2026-08-29 setAddressLabel用。PyBitmessage本家にはJSON-RPC API経由でのラベル変更は
+ * 無いが、GUI(bitmessageqt)は`config.set(address, 'label', newLabel)`で直接変更できており、
+ * 本実装ではこれをAPI経由で提供する独自拡張として追加した(keys.datインポート時のUTF-8文字化け
+ * バグ(§11参照)修正後、既にインポート済みのラベルを正しい値へ再設定する用途)。
+ * 該当addressが存在しなければ非0(sqlite3_changes==0を検出)。成功時0。
+ */
+int bm_identity_store_update_label(sqlite3 *db, const char *address, const char *label);
+
 struct bm_identity_summary
 {
     char address[BM_IDENTITY_ADDRESS_MAX];

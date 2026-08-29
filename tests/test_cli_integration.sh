@@ -201,6 +201,31 @@ echo "$IMPORT_CHAN_OUTPUT" | grep -q "成功1件, 失敗0件" \
 LIST_AFTER_CHAN_IMPORT=$("$CLI" list-addresses)
 echo "$LIST_AFTER_CHAN_IMPORT" | grep -q "\"isChan\":true" \
     || fail "chan = true entry should be imported with isChan:true (got: $LIST_AFTER_CHAN_IMPORT)"
+
+# §11 2026-08-29 set-label/fix-labels-from-keys-dat: keys.datインポート時のUTF-8文字化け
+# バグ修正後、既存アドレスのラベルを後から修正する手段のCLI配線を確認する。
+[ "$("$CLI" set-label "$ADDR5" "手動ラベル")" = "true" ] || fail "set-label should return true"
+LIST_AFTER_SET_LABEL=$("$CLI" list-addresses)
+echo "$LIST_AFTER_SET_LABEL" | grep -q "手動ラベル" \
+    || fail "set-label should update the label (got: $LIST_AFTER_SET_LABEL)"
+
+cat > test_keys_fixlabel.dat <<EOF
+[$ADDR5]
+label = 修正後ラベル
+privsigningkey = $SIGNING_WIF
+privencryptionkey = $ENCRYPTION_WIF
+EOF
+FIX_LABEL_OUTPUT=$("$CLI" fix-labels-from-keys-dat test_keys_fixlabel.dat)
+echo "$FIX_LABEL_OUTPUT" | grep -q "成功1件, 失敗0件" \
+    || fail "fix-labels-from-keys-dat should report 1 success (got: $FIX_LABEL_OUTPUT)"
+LIST_AFTER_FIX_LABEL=$("$CLI" list-addresses)
+echo "$LIST_AFTER_FIX_LABEL" | grep -q "修正後ラベル" \
+    || fail "fix-labels-from-keys-dat should update the label (got: $LIST_AFTER_FIX_LABEL)"
+
+SET_LABEL_UNKNOWN_OUTPUT=$("$CLI" set-label "BM-2cWzSnwjJ7yRP3nLEWUV5LisTZyREWSzUK" "x" 2>&1 || true)
+echo "$SET_LABEL_UNKNOWN_OUTPUT" | grep -q "エラー" \
+    || fail "set-label on unknown address should fail with an error (got: $SET_LABEL_UNKNOWN_OUTPUT)"
+
 "$CLI" delete "$ADDR5" >/dev/null
 
 # アドレス帳(address_book) CRUD
