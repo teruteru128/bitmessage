@@ -214,26 +214,28 @@ static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *
         return NULL;
     }
 
-    int any_unlocked = 0;
+    /*
+     * §11 2026-08-29 h_unlockAddressと違い、ここではbm_object_sync_backfill_trial_decryptを
+     * 意図的に呼ばない。実地検証(5143件規模)でユーザーから指摘され発覚: この関数は
+     * object_pool.db内の全MSGオブジェクト×keyring内の全unlocked identityを線形探索で
+     * 総当たりする(bm_trial_decrypt_msg、ECDH計算を伴う)ため、計算量は
+     * 「MSGオブジェクト数×unlockedアドレス数」に比例する。数千件規模の一括unlockで
+     * これを毎回実行すると、object_pool.dbにMSGオブジェクトが数百件溜まっているだけでも
+     * 数十万回以上のECDH復号試行が同期的に発生し、APIリクエストが致命的に長時間ブロック
+     * されうる。この一括backfill機能自体が本家PyBitmessage(全アドレス常時ロード済みで
+     * 「後から再走査する」概念が無い)には無い本実装独自の追加であることも踏まえ、5000件
+     * 規模の一括unlockでは省略する判断とした(単体のunlockAddressでは1identity分のコスト
+     * で済むため、これまで通りbackfillを継続する)。
+     */
     bm_json_value_t *arr = bm_json_new_array();
     for (size_t i = 0; i < count; i++)
     {
-        if (results[i].unlocked)
-        {
-            any_unlocked = 1;
-        }
         bm_json_value_t *entry = bm_json_new_object();
         bm_json_object_set(entry, "address", bm_json_new_string(results[i].address));
         bm_json_object_set(entry, "unlocked", bm_json_new_bool(results[i].unlocked));
         bm_json_array_append(arr, entry);
     }
     free(results);
-
-    if (any_unlocked && config->object_pool_db != NULL)
-    {
-        /* h_unlockAddressと同じ理由(上記コメント参照)。個別に何度も呼ばず1回だけ再走査する */
-        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring);
-    }
     return arr;
 }
 

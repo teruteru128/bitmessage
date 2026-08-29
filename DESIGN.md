@@ -998,6 +998,29 @@ HTTPリクエストで呼ぶ実装のままだったため、**リクエスト�
 これで§11-19発端の「5000件規模のkeys.datインポート・一括unlock」という目標が実測でも
 達成されたことを確認した。
 
+**2026-08-29追記: unlockAllAddressesからbackfill trial_decryptを削除**。本番daemon Aへの
+デプロイ後、ユーザーから「unlock-all、オブジェクトの復号試行も普通に入ってくるのでめちゃくちゃ
+重くなりますね」と指摘され発覚。`h_unlockAddress`(単体API)はunlock成功後に
+`bm_object_sync_backfill_trial_decrypt`(§11 2026-08-25、joinChan後にchan宛の過去メッセージが
+読めない問題への対応として追加)を呼んでおり、`h_unlockAllAddresses`もこれを踏襲して
+(unlockが1件でも成功したら)1回だけ呼ぶ実装にしていた。しかし`bm_object_sync_backfill_
+trial_decrypt`は内部でobject_pool.db内の**全MSGオブジェクト**それぞれに対し
+`bm_trial_decrypt_msg`(`src/core/trial_decrypt.c`)を呼び、この関数はkeyring内の
+**unlocked鍵全件**を線形探索してECIES復号(ECDH計算を伴う)を試みる実装になっている。
+つまり計算量は「MSGオブジェクト数×unlockedアドレス数」に比例し、5000件規模の一括unlockで
+「1回だけ呼ぶ」よう配慮しても、その1回の中身がobject_pool.dbにMSGオブジェクトが数百件
+溜まっているだけで数十万回以上のECDH計算になり、APIリクエストが致命的に長時間ブロックされる
+(daemonのAPIサーバースレッドが専有され、他のAPI呼び出しも待たされる)。
+
+この一括backfill機能自体が本家PyBitmessage(全アドレスを起動時から常時プロセスメモリに
+ロードしているため「ロック中に受信したメッセージを後から再走査する」という概念自体が存在
+しない、§8-1参照)には無い、本実装独自の追加であることも踏まえ、`unlockAllAddresses`からは
+この呼び出しを削除する対応にした(ユーザーと合意)。単体の`unlockAddress`は1identity分の
+コストで済むため、これまで通りbackfillを継続する。5000件規模の一括インポート直後は、
+そのアドレス群がこれまでネットワークに存在も知られていなかった(=まだメッセージを
+受け取りようがない)のが通常のユースケースであるため、実用上の支障は小さいと判断した。
+ctest 41件全通過。
+
 ## 8. PyBitmessageとの差分・独自追加要件(随時追記)
 
 グランドデザイン本体との混同を避けるため、PyBitmessage標準仕様から意図的に外れる/追加する決定はここに集約する。
