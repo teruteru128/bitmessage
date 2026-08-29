@@ -126,6 +126,48 @@ static void test_serialize_roundtrip(void)
     bm_json_free(reparsed);
 }
 
+static void test_utf8_roundtrip(void)
+{
+    /*
+     * §11 2026-08-29 バグ修正の回帰テスト。以前はparse_string_rawがJSON文字列中の非ASCII
+     * バイト(UTF-8マルチバイトシーケンスの各バイト)をそのままUnicodeコードポイントとして
+     * append_utf8に渡してしまい、二重にUTF-8エンコードしてしまっていた(例: "で"の先頭バイト
+     * 0xE3を「コードポイントU+00E3」と誤解釈し2バイトへ再エンコード、"Ã£ÂÂ"のような
+     * 文字化けを引き起こす)。実際にkeys.datインポートで日本語ラベルが文字化けするバグとして
+     * ユーザーに発見された。
+     */
+    const char *japanese = "でじこ"; /* UTF-8: E3 81 A7 E3 81 98 E3 81 93 (9byte) */
+
+    bm_json_value_t *s = bm_json_new_string(japanese);
+    char *text = bm_json_serialize(s);
+    CHECK(text != NULL, "serialize japanese string produced text");
+
+    bm_json_value_t *reparsed = text != NULL ? bm_json_parse(text, strlen(text)) : NULL;
+    CHECK(reparsed != NULL, "reparse serialized japanese string");
+    if (reparsed != NULL)
+    {
+        const char *round_tripped = bm_json_as_string(reparsed);
+        CHECK(round_tripped != NULL && strcmp(round_tripped, japanese) == 0,
+              "japanese string survives serialize/parse round-trip byte-for-byte");
+    }
+    free(text);
+    bm_json_free(s);
+    bm_json_free(reparsed);
+
+    /* daemon側が受信するリクエストにより近い形: 生のUTF-8バイト列を直接埋め込んだJSON文字列
+     * リテラルをパースしても、コードポイントとして再解釈されずそのまま復元されることを確認 */
+    const char *literal = "\"でじこ\"";
+    bm_json_value_t *v = bm_json_parse(literal, strlen(literal));
+    CHECK(v != NULL, "parse json string literal containing raw utf-8 bytes");
+    if (v != NULL)
+    {
+        const char *parsed_str = bm_json_as_string(v);
+        CHECK(parsed_str != NULL && strcmp(parsed_str, japanese) == 0,
+              "parsed value matches original utf-8 bytes exactly");
+    }
+    bm_json_free(v);
+}
+
 static void test_invalid_inputs(void)
 {
     CHECK(bm_json_parse("{invalid}", strlen("{invalid}")) == NULL, "reject malformed object");
@@ -141,6 +183,7 @@ int main(void)
     test_array_and_object();
     test_jsonrpc_shape();
     test_serialize_roundtrip();
+    test_utf8_roundtrip();
     test_invalid_inputs();
 
     if (failures == 0)

@@ -171,6 +171,26 @@ static void append_utf8(char **out, size_t *out_len, size_t *out_cap, unsigned i
     *out_len += n;
 }
 
+/*
+ * §11 2026-08-29 生バイトをそのままバッファへ追加する(append_utf8と違いUnicodeコードポイントとして
+ * 再エンコードしない)。JSON文字列中の非ASCIIバイトは既にUTF-8としてエンコード済みの生バイト列
+ * (仕様上そのまま埋め込んでよい)なので、これをコードポイントとして再解釈・再エンコードしてはいけない。
+ */
+static void append_raw_byte(char **out, size_t *out_len, size_t *out_cap, unsigned char byte)
+{
+    if (*out_len + 1 + 1 > *out_cap)
+    {
+        *out_cap = (*out_cap == 0 ? 16 : *out_cap * 2);
+        while (*out_len + 1 + 1 > *out_cap)
+        {
+            *out_cap *= 2;
+        }
+        *out = realloc(*out, *out_cap);
+    }
+    (*out)[*out_len] = (char)byte;
+    *out_len += 1;
+}
+
 static int hex_digit(char ch)
 {
     if (ch >= '0' && ch <= '9')
@@ -268,7 +288,25 @@ static char *parse_string_raw(struct cursor *c)
         }
         else
         {
-            append_utf8(&out, &out_len, &out_cap, ch);
+            /*
+             * §11 2026-08-29 バグ修正: 以前はchをそのままUnicodeコードポイントとしてappend_utf8に
+             * 渡していたため、JSON文字列中の非ASCII文字(UTF-8マルチバイトのバイト列、例えば"で"の
+             * 先頭バイト0xE3)を「コードポイントU+00E3」と誤解釈し、append_utf8内で改めて2バイトに
+             * 再エンコードしてしまっていた(いわゆるUTF-8のLatin-1誤読による二重エンコーディング、
+             * "Ã£ÂÂ"のような文字化けパターン)。実際のkeys.datインポートで日本語ラベルが文字化けする
+             * バグとしてユーザーに発見された。0x80以上のバイトは既にUTF-8としてエンコード済みの
+             * 生バイト列(JSON仕様上そのまま埋め込んでよい)なので、コードポイントとして
+             * 再解釈せず生バイトのままコピーする。ASCII範囲(0x7F以下)は従来通りappend_utf8でよい
+             * (1バイトのままコピーされるだけで実質的に差は無いが、経路を分けて意図を明確にする)。
+             */
+            if (ch < 0x80)
+            {
+                append_utf8(&out, &out_len, &out_cap, ch);
+            }
+            else
+            {
+                append_raw_byte(&out, &out_len, &out_cap, ch);
+            }
             c->p++;
         }
     }
