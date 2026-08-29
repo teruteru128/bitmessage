@@ -396,6 +396,62 @@ int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const 
     return rc;
 }
 
+int bm_keyring_export(sqlite3 *db, const char *address, const char *passphrase,
+                       unsigned char out_priv_signing[32], unsigned char out_priv_encryption[32])
+{
+    struct bm_identity_row row;
+    if (bm_identity_store_load(db, address, &row) != 0)
+    {
+        return -1;
+    }
+
+    unsigned char kek[32];
+    if (strcmp(row.kdf_algo, "vault-hkdf") == 0)
+    {
+        unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+        char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+        unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+        unsigned char master_kek[32];
+        if (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) != 0
+            || derive_master_kek(passphrase, vault_salt, vault_kdf_params, master_kek) != 0
+            || verify_vault_canary(master_kek, vault_canary) != 0)
+        {
+            return -1;
+        }
+        int rc = hkdf_expand_wrap_key(master_kek, row.kdf_salt, address, kek);
+        OPENSSL_cleanse(master_kek, sizeof(master_kek));
+        if (rc != 0)
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        uint64_t n = 0;
+        unsigned int r = 0;
+        unsigned int p = 0;
+        if (parse_kdf_params(row.kdf_params, &n, &r, &p) != 0
+            || derive_kek(passphrase, row.kdf_salt, n, r, p, kek) != 0)
+        {
+            return -1;
+        }
+    }
+
+    size_t addr_len = strlen(address);
+    int rc1 = aes256gcm_unwrap(kek, (const unsigned char *)address, addr_len,
+                                row.wrapped_priv_signing_key, out_priv_signing);
+    int rc2 = aes256gcm_unwrap(kek, (const unsigned char *)address, addr_len,
+                                row.wrapped_priv_encryption_key, out_priv_encryption);
+    OPENSSL_cleanse(kek, sizeof(kek));
+    if (rc1 != 0 || rc2 != 0)
+    {
+        OPENSSL_cleanse(out_priv_signing, 32);
+        OPENSSL_cleanse(out_priv_encryption, 32);
+        return -1;
+    }
+    return 0;
+}
+
 int bm_keyring_lock(bm_keyring_t *kr, const char *address)
 {
     pthread_rwlock_wrlock(&kr->lock);

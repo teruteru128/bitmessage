@@ -62,6 +62,16 @@ int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *lab
  */
 int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const char *passphrase);
 
+/*
+ * §11 2026-08-29 exportAddress用(DESIGN.md §6.2/§7、importAddressと対称)。identity.dbから
+ * ラップ済み鍵を読み、passphraseから導出したKEKで復号して平文を返す一回性操作。
+ * unlockAddressと違いkeyringには一切触れない(呼び出し元がWIFへエンコードして返したら
+ * その場で破棄する想定、keyring常駐はさせない)。行がvault-hkdf方式でもscrypt方式でも
+ * 対応する(内部でkdf_algoを見て自動判別する)。成功時0、passphrase誤り・address不在は非0。
+ */
+int bm_keyring_export(sqlite3 *db, const char *address, const char *passphrase,
+                       unsigned char out_priv_signing[32], unsigned char out_priv_encryption[32]);
+
 /* OPENSSL_cleanseでゼロ埋めしてから除去する。見つからなければ非0。identity.db側は変更しない */
 int bm_keyring_lock(bm_keyring_t *kr, const char *address);
 void bm_keyring_lock_all(bm_keyring_t *kr);

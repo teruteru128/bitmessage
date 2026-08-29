@@ -304,6 +304,44 @@ int main(void)
             free(resp);
         }
 
+        /* §11 2026-08-29 exportAddress: importAddressと対称(DESIGN.md §6.2/§7)。
+         * unlock中のaddressをexportし、そのWIFで再インポートできることを確認する */
+        char signing_wif[128] = {0};
+        char encryption_wif[128] = {0};
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"exportAddress\",\"params\":[\"%s\",\"wrong pass\"],\"id\":41}",
+                 created_address);
+        resp = do_request(req, "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *error = v != NULL ? bm_json_object_get(v, "error") : NULL;
+            CHECK(error != NULL, "exportAddress with wrong passphrase returns an error");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"exportAddress\",\"params\":[\"%s\",\"store pass\"],\"id\":42}",
+                 created_address);
+        resp = do_request(req, "testuser", "testpass");
+        CHECK(resp != NULL, "exportAddress HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            const char *sw = result != NULL ? bm_json_as_string(bm_json_object_get(result, "signingWIF")) : NULL;
+            const char *ew = result != NULL ? bm_json_as_string(bm_json_object_get(result, "encryptionWIF")) : NULL;
+            CHECK(sw != NULL && ew != NULL, "exportAddress returns signingWIF/encryptionWIF");
+            if (sw != NULL && ew != NULL)
+            {
+                strncpy(signing_wif, sw, sizeof(signing_wif) - 1);
+                strncpy(encryption_wif, ew, sizeof(encryption_wif) - 1);
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+
         /* deleteAddress */
         snprintf(req, sizeof(req), "{\"jsonrpc\":\"2.0\",\"method\":\"deleteAddress\",\"params\":[\"%s\"],\"id\":5}",
                  created_address);
@@ -327,6 +365,60 @@ int main(void)
             CHECK(result != NULL && result->item_count == 0, "listAddresses empty after delete");
             bm_json_free(v);
             free(resp);
+        }
+
+        /* §11 2026-08-29 importAddress: exportで取り出したWIFで再インポートし、
+         * 新しいstorePassphraseでunlockできることを確認する(keys.datインポートの土台) */
+        CHECK(signing_wif[0] != '\0' && encryption_wif[0] != '\0', "have WIFs for reimport");
+        if (signing_wif[0] != '\0' && encryption_wif[0] != '\0')
+        {
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"importAddress\","
+                     "\"params\":[\"%s\",\"%s\",\"%s\",\"reimported\",\"new store pass\"],\"id\":43}",
+                     created_address, signing_wif, encryption_wif);
+            resp = do_request(req, "testuser", "testpass");
+            CHECK(resp != NULL, "importAddress HTTP request");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+                CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1,
+                      "importAddress returns true");
+                bm_json_free(v);
+                free(resp);
+            }
+
+            /* 再インポートしたアドレスを新しいpassphraseでunlockできること */
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddress\",\"params\":[\"%s\",\"new store pass\"],"
+                     "\"id\":44}",
+                     created_address);
+            resp = do_request(req, "testuser", "testpass");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+                CHECK(result != NULL && result->boolean == 1,
+                      "unlockAddress after importAddress with correct new passphrase returns true");
+                bm_json_free(v);
+                free(resp);
+            }
+
+            /* WIFとaddressの組み合わせが不一致なら失敗すること(signing/encryptionを
+             * 入れ替えて渡す) */
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"importAddress\","
+                     "\"params\":[\"%s\",\"%s\",\"%s\",\"mismatched\",\"pass\"],\"id\":45}",
+                     created_address, encryption_wif, signing_wif);
+            resp = do_request(req, "testuser", "testpass");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *error = v != NULL ? bm_json_object_get(v, "error") : NULL;
+                CHECK(error != NULL, "importAddress with mismatched WIF/address returns an error");
+                bm_json_free(v);
+                free(resp);
+            }
         }
 
         free(created_address);

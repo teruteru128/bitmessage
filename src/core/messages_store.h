@@ -135,4 +135,23 @@ struct bm_subscription
 int bm_messages_store_list_subscriptions(sqlite3 *db, struct bm_subscription **out_list, size_t *out_count);
 void bm_subscription_list_free(struct bm_subscription *list);
 
+/* --- アドレス帳(address_book) 2026-08-29実装。PyBitmessage本家api.pyの
+ * addAddressBookEntry/deleteAddressBookEntry/listAddressBookEntries準拠 --- */
+
+/* 既に同じaddressがあれば失敗させる(重複禁止、UPSERTしない。本家準拠)。成功時0 */
+int bm_messages_store_add_address_book_entry(sqlite3 *db, const char *address, const char *label);
+/* 該当行が無くてもエラーにしない。成功時0 */
+int bm_messages_store_remove_address_book_entry(sqlite3 *db, const char *address);
+
+struct bm_address_book_entry
+{
+    char address[BM_MESSAGES_ADDRESS_MAX];
+    char label[128];
+};
+
+/* 全件列挙する(malloc、呼び出し側でbm_address_book_list_freeすること)。
+ * 成功時0、*out_countに件数を設定する(0件でも成功) */
+int bm_messages_store_list_address_book(sqlite3 *db, struct bm_address_book_entry **out_list, size_t *out_count);
+void bm_address_book_list_free(struct bm_address_book_entry *list);
+
 #endif /* BM_CORE_MESSAGES_STORE_H */

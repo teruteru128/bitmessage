@@ -16,6 +16,10 @@ add_executable(test_keyring test_keyring.c)
 target_link_libraries(test_keyring PRIVATE bm_core)
 add_test(NAME keyring COMMAND test_keyring)
 
+add_executable(test_address_book test_address_book.c)
+target_link_libraries(test_address_book PRIVATE bm_core)
+add_test(NAME address_book COMMAND test_address_book)
+
 add_executable(test_message_builder test_message_builder.c)
 target_link_libraries(test_message_builder PRIVATE bm_core bm_infra)
 add_test(NAME message_builder COMMAND test_message_builder)

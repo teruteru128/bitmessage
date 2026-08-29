@@ -174,6 +174,33 @@ char *bm_address_encode_wif(const unsigned char priv[BM_PRIVATE_KEY_LEN])
     return bm_base58_encode(raw, sizeof(raw));
 }
 
+int bm_address_decode_wif(const char *wif, unsigned char out_priv[BM_PRIVATE_KEY_LEN])
+{
+    unsigned char *data = NULL;
+    size_t data_len = 0;
+    if (bm_base58_decode(wif, &data, &data_len) != 0)
+    {
+        return -1;
+    }
+    if (data_len != 1 + BM_PRIVATE_KEY_LEN + 4 || data[0] != 0x80)
+    {
+        free(data);
+        return -1;
+    }
+
+    unsigned char checksum[32];
+    bm_double_sha256(data, 1 + BM_PRIVATE_KEY_LEN, checksum);
+    if (memcmp(checksum, data + 1 + BM_PRIVATE_KEY_LEN, 4) != 0)
+    {
+        free(data);
+        return -1;
+    }
+
+    memcpy(out_priv, data + 1, BM_PRIVATE_KEY_LEN);
+    free(data);
+    return 0;
+}
+
 int bm_address_decode(const char *address, uint64_t *out_version, uint64_t *out_stream,
                        unsigned char out_ripe[BM_RIPE_LEN])
 {

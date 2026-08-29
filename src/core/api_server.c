@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <poll.h>
 #include <stdio.h>
@@ -236,6 +237,53 @@ static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *
     return arr;
 }
 
+/*
+ * §11 2026-08-29 exportAddress: [address, passphrase]。importAddressと対称
+ * (DESIGN.md §6.2/§7、2026-08-25にユーザーと合意した「importとexportはペアであるべき」への対応)。
+ * unlockAddressとは独立させ、既存keyringには一切触れずその場限りで復号してWIF文字列を
+ * 返すだけの一回性操作にする。呼び出し元はレスポンスのWIFを渡したら即座に破棄すること
+ * (ログ・エラーメッセージには絶対に載せない)。
+ */
+static bm_json_value_t *h_exportAddress(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *passphrase = param_str(params, 1);
+    if (address == NULL || passphrase == NULL)
+    {
+        *out_error = dup_cstr("exportAddress requires [address, passphrase]");
+        return NULL;
+    }
+
+    unsigned char priv_signing[BM_PRIVATE_KEY_LEN];
+    unsigned char priv_encryption[BM_PRIVATE_KEY_LEN];
+    if (bm_keyring_export(config->identity_db, address, passphrase, priv_signing, priv_encryption) != 0)
+    {
+        *out_error = dup_cstr("export failed (wrong passphrase or address not found)");
+        return NULL;
+    }
+
+    char *signing_wif = bm_address_encode_wif(priv_signing);
+    char *encryption_wif = bm_address_encode_wif(priv_encryption);
+    OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
+    OPENSSL_cleanse(priv_encryption, sizeof(priv_encryption));
+
+    if (signing_wif == NULL || encryption_wif == NULL)
+    {
+        free(signing_wif);
+        free(encryption_wif);
+        *out_error = dup_cstr("WIF encoding failed");
+        return NULL;
+    }
+
+    bm_json_value_t *result = bm_json_new_object();
+    bm_json_object_set(result, "signingWIF", bm_json_new_string(signing_wif));
+    bm_json_object_set(result, "encryptionWIF", bm_json_new_string(encryption_wif));
+    free(signing_wif);
+    free(encryption_wif);
+    return result;
+}
+
 static bm_json_value_t *h_lockAddress(const struct bm_api_server_config *config,
                                        const bm_json_value_t *params, char **out_error)
 {
@@ -356,6 +404,87 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
     bm_json_value_t *result = bm_json_new_string(address);
     free(address);
     return result;
+}
+
+/*
+ * §11 2026-08-29 importAddress: [address, signingWIF, encryptionWIF, label, storePassphrase,
+ * nonceTrialsPerByte?, payloadLengthExtraBytes?]
+ *
+ * DESIGN.md §6.2の当初案は[signingWIF, encryptionWIF, storePassphrase]だったが、WIFは秘密鍵の
+ * みでaddressVersion/streamを含まないため、addressそのものを引数に取る形に確定した(keys.dat
+ * (PyBitmessage本家)もセクション名=address文字列という同じ形)。PyBitmessage本家にはWIFを
+ * 直接インポートするAPI/UIが存在しない(決定論的/ランダム生成経由の保存のみ、2026-08-29調査)ため
+ * 本実装独自の拡張。addressから復元したripeとWIFから導出した公開鍵のripeが一致するかを
+ * 検証することで、address文字列とWIFの組み合わせ誤りを検出する。
+ */
+static bm_json_value_t *h_importAddress(const struct bm_api_server_config *config,
+                                         const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *signing_wif = param_str(params, 1);
+    const char *encryption_wif = param_str(params, 2);
+    const char *label = param_str(params, 3);
+    const char *store_passphrase = param_str(params, 4);
+    const bm_json_value_t *nonce_trials_v = bm_json_array_get(params, 5);
+    const bm_json_value_t *payload_extra_v = bm_json_array_get(params, 6);
+
+    if (address == NULL || signing_wif == NULL || encryption_wif == NULL || store_passphrase == NULL)
+    {
+        *out_error = dup_cstr("importAddress requires [address, signingWIF, encryptionWIF, label, "
+                              "storePassphrase, nonceTrialsPerByte?, payloadLengthExtraBytes?]");
+        return NULL;
+    }
+
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char ripe_from_address[BM_RIPE_LEN];
+    if (bm_address_decode(address, &version, &stream, ripe_from_address) != 0)
+    {
+        *out_error = dup_cstr("invalid address");
+        return NULL;
+    }
+
+    unsigned char priv_signing[BM_PRIVATE_KEY_LEN];
+    unsigned char priv_encryption[BM_PRIVATE_KEY_LEN];
+    if (bm_address_decode_wif(signing_wif, priv_signing) != 0
+        || bm_address_decode_wif(encryption_wif, priv_encryption) != 0)
+    {
+        *out_error = dup_cstr("invalid WIF (signingWIF/encryptionWIF)");
+        return NULL;
+    }
+
+    unsigned char pub_signing[BM_PUBLIC_KEY_LEN];
+    unsigned char pub_encryption[BM_PUBLIC_KEY_LEN];
+    if (bm_address_get_public_key(priv_signing, pub_signing) != 0
+        || bm_address_get_public_key(priv_encryption, pub_encryption) != 0)
+    {
+        *out_error = dup_cstr("failed to derive public key from WIF");
+        return NULL;
+    }
+
+    unsigned char ripe_computed[BM_RIPE_LEN];
+    bm_address_calc_ripe(pub_signing, pub_encryption, ripe_computed);
+    if (memcmp(ripe_computed, ripe_from_address, BM_RIPE_LEN) != 0)
+    {
+        *out_error = dup_cstr("WIF keys do not match the given address");
+        return NULL;
+    }
+
+    uint64_t nonce_trials = (nonce_trials_v != NULL)
+        ? (uint64_t)bm_json_as_number(nonce_trials_v) : config->default_nonce_trials_per_byte;
+    uint64_t payload_extra = (payload_extra_v != NULL)
+        ? (uint64_t)bm_json_as_number(payload_extra_v) : config->default_payload_length_extra_bytes;
+
+    int rc = bm_keyring_create_identity(config->identity_db, address, label != NULL ? label : "",
+                                         (int)version, (int)stream, pub_signing, pub_encryption,
+                                         priv_signing, priv_encryption, store_passphrase,
+                                         nonce_trials, payload_extra);
+    if (rc != 0)
+    {
+        *out_error = dup_cstr("failed to store identity (duplicate address?)");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
 }
 
 /*
@@ -725,6 +854,78 @@ static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *c
 }
 
 /*
+ * §11 2026-08-29 アドレス帳(address_book)。PyBitmessage本家api.pyの
+ * addAddressBookEntry/deleteAddressBookEntry/listAddressBookEntries準拠(base64ラップは
+ * 本実装のJSON-RPCでは不要なため省略)。addAddressBookEntryは本家同様、既に同じaddressが
+ * あればエラーにする(UPSERTしない)。
+ */
+static bm_json_value_t *h_addAddressBookEntry(const struct bm_api_server_config *config,
+                                               const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *label = param_str(params, 1);
+    if (address == NULL || label == NULL)
+    {
+        *out_error = dup_cstr("addAddressBookEntry requires [address, label]");
+        return NULL;
+    }
+
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char ripe[BM_RIPE_LEN];
+    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    {
+        *out_error = dup_cstr("invalid address");
+        return NULL;
+    }
+
+    if (bm_messages_store_add_address_book_entry(config->messages_db, address, label) != 0)
+    {
+        *out_error = dup_cstr("address already exists in address book");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
+static bm_json_value_t *h_deleteAddressBookEntry(const struct bm_api_server_config *config,
+                                                  const bm_json_value_t *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    if (address == NULL)
+    {
+        *out_error = dup_cstr("deleteAddressBookEntry requires [address]");
+        return NULL;
+    }
+    int rc = bm_messages_store_remove_address_book_entry(config->messages_db, address);
+    return bm_json_new_bool(rc == 0);
+}
+
+static bm_json_value_t *h_listAddressBookEntries(const struct bm_api_server_config *config,
+                                                  const bm_json_value_t *params, char **out_error)
+{
+    (void)params;
+
+    struct bm_address_book_entry *list = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_address_book(config->messages_db, &list, &count) != 0)
+    {
+        *out_error = dup_cstr("failed to list address book");
+        return NULL;
+    }
+
+    bm_json_value_t *arr = bm_json_new_array();
+    for (size_t i = 0; i < count; i++)
+    {
+        bm_json_value_t *entry = bm_json_new_object();
+        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
+        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
+        bm_json_array_append(arr, entry);
+    }
+    bm_address_book_list_free(list);
+    return arr;
+}
+
+/*
  * §11 2026-08-26: onionピア向け/クリアネットIP向けでSOCKS5設定を分離した
  * (config_store.hのdoc参照。以前は単一設定を全outbound接続に適用しており、これが
  * クリアネットIPまでTor出口ノード経由にしてしまい外部ノードへの接続性を悪化させて
@@ -1057,11 +1258,13 @@ static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *con
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
     {"unlockAllAddresses", h_unlockAllAddresses},
+    {"exportAddress", h_exportAddress},
     {"lockAddress", h_lockAddress},
     {"lockAllAddresses", h_lockAllAddresses},
     {"deleteAddress", h_deleteAddress},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
+    {"importAddress", h_importAddress},
     {"joinChan", h_joinChan},
     {"cachePubkey", h_cachePubkey},
     {"sendMessage", h_sendMessage},
@@ -1071,6 +1274,9 @@ static const struct bm_api_method METHODS[] = {
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
     {"listSubscriptions", h_listSubscriptions},
+    {"addAddressBookEntry", h_addAddressBookEntry},
+    {"deleteAddressBookEntry", h_deleteAddressBookEntry},
+    {"listAddressBookEntries", h_listAddressBookEntries},
     {"getSocksProxyOnion", h_getSocksProxyOnion},
     {"setSocksProxyOnion", h_setSocksProxyOnion},
     {"getSocksProxyClearnet", h_getSocksProxyClearnet},

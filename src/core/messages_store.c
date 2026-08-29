@@ -376,6 +376,78 @@ void bm_subscription_list_free(struct bm_subscription *list)
     free(list);
 }
 
+int bm_messages_store_add_address_book_entry(sqlite3 *db, const char *address, const char *label)
+{
+    static const char *SQL = "INSERT INTO address_book (address, label) VALUES (?1,?2);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, label, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1; /* 既に同じaddressがあればUNIQUE制約違反で非0 */
+}
+
+int bm_messages_store_remove_address_book_entry(sqlite3 *db, const char *address)
+{
+    static const char *SQL = "DELETE FROM address_book WHERE address = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, address, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_list_address_book(sqlite3 *db, struct bm_address_book_entry **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT address, label FROM address_book;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+
+    size_t cap = 4;
+    size_t count = 0;
+    struct bm_address_book_entry *list = malloc(sizeof(*list) * cap);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        if (count >= cap)
+        {
+            cap *= 2;
+            list = realloc(list, sizeof(*list) * cap);
+        }
+        struct bm_address_book_entry *e = &list[count];
+        memset(e, 0, sizeof(*e));
+        const unsigned char *address = sqlite3_column_text(stmt, 0);
+        strncpy(e->address, (const char *)address, sizeof(e->address) - 1);
+        const unsigned char *label = sqlite3_column_text(stmt, 1);
+        if (label != NULL)
+        {
+            strncpy(e->label, (const char *)label, sizeof(e->label) - 1);
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+void bm_address_book_list_free(struct bm_address_book_entry *list)
+{
+    free(list);
+}
+
 int bm_messages_store_list_sent(sqlite3 *db, struct bm_sent_message **out_list, size_t *out_count)
 {
     static const char *SQL =

@@ -38,6 +38,15 @@ char *bm_address_encode(uint64_t version, uint64_t stream, const unsigned char *
 char *bm_address_encode_wif(const unsigned char priv[BM_PRIVATE_KEY_LEN]);
 
 /*
+ * §11 2026-08-29 WIF文字列をデコードする(PyBitmessage highlevelcrypto.decodeWalletImportFormat
+ * 準拠。0x80プレフィックス+32byte秘密鍵+4byteチェックサム(double SHA256)の計37byte構成のみを
+ * 扱う。Bitmessageは圧縮公開鍵を使わないため、Bitcoin側にある圧縮鍵フラグ(末尾0x01、計38byte)
+ * には対応しない)。成功時0、Base58デコード失敗・長さ不正・プレフィックス不一致・
+ * チェックサム不一致は非0。
+ */
+int bm_address_decode_wif(const char *wif, unsigned char out_priv[BM_PRIVATE_KEY_LEN]);
+
+/*
  * "BM-..."(先頭の"BM-"は省略可)をデコードする。addresses.py decodeAddress準拠:
  * checksum検証(double_sha512)、version範囲(1〜4)、ripe長の妥当性、v4の非マレアビリティ検証
  * (先頭0x00バイトが残っていたら不正な非正規エンコーディングとして拒否)を行う。

@@ -810,7 +810,9 @@ api_handler_fn handler; }`の配列をコア層が持ち、HTTPレイヤーとJS
 | `deleteAddress` | address | lock相当の消去 → identity.dbから当該行を完全削除(復元不可、確認はフロント側の責務) |
 | `listAddresses` | (なし) | identity.db一覧 + 各アドレスの`unlocked`状態(bool)を返す |
 | `createDeterministicAddress` | passphrase, addressVersion, stream, ripeNullBytes | §3.3のnonce探索でアドレス生成、KEK(新規passphrase)でラップして保存 |
-| `importAddress` | signingWIF, encryptionWIF, storePassphrase | 既存鍵のインポート、保存時に必ずラップ(平文保存は許容しない) |
+| `unlockAllAddresses` | passphrase | §7.4参照。数千件規模の一括unlock(vault方式) |
+| `importAddress` | address, signingWIF, encryptionWIF, label, storePassphrase, nonceTrialsPerByte?, payloadLengthExtraBytes? | 2026-08-29実装。当初案は`address`を含まなかったが、WIFは秘密鍵のみでaddressVersion/streamを含まないため確定時に追加した(§11参照)。addressから復元したripeとWIFの公開鍵ripeが一致するか検証してから保存する |
+| `exportAddress` | address, passphrase | 2026-08-29実装。importAddressと対称。その場でpassphrase復号しsigningWIF/encryptionWIFを返す一回性操作(keyringには触れない) |
 
 ## 7. 鍵ライフサイクル管理設計(§8-1、ユーザー要望による独自拡張)
 
@@ -1539,16 +1541,50 @@ DNS bootstrap関数(`bootstrap8444.bitmessage.org`等)は、いずれも定義�
   証明書生成まわりの実装/保守コストも避けられる。outbound SOCKS5・inbound onion対応が
   既にあるため、この判断でも実用上のデメリットは小さい。
 
-**2026-08-29着手中: keys.datインポート・API経由の秘密鍵インポート(WIF)・アドレス帳操作、いずれも未実装**。
+**2026-08-29完了: keys.datインポート・API経由の秘密鍵インポート(WIF)・アドレス帳操作**。
+ユーザーからの質問で「いずれも未実装」と発覚(調査時点の詳細は元の記述として下記に残す)。
+まず一括unlockの性能問題(§7.4、上記19番で解決)を先に片付けた上で、以下を実装した:
+
+- `bm_address_decode_wif`(`src/core/address.c`): WIF文字列→秘密鍵のデコード関数を新設
+  (PyBitmessage `highlevelcrypto.decodeWalletImportFormat`準拠、0x80プレフィックス+32byte+
+  4byteチェックサム、圧縮鍵フラグは扱わない)。既存の`bm_address_encode_wif`と対になる
+- `importAddress`(§6.2表参照、`src/core/api_server.c`): address文字列も引数に取る形へ確定
+  (WIFは秘密鍵のみでaddressVersion/streamを含まないため)。addressから復元したripeと
+  WIFの公開鍵から計算したripeが一致するか検証してから保存する。PyBitmessage本家調査
+  (`/home/teruteru/Documents/Projects/teruteru128/PyBitmessage`)の結果、本家にはWIFを
+  直接インポートするAPI/UIが存在しない(決定論的/ランダム生成経由の保存のみ)と確認済みで、
+  本実装独自の拡張
+- `exportAddress`(`address, passphrase`): importAddressと対称。2026-08-25に合意済みだった
+  「importとexportはペアであるべき」への対応。unlockAddressとは独立し、keyringに触れず
+  その場限りで復号してWIFを返す一回性操作。vault-hkdf/scrypt両方式に対応
+- アドレス帳CRUD(`bm_messages_store_add/remove/list_address_book_entry`、
+  `addAddressBookEntry`/`deleteAddressBookEntry`/`listAddressBookEntries` API):
+  PyBitmessage本家`api.py`の同名メソッド準拠(addは重複禁止、deleteは冪等、base64ラップは
+  JSON-RPCでは不要なため省略)
+- `import-keys-dat <path> <storePassphrase>`(CLI、`src/cli/main.c`): keys.dat(PyBitmessage
+  本家、INI形式)を丸ごと一括インポートする簡易INIパーサ。**daemonのHTTPリクエストボディには
+  1MiBのDoS対策上限(`MAX_REQUEST_SIZE`)があり、1.5MB規模のkeys.datをAPI越しに丸ごと送る
+  方式は取れない**と判明したため、CLI側でINIをパースしアドレスごとに`importAddress`を
+  個別に呼ぶ方式にした(ユーザーと合意)。`[bitmessagesettings]`等の特殊セクションは無視し
+  セクション名が`"BM-"`で始まるものだけをアドレスとして扱う(PyBitmessage本家
+  `bmconfigparser.py`の`addresses()`と同じ判定)。storePassphraseは全件で共通の1つを使う
+  (§7.4のvault方式が単一passphraseでの一括unlockを前提にしているため)
+- `call_rpc`(CLI)の内部実装を`call_rpc_raw`(HTTP送受信+エラー判定のみ、結果printfはしない)
+  へ抽出し、5000件規模のループから静かに呼べるようにした
+
+いずれも`tests/test_api_server.c`(importAddress/exportAddress のend-to-end検証、WIF不一致の
+拒否含む)・`tests/test_address_book.c`(新設、CRUD単体テスト)・`tests/test_cli_integration.sh`
+(export→delete→import-address→unlockの往復、import-keys-datのファイル経由インポート、
+アドレス帳CRUDのCLI配線)でカバーした。ctest 41件全通過。
+
+以下、調査時点(2026-08-29着手前)の記録:
 ユーザーからの質問で発覚。PyBitmessageの`keys.dat`(INI形式)を読み込んでアドレスをインポートする機能は
 コード上どこにも無く、`bitmessage.conf`(本実装独自の起動設定ファイル)とは別物。§6.2の表にある
 `importAddress`(signingWIF, encryptionWIF, storePassphrase)もコード未実装で、土台となるWIF文字列→
 秘密鍵のデコード関数自体が無い(`src/core/address.c`にあるのはエクスポート方向の`bm_address_encode_wif`
 のみ)。`address_book`テーブル(`messages_store.c`)もCREATE TABLEのスキーマ定義のみで、追加・削除・
 一覧のCRUD関数もAPIハンドラも一切無い(同型の`subscriptions`は`addSubscription`等まで完成済みなのと対照的)。
-この調査の過程で「keys.datバックアップ(1.5MB、5000件規模のアドレス)が見つかった」という話になり、
-まず一括unlockの性能問題(§7.4、上記19番で解決)を先に片付けた。keys.datパーサ・importAddress・
-アドレス帳CRUD自体は本セッションでは未着手。
+この調査の過程で「keys.datバックアップ(1.5MB、5000件規模のアドレス)が見つかった」という話になった。
 
 **vault管理系ライフサイクルAPI群(未着手、2026-08-29バックログ化)**: §7.4のvault方式実装後、
 ユーザーから「マスターパスフレーズの変更ができない」「変更できるなら対称的に無効化(個別管理方式へ

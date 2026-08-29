@@ -30,11 +30,22 @@ static void print_usage(const char *prog)
             "コマンド:\n"
             "  list-addresses\n"
             "  create-address <passphrase> <version:3|4> <stream> <ripeNullBytes> <label> <storePassphrase>\n"
+            "  import-address <address> <signingWIF> <encryptionWIF> <label> <storePassphrase> "
+            "[nonceTrialsPerByte] [payloadLengthExtraBytes]\n"
+            "      keys.dat(PyBitmessage本家)由来のWIF鍵ペアからアドレスをインポートする。\n"
+            "      addressから復元したripeとWIFの公開鍵ripeが一致しないと失敗する\n"
+            "  import-keys-dat <keys.datのパス> <storePassphrase>\n"
+            "      keys.dat(PyBitmessage本家、INI形式)を丸ごと一括インポートする。全アドレスへ\n"
+            "      共通のstorePassphraseを使う(§7.4のvault方式による一括unlockを前提)。\n"
+            "      1件ずつimportAddressをHTTP経由で呼ぶため、数千件規模では数十秒〜数分かかる\n"
             "  join-chan <passphrase> <label> <storePassphrase>\n"
             "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
             "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
             "      (自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める\n"
             "  unlock <address> <passphrase>\n"
+            "  export-address <address> <passphrase>\n"
+            "      unlock中かどうかに関わらず、その場でpassphrase復号しWIF鍵ペアを返す\n"
+            "      (keyringには触れない一回性操作、importAddressと対称)\n"
             "  unlock-all <passphrase>\n"
             "      identity.db全件に対し共通passphraseでunlockを試みる。行ごとのkdf_saltは\n"
             "      個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
@@ -62,6 +73,10 @@ static void print_usage(const char *prog)
             "      受信したらinboxへ保存する\n"
             "  remove-subscription <address>\n"
             "  list-subscriptions\n"
+            "  add-address-book-entry <address> <label>\n"
+            "      既に同じaddressが登録済みならエラーになる(重複禁止、PyBitmessage本家準拠)\n"
+            "  delete-address-book-entry <address>\n"
+            "  list-address-book-entries\n"
             "  get-socks-proxy-onion\n"
             "  set-socks-proxy-onion <enabled:0|1> <host> <port>\n"
             "      onion peer(.onion宛)専用のoutbound SOCKS5プロキシ(Tor等)設定。config.dbへ\n"
@@ -87,7 +102,16 @@ static void print_usage(const char *prog)
             prog);
 }
 
-static int call_rpc(const struct bm_cli_env *env, const char *method, bm_json_value_t *params)
+/*
+ * §11 2026-08-29 import-keys-dat(5000件規模の一括インポート)向けに、call_rpcのHTTP送受信
+ * ロジックを抽出した内部ヘルパー。成功時true、*out_responseにJSON-RPCレスポンス全体
+ * (resultは呼び出し側がbm_json_object_get(*out_response, "result")で取り出す。使い終わったら
+ * 呼び出し側でbm_json_freeすること、不要ならNULLを渡してよい)を設定する。失敗時はfalseを
+ * 返し、*out_error_msgにエラーメッセージのコピー(malloc、呼び出し側でfree)を設定する。
+ * paramsは呼び出し側が渡したものをこの関数が消費する(bm_json_freeする)。
+ */
+static int call_rpc_raw(const struct bm_cli_env *env, const char *method, bm_json_value_t *params,
+                         bm_json_value_t **out_response, char **out_error_msg)
 {
     bm_json_value_t *req = bm_json_new_object();
     bm_json_object_set(req, "jsonrpc", bm_json_new_string("2.0"));
@@ -106,40 +130,260 @@ static int call_rpc(const struct bm_cli_env *env, const char *method, bm_json_va
         /* §11 IPv6アドレスはhostに':'を含むため、"host:port"のままだとportとの区切りが
          * 分からなくなる。RFC 3986慣習に合わせ"[host]:port"の形にする */
         int host_is_ipv6 = strchr(env->host, ':') != NULL;
-        fprintf(stderr, "接続に失敗しました(%s%s%s:%d、bitmessagedは起動していますか?)\n",
-                host_is_ipv6 ? "[" : "", env->host, host_is_ipv6 ? "]" : "", env->port);
-        return EXIT_FAILURE;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "接続に失敗しました(%s%s%s:%d、bitmessagedは起動していますか?)",
+                 host_is_ipv6 ? "[" : "", env->host, host_is_ipv6 ? "]" : "", env->port);
+        *out_error_msg = strdup(buf);
+        return 0;
     }
     if (status == 401)
     {
-        fprintf(stderr, "認証に失敗しました(BM_API_USER/BM_API_PASSを確認してください)\n");
         free(resp);
-        return EXIT_FAILURE;
+        *out_error_msg = strdup("認証に失敗しました(BM_API_USER/BM_API_PASSを確認してください)");
+        return 0;
     }
 
     bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
     free(resp);
     if (v == NULL)
     {
-        fprintf(stderr, "サーバー応答をJSONとして解釈できませんでした(HTTP %d)\n", status);
-        return EXIT_FAILURE;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "サーバー応答をJSONとして解釈できませんでした(HTTP %d)", status);
+        *out_error_msg = strdup(buf);
+        return 0;
     }
 
     bm_json_value_t *error = bm_json_object_get(v, "error");
     if (error != NULL)
     {
         const char *msg = bm_json_as_string(bm_json_object_get(error, "message"));
-        fprintf(stderr, "エラー: %s\n", msg != NULL ? msg : "(不明なエラー)");
+        char buf[512];
+        snprintf(buf, sizeof(buf), "エラー: %s", msg != NULL ? msg : "(不明なエラー)");
+        *out_error_msg = strdup(buf);
         bm_json_free(v);
-        return EXIT_FAILURE;
+        return 0;
     }
 
-    bm_json_value_t *result = bm_json_object_get(v, "result");
+    if (out_response != NULL)
+    {
+        *out_response = v;
+    }
+    else
+    {
+        bm_json_free(v);
+    }
+    return 1;
+}
+
+static int call_rpc(const struct bm_cli_env *env, const char *method, bm_json_value_t *params)
+{
+    char *error_msg = NULL;
+    bm_json_value_t *response = NULL;
+    if (!call_rpc_raw(env, method, params, &response, &error_msg))
+    {
+        fprintf(stderr, "%s\n", error_msg);
+        free(error_msg);
+        return EXIT_FAILURE;
+    }
+    bm_json_value_t *result = bm_json_object_get(response, "result");
     char *result_text = bm_json_serialize(result);
     printf("%s\n", result_text);
     free(result_text);
-    bm_json_free(v);
+    bm_json_free(response);
     return EXIT_SUCCESS;
+}
+
+/* 前後の空白(スペース/タブ)を除去し、末尾にNULを詰め直して返す(文字列は破壊的に書き換える) */
+static char *trim_inplace(char *s)
+{
+    while (*s == ' ' || *s == '\t')
+    {
+        s++;
+    }
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r'))
+    {
+        s[--len] = '\0';
+    }
+    return s;
+}
+
+/*
+ * §11 2026-08-29 keys.dat(PyBitmessage本家、INI/configparser形式)からの一括インポート。
+ * DESIGN.md §11参照: daemonのHTTPリクエストボディには1MiBのDoS対策上限があり、1.5MB規模の
+ * keys.datをAPI越しに丸ごと送る方式は取れないため、CLI側でINIをパースしてアドレスごとに
+ * importAddressを個別に呼ぶ方式にした(ユーザーと合意、2026-08-29)。
+ *
+ * [bitmessagesettings]等の特殊セクションは無視し、セクション名が"BM-"で始まるものだけを
+ * アドレスとして扱う(PyBitmessage本家bmconfigparser.pyのaddresses()と同じ判定)。
+ * privsigningkey/privencryptionkeyが両方揃っていない行(何らかの理由で欠落したセクション)は
+ * スキップしてカウントするだけで処理は継続する。storePassphraseは全件で共通の1つを使う
+ * (ユーザーの運用が元々「全アドレス同一passphrase」だったこと、および§7.4のvault方式が
+ * 単一passphraseでの一括unlockを前提にしていることに合わせた)。
+ */
+#define KEYS_DAT_LINE_MAX 4096
+#define KEYS_DAT_FIELD_MAX 256
+#define KEYS_DAT_ADDRESS_MAX 64
+
+struct keys_dat_entry
+{
+    char address[KEYS_DAT_ADDRESS_MAX];
+    char label[KEYS_DAT_FIELD_MAX];
+    char signing_wif[KEYS_DAT_FIELD_MAX];
+    char encryption_wif[KEYS_DAT_FIELD_MAX];
+    long nonce_trials_per_byte;
+    long payload_length_extra_bytes;
+    int has_signing;
+    int has_encryption;
+};
+
+static void import_keys_dat_entry(const struct bm_cli_env *env, const struct keys_dat_entry *e,
+                                   const char *store_passphrase, int *imported, int *failed)
+{
+    bm_json_value_t *params = bm_json_new_array();
+    bm_json_array_append(params, bm_json_new_string(e->address));
+    bm_json_array_append(params, bm_json_new_string(e->signing_wif));
+    bm_json_array_append(params, bm_json_new_string(e->encryption_wif));
+    bm_json_array_append(params, bm_json_new_string(e->label));
+    bm_json_array_append(params, bm_json_new_string(store_passphrase));
+    if (e->nonce_trials_per_byte > 0)
+    {
+        bm_json_array_append(params, bm_json_new_number((double)e->nonce_trials_per_byte));
+        if (e->payload_length_extra_bytes > 0)
+        {
+            bm_json_array_append(params, bm_json_new_number((double)e->payload_length_extra_bytes));
+        }
+    }
+
+    char *error_msg = NULL;
+    bm_json_value_t *response = NULL;
+    if (!call_rpc_raw(env, "importAddress", params, &response, &error_msg))
+    {
+        fprintf(stderr, "スキップ: %s (%s)\n", e->address, error_msg);
+        free(error_msg);
+        (*failed)++;
+        return;
+    }
+    bm_json_free(response);
+    (*imported)++;
+}
+
+static int import_keys_dat(const struct bm_cli_env *env, const char *path, const char *store_passphrase)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+    {
+        fprintf(stderr, "エラー: %s を開けません\n", path);
+        return EXIT_FAILURE;
+    }
+
+    struct keys_dat_entry cur;
+    memset(&cur, 0, sizeof(cur));
+    int in_address_section = 0;
+    int imported = 0;
+    int failed = 0;
+    int skipped_no_keys = 0;
+    char line[KEYS_DAT_LINE_MAX];
+
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        char *nl = strchr(line, '\n');
+        if (nl != NULL)
+        {
+            *nl = '\0';
+        }
+        char *trimmed = trim_inplace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#' || trimmed[0] == ';')
+        {
+            continue;
+        }
+
+        if (trimmed[0] == '[')
+        {
+            if (in_address_section)
+            {
+                if (cur.has_signing && cur.has_encryption)
+                {
+                    import_keys_dat_entry(env, &cur, store_passphrase, &imported, &failed);
+                }
+                else
+                {
+                    skipped_no_keys++;
+                }
+            }
+            memset(&cur, 0, sizeof(cur));
+            in_address_section = 0;
+
+            char *end = strchr(trimmed, ']');
+            if (end != NULL)
+            {
+                *end = '\0';
+                const char *section_name = trimmed + 1;
+                if (strncmp(section_name, "BM-", 3) == 0)
+                {
+                    in_address_section = 1;
+                    strncpy(cur.address, section_name, sizeof(cur.address) - 1);
+                }
+            }
+            continue;
+        }
+
+        if (!in_address_section)
+        {
+            continue;
+        }
+
+        char *eq = strchr(trimmed, '=');
+        if (eq == NULL)
+        {
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim_inplace(trimmed);
+        char *value = trim_inplace(eq + 1);
+
+        if (strcasecmp(key, "label") == 0)
+        {
+            strncpy(cur.label, value, sizeof(cur.label) - 1);
+        }
+        else if (strcasecmp(key, "privsigningkey") == 0)
+        {
+            strncpy(cur.signing_wif, value, sizeof(cur.signing_wif) - 1);
+            cur.has_signing = 1;
+        }
+        else if (strcasecmp(key, "privencryptionkey") == 0)
+        {
+            strncpy(cur.encryption_wif, value, sizeof(cur.encryption_wif) - 1);
+            cur.has_encryption = 1;
+        }
+        else if (strcasecmp(key, "noncetrialsperbyte") == 0)
+        {
+            cur.nonce_trials_per_byte = atol(value);
+        }
+        else if (strcasecmp(key, "payloadlengthextrabytes") == 0)
+        {
+            cur.payload_length_extra_bytes = atol(value);
+        }
+    }
+
+    /* ファイル末尾が別セクションの見出しで終わらない場合、最後のセクションはループ内の
+     * "["処理を通らないのでここで拾う */
+    if (in_address_section)
+    {
+        if (cur.has_signing && cur.has_encryption)
+        {
+            import_keys_dat_entry(env, &cur, store_passphrase, &imported, &failed);
+        }
+        else
+        {
+            skipped_no_keys++;
+        }
+    }
+
+    fclose(f);
+
+    printf("インポート完了: 成功%d件, 失敗%d件, 鍵欠落でスキップ%d件\n", imported, failed, skipped_no_keys);
+    return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 int main(int argc, char **argv)
@@ -203,6 +447,45 @@ int main(int argc, char **argv)
         return call_rpc(&env, "createDeterministicAddress", params);
     }
 
+    if (strcmp(cmd, "import-address") == 0)
+    {
+        if (argc < 7 || argc > 9)
+        {
+            fprintf(stderr,
+                    "使い方: %s import-address <address> <signingWIF> <encryptionWIF> <label> "
+                    "<storePassphrase> [nonceTrialsPerByte] [payloadLengthExtraBytes]\n",
+                    argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        bm_json_array_append(params, bm_json_new_string(argv[4]));
+        bm_json_array_append(params, bm_json_new_string(argv[5]));
+        bm_json_array_append(params, bm_json_new_string(argv[6]));
+        if (argc >= 8)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[7])));
+        }
+        if (argc == 9)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[8])));
+        }
+        return call_rpc(&env, "importAddress", params);
+    }
+
+    if (strcmp(cmd, "import-keys-dat") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "使い方: %s import-keys-dat <keys.datのパス> <storePassphrase>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_free(params);
+        return import_keys_dat(&env, argv[2], argv[3]);
+    }
+
     if (strcmp(cmd, "join-chan") == 0)
     {
         if (argc != 5)
@@ -228,6 +511,19 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         bm_json_array_append(params, bm_json_new_string(argv[3]));
         return call_rpc(&env, "unlockAddress", params);
+    }
+
+    if (strcmp(cmd, "export-address") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "使い方: %s export-address <address> <passphrase>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        return call_rpc(&env, "exportAddress", params);
     }
 
     if (strcmp(cmd, "unlock-all") == 0)
@@ -393,6 +689,36 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "list-subscriptions") == 0)
     {
         return call_rpc(&env, "listSubscriptions", params);
+    }
+
+    if (strcmp(cmd, "add-address-book-entry") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "使い方: %s add-address-book-entry <address> <label>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        return call_rpc(&env, "addAddressBookEntry", params);
+    }
+
+    if (strcmp(cmd, "delete-address-book-entry") == 0)
+    {
+        if (argc != 3)
+        {
+            fprintf(stderr, "使い方: %s delete-address-book-entry <address>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        return call_rpc(&env, "deleteAddressBookEntry", params);
+    }
+
+    if (strcmp(cmd, "list-address-book-entries") == 0)
+    {
+        return call_rpc(&env, "listAddressBookEntries", params);
     }
 
     if (strcmp(cmd, "get-socks-proxy-onion") == 0)

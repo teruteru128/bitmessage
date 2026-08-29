@@ -131,4 +131,61 @@ echo "$SEND_DASH_OUTPUT" | grep -q "エラー" \
 "$CLI" delete "$ADDR3" >/dev/null
 "$CLI" delete "$ADDR4" >/dev/null
 
+# §11 2026-08-29 export-address/import-address/import-keys-dat/address-book: keys.dat
+# インポート機能一式のCLI配線を確認する(成功パスの詳細検証はtests/test_api_server.cで
+# カバー済みなので、ここではCLI→API→ファイルI/Oの配線のみ)。
+ADDR5_JSON=$("$CLI" create-address "cli export/import test" 4 1 1 "sender5" "storepass5")
+ADDR5=$(echo "$ADDR5_JSON" | tr -d '"')
+[ "$("$CLI" unlock "$ADDR5" "storepass5")" = "true" ] || fail "unlock sender5 for export/import test"
+
+EXPORT_JSON=$("$CLI" export-address "$ADDR5" "storepass5")
+SIGNING_WIF=$(echo "$EXPORT_JSON" | grep -oP '"signingWIF":"\K[^"]+')
+ENCRYPTION_WIF=$(echo "$EXPORT_JSON" | grep -oP '"encryptionWIF":"\K[^"]+')
+[ -n "$SIGNING_WIF" ] && [ -n "$ENCRYPTION_WIF" ] || fail "export-address should return signingWIF/encryptionWIF (got: $EXPORT_JSON)"
+
+EXPORT_WRONG_OUTPUT=$("$CLI" export-address "$ADDR5" "wrongpass" 2>&1 || true)
+echo "$EXPORT_WRONG_OUTPUT" | grep -q "エラー" \
+    || fail "export-address with wrong passphrase should fail with an error (got: $EXPORT_WRONG_OUTPUT)"
+
+"$CLI" delete "$ADDR5" >/dev/null
+
+# import-address: exportで取り出したWIFで再インポートし、新しいpassphraseでunlockできること
+[ "$("$CLI" import-address "$ADDR5" "$SIGNING_WIF" "$ENCRYPTION_WIF" "reimported" "newpass5")" = "true" ] \
+    || fail "import-address should succeed with the exported WIFs"
+[ "$("$CLI" unlock "$ADDR5" "newpass5")" = "true" ] || fail "unlock after import-address should succeed"
+"$CLI" delete "$ADDR5" >/dev/null
+
+# import-keys-dat: PyBitmessage本家keys.dat形式(INI)のファイルを丸ごとインポートする
+cat > test_keys.dat <<EOF
+[bitmessagesettings]
+port = 8444
+
+[$ADDR5]
+label = reimported via keys.dat
+enabled = true
+noncetrialsperbyte = 1000
+payloadlengthextrabytes = 1000
+privsigningkey = $SIGNING_WIF
+privencryptionkey = $ENCRYPTION_WIF
+EOF
+
+IMPORT_KEYS_DAT_OUTPUT=$("$CLI" import-keys-dat test_keys.dat "keysdatpass")
+echo "$IMPORT_KEYS_DAT_OUTPUT" | grep -q "成功1件, 失敗0件" \
+    || fail "import-keys-dat should report 1 success (got: $IMPORT_KEYS_DAT_OUTPUT)"
+[ "$("$CLI" unlock "$ADDR5" "keysdatpass")" = "true" ] || fail "unlock after import-keys-dat should succeed"
+"$CLI" delete "$ADDR5" >/dev/null
+
+# アドレス帳(address_book) CRUD
+[ "$("$CLI" list-address-book-entries)" = "[]" ] || fail "initial address book should be empty"
+"$CLI" add-address-book-entry "$ADDR5" "book friend" >/dev/null
+LIST_AB=$("$CLI" list-address-book-entries)
+echo "$LIST_AB" | grep -q "\"address\":\"$ADDR5\"" || fail "address book should contain $ADDR5 (got: $LIST_AB)"
+
+DUP_AB_OUTPUT=$("$CLI" add-address-book-entry "$ADDR5" "dup" 2>&1 || true)
+echo "$DUP_AB_OUTPUT" | grep -q "エラー" \
+    || fail "adding a duplicate address book entry should fail with an error (got: $DUP_AB_OUTPUT)"
+
+"$CLI" delete-address-book-entry "$ADDR5" >/dev/null
+[ "$("$CLI" list-address-book-entries)" = "[]" ] || fail "address book should be empty after delete"
+
 echo "ALL OK"
