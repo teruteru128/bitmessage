@@ -687,6 +687,166 @@ int main(void)
         }
     }
 
+    /* §11 2026-08-30 trashMessage: [msgId(hex)] -> bool。上でinboxへ差し込んだmsg_id(abab...)と
+     * sentへ差し込んだmsg_id(cdcd...)の両方に対して、folder='trash'へ更新されることを確認する
+     * (PyBitmessage本家のtrashMessageと同じくinbox/sentの区別なく1つのmsgIdで両方を試す仕様)。
+     * 存在しないmsgIdを渡してもエラーにならないこと、不正な長さのhexはエラーになることも確認する。 */
+    {
+        char inbox_msg_id_hex[65];
+        unsigned char inbox_msg_id[32];
+        memset(inbox_msg_id, 0xab, sizeof(inbox_msg_id));
+        hex_encode(inbox_msg_id, sizeof(inbox_msg_id), inbox_msg_id_hex);
+
+        char sent_msg_id_hex[65];
+        unsigned char sent_msg_id[32];
+        memset(sent_msg_id, 0xcd, sizeof(sent_msg_id));
+        hex_encode(sent_msg_id, sizeof(sent_msg_id), sent_msg_id_hex);
+
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"trashMessage\",\"params\":[\"%s\"],\"id\":20}",
+                 inbox_msg_id_hex);
+        resp = do_request(req, "testuser", "testpass");
+        CHECK(resp != NULL, "trashMessage(inbox) HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1,
+                  "trashMessage(inbox) returns true");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"trashMessage\",\"params\":[\"%s\"],\"id\":21}",
+                 sent_msg_id_hex);
+        resp = do_request(req, "testuser", "testpass");
+        CHECK(resp != NULL, "trashMessage(sent) HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            CHECK(result != NULL && result->type == BM_JSON_BOOL && result->boolean == 1,
+                  "trashMessage(sent) returns true");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* 存在しないmsgId: エラーにならず true が返る(本家の「存在したと仮定」仕様) */
+        resp = do_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"trashMessage\","
+            "\"params\":[\"0000000000000000000000000000000000000000000000000000000000000000\"],\"id\":22}",
+            "testuser", "testpass");
+        CHECK(resp != NULL, "trashMessage(nonexistent) HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+            CHECK(err == NULL, "trashMessage(nonexistent-but-well-formed) does not error");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* 不正な長さのhex(63文字)はエラーになる */
+        resp = do_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"trashMessage\","
+            "\"params\":[\"abc\"],\"id\":23}",
+            "testuser", "testpass");
+        CHECK(resp != NULL, "trashMessage(bad hex) HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+            CHECK(err != NULL, "trashMessage(bad hex) returns error");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* getInboxMessages(folder='inbox')からtrash化した行が消え、folder無指定では
+         * folder='trash'として残っていることを確認する */
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getInboxMessages\",\"params\":[\"inbox\"],\"id\":24}",
+                           "testuser", "testpass");
+        CHECK(resp != NULL, "getInboxMessages(inbox) after trash HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            int found = 0;
+            if (result != NULL)
+            {
+                for (size_t i = 0; i < result->item_count; i++)
+                {
+                    const char *msg_id_hex =
+                        bm_json_as_string(bm_json_object_get(bm_json_array_get(result, i), "msgId"));
+                    if (msg_id_hex != NULL && strcmp(msg_id_hex, inbox_msg_id_hex) == 0)
+                    {
+                        found = 1;
+                    }
+                }
+            }
+            CHECK(!found, "trashed inbox message no longer in folder=inbox listing");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getInboxMessages\",\"params\":[],\"id\":25}",
+                           "testuser", "testpass");
+        CHECK(resp != NULL, "getInboxMessages(all) after trash HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            bm_json_value_t *entry = NULL;
+            if (result != NULL)
+            {
+                for (size_t i = 0; i < result->item_count; i++)
+                {
+                    bm_json_value_t *e = bm_json_array_get(result, i);
+                    const char *msg_id_hex = bm_json_as_string(bm_json_object_get(e, "msgId"));
+                    if (msg_id_hex != NULL && strcmp(msg_id_hex, inbox_msg_id_hex) == 0)
+                    {
+                        entry = e;
+                    }
+                }
+            }
+            CHECK(entry != NULL, "trashed inbox message still present in unfiltered listing");
+            if (entry != NULL)
+            {
+                CHECK(strcmp(bm_json_as_string(bm_json_object_get(entry, "folder")), "trash") == 0,
+                      "trashed inbox message folder == trash");
+            }
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* getSentMessagesはfolder='sent'のみ返すため、trash化した行は消える */
+        resp = do_request("{\"jsonrpc\":\"2.0\",\"method\":\"getSentMessages\",\"params\":[],\"id\":26}",
+                           "testuser", "testpass");
+        CHECK(resp != NULL, "getSentMessages after trash HTTP request");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
+            int found = 0;
+            if (result != NULL)
+            {
+                for (size_t i = 0; i < result->item_count; i++)
+                {
+                    const char *msg_id_hex =
+                        bm_json_as_string(bm_json_object_get(bm_json_array_get(result, i), "msgId"));
+                    if (msg_id_hex != NULL && strcmp(msg_id_hex, sent_msg_id_hex) == 0)
+                    {
+                        found = 1;
+                    }
+                }
+            }
+            CHECK(!found, "trashed sent message no longer in getSentMessages listing");
+            bm_json_free(v);
+            free(resp);
+        }
+    }
+
     /* §11 addPeer: [ipAddress, port, stream?]。手動でpeers.dbへ登録できることを確認する */
     resp = do_request(
         "{\"jsonrpc\":\"2.0\",\"method\":\"addPeer\",\"params\":[\"203.0.113.99\",8444,1],\"id\":16}",

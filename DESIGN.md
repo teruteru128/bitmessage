@@ -1749,5 +1749,37 @@ chan=trueの再現、アドレス帳CRUDのCLI配線)・`tests/test_address_vect
 
 いずれも既存の`unlockAllAddresses`の機能には影響しないため、別セッションで着手する方針。
 
+**2026-08-30完了: trashMessage API/CLI**。ユーザーからの質問「PyBitmessage本家の`trashMessage`
+相当のAPIは作っていなかったか」で発覚(メッセージ関連APIは`sendMessage`/`sendBroadcast`/
+`getInboxMessages`/`getSentMessages`のみで、削除系が未実装だった)。実装方針についてユーザーと
+2回相談した:
+
+1. 「物理削除か論理削除か」→当初「inboxのみ物理削除」と合意しかけたが、`inbox`テーブルの
+   `folder`列(`'inbox'|'trash'`、§2.4で当初から定義済み)がまさにこの用途のために用意されて
+   いたこと、`getInboxMessages`も`folder`引数で絞り込み可能なことにユーザーが気付き、
+   PyBitmessage本家api.pyの実ソース確認(`HandleTrashMessage`は`helper_inbox.trash(msgid)`+
+   `UPDATE sent SET folder='trash' WHERE msgid=?`という論理削除)で本家も同じ設計と確認できた
+   ため、論理削除(`folder='trash'`更新)へ方針転換した
+2. 「実装範囲」→本家には`trashMessage`(inbox/sent両対応)/`trashInboxMessage`/`trashSentMessage`/
+   `trashSentMessageByAckData`の4種があるが、まず`trashMessage`のみを移植する方針で合意
+   (inbox/sent個別指定用の3種は必要になったら追加)
+
+実装内容:
+- `sent`テーブルに`folder TEXT NOT NULL DEFAULT 'sent'`列を追加(新規は`CREATE TABLE`、既存DBは
+  `peer_manager.c`の`is_self`追加時と同じ`ALTER TABLE ... ADD COLUMN`パターンで後付け)。
+  従来`sent`にはfolder概念が無く(DESIGN-LOG.md参照)、trash化した行を隠す手段が無かったため
+- `bm_messages_store_trash_inbox_message`/`bm_messages_store_trash_sent_message`
+  (`messages_store.c`): それぞれ`UPDATE inbox/sent SET folder='trash' WHERE msg_id=?1`。
+  該当行が無くてもエラーにしない(本家の「存在したと仮定して削除した」という応答仕様に合わせる)
+- `bm_messages_store_list_sent`のSQLに`WHERE folder = 'sent'`を追加。追加しないとtrash化しても
+  `getSentMessages`から消えず実質何も隠せないため(`getInboxMessages`は元々`folder_filter`引数が
+  あるのでこちらは変更不要、無指定なら全件・`'inbox'`指定でtrashを除外できる)
+- `trashMessage`API(`api_server.c`)・`trash-message`CLIサブコマンド(`main.c`): `[msgId(hex)]`を
+  受け取り、inbox/sent両方に対して上記2関数を無条件に呼ぶ(呼び出し側はmsgIdがinbox由来か
+  sent由来か意識しなくてよい、本家と同じ構成)。SQL自体が失敗した場合のみエラーを返す
+- `tests/test_api_server.c`に追記: inbox/sent双方への適用、存在しないmsgIdでもエラーにならない
+  こと、不正な長さのhexはエラーになること、`getInboxMessages(['inbox'])`から消えて無指定では
+  `folder='trash'`として残ること、`getSentMessages`から消えることを検証。ctest 41件全通過
+
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。

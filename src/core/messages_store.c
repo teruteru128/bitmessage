@@ -29,7 +29,8 @@ static const char *SCHEMA_SQL =
     "sent_time INTEGER NOT NULL, "
     "ttl INTEGER NOT NULL, "
     "resend_count INTEGER NOT NULL DEFAULT 0, "
-    "next_resend_time INTEGER NOT NULL DEFAULT 0"
+    "next_resend_time INTEGER NOT NULL DEFAULT 0, "
+    "folder TEXT NOT NULL DEFAULT 'sent'" /* 'sent' | 'trash'(§11 2026-08-30 trashMessage用) */
     ");"
     "CREATE TABLE IF NOT EXISTS address_book ("
     "address TEXT PRIMARY KEY, "
@@ -43,7 +44,15 @@ static const char *SCHEMA_SQL =
 
 int bm_messages_store_init_schema(sqlite3 *db)
 {
-    return bm_db_init_schema(db, SCHEMA_SQL);
+    if (bm_db_init_schema(db, SCHEMA_SQL) != 0)
+    {
+        return -1;
+    }
+    /* §11 2026-08-30: folder列は追加時点で既に稼働中のmessages.dbのsentテーブルには存在しない。
+     * peer_manager.cのis_self追加時と同じ理由でALTER TABLEにより後付けする(既存DBとの重複エラーは
+     * 無視する)。trashMessage APIでsent側もfolder='trash'にできるようにするため追加。 */
+    sqlite3_exec(db, "ALTER TABLE sent ADD COLUMN folder TEXT NOT NULL DEFAULT 'sent';", NULL, NULL, NULL);
+    return 0;
 }
 
 int bm_messages_store_insert_inbox(sqlite3 *db, const unsigned char msg_id[32],
@@ -450,9 +459,12 @@ void bm_address_book_list_free(struct bm_address_book_entry *list)
 
 int bm_messages_store_list_sent(sqlite3 *db, struct bm_sent_message **out_list, size_t *out_count)
 {
+    /* §11 2026-08-30: trashMessageでfolder='trash'にした行はPyBitmessage本家のlistSentMessages
+     * (WHERE folder='sent')同様、一覧から除外する。除外しないとtrashMessageが実質何も
+     * 隠さないことになってしまうため。 */
     static const char *SQL =
         "SELECT msg_id, to_address, from_address, subject, body, status, sent_time, ttl, resend_count "
-        "FROM sent ORDER BY sent_time DESC;";
+        "FROM sent WHERE folder = 'sent' ORDER BY sent_time DESC;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
@@ -522,4 +534,36 @@ void bm_sent_message_list_free(struct bm_sent_message *list, size_t count)
         free(list[i].body);
     }
     free(list);
+}
+
+/* §11 2026-08-30: trashMessage API用。PyBitmessage本家api.pyのHandleTrashMessageは
+ * helper_inbox.trash(msgid)とUPDATE sent SET folder='trash' WHERE msgid=?を両方無条件に実行し、
+ * 該当が無くてもエラーにしない(「存在したと仮定して削除した」という応答仕様)。こちらも同じ
+ * 構成にする(該当行数を見ずに常に0を返す)。 */
+int bm_messages_store_trash_inbox_message(sqlite3 *db, const unsigned char msg_id[32])
+{
+    static const char *SQL = "UPDATE inbox SET folder = 'trash' WHERE msg_id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, msg_id, 32, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_messages_store_trash_sent_message(sqlite3 *db, const unsigned char msg_id[32])
+{
+    static const char *SQL = "UPDATE sent SET folder = 'trash' WHERE msg_id = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_blob(stmt, 1, msg_id, 32, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
 }

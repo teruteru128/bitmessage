@@ -1410,6 +1410,37 @@ static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *con
     return arr;
 }
 
+/* §11 2026-08-30: trashMessage: [msgId(hex)] -> bool。PyBitmessage本家api.pyの
+ * HandleTrashMessage準拠。msgIdがinbox/sentのどちらの行を指しているか呼び出し側は
+ * 意識しなくてよいよう、両テーブルに対してfolder='trash'更新を無条件に試みる(該当行が
+ * 無くてもエラーにしない、「存在したと仮定して削除した」という本家と同じ応答仕様)。
+ * SQL自体が失敗した場合(DBエラー等)のみエラーを返す。 */
+static bm_json_value_t *h_trashMessage(const struct bm_api_server_config *config,
+                                        const bm_json_value_t *params, char **out_error)
+{
+    const char *msg_id_hex = param_str(params, 0);
+    if (msg_id_hex == NULL)
+    {
+        *out_error = dup_cstr("trashMessage requires [msgId]");
+        return NULL;
+    }
+    unsigned char msg_id[32];
+    if (hex_decode_fixed(msg_id_hex, msg_id, sizeof(msg_id)) != 0)
+    {
+        *out_error = dup_cstr("msgId must be a 64-character hex string");
+        return NULL;
+    }
+
+    int inbox_rc = bm_messages_store_trash_inbox_message(config->messages_db, msg_id);
+    int sent_rc = bm_messages_store_trash_sent_message(config->messages_db, msg_id);
+    if (inbox_rc != 0 && sent_rc != 0)
+    {
+        *out_error = dup_cstr("failed to trash message");
+        return NULL;
+    }
+    return bm_json_new_bool(1);
+}
+
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
     {"unlockAllAddresses", h_unlockAllAddresses},
@@ -1428,6 +1459,7 @@ static const struct bm_api_method METHODS[] = {
     {"sendBroadcast", h_sendBroadcast},
     {"getInboxMessages", h_getInboxMessages},
     {"getSentMessages", h_getSentMessages},
+    {"trashMessage", h_trashMessage},
     {"addSubscription", h_addSubscription},
     {"removeSubscription", h_removeSubscription},
     {"listSubscriptions", h_listSubscriptions},

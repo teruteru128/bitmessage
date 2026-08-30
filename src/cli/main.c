@@ -73,6 +73,9 @@ static void print_usage(const char *prog)
             "      送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
             "      fromAddress/subject/body/status(encoding|doingpow|broadcasted|\n"
             "      ackreceived)/sentTime/ttl/resendCount\n"
+            "  trash-message <msgId(hex)>\n"
+            "      inbox/sent両方に対してfolder='trash'化を試みる(PyBitmessage本家trashMessage準拠)。\n"
+            "      該当が無くてもエラーにしない\n"
             "  send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n"
             "  add-subscription <address> [label]\n"
             "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
@@ -849,6 +852,18 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         return call_rpc(&env, "getSentMessages", params);
+    }
+
+    if (strcmp(cmd, "trash-message") == 0)
+    {
+        if (argc != 3)
+        {
+            fprintf(stderr, "使い方: %s trash-message <msgId(hex)>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        return call_rpc(&env, "trashMessage", params);
     }
 
     if (strcmp(cmd, "send-broadcast") == 0)

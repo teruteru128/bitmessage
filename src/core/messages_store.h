@@ -93,6 +93,17 @@ int bm_messages_store_list_inbox(sqlite3 *db, const char *folder_filter,
                                   struct bm_inbox_message **out_list, size_t *out_count);
 void bm_inbox_message_list_free(struct bm_inbox_message *list, size_t count);
 
+/*
+ * §11 2026-08-30: trashMessage API用。msg_idでinboxの1行をfolder='trash'へ更新する(PyBitmessage
+ * 本家api.pyのHandleTrashMessage/helper_inbox.trash準拠の論理削除)。inboxテーブルのfolder列
+ * ('inbox'|'trash'、DESIGN.md §2.4)はこの用途のために既に設けられていたが、値を変更するAPIが
+ * これまで無かった(getInboxMessagesのfolder引数は絞り込み専用で書き込み側が未実装だった)ため
+ * 追加。該当行が無くてもエラーにしない(本家も「存在したと仮定して削除した」という応答仕様)。
+ * trashMessage APIはinboxとsentの両方に対してこれと下のbm_messages_store_trash_sent_messageを
+ * 無条件で両方呼ぶ(本家HandleTrashMessageと同じ構成)。成功時0。
+ */
+int bm_messages_store_trash_inbox_message(sqlite3 *db, const unsigned char msg_id[32]);
+
 struct bm_sent_message
 {
     unsigned char msg_id[32];
@@ -116,6 +127,12 @@ struct bm_sent_message
  */
 int bm_messages_store_list_sent(sqlite3 *db, struct bm_sent_message **out_list, size_t *out_count);
 void bm_sent_message_list_free(struct bm_sent_message *list, size_t count);
+
+/* §11 2026-08-30: trashMessage API用。msg_idでsentの1行をfolder='trash'へ更新する
+ * (bm_messages_store_trash_inbox_messageのsent版、詳細はそちらのコメント参照)。
+ * bm_messages_store_list_sentはfolder='sent'の行のみ返すため、これでtrash化した行は
+ * 一覧から消える。成功時0。 */
+int bm_messages_store_trash_sent_message(sqlite3 *db, const unsigned char msg_id[32]);
 
 /* --- §5.4 broadcast購読(subscriptions) --- */
 
