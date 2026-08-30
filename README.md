@@ -23,7 +23,8 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **P2Pネットワーク層**: version/verack/addr/inv/getdata/objectのハンドシェイクと配線。実testnetノードとの
   相互運用を確認済み。接続の常駐維持・再接続、受信objectの他peerへの中継(inv flooding)に対応
 - **direct message送受信**: 送信時のPoW計算・ack機構、getpubkey要求の自動発行/自動応答、ack未着時の
-  自動再送(間隔を倍々に、toPubEncryptionHexを直接指定した送信でも自動でpubkey_cacheへ登録され再送される)
+  自動再送(間隔を倍々に)。宛先の公開鍵は常に`pubkey_cache`経由で解決する(`cachePubkey`で
+  事前登録可能。誤った鍵での暗号化・cache汚染を防ぐため、`sendMessage`への直接指定は廃止した)
 - **broadcast購読・送信**: 購読先アドレスからのbroadcastを自動復号してinboxへ、`sendBroadcast`での送信
 - **chan(私設グループチャンネル)**: 共有passphraseから同じアドレス・鍵を導出して複数人が
   参加(`joinChan`)、自分自身宛のsendMessageで投稿、他メンバーはtrial_decryptで自動復号
