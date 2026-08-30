@@ -12,6 +12,12 @@
  *    chan宛msgオブジェクト(過去ログ)を、unlock後にbm_object_sync_backfill_trial_decrypt
  *    で拾えること(通常の受信フローはobjectを新規受信した瞬間にしかtrial_decryptを試みない
  *    ため、そのままではchan参加前の投稿がinboxに現れない問題への対応)
+ * 5. §11 2026-08-31: bm_object_sync_backfill_trial_decryptのaddress_filter引数が正しく
+ *    スコープを絞ること。unlock-all済みでkeyringに大量のunlocked identityが積まれた状態で
+ *    単体unlockAddress(join-chan含む)を叩くと、backfillがkeyring全体を総当たりしてしまい
+ *    「MSGオブジェクト数×既存unlockedアドレス数」の計算量になって実運用で9時間以上RPCサーバー
+ *    をブロックした問題が発覚したための対応。address_filterに無関係なidentityのアドレスを
+ *    渡した場合は復号されず、正しいアドレスを渡した場合のみ復号されることを確認する。
  * を確認する。
  */
 
@@ -37,6 +43,7 @@
 #define TEST_IDENTITY_DB_B "test_chan_identity_b.db"
 #define TEST_MESSAGES_DB_B "test_chan_messages_b.db"
 #define TEST_OBJECT_POOL_DB_B "test_chan_object_pool_b.db"
+#define TEST_IDENTITY_DB_OTHER "test_chan_identity_other.db"
 
 static int failures = 0;
 
@@ -179,8 +186,9 @@ int main(void)
         CHECK(bm_keyring_unlock(&kr_b_late, identity_db_b, chan_address_b, "storepass-b") == 0,
               "member B joins/unlocks the chan identity after the backlog message was received");
 
-        int decrypted = bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late);
-        CHECK(decrypted == 1, "backfill decrypts exactly the 1 backlog message after unlock");
+        int decrypted =
+            bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b);
+        CHECK(decrypted == 1, "backfill decrypts exactly the 1 backlog message after unlock (address_filter)");
 
         struct bm_inbox_message *inbox_list = NULL;
         size_t inbox_count = 0;
@@ -192,12 +200,83 @@ int main(void)
         bm_inbox_message_list_free(inbox_list, inbox_count);
 
         /* 再実行してもinbox側はmsg_idユニーク制約でIGNOREされ、重複挿入されないこと */
-        CHECK(bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late) == 1,
+        CHECK(bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b)
+                  == 1,
               "re-running backfill still trial-decrypts successfully (idempotent at this layer)");
         CHECK(bm_messages_store_list_inbox(messages_db_b, NULL, &inbox_list, &inbox_count) == 0
                   && inbox_count == 1,
               "re-running backfill does not duplicate the inbox entry");
         bm_inbox_message_list_free(inbox_list, inbox_count);
+
+        /* --- 6. address_filterのスコープ検証: 無関係なidentityをkeyringへ追加してunlockし、
+         * そちらのアドレスをaddress_filterに渡すと、chan宛の新規backlogは復号されない
+         * (keyring全体ではなく指定した1identityだけが試されることの直接証拠) --- */
+        struct bm_generated_address gen_other;
+        CHECK(bm_address_generate_deterministic("unrelated identity, not the chan", 1, &gen_other) == 0,
+              "derive an unrelated (non-chan) identity's keys");
+        char *other_address = bm_address_encode(4, 1, gen_other.ripe, BM_RIPE_LEN);
+        sqlite3 *identity_db_other = open_fresh_db(TEST_IDENTITY_DB_OTHER, bm_identity_store_init_schema);
+        CHECK(bm_keyring_create_identity(identity_db_other, other_address, "unrelated", 4, 1,
+                                          gen_other.pub_signing, gen_other.pub_encryption,
+                                          gen_other.priv_signing, gen_other.priv_encryption,
+                                          "storepass-other", 1000, 1000) == 0,
+              "create an unrelated identity");
+        CHECK(bm_keyring_unlock(&kr_b_late, identity_db_other, other_address, "storepass-other") == 0,
+              "unlock the unrelated identity into member B's keyring alongside the chan identity");
+
+        unsigned char *object3 = NULL;
+        size_t object3_len = 0;
+        int64_t now3 = (int64_t)time(NULL);
+        int rc3 = bm_send_pipeline_send_message(&kr_a, identity_db_a, messages_db_a, chan_address_a, chan_address_a,
+                                                  "third chan post", "another backlog message", 3600, 1,
+                                                  NULL, now3 + BM_RESEND_INITIAL_INTERVAL_SECONDS,
+                                                  &object3, &object3_len);
+        CHECK(rc3 == 0, "member A posts a third chan message (backlog, before B fetches it)");
+        if (rc3 == 0)
+        {
+            unsigned char hash3[32];
+            bm_inventory_hash(object3, object3_len, hash3);
+            CHECK(bm_object_store_insert(object_pool_db_b, hash3, (int)BM_OBJECT_MSG, 1, object3, object3_len,
+                                          now3 + 3600, now3) == 0,
+                  "third backlog object is stored in member B's object_pool.db");
+
+            int decrypted_wrong_filter = bm_object_sync_backfill_trial_decrypt(
+                object_pool_db_b, messages_db_b, &kr_b_late, other_address);
+            CHECK(decrypted_wrong_filter == 0,
+                  "backfill with address_filter pointing at the unrelated identity decrypts nothing, "
+                  "even though the chan identity is also unlocked in the same keyring");
+
+            /* object_pool_db_bはこの時点でobject2(既にinbox済み)とobject3の2件のMSGオブジェクトを
+             * 保持している。backfillはobject_pool_db_b全体を毎回再走査するため、object2分も
+             * 含めて2件が"復号成功"としてカウントされる(inbox挿入自体はmsg_idユニーク制約で
+             * IGNOREされる、上のシナリオ5のidempotency確認と同じ仕組み)。ここではdecrypted件数の
+             * 検証よりも「object3(third chan post)が新たにinboxへ現れたか」を主眼に確認する。 */
+            int decrypted_right_filter = bm_object_sync_backfill_trial_decrypt(
+                object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b);
+            CHECK(decrypted_right_filter == 2,
+                  "backfill with the correct address_filter re-decrypts both backlog messages "
+                  "accumulated so far in object_pool.db");
+
+            struct bm_inbox_message *inbox_list_after = NULL;
+            size_t inbox_count_after = 0;
+            CHECK(bm_messages_store_list_inbox(messages_db_b, NULL, &inbox_list_after, &inbox_count_after) == 0,
+                  "list member B's inbox after the address_filter-scoped backfill");
+            int found_third = 0;
+            for (size_t j = 0; j < inbox_count_after; j++)
+            {
+                if (strcmp(inbox_list_after[j].subject, "third chan post") == 0)
+                {
+                    found_third = 1;
+                }
+            }
+            CHECK(inbox_count_after == 2 && found_third == 1,
+                  "the third chan post newly appears in member B's inbox after the correctly-scoped backfill");
+            bm_inbox_message_list_free(inbox_list_after, inbox_count_after);
+        }
+        free(object3);
+        sqlite3_close(identity_db_other);
+        unlink(TEST_IDENTITY_DB_OTHER);
+        free(other_address);
 
         bm_keyring_destroy(&kr_b_late);
     }

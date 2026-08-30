@@ -183,8 +183,14 @@ static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *confi
          * (bm_object_sync_backfill_trial_decryptのコメント参照)。unlock成功直後、
          * その鍵がkeyringに載った状態でobject_pool.db中の未復号MSGオブジェクトを
          * 再走査する。joinChan自体はDBへidentityを保存するだけでkeyringには載せない
-         * ため、trial_decryptが意味を持つのはこのunlockAddressのタイミングになる。 */
-        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring);
+         * ため、trial_decryptが意味を持つのはこのunlockAddressのタイミングになる。
+         *
+         * §11 2026-08-31 addressを渡してこのidentity1件だけに絞る(以前はkeyring全体を
+         * 対象にしていたが、unlock-all済みでkeyringに数千件規模のunlocked identityが
+         * 積まれた状態だと「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり、
+         * 実運用で9時間以上RPCサーバーをブロックする問題が発覚したため。詳細はDESIGN.mdおよび
+         * object_sync.hのbm_object_sync_backfill_trial_decryptコメント参照)。 */
+        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address);
     }
     return bm_json_new_bool(rc == 0);
 }

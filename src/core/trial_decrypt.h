@@ -31,6 +31,15 @@ struct bm_decoded_msg
  */
 int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t object_len,
                           struct bm_decoded_msg *out);
+
+/*
+ * §11 2026-08-31 bm_trial_decrypt_msgの単一identity限定版。keyring全体ではなく指定した1件の
+ * identityだけでトライアル復号を試みる(理由・使い所はtrial_decrypt.cのコメント、および
+ * object_sync.hのbm_object_sync_backfill_trial_decrypt参照)。成功時0。
+ */
+int bm_trial_decrypt_msg_single(const struct bm_unlocked_identity *identity, const unsigned char *object,
+                                 size_t object_len, struct bm_decoded_msg *out);
+
 void bm_decoded_msg_free(struct bm_decoded_msg *msg);
 
 /*
@@ -44,6 +53,11 @@ void bm_decoded_msg_free(struct bm_decoded_msg *msg);
 int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
                                 const unsigned char *object, size_t object_len,
                                 unsigned char **out_ack_payload, size_t *out_ack_payload_len);
+
+/* §11 2026-08-31 bm_trial_decrypt_and_storeの単一identity限定版(bm_trial_decrypt_msg_single参照) */
+int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identity, sqlite3 *db,
+                                       const unsigned char *object, size_t object_len,
+                                       unsigned char **out_ack_payload, size_t *out_ack_payload_len);
 
 void *bm_trial_decrypt_thread(void *arg);
 

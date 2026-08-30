@@ -82,47 +82,16 @@ static void decode_simple(const unsigned char *data, size_t len, char **out_subj
     }
 }
 
-int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t object_len,
-                          struct bm_decoded_msg *out)
+/*
+ * §11 2026-08-31 backfill_trial_decryptの単一identity限定化(DESIGN.md参照)に伴うリファクタリング。
+ * 「ECIES復号成功後の共通処理(varint解析〜署名検証〜out構築)」を切り出す。matched/decryptedの
+ * cleanse・freeは元の設計通り呼び出し側(bm_trial_decrypt_msg/bm_trial_decrypt_msg_single)の
+ * 責務のままにする(このコア関数はcleanseしない)。
+ */
+static int trial_decrypt_body(const struct bm_unlocked_identity *identity, const struct bm_object_header *hdr,
+                               const unsigned char *object, const unsigned char *decrypted, size_t decrypted_len,
+                               struct bm_decoded_msg *out)
 {
-    struct bm_object_header hdr;
-    if (bm_object_parse_header(object, object_len, &hdr) != 0)
-    {
-        return -1;
-    }
-    if (hdr.object_type != BM_OBJECT_MSG || hdr.version != 1)
-    {
-        return -1;
-    }
-
-    const unsigned char *ciphertext = object + hdr.header_len;
-    size_t ciphertext_len = object_len - hdr.header_len;
-
-    /* keyring内のunlocked鍵全てでトライアル復号を試みる */
-    pthread_rwlock_rdlock(&kr->lock);
-    struct bm_unlocked_identity *cur = kr->head;
-    unsigned char *decrypted = NULL;
-    size_t decrypted_len = 0;
-    struct bm_unlocked_identity matched;
-    int found = 0;
-    while (cur != NULL)
-    {
-        if (bm_crypto_ecies_decrypt(ciphertext, ciphertext_len, cur->priv_encryption, &decrypted, &decrypted_len) == 0)
-        {
-            matched = *cur;
-            matched.next = NULL;
-            found = 1;
-            break;
-        }
-        cur = cur->next;
-    }
-    pthread_rwlock_unlock(&kr->lock);
-
-    if (!found)
-    {
-        return -1;
-    }
-
     size_t p = 0;
     size_t consumed;
     uint64_t from_ver = 0;
@@ -180,7 +149,7 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
         goto fail;
     }
     /* なりすまし転送対策(§5.3): 復号できてもtoRipeが自分のものでなければ拒否 */
-    if (memcmp(decrypted + p, matched.ripe, 20) != 0)
+    if (memcmp(decrypted + p, identity->ripe, 20) != 0)
     {
         goto fail;
     }
@@ -225,7 +194,7 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
     const unsigned char *sig = decrypted + p;
 
     /* 署名対象 = ヘッダ(平文、nonce抜き) || payload(署名を除く)。§5.3 */
-    size_t header_no_nonce_len = hdr.header_len - 8;
+    size_t header_no_nonce_len = hdr->header_len - 8;
     unsigned char *to_sign = malloc(header_no_nonce_len + presig_offset);
     memcpy(to_sign, object + 8, header_no_nonce_len);
     memcpy(to_sign + header_no_nonce_len, decrypted, presig_offset);
@@ -253,7 +222,7 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
         snprintf(out->from_address, sizeof(out->from_address), "%s", from_addr_str);
         free(from_addr_str);
     }
-    snprintf(out->to_address, sizeof(out->to_address), "%s", matched.address);
+    snprintf(out->to_address, sizeof(out->to_address), "%s", identity->address);
 
     if (encoding == 2)
     {
@@ -273,19 +242,104 @@ int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t o
         out->ack_payload_len = ack_len;
     }
 
-    OPENSSL_cleanse(decrypted, decrypted_len);
-    free(decrypted);
-    OPENSSL_cleanse(&matched, sizeof(matched));
     return 0;
 
 fail:
-    if (decrypted != NULL)
-    {
-        OPENSSL_cleanse(decrypted, decrypted_len);
-        free(decrypted);
-    }
-    OPENSSL_cleanse(&matched, sizeof(matched));
     return -1;
+}
+
+int bm_trial_decrypt_msg(bm_keyring_t *kr, const unsigned char *object, size_t object_len,
+                          struct bm_decoded_msg *out)
+{
+    struct bm_object_header hdr;
+    if (bm_object_parse_header(object, object_len, &hdr) != 0)
+    {
+        return -1;
+    }
+    if (hdr.object_type != BM_OBJECT_MSG || hdr.version != 1)
+    {
+        return -1;
+    }
+
+    const unsigned char *ciphertext = object + hdr.header_len;
+    size_t ciphertext_len = object_len - hdr.header_len;
+
+    /* keyring内のunlocked鍵全てでトライアル復号を試みる。ECIES復号(cur->priv_encryption使用)
+     * だけをロック内で行い、見つかったらmatchedへコピーして即座にロックを解放する
+     * (以降の署名検証等の重い処理をロック外で行うことでロック保持時間を最小化する) */
+    pthread_rwlock_rdlock(&kr->lock);
+    struct bm_unlocked_identity *cur = kr->head;
+    unsigned char *decrypted = NULL;
+    size_t decrypted_len = 0;
+    struct bm_unlocked_identity matched;
+    int found = 0;
+    while (cur != NULL)
+    {
+        if (bm_crypto_ecies_decrypt(ciphertext, ciphertext_len, cur->priv_encryption, &decrypted, &decrypted_len) == 0)
+        {
+            matched = *cur;
+            matched.next = NULL;
+            found = 1;
+            break;
+        }
+        cur = cur->next;
+    }
+    pthread_rwlock_unlock(&kr->lock);
+
+    if (!found)
+    {
+        return -1;
+    }
+
+    int rc = trial_decrypt_body(&matched, &hdr, object, decrypted, decrypted_len, out);
+
+    OPENSSL_cleanse(decrypted, decrypted_len);
+    free(decrypted);
+    OPENSSL_cleanse(&matched, sizeof(matched));
+    return rc;
+}
+
+/*
+ * §11 2026-08-31 unlock-all済みでkeyringに数千件規模のunlocked identityが存在する状態で
+ * 単体unlockAddress(join-chan含む)を叩くと、bm_object_sync_backfill_trial_decryptが
+ * bm_trial_decrypt_msg(=keyring全体を対象にした総当たり)をobject_pool.db中の全MSGオブジェクトへ
+ * 適用してしまい、「MSGオブジェクト数×既存unlockedアドレス数」の計算量になる問題が実運用で
+ * 発覚した(ユーザー環境: 5000+identity×約11000オブジェクト≒5500万回のECDH試行で
+ * RPCサーバー(api_server.cはシングルスレッド、accept直後に同期処理する設計)が9時間以上
+ * ブロックし、unlockAddress以外の全RPC呼び出しも道連れで無応答になった)。新規にunlockした
+ * identity 1件だけに絞ってtrial_decryptを試すことで、この呼び出しのコストを
+ * 「MSGオブジェクト数×1」に抑える(bm_object_sync_backfill_trial_decryptのaddress_filter経由で
+ * 使われる想定、詳細はobject_sync.h参照)。
+ */
+int bm_trial_decrypt_msg_single(const struct bm_unlocked_identity *identity, const unsigned char *object,
+                                 size_t object_len, struct bm_decoded_msg *out)
+{
+    struct bm_object_header hdr;
+    if (bm_object_parse_header(object, object_len, &hdr) != 0)
+    {
+        return -1;
+    }
+    if (hdr.object_type != BM_OBJECT_MSG || hdr.version != 1)
+    {
+        return -1;
+    }
+
+    const unsigned char *ciphertext = object + hdr.header_len;
+    size_t ciphertext_len = object_len - hdr.header_len;
+
+    unsigned char *decrypted = NULL;
+    size_t decrypted_len = 0;
+    if (bm_crypto_ecies_decrypt(ciphertext, ciphertext_len, identity->priv_encryption, &decrypted, &decrypted_len)
+        != 0)
+    {
+        return -1;
+    }
+
+    int rc = trial_decrypt_body(identity, &hdr, object, decrypted, decrypted_len, out);
+
+    OPENSSL_cleanse(decrypted, decrypted_len);
+    free(decrypted);
+    return rc;
 }
 
 void bm_decoded_msg_free(struct bm_decoded_msg *msg)
@@ -294,6 +348,34 @@ void bm_decoded_msg_free(struct bm_decoded_msg *msg)
     free(msg->body);
     free(msg->ack_payload);
     memset(msg, 0, sizeof(*msg));
+}
+
+static int store_decoded_msg(sqlite3 *db, const unsigned char *object, size_t object_len,
+                              struct bm_decoded_msg *decoded,
+                              unsigned char **out_ack_payload, size_t *out_ack_payload_len)
+{
+    unsigned char msg_id[32];
+    bm_inventory_hash(object, object_len, msg_id);
+
+    int rc = bm_messages_store_insert_inbox(db, msg_id, decoded->to_address, decoded->from_address,
+                                             decoded->subject, decoded->body, (int64_t)time(NULL));
+
+    if (out_ack_payload != NULL && out_ack_payload_len != NULL && decoded->ack_payload_len > 0)
+    {
+        /* 所有権をdecodedからそのまま呼び出し側へ移す(bm_decoded_msg_freeで二重解放しないよう
+         * decoded側のポインタはNULLにしておく) */
+        *out_ack_payload = decoded->ack_payload;
+        *out_ack_payload_len = decoded->ack_payload_len;
+        decoded->ack_payload = NULL;
+        decoded->ack_payload_len = 0;
+    }
+    else if (out_ack_payload_len != NULL)
+    {
+        *out_ack_payload_len = 0;
+    }
+
+    bm_decoded_msg_free(decoded);
+    return rc;
 }
 
 int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
@@ -305,29 +387,20 @@ int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
     {
         return -1;
     }
+    return store_decoded_msg(db, object, object_len, &decoded, out_ack_payload, out_ack_payload_len);
+}
 
-    unsigned char msg_id[32];
-    bm_inventory_hash(object, object_len, msg_id);
-
-    int rc = bm_messages_store_insert_inbox(db, msg_id, decoded.to_address, decoded.from_address,
-                                             decoded.subject, decoded.body, (int64_t)time(NULL));
-
-    if (out_ack_payload != NULL && out_ack_payload_len != NULL && decoded.ack_payload_len > 0)
+/* §11 2026-08-31 bm_trial_decrypt_msg_singleと対になる単一identity版(理由はそちらのコメント参照) */
+int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identity, sqlite3 *db,
+                                       const unsigned char *object, size_t object_len,
+                                       unsigned char **out_ack_payload, size_t *out_ack_payload_len)
+{
+    struct bm_decoded_msg decoded;
+    if (bm_trial_decrypt_msg_single(identity, object, object_len, &decoded) != 0)
     {
-        /* 所有権をdecodedからそのまま呼び出し側へ移す(bm_decoded_msg_freeで二重解放しないよう
-         * decoded側のポインタはNULLにしておく) */
-        *out_ack_payload = decoded.ack_payload;
-        *out_ack_payload_len = decoded.ack_payload_len;
-        decoded.ack_payload = NULL;
-        decoded.ack_payload_len = 0;
+        return -1;
     }
-    else if (out_ack_payload_len != NULL)
-    {
-        *out_ack_payload_len = 0;
-    }
-
-    bm_decoded_msg_free(&decoded);
-    return rc;
+    return store_decoded_msg(db, object, object_len, &decoded, out_ack_payload, out_ack_payload_len);
 }
 
 void *bm_trial_decrypt_thread(void *arg)

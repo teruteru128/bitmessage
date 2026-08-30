@@ -1358,13 +1358,33 @@ void *bm_object_sync_broadcast_thread(void *arg)
     return NULL;
 }
 
-int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr)
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
+                                           const char *address_filter)
 {
     unsigned char(*hashes)[32] = NULL;
     size_t count = 0;
     if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
     {
         return -1;
+    }
+
+    /* §11 2026-08-31 address_filterが指定されていれば、そのidentity1件だけに絞って
+     * bm_trial_decrypt_and_store_singleを使う(bm_trial_decrypt_and_store経由でkeyring全体を
+     * 総当たりすると、unlock-all済みで既に大量のunlocked identityがkeyringに載っている環境で
+     * 「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり実運用で9時間以上RPCサーバーを
+     * ブロックする問題が発覚したため。詳細はtrial_decrypt.cのbm_trial_decrypt_msg_singleの
+     * コメント参照)。該当identityがkeyringに見つからなければ何もせず0を返す(unlock直後に
+     * 呼ぶ想定のため通常は見つかるが、防御的に扱う)。 */
+    struct bm_unlocked_identity identity;
+    int have_filter_identity = 0;
+    if (address_filter != NULL)
+    {
+        have_filter_identity = bm_keyring_find_by_address(kr, address_filter, &identity) ? 1 : 0;
+        if (!have_filter_identity)
+        {
+            free(hashes);
+            return 0;
+        }
     }
 
     int decrypted_count = 0;
@@ -1376,13 +1396,21 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
         {
             continue;
         }
-        if (bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL) == 0)
+        int rc = (address_filter != NULL)
+                     ? bm_trial_decrypt_and_store_single(&identity, messages_db, payload, payload_len, NULL, NULL)
+                     : bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL);
+        if (rc == 0)
         {
             decrypted_count++;
         }
         free(payload);
     }
     free(hashes);
+
+    if (address_filter != NULL)
+    {
+        OPENSSL_cleanse(&identity, sizeof(identity));
+    }
 
     if (decrypted_count > 0)
     {

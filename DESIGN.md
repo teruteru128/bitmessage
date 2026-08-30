@@ -1836,3 +1836,43 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     誤った/なりすましの鍵をユーザーが手動登録してしまうリスクは残るが、`sendMessage`と違い
     「ユーザーが意図して明示的に登録する」操作である点、および本件のセッションでは
     スコープ外として見送る合意になった点を踏まえ、優先度は低めとして次点に置く。
+
+### backlogへの追記(2026-08-31)
+
+21. **unlockAddress後のbackfill_trial_decryptがkeyring全体を対象にしていた問題を修正**:
+    unlock-all(§7.4のlazy migration経由でも使われる`unlockAllAddresses`)で数千件規模の
+    identityを既にunlockedにしてある状態で、単体の`unlockAddress`(join-chan後の初回unlock含む)
+    を1件叩くと、`h_unlockAddress`が呼ぶ`bm_object_sync_backfill_trial_decrypt`
+    (§11 2026-08-25追加、object_pool.db中の未復号MSGオブジェクトを再走査する処理)が
+    `bm_trial_decrypt_msg`経由でkeyring内の**現在unlockedな全identity**に対してECIES復号を
+    総当たりしていたことが発覚した。実運用(ユーザー環境: unlock-all済みでidentity 5000件超、
+    object_pool.db内MSGオブジェクト約11000件)で、単体unlockAddress 1回が
+    「11000×5000+ ≒ 5500万回のECDH試行」となり9時間以上完了しなかった。しかも
+    api_server.cのRPCサーバーは完全シングルスレッド(`accept()`直後に
+    `bm_api_server_handle_connection`を同期呼び出しするだけで、リクエストごとのスレッド分岐が
+    無い)のため、この間`listAddresses`のような無関係な読み取り専用RPCすら一切応答不能になる
+    ことを実測で確認した(`bitmessage-cli list-addresses`が10秒timeoutで無応答、デーモンの
+    CPU時間はunlock開始からの経過時間とほぼ一致する速度で伸び続けていた)。
+
+    対策として、`bm_trial_decrypt_msg`/`bm_trial_decrypt_and_store`のヘッダ解析・ECIES復号後の
+    共通処理を`trial_decrypt_body`(trial_decrypt.c、static)へ切り出した上で、単一identity限定版
+    `bm_trial_decrypt_msg_single`/`bm_trial_decrypt_and_store_single`(trial_decrypt.h/.c)を追加。
+    `bm_object_sync_backfill_trial_decrypt`(object_sync.h/.c)に`address_filter`引数を追加し、
+    NULLなら従来通りkeyring全体(将来的にunlock-all等、複数identityへの一括backfillが要る
+    場面向けに温存)、非NULLならその1アドレスのみ`bm_keyring_find_by_address`で解決して単一
+    identity版を使うようにした。`core/api_server.c`の`h_unlockAddress`は今回unlockした
+    address自身を渡すよう変更し、これによりunlockAddress 1回あたりのコストを
+    「MSGオブジェクト数×既存unlockedアドレス数」から「MSGオブジェクト数×1」に戻した。
+    `h_unlockAllAddresses`はそもそもbackfillを呼ばない設計(§11 2026-08-29のコメント参照、
+    この一括unlock自体で既に同種の計算爆発が起きるため意図的に省略されている)なので変更不要。
+
+    テストは`tests/test_chan.c`のシナリオ5(既存の過去ログbackfillテスト、`chan_address_b`を
+    `address_filter`として渡すよう変更)とシナリオ6(新規: keyringにchanと無関係なidentityを
+    追加unlockした状態で、`address_filter`に無関係な方のアドレスを渡すと復号が0件になり、
+    正しいアドレスを渡した場合のみ復号されることを確認)で検証している。
+
+    なお、この問題自体は「バグ」というよりは「keyring内のunlocked identity数が想定より
+    遥かに大きいスケール(数千件)で運用される」という、v1設計時に想定していなかった利用
+    パターン(§7.4の一括import機能を実際に数千件規模で使うユーザーが現れたこと)によって
+    表面化したもの。RPCサーバー自体をマルチスレッド化する根本対応(unlockAddress以外の
+    リクエストが道連れでブロックされる問題自体は今回は未解決)は別途backlogとして残す。

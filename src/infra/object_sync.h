@@ -184,8 +184,18 @@ void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx,
  * 呼ばれることを想定するため、埋め込みack_payloadの検証・再送(§5.5)はここでは行わない
  * (受信直後の通常経路とは異なり、送信元へのack配送が遅れる/届かない可能性があるが、
  * v1では「chan参加前の過去ログが読めるようになる」ことを優先し許容する)。
+ *
+ * §11 2026-08-31 address_filter追加(DESIGN.md参照): NULLなら従来通りkr内の全unlocked
+ * identityを対象に総当たりする(unlock_all等、複数identityへの一括backfillが要る場面向け)。
+ * 非NULLならその1アドレスのみに絞る(bm_trial_decrypt_msg_single経由)。unlock-all済みで
+ * keyringに数千件規模のunlocked identityが積まれた状態で単体unlockAddress(join-chan含む)を
+ * 叩くと、NULL渡しでは「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり、実運用で
+ * RPCサーバー(シングルスレッド)が9時間以上ブロックする問題が発覚した。core/api_server.cの
+ * unlockAddressは今回unlockしたaddress自身を渡すことでこれを「MSGオブジェクト数×1」に抑える。
+ *
  * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙に失敗した場合のみ-1。
  */
-int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr);
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
+                                           const char *address_filter);
 
 #endif /* BM_INFRA_OBJECT_SYNC_H */
