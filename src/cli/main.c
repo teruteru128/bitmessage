@@ -46,7 +46,7 @@ static void print_usage(const char *prog)
             "      import-keys-datで文字化けしたラベルを後から修正する用途を想定\n"
             "  join-chan <passphrase> <label> <storePassphrase>\n"
             "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
-            "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> - ...\n"
+            "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> ...\n"
             "      (自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める\n"
             "  unlock <address> <passphrase>\n"
             "  export-address <address> <passphrase>\n"
@@ -61,13 +61,14 @@ static void print_usage(const char *prog)
             "  delete <address>\n"
             "  cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n"
             "      相手の公開鍵(いずれも130桁hex)を手動でpubkey_cacheへ登録する。\n"
-            "      通常はsend-messageがtoPubEncryptionHex省略時に未登録ならgetpubkey要求を\n"
-            "      自動送出し応答を自動キャッシュするため、本コマンドは事前に鍵を知っている\n"
-            "      場合や、その待ち時間を省きたい場合の手動登録手段\n"
-            "  send-message <fromAddress> <toAddress> <toPubEncryptionHex|-> <subject> <body> "
+            "      通常はsend-messageが未登録ならgetpubkey要求を自動送出し応答を自動キャッシュ\n"
+            "      するため、本コマンドは事前に鍵を知っている場合や、その待ち時間を省きたい\n"
+            "      場合の手動登録手段\n"
+            "  send-message <fromAddress> <toAddress> <subject> <body> "
             "[ttlSeconds] [ackStealthLevel]\n"
-            "      toPubEncryptionHexは宛先の公開暗号鍵(130桁hex)。\"-\"を指定するとcache-pubkeyで\n"
-            "      登録済みの鍵を使う\n"
+            "      宛先の公開暗号鍵は常にpubkey_cacheから解決する。未登録ならgetpubkey要求を\n"
+            "      自動送出するので、応答を待ってから同じコマンドを再実行するか、先にcache-pubkeyで\n"
+            "      鍵を登録しておく\n"
             "  get-inbox [folder]\n"
             "  get-sent\n"
             "      送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
@@ -795,10 +796,10 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "send-message") == 0)
     {
-        if (argc < 7 || argc > 9)
+        if (argc < 6 || argc > 8)
         {
             fprintf(stderr,
-                    "使い方: %s send-message <fromAddress> <toAddress> <toPubEncryptionHex|-> "
+                    "使い方: %s send-message <fromAddress> <toAddress> "
                     "<subject> <body> [ttlSeconds] [ackStealthLevel]\n",
                     argv[0]);
             bm_json_free(params);
@@ -806,24 +807,15 @@ int main(int argc, char **argv)
         }
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         bm_json_array_append(params, bm_json_new_string(argv[3]));
-        /* "-" はpubkey_cacheを使う合図(JSON上はnullを送る) */
-        if (strcmp(argv[4], "-") == 0)
-        {
-            bm_json_array_append(params, bm_json_new_null());
-        }
-        else
-        {
-            bm_json_array_append(params, bm_json_new_string(argv[4]));
-        }
+        bm_json_array_append(params, bm_json_new_string(argv[4]));
         bm_json_array_append(params, bm_json_new_string(argv[5]));
-        bm_json_array_append(params, bm_json_new_string(argv[6]));
+        if (argc >= 7)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[6])));
+        }
         if (argc >= 8)
         {
             bm_json_array_append(params, bm_json_new_number(atof(argv[7])));
-        }
-        if (argc >= 9)
-        {
-            bm_json_array_append(params, bm_json_new_number(atof(argv[8])));
         }
         return call_rpc(&env, "sendMessage", params);
     }

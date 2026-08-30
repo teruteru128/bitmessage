@@ -188,7 +188,7 @@ int main(void)
 
     char req_body[1024];
     snprintf(req_body, sizeof(req_body),
-             "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\",\"params\":[\"%s\",\"%s\",null,"
+             "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\",\"params\":[\"%s\",\"%s\","
              "\"subj\",\"body\"],\"id\":1}",
              sender_address, target_address);
     char *resp = do_http_post("127.0.0.1", TEST_PORT, "testuser", "testpass", req_body);

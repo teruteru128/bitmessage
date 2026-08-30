@@ -107,7 +107,7 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
         unsigned char *object = NULL;
         size_t object_len = 0;
         int rc = bm_send_pipeline_send_message(ctx->keyring, ctx->identity_db, ctx->messages_db,
-                                                c->from_address, c->to_address, NULL,
+                                                c->from_address, c->to_address,
                                                 c->subject, c->body, (uint64_t)c->ttl, c->ack_stealth_level,
                                                 c->msg_id, next_resend_time, &object, &object_len);
         if (rc == 0)

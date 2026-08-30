@@ -20,7 +20,6 @@
 #include "../src/core/identity_store.h"
 #include "../src/core/messages_store.h"
 #include "../src/core/peer_manager.h"
-#include "../src/core/pubkey_cache.h"
 #include "../src/infra/network.h"
 #include "../src/infra/peer_registry.h"
 
@@ -475,8 +474,10 @@ int main(void)
     }
 
     /* sendMessage: 送信者をAPI経由で作成・unlockし、受信者はテスト側でローカルに鍵を導出して
-     * toPubEncryptionHexを直接渡す(cachePubkeyは意図的に呼ばない。§11の直接pubkey送信の
-     * 自動再送を検証するため、pubkey_cacheが空の状態から始める) */
+     * cachePubkeyで明示的に登録してから送る(§11 2026-08-30、toPubEncryptionHexの直接指定は
+     * sendMessageの引数から廃止した。呼び出し側が任意のhexを渡せてしまい、①toAddressと
+     * 無関係な鍵で暗号化できてしまう、②その検証されない鍵がそのままpubkey_cacheへ自動upsert
+     * され以後の送信も汚染する、という2つの実害があったため。pubkey_cache経由が唯一の経路) */
     resp = do_request(
         "{\"jsonrpc\":\"2.0\",\"method\":\"createDeterministicAddress\","
         "\"params\":[\"api_server sendMessage sender\",4,1,1,\"sender\",\"senderpass\"],\"id\":10}",
@@ -512,45 +513,26 @@ int main(void)
         char recv_pubenc_hex[131];
         hex_encode(recv_gen.pub_encryption, 65, recv_pubenc_hex);
 
-        char send_req[1024];
-        snprintf(send_req, sizeof(send_req),
+        /* sendMessage(pubkey_cache未登録)はまだ送れない。getpubkey要求の自動送出自体は
+         * tests/test_getpubkey_automation.cで既に検証済みなので、ここではエラーになることだけ
+         * 確認する */
+        char send_req_uncached[1024];
+        snprintf(send_req_uncached, sizeof(send_req_uncached),
                  "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
-                 "\"params\":[\"%s\",\"%s\",\"%s\",\"api test subject\",\"api test body\",3600,1],\"id\":12}",
-                 sender_address, recv_address, recv_pubenc_hex);
-        resp = do_request(send_req, "testuser", "testpass");
-        CHECK(resp != NULL, "sendMessage HTTP request");
+                 "\"params\":[\"%s\",\"%s\",\"api test subject\",\"api test body\",3600,1],\"id\":12}",
+                 sender_address, recv_address);
+        resp = do_request(send_req_uncached, "testuser", "testpass");
+        CHECK(resp != NULL, "sendMessage(uncached) HTTP request");
         if (resp != NULL)
         {
             bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
-            bm_json_value_t *result = v != NULL ? bm_json_object_get(v, "result") : NULL;
-            CHECK(result != NULL, "sendMessage returns a result object");
-            if (result != NULL)
-            {
-                double obj_len = bm_json_as_number(bm_json_object_get(result, "objectLength"));
-                CHECK(obj_len > 0, "sendMessage objectLength > 0");
-                const char *inv_hash = bm_json_as_string(bm_json_object_get(result, "inventoryHash"));
-                CHECK(inv_hash != NULL && strlen(inv_hash) == 64, "sendMessage inventoryHash is 32byte hex");
-            }
+            bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+            CHECK(err != NULL, "sendMessage(uncached) returns an error");
             bm_json_free(v);
             free(resp);
         }
 
-        /* §11 直接pubkeyを渡した送信の自動再送: 上のsendMessageがtoPubEncryptionHexを直接
-         * 渡しただけなのに、cachePubkeyを呼んでいないこの時点で既にpubkey_cacheへ
-         * 自動でupsertされているはず(再送はcache参照のみで行うため) */
-        {
-            uint64_t cv = 0, cs = 0;
-            unsigned char cripe[BM_RIPE_LEN];
-            CHECK(bm_address_decode(recv_address, &cv, &cs, cripe) == 0,
-                  "decode receiver address for pubkey_cache check");
-            struct bm_cached_pubkey cached;
-            CHECK(bm_pubkey_cache_lookup_by_ripe(identity_db, cripe, &cached) == 0,
-                  "sendMessage with a direct toPubEncryptionHex should auto-upsert pubkey_cache");
-            CHECK(memcmp(cached.encryption_pubkey, recv_gen.pub_encryption, 65) == 0,
-                  "auto-upserted pubkey_cache entry should have the encryption pubkey we sent with");
-        }
-
-        /* cachePubkey + sendMessage(toPubEncryptionHex=null): pubkey_cache経由の送信 */
+        /* cachePubkey + sendMessage: pubkey_cache経由の送信 */
         char cache_req[1024];
         snprintf(cache_req, sizeof(cache_req),
                  "{\"jsonrpc\":\"2.0\",\"method\":\"cachePubkey\",\"params\":[\"%s\",\"%s\",\"%s\"],\"id\":14}",
@@ -571,10 +553,10 @@ int main(void)
         char send_req_cached[1024];
         snprintf(send_req_cached, sizeof(send_req_cached),
                  "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
-                 "\"params\":[\"%s\",\"%s\",null,\"cached subject\",\"cached body\",3600,1],\"id\":15}",
+                 "\"params\":[\"%s\",\"%s\",\"cached subject\",\"cached body\",3600,1],\"id\":15}",
                  sender_address, recv_address);
         resp = do_request(send_req_cached, "testuser", "testpass");
-        CHECK(resp != NULL, "sendMessage with null toPubEncryptionHex HTTP request");
+        CHECK(resp != NULL, "sendMessage with cached pubkey HTTP request");
         if (resp != NULL)
         {
             bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
@@ -634,7 +616,7 @@ int main(void)
     /* §11 2026-08-25 getSentMessages: sentテーブルへ1件差し込み、API経由で正しく読めることを
      * 確認する(sendMessageの実際の送信パイプラインはtest_send_pipeline.cで既に検証済みなので、
      * ここではAPI層のクエリ・JSONシリアライズだけを対象にする)。ただしこの時点で、上の
-     * sendMessageテスト2件が実際の送信パイプライン経由で既にsentへ行を挿入済みなので、
+     * cache済みsendMessageが実際の送信パイプライン経由で既にsentへ行を挿入済みなので、
      * 件数を決め打ちせず自分の挿入したmsgIdを配列内から探す */
     {
         unsigned char msg_id[32];

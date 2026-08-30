@@ -5,8 +5,8 @@
  * ("参加"は単なるローカルな鍵導出+is_chanフラグに過ぎない)。
  * 2つの独立したidentity.db/keyring("メンバーA"「メンバーB」)を用意し、
  * 1. 同じpassphraseからのjoinが同一アドレスになること
- * 2. メンバーAがchanアドレス宛(=自分自身宛)にsendMessageできること(toPubEncryptionHex省略、
- *    §11の直接pubkey自動再送修正で追加したself-send fallbackの検証)
+ * 2. メンバーAがchanアドレス宛(=自分自身宛)にpubkey_cache未登録のままsendMessageできること
+ *    (§11のself-send fallbackの検証)
  * 3. メンバーBがその投稿をtrial_decryptで復号できること(共有鍵によるグループチャット動作)
  * 4. §11 2026-08-25: join-chan(=unlock)する「前」に既にobject_pool.dbへ届いていた
  *    chan宛msgオブジェクト(過去ログ)を、unlock後にbm_object_sync_backfill_trial_decrypt
@@ -120,13 +120,13 @@ int main(void)
     CHECK(list_count == 1 && list[0].is_chan == 1, "member A's chan identity has is_chan=1");
     free(list);
 
-    /* --- 3. メンバーAがchanアドレス宛(自分自身宛)にtoPubEncryptionHex省略でsendMessage
-     * できること(§11の直接pubkey自動再送修正で追加したself-send fallback) --- */
+    /* --- 3. メンバーAがchanアドレス宛(自分自身宛)にpubkey_cache未登録のままsendMessage
+     * できること(§11のself-send fallback) --- */
     int64_t now = (int64_t)time(NULL);
     unsigned char *object = NULL;
     size_t object_len = 0;
     int rc = bm_send_pipeline_send_message(&kr_a, identity_db_a, messages_db_a, chan_address_a, chan_address_a,
-                                            NULL, "chan post", "hello, chan!", 3600, 1,
+                                            "chan post", "hello, chan!", 3600, 1,
                                             NULL, now + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                             &object, &object_len);
     CHECK(rc == 0, "member A can post to the chan (self-addressed send) without a cached pubkey");
@@ -156,7 +156,7 @@ int main(void)
     size_t object2_len = 0;
     int64_t now2 = (int64_t)time(NULL);
     int rc2 = bm_send_pipeline_send_message(&kr_a, identity_db_a, messages_db_a, chan_address_a, chan_address_a,
-                                             NULL, "before B joined", "backlog message", 3600, 1,
+                                             "before B joined", "backlog message", 3600, 1,
                                              NULL, now2 + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                              &object2, &object2_len);
     CHECK(rc2 == 0, "member A posts a second chan message (backlog, before B joins)");

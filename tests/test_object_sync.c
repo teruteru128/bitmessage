@@ -27,6 +27,7 @@
 #include "../src/core/keyring.h"
 #include "../src/core/message_builder.h"
 #include "../src/core/messages_store.h"
+#include "../src/core/pubkey_cache.h"
 #include "../src/core/send_pipeline.h"
 #include "../src/common/varint.h"
 #include "../src/infra/object.h"
@@ -364,10 +365,22 @@ int main(void)
           "create receiver identity");
     CHECK(bm_keyring_unlock(&kr, identity_db, recv_address, "receiver pass") == 0, "unlock receiver");
 
+    /* §11 2026-08-30 bm_send_pipeline_send_messageからto_pub_encryption直接指定パスを廃止
+     * したため、送信前にpubkey_cacheへ受信者の鍵を明示的に登録する(cachePubkey相当) */
+    struct bm_cached_pubkey recv_cached;
+    memset(&recv_cached, 0, sizeof(recv_cached));
+    memcpy(recv_cached.ripe, recv_gen.ripe, BM_RIPE_LEN);
+    recv_cached.address_version = 4;
+    recv_cached.stream = 1;
+    memcpy(recv_cached.signing_pubkey, recv_gen.pub_signing, 65);
+    memcpy(recv_cached.encryption_pubkey, recv_gen.pub_encryption, 65);
+    CHECK(bm_pubkey_cache_upsert(identity_db, &recv_cached, 1234567890) == 0,
+          "seed pubkey_cache for receiver before send");
+
     unsigned char *msg_object = NULL;
     size_t msg_object_len = 0;
     CHECK(bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
-                                         recv_gen.pub_encryption, "ack test subject", "ack test body",
+                                         "ack test subject", "ack test body",
                                          3600, 1, NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
                                          &msg_object, &msg_object_len) == 0,
           "send_pipeline_send_message for ack round-trip test");

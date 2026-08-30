@@ -108,29 +108,29 @@ int main(void)
     CHECK(bm_address_generate_deterministic("resend test receiver", 1, &recv_gen) == 0, "gen receiver");
     char *recv_address = bm_address_encode(4, 1, recv_gen.ripe, BM_RIPE_LEN);
 
-    /* pubkey_cacheはまだ空(意図的にcachePubkey相当の事前登録をしない): 再送は
-     * to_pub_encryption=NULL(pubkey_cache参照)で行う設計(§11)なので、以前は初回送信で
-     * 直接pubkeyを渡すだけではcacheに乗らず再送に失敗する制約があった。今はbm_send_pipeline_
-     * send_message自身が、直接pubkeyを渡された送信が成功した時点でcache未登録なら自動で
-     * upsertするようになったため(2026-08-23修正)、ここでの事前登録は不要になっている。 */
+    /* §11 2026-08-30 bm_send_pipeline_send_messageからto_pub_encryption直接指定パスを廃止
+     * した(検証されない鍵での暗号化・pubkey_cache汚染の実害があったため)ので、送信前に
+     * pubkey_cacheへ受信者の鍵を明示的に登録する(cachePubkey相当。この後の再送チェックも
+     * cache参照だけで成功することの前提になる) */
+    struct bm_cached_pubkey recv_cached;
+    memset(&recv_cached, 0, sizeof(recv_cached));
+    memcpy(recv_cached.ripe, recv_gen.ripe, BM_RIPE_LEN);
+    recv_cached.address_version = 4;
+    recv_cached.stream = 1;
+    memcpy(recv_cached.signing_pubkey, recv_gen.pub_signing, 65);
+    memcpy(recv_cached.encryption_pubkey, recv_gen.pub_encryption, 65);
+    CHECK(bm_pubkey_cache_upsert(identity_db, &recv_cached, 1234567890) == 0,
+          "seed pubkey_cache for receiver before send");
 
     /* --- 1. 初回送信(next_resend_timeを過去に設定し、即座に再送対象にする) --- */
     int64_t now = (int64_t)time(NULL);
     unsigned char *object1 = NULL;
     size_t object1_len = 0;
     CHECK(bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
-                                         recv_gen.pub_encryption, "resend test", "body", 3600, 1,
+                                         "resend test", "body", 3600, 1,
                                          NULL, now - 1, &object1, &object1_len) == 0,
           "initial send");
     free(object1);
-
-    /* §11: 直接pubkeyを渡した送信が成功した時点で、pubkey_cacheへ自動登録されているはず
-     * (この後の再送チェックがcache参照だけで成功することの前提) */
-    struct bm_cached_pubkey auto_cached;
-    CHECK(bm_pubkey_cache_lookup_by_ripe(identity_db, recv_gen.ripe, &auto_cached) == 0,
-          "pubkey_cache should be auto-populated after a direct-pubkey send succeeds");
-    CHECK(memcmp(auto_cached.encryption_pubkey, recv_gen.pub_encryption, 65) == 0,
-          "auto-populated pubkey_cache entry should have the encryption pubkey we sent with");
 
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(messages_db, "SELECT msg_id, ack_data, resend_count FROM sent;", -1, &stmt, NULL);

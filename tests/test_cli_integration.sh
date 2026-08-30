@@ -89,46 +89,37 @@ echo "$AUTH_FAIL_OUTPUT" | grep -q "認証に失敗" \
 [ "$("$CLI" get-inbox)" = "[]" ] || fail "get-inbox should be empty initially"
 
 # send-message: CLI層の引数検証・API層のエラーがCLIまで正しく伝播することを確認する
-# (有効な宛先公開鍵をシェルスクリプトから直接得る手段が無いため、成功パスはtests/test_api_server.cで
-#  カバーする。ここではCLI→API→エラー応答→CLI表示までの配線を検証する)
+# (§11 2026-08-30 toPubEncryptionHexの直接指定はsendMessageの引数から廃止したため、宛先の鍵は
+#  常にpubkey_cache経由で解決する。成功パスはtests/test_api_server.cでカバーする。ここでは
+#  CLI→API→エラー応答→CLI表示までの配線を検証する)
 ADDR2_JSON=$("$CLI" create-address "cli send-message test" 4 1 1 "sender2" "storepass2")
 ADDR2=$(echo "$ADDR2_JSON" | tr -d '"')
 [ "$("$CLI" unlock "$ADDR2" "storepass2")" = "true" ] || fail "unlock sender2 for send-message test"
 
-SHORT_HEX_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2" "abcd" "subj" "body" 2>&1 || true)
-echo "$SHORT_HEX_OUTPUT" | grep -q "130 hex" \
-    || fail "send-message with too-short pubkey hex should report the 130-hex-char requirement (got: $SHORT_HEX_OUTPUT)"
+ADDR2B_JSON=$("$CLI" create-address "cli send-message test recv" 4 1 1 "recv2b" "storepass2b")
+ADDR2B=$(echo "$ADDR2B_JSON" | tr -d '"')
 
-GARBAGE_HEX=$(printf '00%.0s' $(seq 1 65))
-SEND_FAIL_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2" "$GARBAGE_HEX" "subj" "body" 2>&1 || true)
-echo "$SEND_FAIL_OUTPUT" | grep -q "エラー" \
-    || fail "send-message with a non-curve-point pubkey should fail with an error (got: $SEND_FAIL_OUTPUT)"
+SEND_UNCACHED_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2B" "subj" "body" 2>&1 || true)
+echo "$SEND_UNCACHED_OUTPUT" | grep -q "エラー" \
+    || fail "send-message to an address with no cached pubkey should fail with an error (got: $SEND_UNCACHED_OUTPUT)"
 
 "$CLI" delete "$ADDR2" >/dev/null
+"$CLI" delete "$ADDR2B" >/dev/null
 
-# cache-pubkey: 引数検証と、有効な鍵での登録->send-message "-"(cache利用)成功までの配線を確認する。
+# cache-pubkey: 引数検証を確認する。
 CACHE_USAGE_OUTPUT=$("$CLI" cache-pubkey "onlyoneparam" 2>&1 || true)
 echo "$CACHE_USAGE_OUTPUT" | grep -q "使い方" \
     || fail "cache-pubkey with wrong arg count should print usage (got: $CACHE_USAGE_OUTPUT)"
-
-ADDR3_JSON=$("$CLI" create-address "cli cache-pubkey test sender" 4 1 1 "sender3" "storepass3")
-ADDR3=$(echo "$ADDR3_JSON" | tr -d '"')
-[ "$("$CLI" unlock "$ADDR3" "storepass3")" = "true" ] || fail "unlock sender3 for cache-pubkey test"
 
 ADDR4_JSON=$("$CLI" create-address "cli cache-pubkey test receiver" 4 1 1 "recv4" "storepass4")
 ADDR4=$(echo "$ADDR4_JSON" | tr -d '"')
 
 # create-addressはpubkeyを返さないため、cache-pubkeyの成功パス自体はtests/test_api_server.cで
-# 既にカバーしている(cachePubkey + sendMessage(null)のHTTPテスト)。ここではCLI引数の配線のみ確認する。
+# 既にカバーしている(cachePubkey + sendMessageのHTTPテスト)。ここではCLI引数の配線のみ確認する。
 CACHE_BAD_HEX_OUTPUT=$("$CLI" cache-pubkey "$ADDR4" "abcd" "abcd" 2>&1 || true)
 echo "$CACHE_BAD_HEX_OUTPUT" | grep -q "エラー" \
     || fail "cache-pubkey with invalid hex should report an error (got: $CACHE_BAD_HEX_OUTPUT)"
 
-SEND_DASH_OUTPUT=$("$CLI" send-message "$ADDR3" "$ADDR4" "-" "subj" "body" 2>&1 || true)
-echo "$SEND_DASH_OUTPUT" | grep -q "エラー" \
-    || fail "send-message with '-' and no cached pubkey should fail with an error (got: $SEND_DASH_OUTPUT)"
-
-"$CLI" delete "$ADDR3" >/dev/null
 "$CLI" delete "$ADDR4" >/dev/null
 
 # §11 2026-08-29 export-address/import-address/import-keys-dat/address-book: keys.dat

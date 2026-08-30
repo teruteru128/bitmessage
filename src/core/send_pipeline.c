@@ -86,7 +86,6 @@ static int generate_full_ack(int stealth_level, uint64_t stream, uint64_t expire
 
 int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite3 *messages_db,
                                    const char *from_address, const char *to_address,
-                                   const unsigned char to_pub_encryption[65],
                                    const char *subject, const char *body,
                                    uint64_t ttl_seconds, int ack_stealth_level,
                                    const unsigned char reuse_msg_id[32], int64_t next_resend_time,
@@ -106,38 +105,35 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
         OPENSSL_cleanse(&from_id, sizeof(from_id));
         return -1;
     }
-    /* §11 直接pubkeyを渡した送信の自動再送: 再送(infra/object_sync.cの
-     * bm_object_sync_check_resends)はto_pub_encryption=NULL固定でこの関数を呼ぶ
-     * (pubkey_cacheのみ参照する設計)ため、呼び出し元がto_pub_encryptionを直接指定した
-     * 場合はcacheに乗らず再送できなかった(2026-08-23発覚)。送信成功時、まだcache未登録
-     * ならこのencryption_pubkeyを自動でupsertし、以後の再送でも使えるようにする
-     * (関数末尾で行う。ここでは「直接指定されたか」だけ憶えておく)。 */
-    int direct_pub_encryption_given = (to_pub_encryption != NULL);
+    /* §11 2026-08-30 direct pubkey送信経路の廃止で自動upsert(entry.address_version代入)が
+     * 無くなり、to_versionはbm_address_decodeの必須出力引数として受けるだけの値になった */
+    (void)to_version;
 
-    /* to_pub_encryptionが指定されなければpubkey_cacheから引く。ただしto_address==from_address
+    /* 宛先の公開暗号鍵は常にpubkey_cacheから引く。ただしto_address==from_address
      * (自分自身宛、§11 chan仕様)の場合はcacheに無くてもfrom_id自身のpub_encryptionを使える
      * (chanは共有passphraseから導出した同一の鍵を全メンバーが持つため、「自分宛に送る」ことが
-     * そのままchanへの投稿になる。他メンバーは同じ鍵を持つtrial_decryptで復号できる)。 */
+     * そのままchanへの投稿になる。他メンバーは同じ鍵を持つtrial_decryptで復号できる)。
+     * §11 2026-08-30 呼び出し側がto_pub_encryptionを直接指定できる経路は廃止した(検証されない
+     * 鍵での暗号化・pubkey_cache汚染の実害があったため)。相手の鍵を事前に知っている場合は
+     * 呼び出し側がbm_pubkey_cache_upsertで明示的に登録してから呼ぶ。 */
     unsigned char cached_pub_encryption[65];
-    if (to_pub_encryption == NULL)
+    const unsigned char *to_pub_encryption;
+    if (memcmp(to_ripe, from_id.ripe, BM_RIPE_LEN) == 0)
     {
-        if (memcmp(to_ripe, from_id.ripe, BM_RIPE_LEN) == 0)
+        memcpy(cached_pub_encryption, from_id.pub_encryption, 65);
+        to_pub_encryption = cached_pub_encryption;
+    }
+    else
+    {
+        struct bm_cached_pubkey cached;
+        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &cached) != 0)
         {
-            memcpy(cached_pub_encryption, from_id.pub_encryption, 65);
-            to_pub_encryption = cached_pub_encryption;
+            OPENSSL_cleanse(&from_id, sizeof(from_id));
+            return -1; /* 宛先のpubkeyが分からない(getpubkey要求の自動化は未実装、TODO) */
         }
-        else
-        {
-            struct bm_cached_pubkey cached;
-            if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &cached) != 0)
-            {
-                OPENSSL_cleanse(&from_id, sizeof(from_id));
-                return -1; /* 宛先のpubkeyが分からない(getpubkey要求の自動化は未実装、TODO) */
-            }
-            memcpy(cached_pub_encryption, cached.encryption_pubkey, 65);
-            to_pub_encryption = cached_pub_encryption;
-            bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
-        }
+        memcpy(cached_pub_encryption, cached.encryption_pubkey, 65);
+        to_pub_encryption = cached_pub_encryption;
+        bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
     }
 
     struct bm_identity_info from_info;
@@ -240,26 +236,6 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     {
         free(object);
         return -1;
-    }
-
-    /* §11 直接pubkeyを渡した送信の自動再送(続き): まだcache未登録ならupsertする。
-     * signing_pubkey等toPubEncryptionHexだけでは分からない情報は既定値(全0)で埋める
-     * (現状これらは受信pubkeyの検証用途にのみ使われ送信経路では未使用のため実害は無い)。
-     * 既にcacheへ登録済み(=実物のpubkeyオブジェクトから得られた、より質の高い情報)なら
-     * 上書きしない。 */
-    if (direct_pub_encryption_given)
-    {
-        struct bm_cached_pubkey existing;
-        if (bm_pubkey_cache_lookup_by_ripe(identity_db, to_ripe, &existing) != 0)
-        {
-            struct bm_cached_pubkey entry;
-            memset(&entry, 0, sizeof(entry));
-            memcpy(entry.ripe, to_ripe, BM_RIPE_LEN);
-            entry.address_version = to_version;
-            entry.stream = to_stream;
-            memcpy(entry.encryption_pubkey, to_pub_encryption, 65);
-            bm_pubkey_cache_upsert(identity_db, &entry, (int64_t)time(NULL));
-        }
     }
 
     *out_object = object;

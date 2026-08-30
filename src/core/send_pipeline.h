@@ -15,11 +15,16 @@
 /*
  * from_address(keyring内でunlocked済みであること)からto_addressへメッセージを送る。
  *
- * to_pub_encryptionはNULL可。NULLの場合、identity_dbのpubkey_cache(§2.3)をto_addressの
- * ripeで検索し、見つかればそれを使う(見つからなければ失敗する。呼び出し側=api_server.cが
- * 見つからない場合にgetpubkey要求を自動発行する、§11)。呼び出し側が既に相手の公開鍵を
- * 知っている場合は直接渡すこともできる(cache参照をbypass)。ack_stealth_levelは§5.5/§8-6
- * (既定値は1)。
+ * 宛先の公開暗号鍵は常にidentity_dbのpubkey_cache(§2.3)をto_addressのripeで検索して使う
+ * (見つからなければ失敗する。呼び出し側=api_server.cが見つからない場合にgetpubkey要求を
+ * 自動発行する、§11)。ただしto_address==from_address(自分自身宛、chan投稿)の場合は
+ * cache不要でfrom_id自身のpub_encryptionを使う。ack_stealth_levelは§5.5/§8-6(既定値は1)。
+ *
+ * §11 2026-08-30 呼び出し側が公開鍵を直接渡せるto_pub_encryption引数を廃止した。渡された
+ * hexがto_addressと対応する保証が無く、①toAddressと無関係の鍵で暗号化してしまう、
+ * ②検証されない鍵がそのままpubkey_cacheへ自動upsertされ以後の送信も汚染する、という2つの
+ * 実害があったため(ユーザー指摘)。相手の鍵を事前に知っている場合は呼び出し側が
+ * bm_pubkey_cache_upsertで明示的に登録してから呼ぶこと。
  *
  * reuse_msg_idはNULL可。NULLなら新規送信としてsent.msg_idをランダム生成する。非NULLなら
  * その32byte IDでsentテーブルの既存行をUPDATEする(§11再送ロジック、object_sync.cの
@@ -31,13 +36,11 @@
  * (呼び出し側でfreeすること)。副作用としてmessages.dbのsentテーブルへ1行記録/更新する。
  * ネットワークへの実際のブロードキャストは呼び出し側の責務(broadcast_queue経由、§1.2)。
  *
- * 失敗する場合: from_addressがunlockedでない、to_addressのデコード失敗、
- * to_pub_encryptionがNULLでpubkey_cacheにも無い、message_builder/pow_engineでのエラー、
- * DB書き込み失敗。
+ * 失敗する場合: from_addressがunlockedでない、to_addressのデコード失敗、pubkey_cacheに
+ * 宛先の鍵が無い、message_builder/pow_engineでのエラー、DB書き込み失敗。
  */
 int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite3 *messages_db,
                                    const char *from_address, const char *to_address,
-                                   const unsigned char to_pub_encryption[65],
                                    const char *subject, const char *body,
                                    uint64_t ttl_seconds, int ack_stealth_level,
                                    const unsigned char reuse_msg_id[32], int64_t next_resend_time,

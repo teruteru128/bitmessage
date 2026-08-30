@@ -1781,5 +1781,58 @@ chan=trueの再現、アドレス帳CRUDのCLI配線)・`tests/test_address_vect
   こと、不正な長さのhexはエラーになること、`getInboxMessages(['inbox'])`から消えて無指定では
   `folder='trash'`として残ること、`getSentMessages`から消えることを検証。ctest 41件全通過
 
+**2026-08-30完了: sendMessageからtoPubEncryptionHex引数を廃止(pubkey_cache経由に一本化)**。
+ユーザーから「toaddressと一致しないpubEncHexを渡したときって考慮に入ってましたっけ?」と
+指摘され発覚。`api_server.c`のh_sendMessage・`send_pipeline.c`のいずれも、直接渡された
+`toPubEncryptionHex`が`toAddress`のripeと対応するかの検証(渡された鍵から
+`ripe=RIPEMD160(SHA512(pub_signing||pub_encryption))`を計算してaddressのripeと突き合わせる)を
+一切行っていなかった。実害は2点: ①toAddressと無関係な鍵で暗号化してしまう(意図した相手が
+復号できない、あるいはなりすまし鍵なら盗聴されうる)、②検証されない鍵がそのまま
+`send_pipeline.c`の自動upsertで`pubkey_cache`へ書き込まれ、以後の`toPubEncryptionHex`省略の
+送信も汚染する(本物のpubkeyオブジェクトがネットワークから届けば`object_sync.c`側で無条件に
+上書きされるため恒久的ではないが、届くまでの間は誤った鍵が使われ続ける)。
+
+ユーザーからtoPubEncryptionHex自体を引数から外す提案があり、「段階を踏んで完全削除」する
+方針で合意。`cachePubkey`側にも同種の検証漏れ(`address, signingPubkeyHex, encryptionPubkeyHex`
+を全部受け取るのでripe再計算による検証は可能)があるが、こちらは今回スコープ外とし別件の
+backlogとして記録するに留めた(下記backlog項目20参照)。
+
+実装内容:
+- `api_server.c`の`sendMessage`パラメータを`[fromAddress, toAddress, toPubEncryptionHex|null,
+  subject, body, ttlSeconds?, ackStealthLevel?]`から`[fromAddress, toAddress, subject, body,
+  ttlSeconds?, ackStealthLevel?]`へ変更。宛先の鍵は常に`pubkey_cache`から解決し、未登録なら
+  従来通りgetpubkey要求を自動broadcastして失敗を返す(§5.0)
+- `cli/main.c`の`send-message`サブコマンドから`<toPubEncryptionHex|->`引数を削除
+  (`<fromAddress> <toAddress> <subject> <body> [ttlSeconds] [ackStealthLevel]`に変更)
+- `send_pipeline.c`の`bm_send_pipeline_send_message`自体のシグネチャからも`to_pub_encryption`
+  引数を削除した(API層だけでなく内部関数のレベルで直接pubkey送信の経路自体を廃止)。常に
+  「to_address==from_addressならfrom_id自身のpub_encryption(chan投稿)、それ以外は
+  pubkey_cache参照」のみを行う。これに伴い、直接pubkey送信成功時の自動upsertロジック
+  (2026-08-23実装分、DESIGN-LOG.md参照)も不要になったため削除した
+- `object_sync.c`の再送呼び出し・`api_server.c`のsendMessage呼び出しを新シグネチャに追従
+- `tests/test_send_pipeline.c`/`test_resend.c`/`test_object_sync.c`: 直接pubkey渡しで送信して
+  いた箇所を、送信前に`bm_pubkey_cache_upsert`で明示的に登録してから送るよう書き換え。
+  直接pubkey送信の自動upsertを検証していたcaseは削除(経路自体が無くなったため)
+- `tests/test_chan.c`: 自分自身宛(chan投稿)の呼び出しはcache不要のfallbackで変わらず動くため、
+  削除された引数を取り除くだけで済んだ
+- `tests/test_api_server.c`: 直接pubkey指定でのsendMessage+自動upsert検証を、
+  「pubkey_cache未登録の宛先へのsendMessageはエラーになる」検証に置き換えたうえで、
+  `cachePubkey`+`sendMessage`(pubkey_cache経由)のテストは維持
+- `tests/test_cli_integration.sh`: 130hex桁数不正・非curve point pubkeyのエラー検証(引数自体が
+  無くなったため意味を失った)を、「pubkey_cache未登録の宛先へのsend-messageはエラーになる」
+  検証に置き換え。`send-message ... "-"`(cache利用の合図)も不要になったため削除
+- ctest 41件全通過
+
 出典・詳細はこのファイル内の各章の実装状況ノートを参照(pubkey_cacheは§2.3、send_pipeline/ackは
 §5末尾、object_sync_threadは§1、api_serverは§6.1末尾)。
+
+### backlogへの追記(2026-08-30)
+
+20. **`cachePubkey`にripe整合性検証が無い**: 上記sendMessageのtoPubEncryptionHex削除と同時に
+    発覚した別件。`cachePubkey([address, signingPubkeyHex, encryptionPubkeyHex])`は、渡された
+    `signing_pubkey`/`encryption_pubkey`から`ripe=RIPEMD160(SHA512(signing||encryption))`を
+    計算し`address`をデコードして得たripeと突き合わせる検証を一切行っていない(こちらは
+    `sendMessage`の直接指定パスと違い`pub_signing`も引数にあるため、検証は技術的に可能)。
+    誤った/なりすましの鍵をユーザーが手動登録してしまうリスクは残るが、`sendMessage`と違い
+    「ユーザーが意図して明示的に登録する」操作である点、および本件のセッションでは
+    スコープ外として見送る合意になった点を踏まえ、優先度は低めとして次点に置く。
