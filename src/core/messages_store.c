@@ -244,7 +244,8 @@ int bm_messages_store_list_resend_candidates(sqlite3 *db, int64_t now, int max_a
 {
     static const char *SQL =
         "SELECT msg_id, to_address, from_address, subject, body, ack_stealth_level, ttl, resend_count "
-        "FROM sent WHERE status != 'ackreceived' AND next_resend_time <= ?1 AND resend_count < ?2;";
+        "FROM sent WHERE status != 'ackreceived' AND status != 'msgsentnoackexpected' "
+        "AND next_resend_time <= ?1 AND resend_count < ?2;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)

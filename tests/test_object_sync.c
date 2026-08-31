@@ -355,15 +355,25 @@ int main(void)
           "create sender identity");
     CHECK(bm_keyring_unlock(&kr, identity_db, sender_address, "sender pass") == 0, "unlock sender");
 
+    /* §11 2026-08-31: このセクションは「別ノードの受信者へack付きで送る」正規のシナリオを
+     * 検証する目的のテストなので、receiverのidentityをsender側のidentity_db(=send_pipelineの
+     * is_self判定・ctx全体で使うidentity_db)には登録しない(登録するとis_self経路(§11
+     * 2026-08-31、identity_db内の自分のidentity宛はack省略になった)に入ってしまい、この
+     * テストが検証したいack往復自体が起きなくなる)。unlock自体は別の使い捨てidentity_dbから
+     * 行い、その後は&kr(in-memory)にさえ載っていればtrial_decrypt側は動くので、
+     * 使い捨てDBはこの直後にcloseして構わない。 */
     struct bm_generated_address recv_gen;
     CHECK(bm_address_generate_deterministic("object_sync test receiver", 1, &recv_gen) == 0, "gen receiver addr");
     char *recv_address = bm_address_encode(4, 1, recv_gen.ripe, BM_RIPE_LEN);
-    CHECK(bm_keyring_create_identity(identity_db, recv_address, "receiver", 4, 1,
+    sqlite3 *recv_only_identity_db = open_fresh_db("test_object_sync_recv_identity.db", bm_identity_store_init_schema);
+    CHECK(bm_keyring_create_identity(recv_only_identity_db, recv_address, "receiver", 4, 1,
                                       recv_gen.pub_signing, recv_gen.pub_encryption,
                                       recv_gen.priv_signing, recv_gen.priv_encryption,
                                       "receiver pass", 1000, 1000) == 0,
           "create receiver identity");
-    CHECK(bm_keyring_unlock(&kr, identity_db, recv_address, "receiver pass") == 0, "unlock receiver");
+    CHECK(bm_keyring_unlock(&kr, recv_only_identity_db, recv_address, "receiver pass") == 0, "unlock receiver");
+    sqlite3_close(recv_only_identity_db);
+    unlink("test_object_sync_recv_identity.db");
 
     /* §11 2026-08-30 bm_send_pipeline_send_messageからto_pub_encryption直接指定パスを廃止
      * したため、送信前にpubkey_cacheへ受信者の鍵を明示的に登録する(cachePubkey相当) */

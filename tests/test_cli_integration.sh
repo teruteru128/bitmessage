@@ -98,13 +98,18 @@ ADDR2=$(echo "$ADDR2_JSON" | tr -d '"')
 
 ADDR2B_JSON=$("$CLI" create-address "cli send-message test recv" 4 1 1 "recv2b" "storepass2b")
 ADDR2B=$(echo "$ADDR2B_JSON" | tr -d '"')
+# §11 2026-08-31: send_pipeline.cのis_self判定はidentity.db在籍(=このノード自身のidentity)で
+# 決まるようになった(fromAddress==toAddressだけでなく別identity宛でも成立、ユーザー指摘での
+# 修正)。ここで検証したいのは「pubkey_cache未登録の外部宛先」への送信失敗なので、ADDR2Bは
+# 送信前にdeleteしてidentity.dbから除いておく必要がある(でなければADDR2B自身のidentity.dbの
+# encryption_pubkeyがそのまま使われ送信が成功してしまう)。
+"$CLI" delete "$ADDR2B" >/dev/null
 
 SEND_UNCACHED_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2B" "subj" "body" 2>&1 || true)
 echo "$SEND_UNCACHED_OUTPUT" | grep -q "エラー" \
     || fail "send-message to an address with no cached pubkey should fail with an error (got: $SEND_UNCACHED_OUTPUT)"
 
 "$CLI" delete "$ADDR2" >/dev/null
-"$CLI" delete "$ADDR2B" >/dev/null
 
 # cache-pubkey: 引数検証を確認する。
 CACHE_USAGE_OUTPUT=$("$CLI" cache-pubkey "onlyoneparam" 2>&1 || true)

@@ -17,8 +17,6 @@
 #include "../src/core/pubkey_cache.h"
 #include "../src/core/send_pipeline.h"
 #include "../src/core/trial_decrypt.h"
-#include "../src/infra/object.h"
-#include "../src/infra/protocol.h"
 
 #define TEST_IDENTITY_DB "test_send_pipeline_identity.db"
 #define TEST_MESSAGES_DB "test_send_pipeline_messages.db"
@@ -81,18 +79,12 @@ int main(void)
     const char *subject = "send_pipeline test";
     const char *body = "does send_pipeline actually produce a decryptable object?";
 
-    /* §11 2026-08-30 bm_send_pipeline_send_messageからto_pub_encryption直接指定を廃止した
-     * ため、送信前にpubkey_cacheへ受信者の鍵を登録しておく(cachePubkey相当) */
-    struct bm_cached_pubkey recv_cached;
-    memset(&recv_cached, 0, sizeof(recv_cached));
-    memcpy(recv_cached.ripe, recv_gen.ripe, BM_RIPE_LEN);
-    recv_cached.address_version = 4;
-    recv_cached.stream = 1;
-    memcpy(recv_cached.signing_pubkey, recv_gen.pub_signing, 65);
-    memcpy(recv_cached.encryption_pubkey, recv_gen.pub_encryption, 65);
-    CHECK(bm_pubkey_cache_upsert(identity_db, &recv_cached, 1234567890) == 0,
-          "seed pubkey_cache for receiver before send");
-
+    /* §11 2026-08-31 ユーザー指摘: is_selfの判定をto_ripe==from_id.ripe(fromAddressとtoAddressが
+     * 全く同一)だけでなく、toAddressがidentity.dbに存在する(=このノードが持つ別のidentityでも
+     * ある)かどうかで見るよう修正した。recv_addressはこの下でidentity_dbにcreate_and_unlock
+     * 済みのため、以後のsend_pipeline呼び出しは常にis_self経路(ack省略/msgsentnoackexpected/
+     * inboxへの即時ループバック)を通る。pubkey_cacheへの事前登録は不要になった
+     * (identity.dbのencryption_pubkeyがそのまま使われるため)。 */
     unsigned char *object = NULL;
     size_t object_len = 0;
     int rc = bm_send_pipeline_send_message(&kr, identity_db, messages_db, sender_address, recv_address,
@@ -103,7 +95,8 @@ int main(void)
     CHECK(rc == 0, "bm_send_pipeline_send_message");
     CHECK(object != NULL && object_len > 0, "produced object should be non-empty");
 
-    /* sentテーブルに1行記録されているか */
+    /* sentテーブルに1行記録されているか。recv_addressはidentity_db内の別identityなので
+     * is_self経路(§11 2026-08-31)を通り、status='msgsentnoackexpected'になる */
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(messages_db, "SELECT to_address, from_address, subject, status FROM sent;", -1, &stmt, NULL);
     int row_count = 0;
@@ -113,10 +106,18 @@ int main(void)
         CHECK(strcmp((const char *)sqlite3_column_text(stmt, 0), recv_address) == 0, "sent.to_address");
         CHECK(strcmp((const char *)sqlite3_column_text(stmt, 1), sender_address) == 0, "sent.from_address");
         CHECK(strcmp((const char *)sqlite3_column_text(stmt, 2), subject) == 0, "sent.subject");
-        CHECK(strcmp((const char *)sqlite3_column_text(stmt, 3), "sent") == 0, "sent.status");
+        CHECK(strcmp((const char *)sqlite3_column_text(stmt, 3), "msgsentnoackexpected") == 0, "sent.status");
     }
     sqlite3_finalize(stmt);
     CHECK(row_count == 1, "sent table should have exactly 1 row");
+
+    /* is_self経路はack自体を生成しない(§11 2026-08-31、PyBitmessage本家準拠)ため、
+     * sent.ack_dataは長さ0で記録されるはず */
+    sqlite3_prepare_v2(messages_db, "SELECT ack_data FROM sent WHERE to_address = ?1;", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, recv_address, -1, SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW, "fetch ack_data from sent");
+    CHECK(sqlite3_column_bytes(stmt, 0) == 0, "sent.ack_data should be empty for is_self send");
+    sqlite3_finalize(stmt);
 
     /* 受信者のkeyringでトライアル復号する(送信者もkeyringに入っているが、toRipe不一致で
      * 送信者自身の鍵では復号成功してもfailするはず、受信者の鍵でのみ成功する) */
@@ -130,42 +131,55 @@ int main(void)
         CHECK(strcmp(decoded.from_address, sender_address) == 0, "decoded.from_address");
         CHECK(strcmp(decoded.subject, subject) == 0, "decoded.subject");
         CHECK(strcmp(decoded.body, body) == 0, "decoded.body");
+        CHECK(decoded.ack_payload_len == 0 && decoded.ack_payload == NULL,
+              "decoded ack_payload should be absent for is_self send");
 
-        /* ackPayload(msgへ平文埋め込みされたfullAckPayload、§5.5)は完成したP2P "object"パケット
-         * (24byteヘッダ込み)であり、それをパースした中身(nonce付きobjectバイト列)がsentテーブルの
-         * ack_dataと一致するはず(sent.ack_dataはack_data、埋め込み側はack_dataをbm_create_packetで
-         * さらに包んだack_packet、send_pipeline.c参照)。 */
-        struct bm_message *ack_msg = NULL;
-        size_t ack_consumed = 0;
-        enum bm_parse_result ack_parse_rc =
-            bm_parse_message(decoded.ack_payload, decoded.ack_payload_len, &ack_msg, &ack_consumed);
-        CHECK(ack_parse_rc == BM_PARSE_OK, "ack_payload should parse as a complete P2P message");
-        CHECK(ack_consumed == decoded.ack_payload_len, "ack_payload should be exactly one P2P message");
-        CHECK(ack_msg != NULL && strncmp(ack_msg->command, "object", 12) == 0,
-              "ack_payload's P2P command should be \"object\"");
-
-        sqlite3_prepare_v2(messages_db, "SELECT ack_data FROM sent WHERE to_address = ?1;", -1, &stmt, NULL);
-        sqlite3_bind_text(stmt, 1, recv_address, -1, SQLITE_TRANSIENT);
-        CHECK(sqlite3_step(stmt) == SQLITE_ROW, "fetch ack_data from sent");
-        const void *ack_data = sqlite3_column_blob(stmt, 0);
-        int ack_data_len = sqlite3_column_bytes(stmt, 0);
-        if (ack_msg != NULL)
-        {
-            CHECK((size_t)ack_data_len == ack_msg->length, "sent.ack_data length matches ack_payload's inner object");
-            CHECK(ack_data_len > 0 && memcmp(ack_data, ack_msg->payload, (size_t)ack_data_len) == 0,
-                  "sent.ack_data content matches ack_payload's inner object");
-
-            /* sent.ack_data(nonce込み)の共通ヘッダも正しくパースできる(§5.0)ことを確認 */
-            struct bm_object_header ack_hdr;
-            CHECK(bm_object_parse_header(ack_msg->payload, ack_msg->length, &ack_hdr) == 0,
-                  "sent.ack_data should parse as a valid object header");
-        }
-        sqlite3_finalize(stmt);
-        bm_free_message(ack_msg);
-
-        printf("OK: send_pipeline -> trial_decrypt -> ack_data一致まで確認\n");
+        printf("OK: send_pipeline -> trial_decrypt (is_self, ack省略) まで確認\n");
         bm_decoded_msg_free(&decoded);
     }
+
+    /* §11 2026-08-31: is_self送信は送信直後にmessages.dbのinboxへ直接ループバックされるはず
+     * (ネットワーク往復を待たない、PyBitmessage本家helper_inbox.insert()相当) */
+    sqlite3_prepare_v2(messages_db,
+                        "SELECT to_address, from_address, subject, body FROM inbox WHERE to_address = ?1;",
+                        -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, recv_address, -1, SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW, "is_self send should be looped back into inbox immediately");
+    CHECK(strcmp((const char *)sqlite3_column_text(stmt, 0), recv_address) == 0, "inbox.to_address");
+    CHECK(strcmp((const char *)sqlite3_column_text(stmt, 1), sender_address) == 0, "inbox.from_address");
+    CHECK(strcmp((const char *)sqlite3_column_text(stmt, 2), subject) == 0, "inbox.subject");
+    CHECK(strcmp((const char *)sqlite3_column_text(stmt, 3), body) == 0, "inbox.body");
+    sqlite3_finalize(stmt);
+
+    /* §11 2026-08-31: is_self判定はidentity.db在籍だけで決まり、keyringでunlock中かどうかは
+     * 無関係(bm_identity_store_loadはunlock不要でDB内の平文encryption_pubkeyを直接読む)。
+     * recv_addressをlockした状態でも同じis_self経路(ack省略・inboxループバック)が機能する
+     * ことを確認する(ユーザー指摘: to_ripe==from_id.ripeだけを見ていた旧実装は、fromと別の
+     * 自分のidentity宛を捕捉できていなかった。その修正がunlock状態に依存しないことも担保する)。 */
+    CHECK(bm_keyring_lock(&kr, recv_address) == 0, "lock receiver before locked-recipient send test");
+
+    unsigned char *object_locked_recv = NULL;
+    size_t object_locked_recv_len = 0;
+    int rc_locked_recv = bm_send_pipeline_send_message(
+        &kr, identity_db, messages_db, sender_address, recv_address,
+        "locked recv subject", "locked recv body", 60, 1,
+        NULL, (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS,
+        &object_locked_recv, &object_locked_recv_len);
+    CHECK(rc_locked_recv == 0, "is_self send should succeed even when the recipient identity is locked");
+    free(object_locked_recv);
+
+    /* subject列はBLOB(messages_store.cのスキーマ)なので、TEXTでbindすると型affinityの
+     * 違いでSQL上の"="が一致しない(SQLiteの比較ルールでBLOB<>TEXTは常に不一致になる)。
+     * insert_inbox自身がsubjectをbind_blobしているのに合わせ、ここもbind_blobで比較する。 */
+    static const char *locked_recv_subject = "locked recv subject";
+    sqlite3_prepare_v2(messages_db,
+                        "SELECT COUNT(*) FROM inbox WHERE to_address = ?1 AND subject = ?2;",
+                        -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, recv_address, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, locked_recv_subject, (int)strlen(locked_recv_subject), SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(stmt) == SQLITE_ROW, "query inbox count for locked-recipient send");
+    CHECK(sqlite3_column_int(stmt, 0) == 1, "locked-recipient is_self send should still loop back into inbox");
+    sqlite3_finalize(stmt);
 
     /* pubkey_cacheフォールバック: cacheに無ければ失敗し、事前にbm_pubkey_cache_upsertして
      * おけば成功する(§2.3, core/pubkey_cache.c)。まだ一度も送っていない別の宛先を使う。 */

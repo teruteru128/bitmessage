@@ -6,9 +6,11 @@
 #include <string.h>
 #include <time.h>
 
+#include "../common/hash.h"
 #include "../infra/protocol.h"
 #include "../pow/pow_engine.h"
 #include "address.h"
+#include "identity_store.h"
 #include "message_builder.h"
 #include "messages_store.h"
 #include "pubkey_cache.h"
@@ -109,18 +111,22 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
      * 無くなり、to_versionはbm_address_decodeの必須出力引数として受けるだけの値になった */
     (void)to_version;
 
-    /* 宛先の公開暗号鍵は常にpubkey_cacheから引く。ただしto_address==from_address
-     * (自分自身宛、§11 chan仕様)の場合はcacheに無くてもfrom_id自身のpub_encryptionを使える
-     * (chanは共有passphraseから導出した同一の鍵を全メンバーが持つため、「自分宛に送る」ことが
-     * そのままchanへの投稿になる。他メンバーは同じ鍵を持つtrial_decryptで復号できる)。
+    /* 宛先の公開暗号鍵は常にpubkey_cacheから引く。ただしto_addressが自分自身のidentity
+     * (identity.dbに存在する。fromAddressと同一のchan投稿だけでなく、unlockしている/いないに
+     * 関わらず自分が持つ別のidentity宛でも成立する、§11 2026-08-31 ユーザー指摘で
+     * to_ripe==from_id.ripeのみを見ていた旧実装のバグを修正)の場合はcacheに無くても
+     * identity.dbに保存済みのencryption_pubkeyをそのまま使える(公開鍵はunlock不要で
+     * identity.dbに平文保存されている、§2.3)。
      * §11 2026-08-30 呼び出し側がto_pub_encryptionを直接指定できる経路は廃止した(検証されない
      * 鍵での暗号化・pubkey_cache汚染の実害があったため)。相手の鍵を事前に知っている場合は
      * 呼び出し側がbm_pubkey_cache_upsertで明示的に登録してから呼ぶ。 */
+    struct bm_identity_row to_identity_row;
+    int is_self = (bm_identity_store_load(identity_db, to_address, &to_identity_row) == 0);
     unsigned char cached_pub_encryption[65];
     const unsigned char *to_pub_encryption;
-    if (memcmp(to_ripe, from_id.ripe, BM_RIPE_LEN) == 0)
+    if (is_self)
     {
-        memcpy(cached_pub_encryption, from_id.pub_encryption, 65);
+        memcpy(cached_pub_encryption, to_identity_row.encryption_pubkey, 65);
         to_pub_encryption = cached_pub_encryption;
     }
     else
@@ -150,15 +156,25 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
 
     uint64_t expires_time = (uint64_t)time(NULL) + ttl_seconds;
 
+    /* §11 2026-08-31 ユーザー指摘: 自分自身宛(=chanへの投稿含む)はack要求相手がいない
+     * (自分がtrial_decryptで復号するだけで、誰も自分にackを返送してこない)ため、ackを
+     * 組み立てて埋め込むこと自体が無駄なPoW/帯域の浪費だった。PyBitmessage本家
+     * class_singleWorker.pyのsendMsg()も同じ理由でself/chan宛はfullAckPayload=''
+     * (ackを一切生成・埋め込まない)にしている(コメント "Not bothering to include ackdata
+     * because we are sending to ourselves or a chan.")。それに合わせ、is_selfの場合は
+     * generate_full_ack自体を呼ばない。 */
     unsigned char *ack_data = NULL;    /* nonce付き完成object(§5.0形式)、sent.ack_dataとして保存 */
     size_t ack_data_len = 0;
     unsigned char *ack_packet = NULL;  /* P2P "object"パケット(24byteヘッダ込み)、msgへ平文埋め込み */
     size_t ack_packet_len = 0;
-    if (generate_full_ack(ack_stealth_level, to_stream, expires_time, ttl_seconds,
-                           &ack_data, &ack_data_len, &ack_packet, &ack_packet_len) != 0)
+    if (!is_self)
     {
-        OPENSSL_cleanse(&from_id, sizeof(from_id));
-        return -1;
+        if (generate_full_ack(ack_stealth_level, to_stream, expires_time, ttl_seconds,
+                               &ack_data, &ack_data_len, &ack_packet, &ack_packet_len) != 0)
+        {
+            OPENSSL_cleanse(&from_id, sizeof(from_id));
+            return -1;
+        }
     }
 
     size_t payload_len = 0;
@@ -226,9 +242,17 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
         return -1;
     }
 
-    int rc = bm_messages_store_insert_sent(messages_db, msg_id, ack_data, ack_data_len, to_address, from_address,
-                                            subject, body, "sent", ack_stealth_level, (int64_t)time(NULL),
-                                            (int64_t)ttl_seconds, next_resend_time);
+    /* §11 2026-08-31: is_selfはack_data==NULL(上のgenerate_full_ack省略)なので、sent.ack_data
+     * (NOT NULL制約)にはNULLではなく長さ0の非NULLバッファを渡す。PyBitmessage本家の
+     * status='msgsentnoackexpected'(class_singleWorker.py)に合わせ、resend候補一覧からも
+     * 除外する(bm_messages_store_list_resend_candidates側の対応するWHERE句参照)。 */
+    static const unsigned char empty_ack_data[1] = {0};
+    const unsigned char *ack_data_for_store = (ack_data != NULL) ? ack_data : empty_ack_data;
+    const char *status = is_self ? "msgsentnoackexpected" : "sent";
+    int64_t sent_time = (int64_t)time(NULL);
+    int rc = bm_messages_store_insert_sent(messages_db, msg_id, ack_data_for_store, ack_data_len, to_address,
+                                            from_address, subject, body, status, ack_stealth_level,
+                                            sent_time, (int64_t)ttl_seconds, next_resend_time);
     free(ack_data);
     OPENSSL_cleanse(&from_id, sizeof(from_id));
 
@@ -236,6 +260,22 @@ int bm_send_pipeline_send_message(bm_keyring_t *kr, sqlite3 *identity_db, sqlite
     {
         free(object);
         return -1;
+    }
+
+    /* §11 2026-08-31 ユーザー指摘: 自分自身宛(chan投稿含む)はネットワーク経由で自分の元へ
+     * ack/gossipが返ってこない限りinboxに現れない(chanの場合、他メンバーがgossipし直して
+     * 初めて自分のノードにも届く。孤立ノードや他メンバー不在なら永久に現れない)。
+     * PyBitmessage本家class_singleWorker.pyのsendMsg()も同じ理由でhelper_inbox.insert()により
+     * 送信直後に同期的に自分のinboxへコピーを入れている。それに合わせ、is_selfの場合はここで
+     * 直接messages.dbのinboxへ挿入する。msg_idはinbox側の慣習(trial_decrypt.c等)に合わせ
+     * object全体のinventory hashを使う(sentテーブルのランダムmsg_idとは別概念)。ネットワーク
+     * 経由で同じobjectを後から受信してもINSERT OR IGNOREのため重複は起きない。 */
+    if (is_self)
+    {
+        unsigned char inbox_msg_id[32];
+        bm_inventory_hash(object, object_len, inbox_msg_id);
+        bm_messages_store_insert_inbox(messages_db, inbox_msg_id, to_address, from_address,
+                                        subject, body, sent_time);
     }
 
     *out_object = object;

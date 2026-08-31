@@ -1876,3 +1876,84 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     パターン(§7.4の一括import機能を実際に数千件規模で使うユーザーが現れたこと)によって
     表面化したもの。RPCサーバー自体をマルチスレッド化する根本対応(unlockAddress以外の
     リクエストが道連れでブロックされる問題自体は今回は未解決)は別途backlogとして残す。
+
+22. **自分自身宛/chan宛のsendMessageが、ack生成・再送・inbox反映のいずれも通常の他人宛と
+    同じ扱いだった問題を修正**: ユーザーから「CLIのsend-messageでchanアドレスをtoAddressに
+    指定した場合、自分自身宛の特別処理(pubkey_cache参照スキップ)は入っているのに、そこから
+    先(ackの要否・再送・inbox反映)には何も入っていないのでは」との指摘があり調査。
+    `send_pipeline.c`の`bm_send_pipeline_send_message`を確認した結果、指摘通り
+    以下3点が通常の他人宛と全く同じコードパスを通っていたことが判明した。
+
+    - ackの生成・埋め込み: is_self(自分自身宛)でも`generate_full_ack`を無条件に呼び、
+      ackobjectを組み立ててmsgへ埋め込んでいた。しかし自分自身宛/chan宛には誰もackを
+      返送してこない(chanの場合、自分が投稿した内容を復号できるのは自分自身であり、
+      他メンバーが「あなたの投稿を受け取った」というackを返す設計にはそもそもなっていない)ため、
+      PoW計算も含めて完全に無駄だった。
+    - 再送(resend): `bm_messages_store_list_resend_candidates`は`status != 'ackreceived'`
+      のみを条件にしており、is_self送信もack未着として扱われ`BM_RESEND_MAX_ATTEMPTS`
+      (5回)まで無駄な再送を繰り返してから諦めていた。
+    - inboxへの反映: is_self送信が送信者自身のinboxに現れる手段が、ネットワーク経由で
+      戻ってくる(chanなら他メンバーのgossip、孤立ノードや他メンバー不在なら永久に届かない)か、
+      `bm_object_sync_backfill_trial_decrypt`(§11項目21参照、`unlockAddress`時のみ発火)しか
+      無く、「送った内容がすぐ自分のinboxに見える」設計にすらなっていなかった。
+
+    PyBitmessage本家(`/home/teruteru/Documents/Projects/teruteru128/PyBitmessage`)の
+    `class_singleWorker.py`を確認したところ、`config.has_section(toaddress)`(toAddressが
+    自分の持ついずれかのidentityかどうか)で自分/chan宛を判定し、①`fullAckPayload = ''`
+    (ackを一切埋め込まない、コメント"Not bothering to include ackdata because we are sending
+    to ourselves or a chan.")、②status`'msgsentnoackexpected'`(通常は`'msgsent'`)を設定、
+    ③`class_singleCleaner.py`の再送候補SQLがこのstatusを明示的に除外、④送信直後に
+    `helper_inbox.insert()`で同期的に自分のinboxへコピーを挿入、という4点セットで
+    軽量化・即時反映していることを確認した。これに合わせて実装した。
+
+    さらに実装中、ユーザーから「is_selfの判定はto_ripe==from_id.ripe(fromAddressと
+    toAddressが完全に同一)だけでよいのか、identity全部を見なくていいのか」という指摘が
+    入った。旧実装(直近の2026-08-30セッションでpubkey_cache参照スキップのために書かれた
+    判定式)は`to_ripe == from_id.ripe`のみを見ており、「fromAddressとtoAddressが同一
+    (chan投稿含む)」の場合しか捕捉できず、「fromAddressとtoAddressが別だが、toAddressも
+    このノードが持つ別のidentityである」場合(例: identity Aからidentity Bへ送る、両方
+    自分がunlock/lock問わず所有している)を捕捉できていなかった。これはPyBitmessage本家の
+    `config.has_section(toaddress)`(自分の持つ**いずれかの**identityかどうか、fromAddressとは
+    無関係)より狭い判定であり、正確な指摘だった。
+
+    実装内容(`src/core/send_pipeline.c`):
+    - is_selfの判定を`memcmp(to_ripe, from_id.ripe, ...)`から
+      `bm_identity_store_load(identity_db, to_address, &to_identity_row) == 0`
+      (toAddressがidentity.dbに存在するか)へ変更。公開鍵はunlock不要でidentity.dbに
+      平文保存されている(§2.3)ため、to_identity_row.encryption_pubkeyをそのまま使える。
+      toAddressのidentityがkeyringでunlock中かどうかは一切問わない(PyBitmessage本家の
+      `has_section`もrunlock状態を見ていないことと整合)。
+    - is_selfの場合、`generate_full_ack`自体を呼ばずack_data/ack_packetをNULLのまま
+      進める(sent.ack_dataのNOT NULL制約に合わせ、DB保存時のみ長さ0の非NULLバッファに
+      差し替える)。
+    - sent.statusをis_selfなら`'msgsentnoackexpected'`、それ以外は従来通り`'sent'`に設定。
+    - `bm_messages_store_list_resend_candidates`(messages_store.c)のWHERE句に
+      `AND status != 'msgsentnoackexpected'`を追加し、再送候補から除外。
+    - `struct bm_sent_message`の`status[16]`は`'msgsentnoackexpected'`(21文字)が
+      収まらないため`status[24]`へ拡張。
+    - is_self送信が成功したら、object全体のinventory hash(trial_decrypt.c等inbox側の
+      慣習に合わせる、sentテーブルの乱数msg_idとは別概念)をキーに
+      `bm_messages_store_insert_inbox`を同期的に呼び、messages.dbのinboxへ即時反映する
+      (INSERT OR IGNOREのため、後からネットワーク経由で同じobjectを受信しても重複しない)。
+
+    テスト:
+    - `tests/test_send_pipeline.c`: 従来「2つの別identityを同一identity_dbにcreate_and_unlock
+      して送受信roundtripを見る」構成になっていたテストが、is_selfの新判定により
+      そのままis_self経路を通るようになった。status='msgsentnoackexpected'・ack省略
+      (`decoded.ack_payload_len == 0`)・inboxへの即時ループバックを確認するよう更新。
+      さらに、受信者identityをlockした状態でもis_self経路(ack省略・inboxループバック)が
+      機能することを確認するケースを追加(is_self判定がunlock状態に依存しないことの担保)。
+    - `tests/test_object_sync.c`: 「ack往復」を検証する既存セクション(4節目)は、sender/receiver
+      両identityを同一identity_dbに置いていたため、is_self化の影響でack自体が生成されなくなり
+      検証が成立しなくなった。receiver identityの作成・unlockだけ使い捨ての別identity_db
+      (`test_object_sync_recv_identity.db`)で行うよう分離し(unlock後は`&kr`に載るだけなので
+      trial_decrypt側の検証には影響しない)、sender側の`identity_db`(ctx全体で共有、is_self判定
+      に使われる)にreceiverが登録されない状態を維持することで、本来検証したかった
+      「別ノード宛のack往復」シナリオを保った。
+    - `tests/test_cli_integration.sh`: 「pubkey_cache未登録の宛先へのsend-messageは失敗する」
+      検証で使っていたADDR2Bが`create-address`で作られた(=identity.db在籍の)自分のidentityだった
+      ため、is_self化によりpubkey_cache無しでも送信が成功するようになってしまった。send-message
+      呼び出し前に`delete ADDR2B`してidentity.dbから除いてから検証するよう修正。
+    - ctest 41件全通過。
+
+    出典・詳細はこのファイル内§5末尾(send_pipeline/ack)、§7.3(送信パイプラインとの関係)も参照。

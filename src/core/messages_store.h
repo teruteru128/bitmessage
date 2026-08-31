@@ -62,9 +62,11 @@ struct bm_sent_resend_candidate
 };
 
 /*
- * status!='ackreceived' かつ next_resend_time<=now かつ resend_count<max_attemptsな行を
- * 一覧する(object_sync_threadの再送チェックから呼ばれる)。成功時0、*out_countに件数を
- * 設定する(0件でも成功)。呼び出し側でbm_sent_resend_candidate_list_freeすること。
+ * status!='ackreceived' かつ status!='msgsentnoackexpected'(§11 2026-08-31 自分自身宛/chan宛は
+ * ackが返ってこないため再送しても無駄、PyBitmessage本家class_singleCleaner.py準拠で除外)
+ * かつ next_resend_time<=now かつ resend_count<max_attemptsな行を一覧する(object_sync_threadの
+ * 再送チェックから呼ばれる)。成功時0、*out_countに件数を設定する(0件でも成功)。呼び出し側で
+ * bm_sent_resend_candidate_list_freeすること。
  */
 int bm_messages_store_list_resend_candidates(sqlite3 *db, int64_t now, int max_attempts,
                                               struct bm_sent_resend_candidate **out_list, size_t *out_count);
@@ -111,7 +113,7 @@ struct bm_sent_message
     char from_address[BM_MESSAGES_ADDRESS_MAX];
     char *subject; /* malloc */
     char *body;    /* malloc */
-    char status[16]; /* 'encoding'|'doingpow'|'broadcasted'|'ackreceived' */
+    char status[24]; /* 'sent'|'ackreceived'|'msgsentnoackexpected'(§11 2026-08-31、自分自身宛/chan宛) */
     int64_t sent_time;
     int64_t ttl;
     int resend_count;
