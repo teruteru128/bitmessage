@@ -542,7 +542,11 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             continue;
         }
 
-        if (bm_post_version(sock, config->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
+        /* §11 2026-08-31: addrFromにはconn->local_addr(ephemeralなTCP送信元)ではなく
+         * 「自分の到達可能アドレスは不明」を表す0.0.0.0を使う(protocol.hのdoc参照)。 */
+        struct sockaddr_storage self_addr;
+        bm_unspecified_ipv4_address(&self_addr);
+        if (bm_post_version(sock, config->user_agent, 3, &conn->peer_addr, &self_addr) != 0)
         {
             bm_log_warn("[peer_connector] failed to send version to %s\n", addr_buf);
             epoll_ctl(config->epfd, EPOLL_CTL_DEL, sock, NULL);

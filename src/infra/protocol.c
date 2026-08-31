@@ -154,6 +154,23 @@ void bm_encode_network_address(unsigned char addr[26], const struct sockaddr_sto
     }
 }
 
+/* §11 2026-08-31発覚のバグ修正: version messageのaddrFrom(送信者が主張する「自分自身の
+ * アドレス」)を組み立てる際、以前はconn->local_addr(getsockname()で得たTCP接続の送信元
+ * =NAT配下ではOSが選んだephemeralなローカルポート)をそのまま使っていた(peer_connector.c/
+ * object_sync.cのbm_post_version呼び出し箇所)。これは自分のリッスンポート(inbound_port)
+ * とは無関係な値であり、外部からアクセス不能な自宅IPv4+ephemeralポートが「自分の連絡先」
+ * として接続先peerへ伝わり、addr message経由でネットワークを巡って自分自身のpeers.dbにも
+ * 到達不能な接続候補として混入する原因になっていた(ユーザー報告、DESIGN.md §11参照)。
+ * 自分の実際に到達可能な外部IPv4アドレスを把握する仕組みが無い(本家PyBitmessageにも
+ * 存在しない)以上、詐称するより「知らない」ことを正直に0.0.0.0で示す方が安全。
+ * is_routable_ipv4_peer_address(object_sync.c)は0.0.0.0を非routableとして弾く設計に
+ * 既になっているため、これを受け取ったpeerがaddr message経由でさらに広めることもない。 */
+void bm_unspecified_ipv4_address(struct sockaddr_storage *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->ss_family = AF_INET;
+}
+
 void bm_parse_version_message(const unsigned char *payload, size_t payload_len,
                                struct bm_version_message *out_msg)
 {

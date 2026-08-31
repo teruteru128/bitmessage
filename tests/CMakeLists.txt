@@ -148,6 +148,10 @@ add_executable(test_network_format_host_port test_network_format_host_port.c)
 target_link_libraries(test_network_format_host_port PRIVATE bm_infra)
 add_test(NAME network_format_host_port COMMAND test_network_format_host_port)
 
+add_executable(test_version_addr_from test_version_addr_from.c)
+target_link_libraries(test_version_addr_from PRIVATE bm_infra)
+add_test(NAME version_addr_from COMMAND test_version_addr_from)
+
 add_executable(test_logging test_logging.c)
 target_link_libraries(test_logging PRIVATE bm_common Threads::Threads)
 add_test(NAME logging COMMAND test_logging)

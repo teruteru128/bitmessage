@@ -1957,3 +1957,55 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - ctest 41件全通過。
 
     出典・詳細はこのファイル内§5末尾(send_pipeline/ack)、§7.3(送信パイプラインとの関係)も参照。
+
+23. **version messageのaddrFromがephemeralなローカルポートを漏らし、自宅IPv4+
+    ephemeralポートが自分自身のpeers.dbへ混入する問題を修正**: ユーザーから「peers DBに
+    自分自身のIPv4アドレスが登録されている。手動で`is_self`は立てたが、自分自身かどうかを
+    知る本来の方法が無い」との指摘で発覚。調査の結果、ユーザーの自宅IPv4回線は
+    外部から確実にアクセス不能(NAT配下・ポート転送なし)であり、他peerとの実接続による
+    self-connection検知(version messageの`nonce`比較、PyBitmessage本家の
+    `isAlreadyConnected`相当)は接続自体が成立しないため機能しない。既存の`is_self`
+    フラグ機構(`bm_peer_manager_mark_self`、`peer_manager.c`)もonionアドレス専用で、
+    IPv4向けの自動検知経路が皆無だった。
+
+    根本原因を`infra/network.c`/`infra/protocol.c`を実際に読んで特定した:
+    version messageの`addrFrom`(送信者が主張する「自分自身のアドレス」)に、
+    `bm_fd_data_new`(`network.c`)が接続確立直後に`getsockname(fd,...)`で取得した
+    `conn->local_addr`(=そのTCP接続のOSが選んだephemeralなローカル送信元ポート)を
+    そのまま使っていた(`peer_connector.c:545`, `object_sync.c:1127`)。設定済みの
+    リッスンポート(`inbound_port`)は一切参照されていなかった。SOCKS5/Tor経由の
+    `peer_addr`(addrRecv相当)側は既に`logical_peer_ip`でプロキシアドレスとの混同を
+    回避済みなのに、`local_addr`(addrFrom)側だけ対応漏れという非対称な実装だった。
+    この誤ったaddrFromを受け取ったpeerがaddr messageで再共有すると、自宅IP+
+    ephemeralポートが正規のpeer候補として流通し、addr relay経由で(第三者経由の
+    伝聞のため直接のnonce比較では検知不能な形で)自分自身のpeers.dbにも巡り巡って
+    戻ってくる。
+
+    PyBitmessage本家(`/home/teruteru/Documents/Projects/teruteru128/PyBitmessage`)の
+    `bmproto.py`も調査したが、`bm_command_version`が受信した`addrRecv`(=相手から見た
+    自分)を`logger.debug('my external IP: %s', ...)`とデバッグログに出すだけで、
+    自己IP学習も`bm_command_addr`側の自己アドレス除外フィルタも存在しなかった。
+    「複数peerが報告したaddrRecvの一致から自分の外部IPを推定する」ようなBitcoin Core的な
+    仕組みは本家にも無く、この設計上の穴は本家にも共通することを確認した上で、
+    今回はC実装側の非対称バグ(addrFrom生成)の是正を優先した。
+
+    対応: `infra/protocol.c`に`bm_unspecified_ipv4_address()`を新設し、addrFromには
+    「自分の到達可能なIPv4アドレスは分からない」ことを正直に示す`0.0.0.0`を常に使う
+    ようにした(`peer_connector.c`/`object_sync.c`の`bm_post_version`呼び出し2箇所を
+    修正)。`is_routable_ipv4_peer_address`(`object_sync.c`)は既に`0.0.0.0`を
+    非routableとして弾く設計になっているため、これを受け取ったpeerがaddr messageで
+    さらに広めることもない。`conn->local_addr`/`getsockname()`自体は
+    `tests/test_object_sync.c`が独立にテスト用version packet組み立てに使っているため
+    struct/取得処理は変更せず、production側の2呼び出し箇所だけ切り離した。
+
+    自分の実際の外部到達可能アドレスを学習・活用する仕組み(Bitcoin Core的な複数peer
+    合意によるself-IP推定)は今回はスコープ外(本家にも無い設計であり、ユーザーの
+    IPv4回線はそもそも外部到達不能と確定しているため実益が薄い)。既に混入している
+    自宅IP+ephemeralポートのpeers.dbエントリは、レイティング減衰(`bm_peer_manager_
+    cleanup`)による自然消滅を待つか、手動でDELETEする。
+
+    テスト: `tests/test_version_addr_from.c`を新設。`bm_unspecified_ipv4_address()`が
+    `AF_INET`+`0.0.0.0`+port 0を返すこと、ephemeralなローカルアドレスを渡しても
+    実際にbm_new_version_messageが組み立てるversion payloadのaddrFromが常に
+    `0.0.0.0:0`になること、addrRecv(peer_addr)側は影響を受けないことを確認する。
+    ctest 42件全通過。

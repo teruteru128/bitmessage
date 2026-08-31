@@ -122,6 +122,10 @@ void bm_free_message(struct bm_message *msg);
 void bm_encode_network_address(unsigned char addr[26], const struct sockaddr_storage *local_addr);
 void bm_encode_time_and_stream(unsigned char *addr, uint64_t time, uint32_t stream);
 
+/* §11 2026-08-31: version messageのaddrFromに使う「自分の到達可能アドレスは不明」を
+ * 表す値(0.0.0.0)を構築する。詳細はbm_unspecified_ipv4_addressの定義側コメント参照。 */
+void bm_unspecified_ipv4_address(struct sockaddr_storage *out);
+
 void bm_parse_version_message(const unsigned char *payload, size_t payload_len,
                                struct bm_version_message *out_msg);
 void bm_free_version_message(struct bm_version_message *msg);

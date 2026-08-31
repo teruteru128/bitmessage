@@ -1124,7 +1124,11 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
          * 実ネットワークの他ノードからの応答でも同じ挙動が観測されている) */
         if (conn->type == BM_FD_SERVER_SOCKET && ctx->user_agent != NULL)
         {
-            if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &conn->local_addr) != 0)
+            /* §11 2026-08-31: addrFromにはconn->local_addr(ephemeralなTCP送信元)ではなく
+             * 「自分の到達可能アドレスは不明」を表す0.0.0.0を使う(protocol.hのdoc参照)。 */
+            struct sockaddr_storage self_addr;
+            bm_unspecified_ipv4_address(&self_addr);
+            if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &self_addr) != 0)
             {
                 bm_log_warn("[object_sync] failed to send version to inbound peer\n");
             }
