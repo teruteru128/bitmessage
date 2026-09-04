@@ -2092,3 +2092,59 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     なお残タスク(2)(idle_sweepが特定の接続を刈り取らない根本原因の特定)は本修正の
     スコープ外のまま。今回の(1)は「read側検知が機能しない接続」を独立した経路で救済する
     安全網であり、(2)自体の原因究明が完了したわけではない。
+
+    追記(2026-09-05、根本原因(2)の調査続き): journalctlを時系列で洗い直したところ、
+    問題のinbound 8本は「じわじわ」発生したのではなく、9/4 22:50:29の1秒の間にまとめて
+    (fd=24,29〜35として)acceptされていたことが判明した。同時刻に既存outbound接続1本の
+    EOF切断+再接続も起きている。同時刻帯の他サービス(本機で常時クラッシュループしている
+    `anbox-cloud-appliance`関連、dashboard再起動カウンタ48,308回)のノイズとの相関も
+    疑ったが、これは1日中絶え間なく発生している背景ノイズであり22:50:29固有の現象では
+    ないと判断した。`tor@default.service`は該当時間帯にログを一切出しておらず、Tor側の
+    直接的な裏付けは取れなかった。
+
+    この「バーストaccept」を手掛かりに、ローカルで2種類の再現テストを作成した:
+
+    1. `tests/test_burst_accept_idle_sweep.c`(新設、`burst_accept_idle_sweep`として登録):
+       `bm_network_handle_accept`と`bm_network_idle_sweep`を合成時刻で直接呼ぶ方式
+       (test_idle_sweep.c等と同じ決定的テスト方針)。listen backlog(16、`network.c`の
+       `listen(sock, 16)`)を超える本数(32本)を無防備にblocking connect()すると、
+       backlogを超えた分のSYNがカーネル側で詰まりconnect()自体が長時間ブロックして
+       テストがハングすることが判明した(実際に120秒タイムアウトを確認)ため、本番と
+       同じ実測値である8本に抑えた。シナリオ1(接続だけして即座に消えるpeer)・
+       シナリオ2(本番のss調査で見つかったCLOSE-WAIT/Recv-Q=130に近い状況を模した、
+       130バイトの不正データ送信後に消えるpeer)いずれも、ハンドシェイクタイムアウト後に
+       全数正しく刈り取られ、**再現しなかった**。
+    2. `tests/test_burst_accept_real_epoll_thread.c`(新設、`burst_accept_real_epoll_thread`
+       として登録): 直接呼び出しでは`bm_network_idle_sweep`のタイムアウト計算ロジックしか
+       検証できず、本番で観測した「CLOSE-WAIT状態でRecv-Q=130バイトの未読データが残った
+       まま」(=epoll_waitがそのfdに対して一度もreadableイベントを配送していない可能性)は
+       検証できていなかったため、`bm_network_epoll_thread`を実スレッドとしてpthread_create
+       し、本物の`epoll_wait`経由で同じシナリオ(バーストaccept→130バイトの不正データ→
+       即座にclose())を再現するテスト。`tests/test_peer_rating_on_disconnect.c`と同じ
+       「実スレッド起動+ポーリング待機」方式。結果、read側のEOF検知(`"peer closed (EOF)"`)が
+       1秒未満で即座に正しく働き、**これも再現しなかった**。
+
+    2件とも失敗したことで、「バーストaccept+早期切断」という単純なTCP/epollレベルの条件
+    だけでは再現せず、本番固有の要因(Tor hidden service経由という要素そのもの、
+    peer_connector_thread/object_sync_broadcast_thread等他スレッドとの競合、24時間以上の
+    稼働・大量のfd churnを経た状態固有の何か)が絡んでいる可能性が高いと判断した。ユーザーと
+    相談の上、これ以上ローカルでの条件作り込みには進まず、計装ビルドを本番daemon(daemon A)
+    へ実際にデプロイして自然発生を待つ方針に切り替えた(ユーザーが就寝前に手離れさせたい
+    という事情もあった)。
+
+    `src/infra/network.c`の`idle_sweep_one`(ハンドシェイク未完了の接続を評価するたびに
+    fd・経過秒数・閾値を記録)と`bm_network_epoll_thread`のepoll_wait配送ループ
+    (ハンドシェイク未完了の接続にイベントが配送されるたびにfdとevents bitmaskを記録)の
+    2箇所へ、`bm_log_debug`での一時的な調査用ログを追加した(原因特定後は削除する想定)。
+    もしゴースト化した接続のfdが、accept直後を最後に後者のログへ二度と現れなくなれば、
+    epoll_wait自体がそのfdへイベントを配送していないことの直接証拠になる。ctest 45件
+    全通過。
+
+    本番daemon Aは`BM_LOG_LEVEL`が既定(DEBUG無効)のままだったため、上記ログを実際に
+    観測するには有効化が必要だった。ユーザー提案により、systemd unitの
+    `Environment=`を直接書き換えるのではなく、`EnvironmentFile=-/etc/bitmessage/
+    bitmessaged.env`(存在しなくても起動を妨げないよう`-`プレフィックス付き)を
+    `bitmessaged.service.d/override.conf`へ追加し、実体である`BM_LOG_LEVEL=DEBUG`は
+    `/etc/bitmessage/bitmessaged.env`側に置く方式にした(unitファイル自体を触らずに
+    済み、`systemctl daemon-reload`だけで反映できる)。既存の`bitmessage.conf`(アプリ本体の
+    設定、INI形式)とは役割・形式が異なる別ファイルとして`/etc/bitmessage/`配下に並置した。

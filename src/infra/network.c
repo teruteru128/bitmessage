@@ -695,6 +695,17 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
 
     if (!conn->handshake_complete)
     {
+        /* §11 2026-09-05: 本番daemon(daemon A)でハンドシェイク未完了のinbound接続が
+         * 20秒のタイムアウトを大幅に超えても刈り取られずにpeer_registryへ残り続ける
+         * バグの調査用計装(DESIGN.md参照)。ローカルでのバースト再現テスト(tests/
+         * test_burst_accept_idle_sweep.c, tests/test_burst_accept_real_epoll_thread.c)
+         * ではidle_sweep自体は正しく動作しており再現できなかったため、本番環境固有の
+         * 何かを特定する目的で、handshake未完了の接続(通常は個体数が少なく、正常なら
+         * 20秒以内に消えるはず)についてのみ、この判定が呼ばれるたびの状態を記録する。
+         * 原因特定後は削除する想定の一時的なログ。 */
+        bm_log_debug("[network] idle_sweep(handshake未完了): fd=%d %s idle=%" PRId64 "s threshold=%ds\n", conn->fd,
+                conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds,
+                BM_HANDSHAKE_TIMEOUT_SECONDS);
         if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)
         {
             bm_log_warn("[network] closing %s connection (fd=%d): handshake not completed within %ds\n",
@@ -758,6 +769,17 @@ void *bm_network_epoll_thread(void *arg)
             {
                 bm_network_handle_accept(args, conn, now);
                 continue;
+            }
+            /* §11 2026-09-05: idle_sweep_oneの計装と対の調査用ログ(DESIGN.md参照)。
+             * handshake未完了の接続に限定して、epoll_waitが実際にこのfdへイベントを
+             * 配送したかどうか(events bitmask込み)を記録する。もしゴースト化した接続の
+             * fdが、accept直後を最後に二度とこのログへ現れなくなるなら、epoll_wait自体が
+             * そのfdへイベントを配送していないことの直接証拠になる。原因特定後は削除する
+             * 想定の一時的なログ。 */
+            if (!conn->handshake_complete)
+            {
+                bm_log_debug("[network] epoll_wait event: fd=%d %s events=0x%x\n", conn->fd,
+                        conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", events[i].events);
             }
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
             if (rc != 0)
