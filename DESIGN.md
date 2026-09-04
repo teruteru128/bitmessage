@@ -2044,11 +2044,51 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     追加した(`core/api_server.c`の`list_connections_one`、`cli/main.c`のヘルプ文言も
     同期)。broadcast_inv失敗ログの"fd=N"とは無関係である旨をコメントで明記した。
 
-    残タスク(backlog): (1) `bm_peer_registry_broadcast_inv`の書き込み失敗
-    (EPIPE等)を検知した際、ログを出すだけでなく該当接続を能動的に`close_connection`
-    相当で除去する防御的な修正(read側検知に依存しない独立した安全網になる)、
-    (2) idle_sweepのハンドシェイクタイムアウトが特定の接続に対して機能しない
-    根本原因の特定(本番daemonへの侵襲的デバッグが必要、要ユーザー承認)。
-    inbound上限`BM_MAX_INBOUND_CONNECTIONS`(64)に対し現状8本程度なので即座の
-    実害(新規inbound拒否)には至っていないが、リークが継続すれば将来的に枯渇しうる。
+    残タスク(backlog、うち(1)は同日中に実装、下記追記参照): (1) `bm_peer_registry_
+    broadcast_inv`の書き込み失敗(EPIPE等)を検知した際、ログを出すだけでなく該当接続を
+    能動的に`close_connection`相当で除去する防御的な修正(read側検知に依存しない独立した
+    安全網になる)、(2) idle_sweepのハンドシェイクタイムアウトが特定の接続に対して
+    機能しない根本原因の特定(本番daemonへの侵襲的デバッグが必要、要ユーザー承認、
+    未着手)。inbound上限`BM_MAX_INBOUND_CONNECTIONS`(64)に対し現状8本程度なので
+    即座の実害(新規inbound拒否)には至っていないが、リークが継続すれば将来的に枯渇しうる。
     ctest 42件全通過。
+
+    追記(2026-09-05、同日中): 上記残タスク(1)を実装した。`bm_peer_registry_broadcast_inv`は
+    `object_sync_broadcast_thread`(network_epoll_threadとは別スレッド)から呼ばれるため、
+    write失敗時に対象の`struct bm_fd_data *conn`へ素朴に触れて`close`+`free`すると、
+    ロック解放後dup()した複製fdへ書き込むまでの間に、network_epoll_thread側がread側検知で
+    先にclose_connection済み+free()し、同じヒープアドレスへ別の新しいaccept()由来のconnが
+    割り当てられていた場合、無関係な生きている接続を誤って破壊してしまう(ABA問題)。
+
+    対策として`struct bm_fd_data`に`generation`(uint64_t)を追加し、`bm_peer_registry_add`が
+    登録のたびに`reg->next_generation`(1始まりの単調増加カウンタ、レジストリ自身の
+    mutexで保護)から払い出すようにした。`bm_peer_registry_broadcast_inv`はdup()前の
+    ロック区間で`pending[].conn`と`pending[].generation`を一緒に記録しておき、write失敗後に
+    新設した`bm_peer_registry_evict_if_current(reg, conn, generation)`を呼ぶ。この関数は
+    ロックを取り直して`reg->conns[]`を線形探索し、**ポインタが一致した配列要素**(=この時点で
+    確実に生きている、dereferenceして安全)の`generation`を読んで比較し、両方一致した場合
+    のみ除去(registryから外す)・`close`・`bm_fd_data_free`を行う。ポインタ不一致(既に
+    別経路で除去済み)はもちろん、ポインタ一致でもgeneration不一致(ABA発生、別の新しい
+    接続が同じアドレスを再利用している)の場合も一切dereferenceせず0を返して何もしない。
+    close_connection側(network.c、単一スレッドの中でしか動かない既存経路)はこの
+    generationチェックが無くても元々安全(スナップショットと同じロックスコープ内で
+    即座に使う既存の`bm_peer_registry_for_each`/`for_each_locked`とは異なり、こちらは
+    ロック解放後・別スレッドから“後で”触るケースなので、この2つは区別して考える必要がある)
+    ため、既存の`bm_peer_registry_remove`(pointerのみ比較)はそのまま維持し、新関数は
+    broadcast_inv専用として追加した。
+
+    書き込み失敗時のサマリログ(既存の`bm_log_debug("[peer_registry] broadcast inv: ..."`)
+    に`evicted %zu dead peer(s)`を追記し、除去件数も可視化した。
+
+    テスト: `tests/test_peer_registry_evict.c`を新設し`tests/CMakeLists.txt`へ登録
+    (`peer_registry_evict`)。(a) `bm_peer_registry_add`のたびにgenerationが1から単調増加
+    すること、(b) generation不一致なら(ポインタが登録済みでも)除去せず登録数も減らない
+    こと(ABA対策の核心)、(c) ポインタ+generation一致なら除去され登録数が減ること、
+    (d) 既にregistryから外れている(free済みの)connへ`evict_if_current`を呼んでも0を返し
+    dangling pointerをdereferenceしないこと、をそれぞれ確認する。(d)はfree済みポインタを
+    そのまま関数へ渡すと`-Wuse-after-free`(gcc)で警告になるため、`uintptr_t`経由で
+    コンパイラの変数追跡を意図的に切り離した(コメントで理由を明記)。ctest 43件全通過。
+
+    なお残タスク(2)(idle_sweepが特定の接続を刈り取らない根本原因の特定)は本修正の
+    スコープ外のまま。今回の(1)は「read側検知が機能しない接続」を独立した経路で救済する
+    安全網であり、(2)自体の原因究明が完了したわけではない。

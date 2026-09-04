@@ -17,6 +17,7 @@ void bm_peer_registry_init(struct bm_peer_registry *reg)
     reg->conns = NULL;
     reg->count = 0;
     reg->capacity = 0;
+    reg->next_generation = 1; /* 0は「未登録」を表すbm_fd_dataのcalloc既定値と衝突させない */
 }
 
 void bm_peer_registry_destroy(struct bm_peer_registry *reg)
@@ -43,6 +44,7 @@ void bm_peer_registry_add(struct bm_peer_registry *reg, struct bm_fd_data *conn)
         reg->conns = grown;
         reg->capacity = new_cap;
     }
+    conn->generation = reg->next_generation++;
     reg->conns[reg->count++] = conn;
     pthread_mutex_unlock(&reg->lock);
 }
@@ -60,6 +62,40 @@ void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *co
         }
     }
     pthread_mutex_unlock(&reg->lock);
+}
+
+int bm_peer_registry_evict_if_current(struct bm_peer_registry *reg, struct bm_fd_data *conn, uint64_t generation)
+{
+    /* §11 2026-09-05: reg->conns[i] == connのポインタ一致は、比較する2つの側がどちらも
+     * 「現在ロック中のreg->conns配列そのものの要素」であるうちは安全(このループの中でしか
+     * conn->generationを読まない)。ポインタが一致した時点でconnは確実に生きている(配列に
+     * 実在する)ため、その場でgenerationも読んで比較して問題ない。一致しなければ、呼び出し元が
+     * 捕まえていたconnは既に別の理由で除去・free済みで、そのアドレスへたまたま別の新しい
+     * connが割り当てられただけ(ABA問題)と判断し、一切触れずに除去を諦める。 */
+    pthread_mutex_lock(&reg->lock);
+    int found = 0;
+    for (size_t i = 0; i < reg->count; i++)
+    {
+        if (reg->conns[i] == conn)
+        {
+            if (conn->generation == generation)
+            {
+                reg->conns[i] = reg->conns[reg->count - 1];
+                reg->count--;
+                found = 1;
+            }
+            break; /* ポインタ一致は高々1件のみなので、generation不一致でも探索終了 */
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+
+    if (!found)
+    {
+        return 0;
+    }
+    close(conn->fd);
+    bm_fd_data_free(conn);
+    return 1;
 }
 
 size_t bm_peer_registry_count(struct bm_peer_registry *reg)
@@ -162,6 +198,13 @@ struct pending_inv_send
     size_t fluff_count;
     unsigned char (*stem_hashes)[32];
     size_t stem_count;
+    /* §11 2026-09-05: write失敗時にbm_peer_registry_evict_if_currentへ渡す識別情報。
+     * connポインタ単体では、ロック解放後に元の接続がclose_connection済み+free()され、
+     * 同じアドレスへ別の新しいconnが割り当てられた場合に誤って別接続を除去しかねない
+     * (ABA問題、network.hのconn->generationのdoc参照)ため、この時点(ロック中)で読んだ
+     * generationも一緒に保持し、除去時に両方の一致を要求する。 */
+    struct bm_fd_data *conn;
+    uint64_t generation;
 };
 
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
@@ -230,6 +273,8 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
             pending[pending_count].fluff_count = fluff_count;
             pending[pending_count].stem_hashes = stem;
             pending[pending_count].stem_count = stem_count;
+            pending[pending_count].conn = conn;
+            pending[pending_count].generation = conn->generation;
             pending_count++;
         }
         else
@@ -242,8 +287,15 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
 
     size_t inv_sent_peers = 0;
     size_t dinv_sent_peers = 0;
+    size_t evicted_peers = 0;
+    char reason[BUFSIZ];
     for (size_t i = 0; i < pending_count; i++)
     {
+        /* §11 2026-09-05: fluff/stemいずれかのwriteが失敗したら、ループの最後でこの接続を
+         * evict_if_currentへ渡す(read側検知に頼らない能動的な除去、peer_registry.hのdoc参照)。
+         * 一方が失敗しもう一方が成功しても、同じdup済みfd=同じ接続である以上「現時点で
+         * 書き込み不能」という結論は変わらないため、evict対象とする。 */
+        int write_failed = 0;
         if (pending[i].fluff_count > 0)
         {
             size_t packet_len = 0;
@@ -252,10 +304,11 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
             if (packet != NULL)
             {
                 if (bm_network_write_all(pending[i].fd, packet, packet_len,
-                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0)
+                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason, BUFSIZ)
                     != 0)
                 {
-                    bm_log_warn("[peer_registry] failed to send inv to fd=%d\n", pending[i].fd);
+                    bm_log_warn("[peer_registry] failed to send inv to fd=%d(%s)\n", pending[i].fd, reason);
+                    write_failed = 1;
                 }
                 else
                 {
@@ -276,6 +329,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                     != 0)
                 {
                     bm_log_warn("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
+                    write_failed = 1;
                 }
                 else
                 {
@@ -287,6 +341,12 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
         close(pending[i].fd);
         free(pending[i].fluff_hashes);
         free(pending[i].stem_hashes);
+
+        if (write_failed
+            && bm_peer_registry_evict_if_current(reg, pending[i].conn, pending[i].generation))
+        {
+            evicted_peers++;
+        }
     }
     /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(何件のhashを何peerへ
      * 配信できたか)が可視化されていなかった(handle_inv等の可視化と同種の穴、
@@ -295,8 +355,10 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
      * (pending_count==0)場合は出さない。 */
     if (pending_count > 0)
     {
-        bm_log_debug("[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s)\n", count,
-                inv_sent_peers, dinv_sent_peers);
+        bm_log_debug(
+                "[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s), evicted "
+                "%zu dead peer(s)\n",
+                count, inv_sent_peers, dinv_sent_peers, evicted_peers);
     }
     free(pending);
 }

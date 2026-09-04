@@ -41,6 +41,15 @@ struct bm_fd_data
 {
     enum bm_fd_type type;
     int fd;
+    /* §11 2026-09-05: peer_registry.cのbm_peer_registry_evict_if_current用。connをregistryへ
+     * 登録する際(bm_peer_registry_add)にreg->next_generationから払い出す一意な値(bm_fd_data_new
+     * 時点はcalloc由来の0のまま=未登録)。broadcast_inv(object_sync_broadcast_threadという
+     * network_epoll_threadとは別スレッドから呼ばれる)がwrite失敗を検知して能動的に接続を
+     * 除去する際、close_connection済みで既にfree()されたconnのアドレスが直後に別の新しい
+     * accept()で再利用され(malloc実装によってはよくある)、無関係な生きている接続を誤って
+     * 破壊してしまう(ABA問題)のを防ぐ。conn==ポインタ一致に加えてgenerationも一致した場合
+     * のみ「自分が捕まえたのと同一の接続である」とみなして除去してよい(peer_registry.c参照)。 */
+    uint64_t generation;
     size_t size;
     size_t length;
     unsigned char *recv_buffer;

@@ -19,6 +19,10 @@ struct bm_peer_registry
     struct bm_fd_data **conns; /* malloc済み配列、各要素は借用ポインタ(所有権は持たない) */
     size_t count;
     size_t capacity;
+    /* §11 2026-09-05: bm_peer_registry_addのたびに払い出す単調増加カウンタ。conn->generation
+     * (network.hのdoc参照)の発行元。1から始める(0は「未登録」を表す既定値としてbm_fd_data_new
+     * のcalloc結果と衝突しないようにするため)。 */
+    uint64_t next_generation;
 };
 
 void bm_peer_registry_init(struct bm_peer_registry *reg);
@@ -27,6 +31,17 @@ void bm_peer_registry_destroy(struct bm_peer_registry *reg);
 void bm_peer_registry_add(struct bm_peer_registry *reg, struct bm_fd_data *conn);
 /* connが登録されていなくても何もしない(既に削除済み等) */
 void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *conn);
+
+/*
+ * §11 2026-09-05: bm_peer_registry_broadcast_inv用。network_epoll_thread以外のスレッドから
+ * 「このconnはもう死んでいるはずだから除去したい」場合に使う、close_connection相当の処理
+ * (registryから除去・close・bm_fd_data_free)。connポインタだけでなくgenerationも一致した
+ * 場合のみ実行する(network.hのconn->generationのdoc、ABA問題の説明を参照)。
+ * 既にnetwork_epoll_thread側で(read側検知等により)先に除去・free済みの場合や、その後
+ * 同じアドレスに別の新しいconnが割り当てられていた場合は何もせず0を返す(その場合はfd/connに
+ * 一切触れない、呼び出し元はもう何もしてはいけない)。実際に除去・close・freeした場合は1。
+ */
+int bm_peer_registry_evict_if_current(struct bm_peer_registry *reg, struct bm_fd_data *conn, uint64_t generation);
 
 /* 現在の登録数(peer_connectorが接続数維持の判断に使う) */
 size_t bm_peer_registry_count(struct bm_peer_registry *reg);
@@ -68,9 +83,14 @@ void bm_peer_registry_for_each_locked(struct bm_peer_registry *reg,
  * infra/object.hのbm_decide_propagation(§9 Dandelion++の差し込み点)を呼び、FLUFF判定
  * されたhashは通常のinv、STEM判定されたhashはdinvとして送る(SKIP判定のhashはその接続へは
  * 送らない)。v1 Stage 1時点はbm_decide_propagationが常にFLUFFを返すダミーのため、
- * 送信内容・宛先は「全peerへinv」のまま変わらない。個々のwrite失敗は無視する
- * (接続の生死判定はnetwork_epoll_thread側のepoll_wait/readに任せ、ここでは能動的に
- * 切断しない)。
+ * 送信内容・宛先は「全peerへinv」のまま変わらない。
+ *
+ * §11 2026-09-05: 以前は個々のwrite失敗をログに残すだけで無視していた(接続の生死判定は
+ * network_epoll_thread側のepoll_wait/readに一元化する方針だった)が、実運用で「read側検知が
+ * 何らかの理由で働かず、ハンドシェイク未完了のまま何時間もregistryに残り続けるinbound接続」
+ * が見つかった(DESIGN.md §11参照)。read側検知に依存しない独立した安全網として、
+ * write失敗(EPIPE等、bm_network_write_allの2秒タイムアウトを含む)を検知した接続は
+ * bm_peer_registry_evict_if_currentで能動的に除去するようにした。
  */
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
                                      size_t count, const struct bm_fd_data *except);
