@@ -2008,4 +2008,47 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `AF_INET`+`0.0.0.0`+port 0を返すこと、ephemeralなローカルアドレスを渡しても
     実際にbm_new_version_messageが組み立てるversion payloadのaddrFromが常に
     `0.0.0.0:0`になること、addrRecv(peer_addr)側は影響を受けないことを確認する。
+
+23. `[peer_registry] failed to send inv to fd=N(write: Broken pipe)`ログ頻発の調査(2026-09-05、
+    ユーザー指摘)。
+
+    本番daemon(daemon A)のjournalctlログで、数分おきのinv broadcastのたびに同じ
+    8〜9本ぶんの書き込み失敗警告が繰り返し出ていた。まずこのfd番号自体は
+    `bm_peer_registry_broadcast_inv`が`dup()`した使い捨て複製fd(書き込み直後に
+    close()される、`peer_registry.c`のdocコメント参照)であり、番号が固定的に
+    見えるのは単に小さい未使用番号から再利用されているだけで、それ自体は異常の
+    兆候ではないと確認した。
+
+    `list-connections` API(`BM_API_PORT=8442`、認証情報は`/etc/bitmessage/
+    bitmessage.conf`とは別に起動時表示されるパスワード)で実接続状態を確認した
+    ところ、outbound 7本は全て`fullyEstablished:true`かつ数十万バイト送受信済みで
+    正常。一方inbound 8本は**全て`fullyEstablished:false`・送受信0バイトのまま**
+    (これがinv broadcast失敗の対象と一致する数)。
+
+    さらに`ss -tan 'sport = :8444'`で実OSソケット状態を確認すると、registryが
+    報告する8本のポート番号はどれも現存する実ソケットと一致せず、代わりに全く別の
+    2本が`CLOSE-WAIT`(相手は既にFIN送信済み、Recv-Q=130バイトの未読データが
+    残ったまま)で滞留していた。`bm_fd_data.last_activity`は`bm_network_
+    handle_readable`の読み取り成功時にしか更新されず(`network.c`)、
+    `BM_HANDSHAKE_TIMEOUT_SECONDS`は20秒(`network.h`)なので、
+    handshake未完了のまま何時間も残り続けているのは`bm_network_idle_sweep`の
+    ハンドシェイクタイムアウト判定が本来なら20秒で刈り取るはずの接続だと確定した。
+    ただし「なぜ刈り取られないか」の根本原因(read側のepoll検知がこれらの接続に
+    対してだけ働いていないように見える)は、稼働中の本番daemonにgdb/strace等の
+    侵襲的なデバッグを行わずには特定できず、今回はここまでの切り分けに留めた
+    (本番daemonへのアタッチは要ユーザー確認、CLAUDE.md「安全に関する厳守事項」の
+    範囲外の行為のため今回は実施していない)。
+
+    上記調査中、fd番号がdup()複製なのか実registry上のfdなのか区別できず苦労した
+    (ユーザー指摘)ため、`list-connections`の各接続エントリに実fd番号(`conn->fd`)を
+    追加した(`core/api_server.c`の`list_connections_one`、`cli/main.c`のヘルプ文言も
+    同期)。broadcast_inv失敗ログの"fd=N"とは無関係である旨をコメントで明記した。
+
+    残タスク(backlog): (1) `bm_peer_registry_broadcast_inv`の書き込み失敗
+    (EPIPE等)を検知した際、ログを出すだけでなく該当接続を能動的に`close_connection`
+    相当で除去する防御的な修正(read側検知に依存しない独立した安全網になる)、
+    (2) idle_sweepのハンドシェイクタイムアウトが特定の接続に対して機能しない
+    根本原因の特定(本番daemonへの侵襲的デバッグが必要、要ユーザー承認)。
+    inbound上限`BM_MAX_INBOUND_CONNECTIONS`(64)に対し現状8本程度なので即座の
+    実害(新規inbound拒否)には至っていないが、リークが継続すれば将来的に枯渇しうる。
     ctest 42件全通過。

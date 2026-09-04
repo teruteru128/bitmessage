@@ -1269,6 +1269,11 @@ static void list_connections_one(struct bm_fd_data *conn, void *user_data)
     bm_json_value_t *entry = bm_json_new_object();
     bm_json_object_set(entry, "host", bm_json_new_string(ip));
     bm_json_object_set(entry, "port", bm_json_new_number((double)port));
+    /* §11 2026-09-05: デバッグ用にregistry上の実fd番号を追加(ユーザー要望、"failed to send
+     * inv to fd=N"ログ調査中に必要になった)。broadcast_inv側のログに出るfdはpeer_registry.c
+     * のdup()で複製した使い捨て番号(書き込み後すぐclose()される)であり、この値とは無関係
+     * なので、他の接続と誤って対応付けないよう混同しないこと。 */
+    bm_json_object_set(entry, "fd", bm_json_new_number((double)conn->fd));
     bm_json_object_set(entry, "fullyEstablished", bm_json_new_bool(conn->handshake_complete));
     bm_json_object_set(entry, "userAgent", bm_json_new_string(conn->user_agent != NULL ? conn->user_agent : ""));
     /* §11 2026-08-23 backlog項目5(送受信バイト数、後半分)。PyBitmessage自体には
