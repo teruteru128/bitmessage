@@ -2148,3 +2148,56 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `/etc/bitmessage/bitmessaged.env`側に置く方式にした(unitファイル自体を触らずに
     済み、`systemctl daemon-reload`だけで反映できる)。既存の`bitmessage.conf`(アプリ本体の
     設定、INI形式)とは役割・形式が異なる別ファイルとして`/etc/bitmessage/`配下に並置した。
+
+24. **`received getdata`のnot_found大量発生・`sent getdata`に対する`received object`不足の
+    調査(2026-09-07、進行中)**: ユーザーから「`received getdata: N item(s) requested,
+    0 sent, N not found`が大量発生している、`sent getdata`に対する`received object`も
+    少ないのでは」との指摘で調査開始。
+
+    まず本番daemon A(systemd管理、journalctl経由。ローカルの`bitmessaged_bootstrap.log`は
+    2026-08-25で止まっており現状を反映していなかった)の直近約1日分(9/6 11:53〜)を
+    集計した:
+    - `received getdata`(相手→自分): requested合計6897件中、**not_found 4409件(63.9%)**。
+      特定の時間帯のバーストではなく30分バケットで見ても常時289〜309件と定常的に高い。
+    - `sent getdata`(自分→相手)796件に対し`received object`577件、比率0.72。
+    - `received inv`(missing>0)から`sent getdata`送信までの遅延は中央値0.112ms・
+      最大1.7ms(=事実上ゼロ遅延)。同一秒内に複数接続からmissing>0のinvを受けた
+      ケースが605秒中130秒(21%)。
+
+    ユーザーの「invに対してgetdataが早すぎるのでは」という仮説を検証するため、
+    PyBitmessage本家(`/home/teruteru/Documents/Projects/teruteru128/PyBitmessage`)の
+    `network/objectracker.py`/`network/downloadthread.py`を確認した。本家は
+    `handleReceivedInventory`ではgetdataを送らず接続ごとの`objectsNewToMe`
+    (`RandomTrackingDict`)に積むだけで、別スレッド`DownloadThread`が**1秒間隔**で
+    全established接続を横断し、`missingObjects`というグローバル辞書を介して
+    ランダムにチャンク要求する設計(`minPending=200`/`maxRequestChunk=1000`)。
+    対してこのC実装の`handle_inv`(`object_sync.c`)はinv受信のその場で、他の接続との
+    調整なしに即座にgetdataを送る。この「無条件・即時・接続間非協調」がnot_found
+    大量発生や0.72という比率に寄与している可能性が高いが、not_foundの直接原因
+    (GCによる期限切れ削除が先に走っているのか、そもそも要求元が実際にobjectを
+    持つnodeではないのか)は、既存ログにhashも接続識別子も含まれておらず特定できて
+    いなかった。
+
+    ログにはhash・接続識別子(hash単位で追跡するため)が一切含まれておらず、
+    journalctlでの集計はできても個々のhashの生死を追えなかったため、計測強化の
+    ログを追加した(挙動は変更していない、ログ追加のみ):
+    - `handle_inv`: `sent getdata`成功時に、送った各hash(64桁hex)+送信先peer
+      (`bm_network_resolve_peer_ip_port`)+fdを1行ずつ`sent getdata item`として出す。
+    - `handle_getdata`: not_found発生時に、該当hash+要求元peer+fdを`getdata not found`
+      として出す。
+    - `handle_object`: 保存成功時の既存ログ(`received object`)にhashを追加。加えて、
+      既知object(重複)として無言returnしていた分岐にも`hash=... already known
+      (duplicate), ignoring`ログを追加した。これは0.72という比率が「本当に届かなかった」
+      のか「届いたが2件目以降として黙って捨てられただけ」なのかを切り分けるための計測
+      (`bm_object_store_has`による重複判定は元々`received object`ログより前にあり、
+      複数peerから同一objectをinvされて複数接続へgetdataを送った場合、2件目以降は
+      これまで一切ログに残らなかった)。
+
+    `hash_hex`(api_server.cの`hex_encode`と同じ実装、共通化するほどの規模ではないため
+    このファイルにも複製)を追加。ビルド警告ゼロ、ctest 45件全通過を確認済み。
+
+    デプロイは保留中: 同時期に本番daemon Aへ項目23(idle_sweep/burst accept)の調査用ログを
+    デプロイして自然発生待ちの状態であり、ユーザーから「別エージェントが長期計測中なので
+    再起動は先送りする方針で」と指示された。そのため今回のログ追加はコミットのみ行い、
+    daemon Aへの反映(ビルド差し替え+`systemctl restart`)は項目23の観測が一段落してから
+    改めてユーザーに確認の上で行う。

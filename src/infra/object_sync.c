@@ -50,6 +50,23 @@
  * pubkey告知の目安(数週間)を参考にした固定値。 */
 #define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
 
+/* §11 2026-09-07: 「sent getdataに対してreceived objectが少ない」「received getdataの
+ * not_foundが大量発生している」というユーザー指摘の調査用。既存のログはhash・接続先を
+ * 一切含まず、集計件数の突合せしかできなかった(journalctlで日次集計したところnot_found率
+ * 63.9%という異常値を確認したが、個々のhashがいつ・どの接続からgetdataされ、いつGCで
+ * 消えたのかは追えなかった)。hashをそのままログへ出せるよう、api_server.cのhex_encodeと
+ * 同じ実装をここにも置く(共通化するほどの規模ではない一行ヘルパー)。 */
+static void hash_hex(const unsigned char hash[32], char out[65])
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; i++)
+    {
+        out[i * 2] = digits[hash[i] >> 4];
+        out[i * 2 + 1] = digits[hash[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
                               sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,
                               bm_keyring_t *keyring, struct bm_peer_registry *registry,
@@ -562,8 +579,18 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
      * 未確認行だけを舐める)ので、既知/未知に関わらず毎回呼んでよい。 */
     bm_messages_store_try_mark_ack_received(ctx->messages_db, hash);
 
+    char hash_hex_str[65];
+    hash_hex(hash, hash_hex_str);
+
     if (bm_object_store_has(ctx->object_pool_db, hash))
     {
+        /* §11 2026-09-07: sent getdataに対するreceived objectの比率が0.72程度に留まる
+         * (journalctl実測)原因の切り分け用。同一hashを複数接続へgetdataした場合、2件目
+         * 以降はここで無言returnしていたため「本当にobjectが届かなかった」のか「届いたが
+         * 重複として捨てられた」のか区別できなかった。hashを出すことでsent getdata item
+         * ログと突き合わせ、"objectは届いていたが集計上見えていなかっただけ"のケースを
+         * 定量化する。 */
+        bm_log_debug("[object_sync] received object: hash=%s already known (duplicate), ignoring\n", hash_hex_str);
         return; /* 既知object。以降の保存・型別処理は再実行しない(通常のflooding gossipで
                  * 重複受信するのは正常) */
     }
@@ -578,9 +605,11 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
      * (getpubkey/broadcast/onionpeer/ack、あるいは自分宛でなかったmsg/pubkey)は
      * object_pool.dbへ受理・保存されても一切ログが出ておらず、「received inv →
      * sent getdata」の続き(実際にobjectが届いて保存された)が追えなかった
-     * (ユーザー指摘)。型に関わらず、受理・保存した時点で一律にDEBUGログを出す。 */
-    bm_log_debug("[object_sync] received object: type=%d stream=%d %u bytes, stored to object_pool.db\n",
-                 (int)hdr.object_type, (int)hdr.stream, msg->length);
+     * (ユーザー指摘)。型に関わらず、受理・保存した時点で一律にDEBUGログを出す。
+     * §11 2026-09-07: hashも出すようにした(sent getdata itemログとの突き合わせ用、
+     * 経緯は直前のduplicateログのコメント参照)。 */
+    bm_log_debug("[object_sync] received object: hash=%s type=%d stream=%d %u bytes, stored to object_pool.db\n",
+                 hash_hex_str, (int)hdr.object_type, (int)hdr.stream, msg->length);
 
     if (hdr.object_type == BM_OBJECT_MSG)
     {
@@ -750,6 +779,24 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
                  * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
                  * 受信側の可視化と同種の穴、ユーザー指摘)。 */
                 bm_log_debug("[object_sync] sent getdata: %zu item(s)\n", missing_count);
+                /* §11 2026-09-07: not_found大量発生・sent getdataに対するreceived object
+                 * 不足の調査用計測。従来は件数の集計しかできず、個々のhashが「いつ・どの
+                 * 接続へ要求され、その後objectとして届いたか/相手からnot_foundで返されたか」
+                 * を突き合わせられなかった(ユーザー指摘、journalctl集計でnot_found率63.9%
+                 * を確認したが原因のhash単位追跡ができなかった)。hash+接続先を1行ずつ出す
+                 * ことで、後でこのログとhandle_getdataのnot_found・handle_objectの
+                 * received objectをhash文字列でgrep突合せできるようにする。日次で最大でも
+                 * 数百〜数千件程度(実測796件/日)なのでログ量として許容範囲。 */
+                char ip[BM_PEER_IP_STRLEN];
+                int port = 0;
+                bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+                for (size_t j = 0; j < missing_count; j++)
+                {
+                    char hex[65];
+                    hash_hex(missing[j], hex);
+                    bm_log_debug("[object_sync] sent getdata item: hash=%s peer=%s:%d fd=%d\n", hex, ip, port,
+                                 conn->fd);
+                }
             }
             free(packet);
         }
@@ -775,6 +822,12 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
     uint64_t requested_count = inv_msg.count;
     size_t sent_count = 0;
     size_t not_found_count = 0;
+    /* §11 2026-09-07: not_found率63.9%(journalctl実測)の原因調査用。hash+要求元をログに
+     * 残し、handle_invのsent getdata item/handle_objectのreceived objectとhash文字列で
+     * 突き合わせられるようにする(このブロック追加の経緯は上のsent getdata item参照)。 */
+    char requester_ip[BM_PEER_IP_STRLEN];
+    int requester_port = 0;
+    bm_network_resolve_peer_ip_port(conn, requester_ip, sizeof(requester_ip), &requester_port);
     for (uint64_t i = 0; i < inv_msg.count; i++)
     {
         unsigned char *payload = NULL;
@@ -782,6 +835,10 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         if (bm_object_store_get(ctx->object_pool_db, inv_msg.items[i], &payload, &payload_len) != 0)
         {
             not_found_count++;
+            char hex[65];
+            hash_hex(inv_msg.items[i], hex);
+            bm_log_debug("[object_sync] getdata not found: hash=%s requester=%s:%d fd=%d\n", hex, requester_ip,
+                         requester_port, conn->fd);
             continue; /* 持っていない要求は黙って無視(切断まではしない) */
         }
         size_t packet_len = 0;
