@@ -2250,3 +2250,43 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     がpeerには何も送られない)こと」「後から実際にobjectを受信・保存できれば、通常の
     `handle_object`経路のbroadcast_invで正規にannounceされること」を確認する回帰テストを
     追加した。ビルド警告ゼロ、ctest 45件全通過(Debug/Release両方)。
+
+    本家との比較(2026-09-07、ユーザーから「これはバグか、本家ではどうなっているか」との
+    質問で調査): `/home/teruteru/Documents/Projects/teruteru128/PyBitmessage`の
+    `network/dandelion.py`(`Dandelion.expire()`)と`network/invthread.py`
+    (`handleExpiredDandelion`/`InvThread.run()`)を実際に読んだ。**「stemタイムアウト時に
+    所持確認(`state.Inventory`)せずbroadcastする」という構造上のギャップ自体は本家にも
+    存在する**(`expire()`は`state.Inventory`を一切参照せず`invQueue`へ積み、
+    `InvThread.run()`のchunk処理・実送信箇所にも所持確認が無い)。したがって今回の
+    C実装のバグは、本家にも共通する設計上の穴を偶然踏み抜いた形と言える。
+
+    ただし発火条件は本家と逆転していた: 本家`bmproto.py`の`_command_inv`
+    (`extend_dandelion_stem`引数で`inv`/`dinv`を共通処理)を見ると、
+    `dandelion_ins.addHash()`(=タイムアウト追跡エントリ作成)を呼ぶのは**`dinv`受信時
+    (`extend_dandelion_stem=True`)だけ**で、通常の`inv`では呼ばれない。対してこのC実装の
+    `bm_dandelion_note_source`は逆に、**`is_dinv=0`(=通常の`inv`)の場合にだけ**
+    `find_or_create_entry`でエントリを作り、`is_dinv=1`(`dinv`)は早期returnして何もしない
+    (§9.5 Stage 3の「既に他ノードがfluff済みのinv経由objectは即座にfluffしてよい」という
+    意図自体は妥当だが、実装が「即座に」ではなく「タイムアウト待ちのエントリを作る」形に
+    なってしまっていた)。本家では発生頻度の低い`dinv`(今まさにstem中継されている新規
+    object)だけがこの危険な経路に入るのに対し、この実装ではネットワーク上のごく普通の
+    `inv`トラフィック(大半を占める)全てがこの経路に入ってしまっており、本家に共通する
+    ギャップが母数の違いで大きく顕在化していた。
+
+    ユーザーと相談の上、今回は「所持確認せずbroadcastする」直接の原因(今回の修正)だけを
+    先にdeployし、この`is_dinv`条件の逆転(本家同様`dinv`受信時のみエントリを作るよう
+    変更する件)は別途backlog化して改めて着手することにした。次回はis_dinv=0/1双方の
+    エントリ作成条件を本家の`_command_inv`ロジックと突き合わせて設計し直し、Stage 3の
+    元々の意図(「既にfluff済みのobjectは即座にfluffしてよい」)をタイムアウト経由ではなく
+    別の形(例えば即座に`bm_decide_propagation`相当を呼んでその場でfluffする等)で実現する
+    ことを検討する。
+
+25. **`bm_dandelion_note_source`の`is_dinv`判定が本家と逆転している(項目24から分離、
+    未着手)**: 本家PyBitmessageは`dinv`受信時(`extend_dandelion_stem=True`)にのみ
+    `dandelion_ins.addHash()`でタイムアウト追跡エントリを作るのに対し、このC実装は
+    `is_dinv=0`(通常の`inv`)の場合にだけエントリを作り、`dinv`は早期returnして
+    何もしない(`bm_dandelion_note_source`、`dandelion.c`)。項目24の根本原因(stem
+    タイムアウト時の無条件broadcast)は修正済みだが、この条件の逆転自体はネットワーク上の
+    大半を占める通常の`inv`トラフィックを毎回タイムアウト追跡対象にしてしまう非効率
+    (と、まだ見つかっていない副作用の可能性)を残したままである。本家の`_command_inv`
+    (`bmproto.py`)のロジックに合わせて設計し直す必要がある(項目24の該当セッション参照)。
