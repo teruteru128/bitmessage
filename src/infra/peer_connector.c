@@ -611,7 +611,15 @@ void *bm_peer_connector_thread(void *arg)
             if (args->config.registry != NULL)
             {
                 bm_dandelion_maybe_reshuffle(args->config.registry, now);
-                bm_dandelion_expire_and_refluff(args->config.registry, now);
+                /* §11 2026-09-07: object_pool_dbはobject_sync_ctx経由(dandelion.hのdoc
+                 * コメント参照、まだ持っていないobjectを持っている振りしてbroadcastして
+                 * しまうバグの修正でNULL不可の引数を追加した)。registryが非NULLの構成では
+                 * main.cが両方とも同時に設定するため、object_sync_ctx自体がNULLになるのは
+                 * テスト等の特殊な構成のみ(その場合はfail-safe側に倒れ、broadcastしない)。 */
+                bm_dandelion_expire_and_refluff(
+                        args->config.registry,
+                        args->config.object_sync_ctx != NULL ? args->config.object_sync_ctx->object_pool_db : NULL,
+                        now);
             }
             /* §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送も同じくこの
              * 1秒間隔ループに相乗りさせる。registryの有無とは無関係(§9のDandelion++とは

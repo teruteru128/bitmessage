@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "object_store.h"
+
 #define BM_DANDELION_EPOCH_SECONDS 600
 #define BM_DANDELION_TIMEOUT_BASE_SECONDS 10
 #define BM_DANDELION_TIMEOUT_MEAN_SECONDS 30.0
@@ -336,7 +338,7 @@ enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32]
     return result;
 }
 
-int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t now)
+int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, sqlite3 *object_pool_db, int64_t now)
 {
     unsigned char to_fluff[BM_DANDELION_MAX_EXPIRE_PER_CALL][32];
     size_t to_fluff_count = 0;
@@ -382,6 +384,13 @@ int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t n
 
     for (size_t i = 0; i < to_fluff_count; i++)
     {
+        /* §11 2026-09-07: dandelion.hのdocコメント参照。stemタイムアウトが来ても
+         * object本体をまだ持っていなければ、持っている振りをしてbroadcastしない
+         * (fail-safe。object_pool_db==NULLの呼び出し側も同様にbroadcastしない)。 */
+        if (object_pool_db == NULL || !bm_object_store_has(object_pool_db, to_fluff[i]))
+        {
+            continue;
+        }
         bm_peer_registry_broadcast_inv(registry, &to_fluff[i], 1, NULL);
     }
     return (int)to_fluff_count;

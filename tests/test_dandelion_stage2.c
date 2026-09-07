@@ -7,7 +7,9 @@
  * - bm_dandelion_decide: stem successorがtarget_connectionの場合はSTEM、それ以外はSKIP、
  *   タイムアウト経過後は誰に対してもFLUFFになること
  * - bm_dandelion_expire_and_refluff: タイムアウトを過ぎたhashを実際にinvとしてbroadcastし、
- *   それまでSKIPだった接続にも届くようになること
+ *   それまでSKIPだった接続にも届くようになること。ただし§11 2026-09-07のバグ修正により、
+ *   object_pool_dbに実際に保存済み(=object本体を受信できた)hashだけがbroadcastされ、
+ *   まだ受信できていないhashは(stem状態からは抜けるが)broadcastされないこと
  *
  * 時刻は全て呼び出し側が明示的に渡すため(dandelion.h参照)、実時間を待たずに
  * 決定的にテストできる。
@@ -24,6 +26,7 @@
 
 #include "../src/infra/dandelion.h"
 #include "../src/infra/network.h"
+#include "../src/infra/object_store.h"
 #include "../src/infra/peer_registry.h"
 #include "../src/infra/protocol.h"
 
@@ -185,9 +188,14 @@ int main(void)
         bm_peer_registry_destroy(&reg);
     }
 
-    /* --- 3. expire_and_refluff: タイムアウト経過後、実際にinvがbroadcastされること --- */
+    /* --- 3. expire_and_refluff: タイムアウト経過後、object_pool_dbに保存済みのhashは
+     * 実際にinvがbroadcastされること --- */
     {
         bm_dandelion_module_init(); /* このシナリオ専用にstateをリセット */
+
+        sqlite3 *object_pool_db = NULL;
+        CHECK(sqlite3_open(":memory:", &object_pool_db) == SQLITE_OK, "open in-memory object_pool_db (scenario 3)");
+        CHECK(bm_object_store_init_schema(object_pool_db) == 0, "init object_pool_db schema (scenario 3)");
 
         struct bm_peer_registry reg;
         bm_peer_registry_init(&reg);
@@ -212,6 +220,14 @@ int main(void)
          * (一様ランダム)ため、変数名で決め打ちせず実際に選ばれた方を都度判定する */
         unsigned char hash3[32];
         memset(hash3, 0xCC, sizeof(hash3));
+        /* §11 2026-09-07: expire_and_refluffがbroadcastするのはobject_pool_dbに実際に
+         * 保存済みのhashだけになったため、「持っている」ケースを検証するこのシナリオでは
+         * 事前にinsertしておく必要がある(handle_objectが保存成功時に行うのと同じ手順)。 */
+        unsigned char dummy_payload3[8] = {0};
+        CHECK(bm_object_store_insert(object_pool_db, hash3, 2, 1, dummy_payload3, sizeof(dummy_payload3),
+                                      (int64_t)time(NULL) + 86400, (int64_t)time(NULL))
+                  == 0,
+              "seed hash3 into object_pool_db so expire_and_refluff is allowed to broadcast it");
 
         /* まずbroadcast_inv経由で新規object扱いにする(1回目はstem/skipに振り分けられ、
          * どちらの接続にも通常のinvは届かないはず)。この呼び出し(内部でtime(NULL)を使う)で
@@ -236,7 +252,7 @@ int main(void)
          * 指数分布の平均30秒(+固定10秒)に対し、+10000秒は現実的な乱数の範囲を大きく
          * 超えるため、実時刻基準でも安全にタイムアウト後とみなせる */
         int64_t far_future = t0 + 10000;
-        int fluffed = bm_dandelion_expire_and_refluff(&reg, far_future);
+        int fluffed = bm_dandelion_expire_and_refluff(&reg, object_pool_db, far_future);
         CHECK(fluffed == 1, "expire_and_refluff should report exactly one hash fluffed");
 
         unsigned char stem_buf[256];
@@ -253,6 +269,88 @@ int main(void)
         close(fds_stem[1]);
         close(fds_other[1]);
         bm_peer_registry_destroy(&reg);
+        sqlite3_close(object_pool_db);
+    }
+
+    /* --- 4. §11 2026-09-07バグ修正の回帰テスト: stemタイムアウトを過ぎても
+     * object_pool_dbにまだ保存できていない(=object本体が届いていない)hashは、
+     * fluff状態には遷移する(fluffed件数にはカウントされる)がbroadcastされないこと。
+     * 本番daemon Aで実際に観測した「stem元へのgetdataが応答されないまま stemタイムアウトを
+     * 迎え、持っていないobjectを持っているかのように全peerへbroadcastしてしまい、
+     * 全員からgetdata not_foundを返され続ける」バーストの再現・修正確認 --- */
+    {
+        bm_dandelion_module_init();
+
+        sqlite3 *object_pool_db = NULL;
+        CHECK(sqlite3_open(":memory:", &object_pool_db) == SQLITE_OK, "open in-memory object_pool_db (scenario 4)");
+        CHECK(bm_object_store_init_schema(object_pool_db) == 0, "init object_pool_db schema (scenario 4)");
+
+        struct bm_peer_registry reg;
+        bm_peer_registry_init(&reg);
+
+        int fds_stem[2], fds_other[2];
+        struct bm_fd_data *stem_conn =
+            make_test_conn(BM_FD_CLIENT_SOCKET, BM_SERVICE_NODE_DANDELION, &fds_stem[0], &fds_stem[1]);
+        struct bm_fd_data *other_conn =
+            make_test_conn(BM_FD_CLIENT_SOCKET, BM_SERVICE_NODE_DANDELION, &fds_other[0], &fds_other[1]);
+        bm_peer_registry_add(&reg, stem_conn);
+        bm_peer_registry_add(&reg, other_conn);
+
+        int64_t t0 = (int64_t)time(NULL);
+        bm_dandelion_maybe_reshuffle(&reg, t0);
+
+        int flags_stem = fcntl(fds_stem[1], F_GETFL, 0);
+        fcntl(fds_stem[1], F_SETFL, flags_stem | O_NONBLOCK);
+        int flags_other = fcntl(fds_other[1], F_GETFL, 0);
+        fcntl(fds_other[1], F_SETFL, flags_other | O_NONBLOCK);
+
+        unsigned char hash4[32];
+        memset(hash4, 0xDD, sizeof(hash4));
+        /* §11 2026-09-07: 本番の実際のトリガーはhandle_inv→bm_dandelion_note_sourceであり、
+         * bm_peer_registry_broadcast_inv(=自分がobjectを既に持っている前提のAPI)経由では
+         * ない。is_dinv=0(通常のplain inv、DESIGN.mdのStage 3: 「既に他ノードがfluff済み」)で
+         * 未所持hashを知った場合だけfind_or_create_entryが実際に呼ばれ、フルなタイムアウトが
+         * 設定されたエントリが作られる(is_dinv=1のdinv経由はここでは何もしないnoop、
+         * dandelion.cのbm_dandelion_note_source参照)。object_pool_dbには一切insertしない
+         * (=stem元へのgetdataがまだ応答されていない状況)。 */
+        bm_dandelion_note_source(hash4, /* is_dinv= */ 0, t0);
+
+        int64_t far_future = t0 + 10000;
+        int fluffed = bm_dandelion_expire_and_refluff(&reg, object_pool_db, far_future);
+        CHECK(fluffed == 1, "expire_and_refluff should still count hash4 as fluffed (left stem state)");
+
+        unsigned char stem_buf[256];
+        ssize_t n_stem_after = recv(fds_stem[1], stem_buf, sizeof(stem_buf), MSG_PEEK);
+        unsigned char other_buf[256];
+        ssize_t n_other_after = recv(fds_other[1], other_buf, sizeof(other_buf), MSG_PEEK);
+        CHECK(n_stem_after < 0,
+              "must NOT broadcast an inv for an object we haven't actually received/stored yet (peer 1)");
+        CHECK(n_other_after < 0,
+              "must NOT broadcast an inv for an object we haven't actually received/stored yet (peer 2)");
+
+        /* 後からobjectを実際に受信・保存できた場合は、通常のhandle_object経路
+         * (broadcast_inv呼び出し)で正規にbroadcastされる。ここでは「保存すれば
+         * broadcast_invがちゃんと届く」ことだけ確認し、expire_and_refluff自体の
+         * 責務ではないことを明示する */
+        unsigned char dummy_payload4[8] = {0};
+        CHECK(bm_object_store_insert(object_pool_db, hash4, 2, 1, dummy_payload4, sizeof(dummy_payload4),
+                                      (int64_t)time(NULL) + 86400, (int64_t)time(NULL))
+                  == 0,
+              "hash4 can be stored later once the object actually arrives");
+        bm_peer_registry_broadcast_inv(&reg, &hash4, 1, NULL);
+        ssize_t n_stem_late = recv(fds_stem[1], stem_buf, sizeof(stem_buf), MSG_PEEK);
+        ssize_t n_other_late = recv(fds_other[1], other_buf, sizeof(other_buf), MSG_PEEK);
+        CHECK(n_stem_late > 0 || n_other_late > 0,
+              "once actually stored, the normal broadcast_inv path (handle_object) still announces hash4");
+
+        bm_peer_registry_remove(&reg, stem_conn);
+        bm_peer_registry_remove(&reg, other_conn);
+        bm_fd_data_free(stem_conn);
+        bm_fd_data_free(other_conn);
+        close(fds_stem[1]);
+        close(fds_other[1]);
+        bm_peer_registry_destroy(&reg);
+        sqlite3_close(object_pool_db);
     }
 
     if (failures == 0)

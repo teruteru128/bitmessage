@@ -21,6 +21,7 @@
  * §9.2で確保済み)がこのモジュールへ委譲する形で実際のロジックを提供する。
  */
 
+#include <sqlite3.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -71,9 +72,21 @@ enum bm_propagation_mode bm_dandelion_decide(const unsigned char object_hash[32]
  * stemのまま埋もれてしまう。定期的に(1秒間隔目安、DESIGN.md §9.2のInvThread.expire()相当)
  * peer_connector_threadの再接続ループ等から呼ぶ想定。合わせて、fluff済みになってから
  * 十分時間が経った古いエントリを間引く(無制限のメモリ増加を防ぐ)。
- * 実際にfluffした件数を返す。
- */
-int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, int64_t now);
+ * 実際にfluffした(=stem状態を抜けた)件数を返す。
+ *
+ * §11 2026-09-07発覚のバグ修正: object_pool_dbはNULL不可(NULLなら誰にもbroadcastしない、
+ * fail-safe側に倒す)。stemタイムアウトが来た時点で、まだobject本体を受信・保存できて
+ * いない(stem元へ送ったgetdataがまだ応答されていない)hashを、これまで無条件で
+ * bm_peer_registry_broadcast_invしていた。実際には持っていないobjectを「持っている」と
+ * 広告してしまうため、fluff先の全peer(除外無し)がほぼ同時にgetdataを送ってきて、
+ * 全員に対してnot_foundを返し続けるバーストを引き起こしていた(本番daemon Aのjournalctl実測、
+ * ユーザー指摘で発覚: 1つのhashに対し12接続から数分間・約60秒おきにgetdata not_foundが
+ * 繰り返された)。bm_object_store_has(object_pool_db, hash)で実際に保存済みと確認できた
+ * hashだけをbroadcastするよう変更した。保存済みでないhashもstem状態からは抜ける
+ * (fluffed_atは無条件で更新、以後stemの再試行はしない)が、broadcastはしない。将来
+ * 実際にobjectを受信できれば、handle_object側の既存の保存直後broadcastで正規に
+ * announceされる。 */
+int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, sqlite3 *object_pool_db, int64_t now);
 
 /*
  * §11 2026-08-24発覚のバグ修正: object_sync.cのsend_big_inv(自分の保有object全件を

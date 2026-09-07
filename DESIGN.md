@@ -2196,8 +2196,57 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `hash_hex`(api_server.cの`hex_encode`と同じ実装、共通化するほどの規模ではないため
     このファイルにも複製)を追加。ビルド警告ゼロ、ctest 45件全通過を確認済み。
 
-    デプロイは保留中: 同時期に本番daemon Aへ項目23(idle_sweep/burst accept)の調査用ログを
-    デプロイして自然発生待ちの状態であり、ユーザーから「別エージェントが長期計測中なので
-    再起動は先送りする方針で」と指示された。そのため今回のログ追加はコミットのみ行い、
-    daemon Aへの反映(ビルド差し替え+`systemctl restart`)は項目23の観測が一段落してから
-    改めてユーザーに確認の上で行う。
+    デプロイは一旦保留(項目23の観測を優先)としたが、その後ユーザーが項目23側の状況を
+    確認・調整の上で「デプロイ&再起動やっちゃいましょう」と明示的に指示したため、
+    2026-09-07 21:38:56 JSTに計測ログ入りビルドを本番daemon Aへ反映・再起動した(ビルド
+    バイナリsha256: `932dcb4a...`)。再起動直後にjournalctlで実際に`sent getdata item`→
+    `received object`が同一hashで正しく対応するログを確認できた(項目23のidle_sweep/
+    epoll_wait調査用ログも継続して出力されており、計装は失われていない)。
+
+    根本原因の特定(2026-09-07、同日中): デプロイ後まもなく、ユーザーが実際のnot_foundバースト
+    (`hash=7805056a...`、12接続から数分間・約60秒おきに繰り返しnot_found)を発見し、
+    「`sent getdata item`してから`received object`していないのに`broadcast_inv`するから
+    ではないか」と指摘。該当hashのjournalctlログを時系列で確認したところ:
+    23:23:56に1接続(45.136.157.154:8444)へ`sent getdata item`を送ったのを最後に
+    `received object`は一度も無いまま、15秒後の23:24:11から、全く別の12接続(45.136.157.154
+    以外)がほぼ同時に`getdata not found`を要求してくるバーストが発生し、以後23:28台まで
+    ~60秒おきに同じパターンが繰り返された。
+
+    `bm_peer_registry_broadcast_inv`の全呼び出し箇所(`grep`で洗い出し)を確認したところ、
+    `object_sync.c`側の6箇所は全て「`bm_object_store_insert`で実際に保存した後」にのみ
+    呼ばれており問題無かったが、`dandelion.c:385`(`bm_dandelion_expire_and_refluff`、
+    Dandelion++のstemタイムアウト処理、`peer_connector.c`の1秒間隔ポーリングから毎秒呼ばれる)
+    が**object_pool_dbの保有確認を一切せず**、stemタイムアウト(固定10秒+平均30秒の指数分布)
+    を迎えたhashを無条件で全peerへbroadcast_invしていたことが判明した。実際の発生経路:
+
+    1. `handle_inv`(通常の"inv"、"dinv"ではない)で未所持hashを受信 →
+       `bm_dandelion_note_source(hash, is_dinv=0, now)`が呼ばれ、`find_or_create_entry`が
+       実時刻ベースのfluff_deadline(10〜40秒後)を持つ`dandelion_entry`を作る
+       (is_dinv=1のdinv経由はこの時点では何もしないno-opであることに注意、
+       `bm_dandelion_note_source`参照)。
+    2. 同じ`handle_inv`が、そのhashをgetdataで要求する(今回の相手45.136.157.154宛)。
+    3. 相手が応答しない(または遅延する)まま10〜40秒が経過し、`bm_dandelion_expire_and_refluff`
+       の毎秒スキャンが`fluff_deadline`超過を検出、`bm_object_store_has`による確認なしに
+       `bm_peer_registry_broadcast_inv(registry, &hash, 1, NULL)`を全接続(除外無し)へ実行。
+    4. broadcastを受け取った全peerが(自分たちは実際にhashを知らなかった、あるいは
+       広告を信じて)一斉にgetdataを送ってくるが、こちらは依然として本体を持っておらず
+       `getdata not found`を返し続ける。相手側の再要求ロジックにより、これが約60秒おきに
+       繰り返される。
+
+    修正: `bm_dandelion_expire_and_refluff`に`object_pool_db`引数を追加し(`dandelion.h`/
+    `dandelion.c`)、fluffループ内で`bm_object_store_has(object_pool_db, hash)`が真の
+    hashだけをbroadcastするよう変更した。stem状態からの離脱(`fluffed_at`更新)自体は
+    従来通り無条件で行う(まだ持っていなくても、以後stemを再試行する意味は無いため)。
+    `object_pool_db`がNULLの場合は何もbroadcastしないfail-safe側に倒した(元の
+    無条件broadcastへ暗黙に後退させない)。呼び出し元`peer_connector.c`は
+    `args->config.object_sync_ctx->object_pool_db`を渡すよう変更(`object_sync_ctx`は
+    `main.c`で`registry`と常に同時に設定されるため、`registry != NULL`の構成では
+    実質的に必ず非NULL)。
+
+    テスト: `tests/test_dandelion_stage2.c`のシナリオ3(既存)にobject_pool_dbを追加し、
+    「stemタイムアウト後、実際に保存済みのhashは従来通りbroadcastされること」を維持しつつ、
+    新設のシナリオ4で「`bm_dandelion_note_source(hash, is_dinv=0, now)`だけでobject_pool_dbに
+    未保存のhashについては、stemタイムアウト後もbroadcastされない(fluffed状態には遷移する
+    がpeerには何も送られない)こと」「後から実際にobjectを受信・保存できれば、通常の
+    `handle_object`経路のbroadcast_invで正規にannounceされること」を確認する回帰テストを
+    追加した。ビルド警告ゼロ、ctest 45件全通過(Debug/Release両方)。
