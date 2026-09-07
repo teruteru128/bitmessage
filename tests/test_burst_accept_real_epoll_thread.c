@@ -25,6 +25,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/lsan_interface.h>
+#endif
+
 #include "../src/infra/network.h"
 #include "../src/infra/peer_registry.h"
 
@@ -78,6 +82,14 @@ int main(void)
 
     struct bm_fd_data *listener = bm_fd_data_new(BM_FD_LISTEN_SOCKET, listen_fd);
     CHECK(listener != NULL, "bm_fd_data_new for the listener should succeed");
+#if defined(__SANITIZE_ADDRESS__)
+    /* §11 2026-09-08 CI失敗調査: bm_network_epoll_threadはグレースフルシャットダウン機構を
+     * 持たず、listenerはプロセス終了までスレッドに道連れにされる意図的な設計(下の注釈参照)。
+     * カーネルのepoll interest listにしかポインタが残らないためLeakSanitizerからは
+     * 到達不能に見え、直接/間接リークとして誤検出される。ここで明示的にリーク追跡対象から
+     * 除外し、テスト本来の目的(本物の意図しないリーク検出)はdetect_leaks有効のまま保つ。 */
+    __lsan_ignore_object(listener);
+#endif
     struct epoll_event lev;
     lev.events = EPOLLIN;
     lev.data.ptr = listener;
@@ -151,6 +163,17 @@ int main(void)
 
     /* bm_network_epoll_threadはグレースフルシャットダウン機構を持たないため、
      * プロセス終了時に道連れで終わらせる(test_peer_rating_on_disconnect.cと同じ方針)。 */
+#if defined(__SANITIZE_ADDRESS__)
+    /* §11 2026-09-08: registry.connsもlistenerと同じ理由(道連れ方針)でリークとして
+     * 誤検出される。bm_peer_registry_removeは配列を縮小しないため、ここまでに一度でも
+     * add()されていればこの時点のポインタ値がプロセス終了まで変わらないことを利用して
+     * 除外する。bm_peer_registry_destroy()は呼ばない(mutex破棄・freeを伴い、実スレッドが
+     * まだregistryを触りうる状況で呼ぶのは真性のuse-after-freeを生むため)。 */
+    if (registry.conns != NULL)
+    {
+        __lsan_ignore_object(registry.conns);
+    }
+#endif
 
     if (failures == 0)
     {

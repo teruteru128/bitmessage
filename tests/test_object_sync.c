@@ -223,15 +223,44 @@ int main(void)
 
     /* --- 1b. §11: ネットワーク既定の最低難易度(1000,1000)を満たさないobjectは拒否される --- */
     {
+        /* §11 2026-09-08 CI失敗調査: 以前は固定の(50,50)でPoWしたnonceをそのままテストに
+         * 使っていたが、bm_pow_trial_valueが疑似ランダムな64bit値であるため、見つかった
+         * nonceが「たまたま」ネットワーク既定(1000,1000)の閾値も満たしてしまう事象が
+         * 理論値・実測とも約0.4%の確率で起こり得た(実際にCIのbuild-and-testジョブで
+         * 1度発生、DESIGN-LOG.mdの該当セッション参照)。単にパラメータをより緩く(1,0)
+         * するだけでは確率を下げられても(約0.02%)ゼロにはできず、CIを回し続ければ
+         * いつか踏み抜く。そこで、万一1回で偶然一致してもripeを1バイト変えて
+         * (=initial_hashを変えて)独立な乱数列で最大8回まで再試行し、ネットワーク既定を
+         * 満たさないnonceが見つかるまで繰り返す(1回あたり約0.02%の失敗確率が8回連続で
+         * 外れる確率は(0.0002)^8のオーダーで実用上ゼロ)ことで、統計的な運ではなく
+         * 決定的に「必ず最低難易度未満のobjectを用意できる」テストにした。 */
         unsigned char weak_ripe[20];
         memset(weak_ripe, 0x99, sizeof(weak_ripe));
         uint64_t weak_ttl = 3600;
+        uint64_t weak_target = 0;
+        uint64_t network_min_target = 0;
+        uint64_t weak_nonce = 0;
+        unsigned char *weak_payload = NULL;
         size_t weak_payload_len = 0;
-        unsigned char *weak_payload =
-            bm_build_getpubkey(4, 1, weak_ripe, (uint64_t)time(NULL) + weak_ttl, &weak_payload_len);
-        /* わざと最低難易度未満(50,50)でPoWする */
-        uint64_t weak_target = bm_pow_get_target(weak_payload_len, weak_ttl, 50, 50);
-        uint64_t weak_nonce = bm_pow_run(weak_payload, weak_payload_len, weak_target);
+        unsigned char initial_hash[64];
+        int attempt;
+        const int max_attempts = 8;
+        for (attempt = 0; attempt < max_attempts; attempt++)
+        {
+            weak_ripe[19] = (unsigned char)attempt;
+            free(weak_payload);
+            weak_payload = bm_build_getpubkey(4, 1, weak_ripe, (uint64_t)time(NULL) + weak_ttl, &weak_payload_len);
+            weak_target = bm_pow_get_target(weak_payload_len, weak_ttl, 1, 0);
+            network_min_target = bm_pow_get_target(weak_payload_len, weak_ttl, 1000, 1000);
+            weak_nonce = bm_pow_run(weak_payload, weak_payload_len, weak_target);
+            bm_sha512(weak_payload, weak_payload_len, initial_hash);
+            if (bm_pow_trial_value(weak_nonce, initial_hash) > network_min_target)
+            {
+                break;
+            }
+        }
+        CHECK(attempt < max_attempts,
+              "should find a weak-but-below-network-minimum nonce within a few independent attempts");
         size_t weak_object_len = 8 + weak_payload_len;
         unsigned char *weak_object = malloc(weak_object_len);
         for (int i = 0; i < 8; i++)

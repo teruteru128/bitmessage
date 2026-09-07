@@ -2290,3 +2290,15 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     大半を占める通常の`inv`トラフィックを毎回タイムアウト追跡対象にしてしまう非効率
     (と、まだ見つかっていない副作用の可能性)を残したままである。本家の`_command_inv`
     (`bmproto.py`)のロジックに合わせて設計し直す必要がある(項目24の該当セッション参照)。
+
+26. **`bm_network_epoll_thread`にグレースフルシャットダウン機構が無い(未着手)**:
+    現状は`main.c`の通常終了時も含め、このスレッドをjoinせずプロセス終了に道連れにする
+    設計になっており、`test_peer_rating_on_disconnect.c`・`test_burst_accept_real_epoll_thread.c`
+    等の実スレッドテストも明示的にこの方針を踏襲している。本番の終了パスを忠実に
+    再現できる利点はあるが、CI `sanitize`ジョブでのLeakSanitizer対応のたびに「意図的な
+    道連れリークか、本物の意図しないリークか」を判別して`__lsan_ignore_object()`等で
+    個別に除外する対症療法が必要になり、同種の実スレッドテストが増えるほど保守コストが
+    積み重なる(2026-09-08のCI失敗調査で発覚、DESIGN-LOG.mdの該当セッション参照)。
+    `stop_flag`+`eventfd`等で`epoll_wait`を起こしてループを抜けさせ、`pthread_join`で
+    正しく終了を待つ機構を実装すれば、テスト側でも安全に`bm_fd_data_free`/
+    `bm_peer_registry_destroy`を呼んでクリーンに終了できるようになる。

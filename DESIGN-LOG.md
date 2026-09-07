@@ -2971,3 +2971,103 @@ build-Debug --parallel`警告ゼロ、`ctest --output-on-failure`で40件全通�
 CIの`sanitize`ジョブと同じ設定(`-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`、
 `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1`)の`build-Sanitize`で
 `ctest --output-on-failure`を実行し、40件全通過・sanitizerのエラー検出なしを確認した。
+
+### CIの直近5回中4回失敗を調査、sanitizeジョブのLeakSanitizer誤検出を修正(2026-09-08)
+
+**経緯**: ユーザーから「GitHubのCIで最近5回の実行のうち4回で失敗している」との報告を受け、
+`gh run list`/`gh run view --log-failed`で直近5回を確認した。内訳は3回が`sanitize`ジョブ
+(`d7ed523`・`8532fe3`・`8b96ada`の各push)、1回が`build-and-test`ジョブ(`4838ddf`のpush、
+`object_sync`テストが4件のCHECKで失敗)で、残り1回(`unlockAddress後の...`push)のみ成功
+していた。
+
+**sanitizeジョブの原因**: 3回とも同一で、`burst_accept_real_epoll_thread`
+(`8b96ada`で新設、`tests/test_burst_accept_real_epoll_thread.c`)が
+`==NNNN==ERROR: LeakSanitizer: detected memory leaks`で失敗していた。このテストは
+`bm_network_epoll_thread`を実スレッドとして起動し、本物の`epoll_wait`経由でバースト
+accept→切断シナリオを再現する(コード冒頭コメント参照)。`bm_network_epoll_thread`は
+グレースフルシャットダウン機構を持たないため、`test_peer_rating_on_disconnect.c`と
+同じ方針で「joinせずプロセス終了時に道連れにする」設計になっているが、このテストでは
+リスナー用の`bm_fd_data`(`listener`、`main`のローカル変数)と`registry.conns`
+(`bm_peer_registry_add`が内部で`realloc`する配列)がプロセス終了まで生き続ける。
+`listener`へのポインタは`epoll_ctl`経由でカーネル側のepoll interest listにしか
+渡されず、ユーザー空間からはどこからも到達不能に見える上、`main`がreturnした時点で
+そのスタックフレーム自体もLeakSanitizerのルートスキャン範囲から外れるため、
+`bm_fd_data_new`が確保した464バイト(本体)+131072バイト(内部バッファ、indirect leak)、
+および`bm_peer_registry_add`がreallocした64バイト(`registry.conns`)の計3件が
+「本物のリーク」として誤検出されていた(手元の`build-sanitize`で再現を確認済み)。
+`pthread_create`に渡した`args`だけは、実行中のepoll_threadのスタック上に生き残って
+いるため到達可能と判定されリークとして報告されない。
+
+**検討した対処とユーザーとのやり取り**: 最初に「このテストのCTestプロパティで
+`ASAN_OPTIONS=detect_leaks=0`を設定する」案を提示・実施しかけたが、ユーザーから
+「リーク検出テストなのにリーク検出を止めるのか」との指摘を受けた。これはもっともな
+懸念で、sanitizeジョブ全体の目的(本物のメモリ安全性バグの継続的検出)に反し、この
+テスト内で将来起こりうる本物のリークまで一律に見えなくしてしまう。そこで、GCCの
+`-fsanitize=address`がコンパイル時に自動定義する`__SANITIZE_ADDRESS__`マクロを
+ガードに使い、`<sanitizer/lsan_interface.h>`の`__lsan_ignore_object()`で「意図的に
+道連れにする2つのオブジェクト(`listener`本体、`registry.conns`)」だけをピンポイントで
+リーク追跡対象から除外する方式に変更した(`tests/test_burst_accept_real_epoll_thread.c`)。
+`registry.conns`については`bm_peer_registry_remove`が配列を縮小せず`capacity`を
+保持したままなことを`peer_registry.c`で確認した上で、全接続reap確認後(この時点までに
+必ず一度は`add()`されているため配列の実ポインタが確定している)に呼んでいる。
+`bm_peer_registry_destroy()`は呼んでいない(`pthread_mutex_destroy`+`free`を伴い、
+実スレッドがまだ`registry`を触りうる状況で呼ぶと真性のuse-after-freeを生むため)。
+
+**検証**: 修正前後で以下を確認した。
+- 修正後の`build-sanitize`で`test_burst_accept_real_epoll_thread`を単体で3回連続実行し
+  全て`EXIT: 0`・`ALL OK`・リークレポート無し。
+- 除外が粗すぎて本物のリークまで隠していないことを確認するため、一時的に
+  `args`構築直後へ`malloc(12345)`の無関係なリークを注入して実行したところ、
+  `LeakSanitizer: detected memory leaks`で正しく検出されることを確認した上で
+  カナリーコードを削除した。
+- `build-Debug`(`cmake --build build-Debug --parallel`警告ゼロ)で`ctest
+  --output-on-failure`45件全通過。
+- `build-sanitize`(`-DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON`)で`ASAN_OPTIONS=
+  detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1`のもと`ctest --output-on-failure`
+  45件全通過。
+
+**設計トレードオフについての議論**: 修正後、ユーザーから「(スレッドを)意図的に開放しない
+設計自体も良し悪しでは」との指摘があった。この設計は本番`main.c`の実際の終了パス
+(シグナル受信時にワーカースレッドをjoinせず終わらせる)を忠実に再現できる利点がある
+一方、代償として今回のようにサニタイザ対応のたびに「本物のリークか、意図した道連れか」
+を判別し`__lsan_ignore_object()`等で個別に除外する対症療法が必要になり、同種の実スレッド
+テストが増えるほど保守コストが積み重なる。根本解決は`bm_network_epoll_thread`への
+グレースフルシャットダウン機構(`stop_flag`+`eventfd`+`pthread_join`等)の実装だが、
+`main.c`の終了処理にも波及する本番コードの設計変更であり、今回のCI失敗調査という
+スコープを超えるため、DESIGN.md backlog項目26として別途起票することにした。
+
+**build-and-testジョブの`object_sync`失敗について**: `4838ddf`のpush時に1回だけ、
+`build-and-test`ジョブ(sanitizeなしの通常ビルド)で発生し、同一コミットの
+`sanitize`/`sanitize-thread`/`build-and-test-fedora`ジョブでは`object_sync`は
+成功していた。「object with insufficient PoW should be rejected, not stored」を
+含む4件のCHECKが連鎖的に失敗するパターンで、ローカルの`build-Debug`で
+`test_object_sync`を15回連続実行したところ1回再現した(タイミング依存ではなく
+統計的なflakinessと判明、詳細は次項)。
+
+**`object_sync`のflakinessの根本原因**: シナリオ1b(`tests/test_object_sync.c`)は
+「ネットワーク既定の最低難易度(1000,1000)を満たさないobjectは拒否される」ことを
+検証するため、わざと緩い`nonce_trials_per_byte=50, payload_length_extra_bytes=50`で
+PoWした`nonce`を使っていた。`bm_pow_get_target`(`pow_engine.c`)の計算式で実際の
+比率を検証プログラム(一時的に`src/`のライブラリをリンクして作成、テスト本体には
+含めない)で確認したところ、この設定でのtargetはネットワーク既定targetのおよそ
+203倍緩いだけで、`bm_pow_trial_value`が疑似ランダムな64bit値であることから、
+見つかった`nonce`が「たまたま」ネットワーク既定の閾値も満たしてしまう確率が
+理論値・実測(5000試行のシミュレーション)とも約0.4%あることが分かった。
+15回に1回(6.7%)というローカルでの再現率は、サンプル数が少ない中でこの低確率事象を
+たまたま引いただけであり(ポアソン近似で15回中1回以上発生する確率は約5.8%と
+矛盾しない)、CI環境固有の問題ではなく、テストコード自体が本質的に統計的flakinessを
+内包していたと結論づけた。
+
+**修正**: ユーザーから「確率を下げるだけでは、CIを何度も回していればいつか踏み抜く」との
+指摘を受け、単にパラメータをより緩く(`1,0`、これ以上緩められない下限)するだけでなく、
+`weak_ripe`の最終バイトを変えて(=SHA512の`initial_hash`を変えて独立な乱数列にする)
+最大8回まで再試行し、ネットワーク既定を満たさない`nonce`が見つかった時点でループを
+抜ける方式に変更した(`tests/test_object_sync.c`のシナリオ1b)。パラメータを`(1,0)`に
+緩めた時点で1回あたりの偶然一致確率は約0.02%まで下がっており、これが8回連続で
+外れる確率は`(0.0002)^8`のオーダーで実用上ゼロと言える。8回全て外れた場合は
+`CHECK(attempt < max_attempts, ...)`でテスト自体を失敗させ、無限にリトライして
+ハングすることも無い。
+
+**検証**: 修正後の`test_object_sync`を`build-Debug`で60回連続実行し、全て成功
+(flakinessの再発なし)。`build-Debug`/`build-sanitize`(`ASAN_OPTIONS=detect_leaks=1
+UBSAN_OPTIONS=print_stacktrace=1`)とも`ctest --output-on-failure`45件全通過。
