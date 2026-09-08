@@ -2149,6 +2149,45 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     済み、`systemctl daemon-reload`だけで反映できる)。既存の`bitmessage.conf`(アプリ本体の
     設定、INI形式)とは役割・形式が異なる別ファイルとして`/etc/bitmessage/`配下に並置した。
 
+    追記(2026-09-08、`/loop`による継続監視中に疑わしい接続を捕捉): 本番daemon A
+    (PID 2358197)のjournalctlを30分間隔で監視していたところ、inbound fd=38
+    (Tor hidden service経由、`127.0.0.1:8444`⇔`127.0.0.1:56270`のrendezvous接続)で
+    以下の挙動を観測した。
+
+    - 14:07:59 accept、14:08:08まで`idle_sweep(handshake未完了)`ログが正常に(1秒間隔で)
+      出力されるが、**その後22分間、このfdに関するログ(idle_sweep/epoll_wait event両方)が
+      完全に途絶えた**。
+    - `idle_sweep_one`(network.c)は`handshake_complete==0`の間、判定のたびに必ずこの
+      ログを出す構造になっているため、ログが消えたこと自体は「この時点でhandshakeが
+      完了した」ことを示唆する一方、`BM_IDLE_PING_TIMEOUT_SECONDS`(300秒)後に出るはずの
+      最初のkeepaliveログが実際に出たのは22分後(14:35:49、`idle 304s`)だった。同時刻に
+      acceptされた比較対象のfd(fd=37)は約5分19秒で最初のkeepaliveが出ており、fd=38だけが
+      異常に遅かった。
+    - `bitmessage-cli list-connections`(ユーザーからAPI認証情報の提供を受け、初めて本番の
+      内部状態を直接確認できた)で調べたところ、この時点で該当接続は`fullyEstablished:true`
+      となっており、以後は正常なトラフィックパターン(2回目以降のkeepaliveは想定通り
+      300秒強の間隔)に復帰していた。
+    - `/var/log/tor/info.log`(teruteruがadmグループのため`sudo`無しで直接閲覧可能)を
+      該当時間帯で確認したところ、`hs_circ_service_rp_has_opened`によりrendezvous circuit
+      自体は14:07:58〜14:08:00の数秒で構築完了していたが、その後この特定circuitに関する
+      追跡ログ(実際にTCPストリームがbitmessagedへ渡るタイミングを示すもの)が見当たらず、
+      22分間の空白がTor側の遅延によるものか、bitmessaged側の何らかの処理漏れによるものかを
+      ログだけからは断定できなかった。
+
+    現時点の判断: 「epoll_waitが特定fdへのイベント配送を完全に停止する」という当初の
+    最有力仮説を裏付ける決定的証拠は得られなかった(epollはlevel-triggered、`EPOLLET`
+    未使用であり、取りこぼしたイベントは次回のepoll_wait呼び出しで再度検出されるはずの
+    設計になっている点もこの仮説への疑問材料)。一方で「Tor hidden service経由の接続は
+    rendezvous circuit確立後もアプリケーションへの引き渡しに数分〜数十分単位の遅延が
+    生じうる」という別の仮説(bitmessaged側のバグではない)の方が現状では有力候補だが、
+    これも確証には至っていない。`idle_sweep(handshake未完了)`ログが本当に「20秒の
+    タイムアウトを超えても切断されない」形で残り続けた実例はまだ一度も観測できていない
+    (今回はログが途絶えただけで、実際に無限に待たされたわけではなく、最終的には
+    正常完了している)ため、残タスク(2)は依然として未解決のまま、`/loop`による監視を
+    継続する。次回類似の事象が発生した際は、ログが途絶えた直後(検知まで30分待たず)に
+    Torの`info.log`と突き合わせられるよう、疑わしい兆候を検知した時点で監視間隔を
+    5〜10分に短縮する運用とした。
+
 24. **`received getdata`のnot_found大量発生・`sent getdata`に対する`received object`不足の
     調査(2026-09-07、進行中)**: ユーザーから「`received getdata: N item(s) requested,
     0 sent, N not found`が大量発生している、`sent getdata`に対する`received object`も
