@@ -2341,3 +2341,52 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `stop_flag`+`eventfd`等で`epoll_wait`を起こしてループを抜けさせ、`pthread_join`で
     正しく終了を待つ機構を実装すれば、テスト側でも安全に`bm_fd_data_free`/
     `bm_peer_registry_destroy`を呼んでクリーンに終了できるようになる。
+
+27. **`bm_peer_registry_evict_if_current`のマルチスレッド競合によるdouble free事故
+    (2026-09-09発覚・同日修正完了)**: 本番daemon(daemon A)が
+    `double free or corruption (out)`でSIGABRT死し、systemdの自動再起動で復旧する事故が
+    発生した(ユーザー報告のjournalログ: `epoll_wait event: fd=29863 outbound events=0x19`
+    → `read (fd=29863): Bad file descriptor` → `closing outbound connection (fd=29863):
+    read error` → `double free or corruption (out)`)。コアダンプは`/var/crash/`に残らず
+    (apport管理外バイナリ)、`coredumpctl`も未導入のため、journalログとソース読解のみで
+    原因を特定した。
+
+    根本原因: `bm_peer_registry_evict_if_current`(`peer_registry.c`)は
+    `bm_peer_registry_broadcast_inv`経由で`network_epoll_thread`以外のスレッド
+    (`peer_connector_thread`の1秒間隔ループに相乗りしている`bm_dandelion_expire_and_
+    refluff`等)からも呼ばれる。§11 2026-09-05時点の実装は、connポインタ+generation
+    (ABA問題対策、`network.h`の`conn->generation`のdoc参照)が一致した時点で、その場で
+    `close(conn->fd)`・`bm_fd_data_free(conn)`まで直接実行していた。しかしgeneration
+    照合は「このconnがまだregistryに実在するか」しか保証せず、「他スレッドが今まさに
+    このメモリへアクセスしていないか」は保証できない。まさに同じ瞬間に
+    `network_epoll_thread`が`epoll_wait()`で同じconnへのイベントを既に受け取り
+    (`events[]`配列にdata.ptrとして保持済み)、これから読み取ろうとしていた場合、
+    evict側が先に`close`・`free`し、直後に`network_epoll_thread`側が「まだ生きている」
+    と思い込んだまま同じconnを`read()`(既にcloseされたfdへの`EBADF`="Bad file
+    descriptor"を経て)、さらに`close_connection()`で**二重close・二重free**してしまう
+    (実際のクラッシュ手順そのもの)。`tests/test_peer_registry_evict.c`の当時のコメントは
+    「broadcast_inv側が先に捕まえ、network_epoll_thread側が後から先にfree済みのconnへ
+    ABA的に触れてしまう」逆方向の競合しか想定しておらず、この「evict側が先に実行し、
+    epoll_thread側がまだ生きた参照を保持している」向きの競合は未対策だった。
+
+    修正: `bm_peer_registry_evict_if_current`は実際のclose/freeを行わず、
+    `conn->pending_eviction`(新設フィールド、`network.h`)フラグを立てるだけに変更した。
+    実際の`close_connection`呼び出しは常に`network_epoll_thread`単一スレッド内
+    (`network.c`の`idle_sweep_one`、`bm_network_idle_sweep`経由で最大`BM_IDLE_SWEEP_
+    INTERVAL_MS`=5秒間隔)に一元化し、`bm_fd_data_free`が常にその1スレッドからしか
+    呼ばれないようにすることで、double freeを構造的に防ぐ。`pending_eviction`はロック
+    (`reg->lock`)下で書き込まれるが、`idle_sweep_one`側はロック無しで読む(int型の
+    読み書き自体は破損しない、最悪でも次のidle sweepまで最大5秒検出が遅れるだけで安全性
+    上の問題は無い、という設計)。read側検知に依存しない安全網としての即応性は多少
+    落ちる(以前は即座にfree、現在は最大5秒後)が、詰まった接続の除去という用途では
+    許容範囲と判断した。
+
+    テスト: `tests/test_peer_registry_evict.c`を新動作(フラグを立てるだけ、free/closeは
+    しない)に合わせて書き換え、`tests/test_idle_sweep.c`にシナリオ4として
+    「`pending_eviction`が立った接続は、他のタイムアウト判定より優先して次のidle sweepで
+    確実に`close_connection`される」ことを検証する回帰テストを追加した。ビルド警告ゼロ、
+    ctest 45件全通過。
+
+    残課題: `evicted_peers`カウンタ・関連ログ文言(`peer_registry.c`)は「実際に除去した
+    数」から意味的には「除去をマークした数」に変わったが、実用上ほぼ即座に処理される
+    ため文言はそのままにした(次にこの周辺を触る際に気になったら見直す程度の軽微な項目)。

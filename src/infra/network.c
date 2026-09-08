@@ -683,6 +683,18 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
     {
         return;
     }
+    /* §11 2026-09-09発覚のバグ修正: bm_peer_registry_evict_if_current(peer_connector_thread等、
+     * network_epoll_threadとは別スレッドから呼ばれる)がconn->pending_evictionを立てた場合、
+     * 実際のclose_connection呼び出しはここ(network_epoll_thread単一スレッド)でのみ行う
+     * (network.hのconn->pending_evictionのdoc参照、double free対策の中核)。他の判定
+     * (big inv送信・ハンドシェイク/アイドルタイムアウト)より必ず先に行う。 */
+    if (conn->pending_eviction)
+    {
+        bm_log_warn("[network] closing %s connection (fd=%d): evicted by another thread (write failure)\n",
+                conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd);
+        close_connection(ctx->args, conn);
+        return;
+    }
     /* §11 2026-08-26: big invの後続チャンク送信(bm_network_begin_big_inv参照)。
      * handshake_completeやidle timeoutの判定より先に行うことで、詰まったコネクションの
      * 判定と無関係に独立して動く(pending_inv_hashesはverack受信後にしか立たないため

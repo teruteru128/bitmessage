@@ -17,6 +17,16 @@
  *   次のチャンクをbm_network_idle_sweep経由で送るようにした。ここではその境界値
  *   (間隔未経過では追加送信されない・経過後は次のchunkが送られる・最後の半端な件数の
  *   chunkも正しく送られてpending状態がクリアされる)を検証する。
+ * - シナリオ4(§11 2026-09-09追加): 本番daemon(daemon A)がdouble free or corruption (out)で
+ *   SIGABRT死した事故の修正検証。bm_peer_registry_evict_if_current(network_epoll_thread
+ *   以外のスレッドから呼ばれる)は、以前はgeneration一致時にその場でclose・
+ *   bm_fd_data_freeまで行っていたが、これがnetwork_epoll_thread側の同時処理と競合し
+ *   二重free/二重closeを引き起こしていた。修正後はconn->pending_evictionフラグを
+ *   立てるだけにし、実際のclose_connectionはnetwork_epoll_thread単一スレッド内
+ *   (bm_network_idle_sweep)に一元化した。ここではpending_evictionが立った接続が
+ *   idle_sweep呼び出しで確実にclose_connectionされる(registryから消え、fdがcloseされる)
+ *   ことを検証する(tests/test_peer_registry_evict.cはフラグが立つことまでを検証、
+ *   本テストはそのフラグが実際に消費されることを検証、住み分け)。
  */
 
 #include <errno.h>
@@ -311,6 +321,52 @@ int main(void)
         bm_peer_registry_remove(&registry, conn);
         bm_fd_data_free(conn);
         close(local_fd);
+        close(remote_fd);
+        bm_peer_registry_destroy(&registry);
+        close(epfd);
+    }
+
+    /* --- 4. §11 2026-09-09: pending_evictionが立った接続は、idle_sweepで確実に
+     * close_connectionされる(double free事故の修正検証) --- */
+    {
+        int epfd = epoll_create1(0);
+        CHECK(epfd >= 0, "epoll_create1 should succeed (scenario 4)");
+
+        struct bm_peer_registry registry;
+        bm_peer_registry_init(&registry);
+
+        int local_fd, remote_fd;
+        struct bm_fd_data *conn = make_test_conn(epfd, &local_fd, &remote_fd);
+        CHECK(conn != NULL, "make_test_conn should succeed (scenario 4)");
+        bm_peer_registry_add(&registry, conn);
+        conn->handshake_complete = 1; /* fully establishedでもpending_evictionが優先されることを確認 */
+
+        struct bm_epoll_thread_args args;
+        memset(&args, 0, sizeof(args));
+        args.epfd = epfd;
+        args.registry = &registry;
+        args.peers_db = NULL;
+
+        int64_t t0 = (int64_t)1893456000;
+        conn->last_activity = t0; /* アイドル/ハンドシェイクタイムアウトの対象にはならない直近値 */
+
+        /* bm_peer_registry_evict_if_currentが別スレッドから呼ばれた状況を模す:
+         * generation一致でpending_evictionを立てる(この時点ではまだfree/closeされない)。 */
+        int rc = bm_peer_registry_evict_if_current(&registry, conn, conn->generation);
+        CHECK(rc == 1, "evict_if_current should mark a currently-registered connection");
+        CHECK(bm_peer_registry_count(&registry) == 1,
+              "evict_if_current alone must not remove the connection from the registry yet");
+
+        /* idle_sweepがpending_evictionを見つけてclose_connectionする。last_activityが
+         * 直近(t0)のままでも、アイドルタイムアウト判定より優先して切断されるはず。 */
+        bm_network_idle_sweep(&args, t0);
+        CHECK(bm_peer_registry_count(&registry) == 0,
+              "a connection with pending_eviction set must be closed by the next idle sweep, "
+              "even though it is not otherwise idle/handshake-timed-out");
+
+        ssize_t n = write(local_fd, "x", 1);
+        CHECK(n < 0 && errno == EBADF, "the local fd should have been closed by the idle sweep");
+
         close(remote_fd);
         bm_peer_registry_destroy(&registry);
         close(epfd);

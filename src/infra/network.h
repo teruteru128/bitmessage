@@ -96,6 +96,27 @@ struct bm_fd_data
      * 直後にこのフラグを見て、切断が必要な通常の読み取りエラーと同じ経路(戻り値-1)へ
      * 合流させる。0=切断不要(既定)。 */
     int should_disconnect;
+    /* §11 2026-09-09発覚のバグ修正: 本番daemon(daemon A)がdouble free or corruption (out)で
+     * SIGABRT死した事故の調査結果(DESIGN.md参照)。broadcast_inv経由のbm_peer_registry_
+     * evict_if_current(peer_connector_thread等、network_epoll_thread以外のスレッドから
+     * 呼ばれる)は、以前はgeneration一致確認後にその場でclose(conn->fd)・bm_fd_data_free(conn)
+     * まで直接実行していた。しかしこれは、まさに同じ瞬間にnetwork_epoll_thread側が
+     * epoll_wait()で同じconnへのイベントを既に受け取り(events[]配列内のdata.ptrとして
+     * 保持済み)、これから読み取り処理をしようとしていた場合との競合を防げなかった:
+     * evict側が先にclose/freeし、直後にnetwork_epoll_thread側が生きていると思い込んだ
+     * ままそのconnをread()(既にcloseされたfdへのEBADF="Bad file descriptor"を経て)、
+     * さらにclose_connection()で二重close・二重freeしてしまう(実際のクラッシュ手順)。
+     * generation照合はABA問題(同じアドレスへの別connの再割り当て)は防げるが、この
+     * 「evict側が先に実行し、epoll_thread側がまだ古い生きた参照を保持している」逆方向の
+     * 競合には無力だった。対策として、evict_if_currentは実際のclose/freeを行わず、この
+     * フラグを立てるだけにする(peer_registry.c参照)。実際のclose_connection呼び出しは
+     * 常にnetwork_epoll_thread単一スレッド内(bm_network_idle_sweepの5秒間隔走査、
+     * network.cのidle_sweep_one参照)に一元化し、free()がその1スレッドからしか
+     * 発生しないようにすることでdouble freeを構造的に防ぐ。generation照合の下でreg->lock
+     * を保持したまま書き込む(peer_registry.c参照)一方、読み取り側(idle_sweep_one)は
+     * ロック無しで読む。int型の読み書き自体は破損しない(x86でアトミック)ため、
+     * 最悪でも次のidle_sweep(最大5秒後)まで検出が遅れるだけで安全性上の問題は無い。 */
+    int pending_eviction;
     /* §11 2026-08-23 backlog項目5: listConnections API(core/api_server.c)用。相手から
      * 受信したversion messageのuser agent文字列(malloc済み、NUL終端)。
      * object_sync.cのversion受信処理が設定する(接続直後・まだversion未受信の間はNULL)。

@@ -71,7 +71,16 @@ int bm_peer_registry_evict_if_current(struct bm_peer_registry *reg, struct bm_fd
      * conn->generationを読まない)。ポインタが一致した時点でconnは確実に生きている(配列に
      * 実在する)ため、その場でgenerationも読んで比較して問題ない。一致しなければ、呼び出し元が
      * 捕まえていたconnは既に別の理由で除去・free済みで、そのアドレスへたまたま別の新しい
-     * connが割り当てられただけ(ABA問題)と判断し、一切触れずに除去を諦める。 */
+     * connが割り当てられただけ(ABA問題)と判断し、一切触れずに除去を諦める。
+     * §11 2026-09-09発覚のバグ修正: ここでgenerationが一致しても、その場でclose・
+     * bm_fd_data_freeまで行ってはいけない(network.hのconn->pending_evictionのdoc参照)。
+     * この関数はnetwork_epoll_thread以外のスレッドから呼ばれるため、まさに同じ瞬間に
+     * network_epoll_thread側がepoll_wait()で同じconnへのイベントを既に受け取って処理中
+     * だった場合、そちら側の処理と競合して二重close・二重freeを引き起こす
+     * (実際に本番daemonをdouble free or corruptionでクラッシュさせた)。generation照合は
+     * 「このconnがまだregistryに実在するか(=別の理由で既に片付いていないか)」しか保証せず、
+     * 「他スレッドが今まさにこのメモリへアクセスしていないか」までは保証できないため、
+     * 実際のfree()は必ずnetwork_epoll_thread単一スレッド内(idle_sweep_one)に一元化する。 */
     pthread_mutex_lock(&reg->lock);
     int found = 0;
     for (size_t i = 0; i < reg->count; i++)
@@ -80,22 +89,14 @@ int bm_peer_registry_evict_if_current(struct bm_peer_registry *reg, struct bm_fd
         {
             if (conn->generation == generation)
             {
-                reg->conns[i] = reg->conns[reg->count - 1];
-                reg->count--;
+                conn->pending_eviction = 1;
                 found = 1;
             }
             break; /* ポインタ一致は高々1件のみなので、generation不一致でも探索終了 */
         }
     }
     pthread_mutex_unlock(&reg->lock);
-
-    if (!found)
-    {
-        return 0;
-    }
-    close(conn->fd);
-    bm_fd_data_free(conn);
-    return 1;
+    return found;
 }
 
 size_t bm_peer_registry_count(struct bm_peer_registry *reg)

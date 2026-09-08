@@ -34,12 +34,18 @@ void bm_peer_registry_remove(struct bm_peer_registry *reg, struct bm_fd_data *co
 
 /*
  * §11 2026-09-05: bm_peer_registry_broadcast_inv用。network_epoll_thread以外のスレッドから
- * 「このconnはもう死んでいるはずだから除去したい」場合に使う、close_connection相当の処理
- * (registryから除去・close・bm_fd_data_free)。connポインタだけでなくgenerationも一致した
- * 場合のみ実行する(network.hのconn->generationのdoc、ABA問題の説明を参照)。
+ * 「このconnはもう死んでいるはずだから除去したい」場合に使う。connポインタだけでなく
+ * generationも一致した場合のみ、conn->pending_eviction(network.hのdoc参照)を立てる。
  * 既にnetwork_epoll_thread側で(read側検知等により)先に除去・free済みの場合や、その後
  * 同じアドレスに別の新しいconnが割り当てられていた場合は何もせず0を返す(その場合はfd/connに
- * 一切触れない、呼び出し元はもう何もしてはいけない)。実際に除去・close・freeした場合は1。
+ * 一切触れない、呼び出し元はもう何もしてはいけない)。マークできた場合は1。
+ * §11 2026-09-09発覚のバグ修正: 以前はここでその場でclose・bm_fd_data_freeまで実行して
+ * いたが、これはnetwork_epoll_thread側がまさに同じconnのepollイベントを処理中の場合と
+ * 競合し、二重close・二重freeを引き起こしえた(本番daemonでdouble free or corruptionに
+ * よるSIGABRTクラッシュとして実際に発生、DESIGN.md参照)。generation照合は「このconnが
+ * まだregistryに実在するか」は保証するが「他スレッドが今まさにこのメモリへアクセスして
+ * いないか」は保証できないため、実際のclose/freeは常にnetwork_epoll_thread単一スレッド
+ * 内(network.cのidle_sweep_one、bm_network_idle_sweep経由で最大5秒間隔)に一元化した。
  */
 int bm_peer_registry_evict_if_current(struct bm_peer_registry *reg, struct bm_fd_data *conn, uint64_t generation);
 
