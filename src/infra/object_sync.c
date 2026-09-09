@@ -557,7 +557,8 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     int64_t now0 = (int64_t)time(NULL);
     if ((int64_t)hdr.expires_time <= now0)
     {
-        bm_log_debug("[object_sync] object already expired, ignoring\n");
+        /* already expired objectがそこそこ見られるためデバッグのために時刻を追加。 */
+        bm_log_debug("[object_sync] object already expired, ignoring(%"PRId64")\n", (int64_t)hdr.expires_time);
         return;
     }
     /* §11: ネットワーク既定の最低難易度を満たさないobjectは受け入れない(悪意ある相手に

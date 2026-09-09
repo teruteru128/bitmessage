@@ -2390,3 +2390,11 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     残課題: `evicted_peers`カウンタ・関連ログ文言(`peer_registry.c`)は「実際に除去した
     数」から意味的には「除去をマークした数」に変わったが、実用上ほぼ即座に処理される
     ため文言はそのままにした(次にこの周辺を触る際に気になったら見直す程度の軽微な項目)。
+
+    追記(2026-09-09、ユーザーによる軽微な計装追加): 本番daemon Aのログで
+    `[object_sync] object already expired, ignoring`がそこそこの頻度で出ていることに
+    ユーザーが気づき、`handle_object`(`object_sync.c`)の該当ログへ`expires_time`を
+    追加した(`bm_log_debug("...ignoring(%"PRId64")\n", (int64_t)hdr.expires_time)`)。
+    挙動変更は無く計装のみ。ビルド警告ゼロ、ctest 45件全通過を確認済み。本番daemon Aへ
+    ビルド・デプロイ・再起動済み(21:03:22 JST、PID変更、`NRestarts=0`の正常な意図的
+    再起動)。根本原因(なぜ期限切れobjectがそこそこ受信されているのか)はまだ未調査。
