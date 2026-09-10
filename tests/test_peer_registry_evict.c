@@ -110,7 +110,19 @@ int main(void)
     free(conn2);
     CHECK(bm_peer_registry_count(&reg) == 1, "registry should contain only conn1 after removing conn2");
 
+    /* uintptr_t経由の変数追跡切り離しだけではRelease(-O2)最適化下でGCCが追跡を復元し
+     * 再度-Wuse-after-freeを出すことがあるため、このテストの意図(絶対にdereferenceされない
+     * ことの検証)を壊さない範囲でこの1行だけ警告を抑制する。-Wuse-after-freeはGCC固有の
+     * 警告(clangには存在しない)なので、__clang__を明示的に除外する
+     * (でないとclangで「未知の警告オプション」自体が新たな警告になる)。 */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuse-after-free"
+#endif
     int rc_not_found = bm_peer_registry_evict_if_current(&reg, (struct bm_fd_data *)conn2_addr, conn2_generation);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     CHECK(rc_not_found == 0, "evicting an already-removed connection must return 0 without touching it");
 
     /* conn1はpending_evictionが立ったままだが、実際のclose/freeはこのテストの対象外

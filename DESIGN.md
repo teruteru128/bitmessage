@@ -2398,3 +2398,51 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     挙動変更は無く計装のみ。ビルド警告ゼロ、ctest 45件全通過を確認済み。本番daemon Aへ
     ビルド・デプロイ・再起動済み(21:03:22 JST、PID変更、`NRestarts=0`の正常な意図的
     再起動)。根本原因(なぜ期限切れobjectがそこそこ受信されているのか)はまだ未調査。
+
+    根本原因の特定と修正(2026-09-10): 上記の計装ログを本番daemon Aで観測したところ、
+    `expires_time`と実際の受信時刻の差が18件全てで184〜358秒(約3〜6分)という狭い
+    範囲に収まっており、単なるランダムな遅延にしては不自然に一貫していることにユーザーが
+    気づいた。「有効期限切れをすぐ消すのではなく猶予をおいて消す仕様がプロトコルに
+    あったか」という質問を受け、PyBitmessage本家を実ソースで確認した結果:
+    - 受信時の猶予: `network/bmobject.py`の`BMObject.minTTL = -3600`(値は3600秒=1時間。
+      コード上のコメントには「3 hour」とあるが実際の値は1時間で、コメントの方が誤記と
+      判断した)。`expiresTime - now() < minTTL`の場合のみ拒否する。
+    - GC削除時の猶予: `storage/sqlite.py`の`SqliteInventory.clean()`、
+      `DELETE FROM inventory WHERE expirestime<?`に`now() - 60*60*3`(3時間)を渡している。
+      受信時とGC時で異なる値(1時間 vs 3時間)を使っている点に注意(本家内でも一貫していない)。
+
+    対してこのC実装(`object_sync.c`の`handle_object`・`validate_and_store_ack`、
+    `object_store.c`の`bm_object_store_delete_expired`呼び出し元)はいずれも猶予なしで
+    `expires_time <= now`の時点で即座に拒否・削除していた。これが「本家なら受け入れる
+    はずの期限切れ直後のobjectを無条件で捨てていた」直接原因だったと判明した。
+
+    修正: `object_sync.c`に`BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS`(3600、受信時用)と
+    `BM_OBJECT_GC_GRACE_PERIOD_SECONDS`(3*60*60、GC用)を新設し、本家の値をそのまま
+    移植した。`handle_object`・`validate_and_store_ack`の判定を
+    `expires_time < now - BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS`に、`bm_object_sync_gc`が
+    `bm_object_store_delete_expired`へ渡す閾値を`now - BM_OBJECT_GC_GRACE_PERIOD_SECONDS`に
+    変更した(`object_store.c`自体は汎用的な`expires_time < ?1`のままで変更不要、猶予の
+    計算は呼び出し元のビジネスロジック側に置いた)。PoW検証用の`object_pow_is_valid`の
+    ttl計算(期限切れならttl=0として最も厳しく判定する既存ロジック)はこの変更と独立して
+    安全なため変更していない。
+
+    副次的に見つかったbuild-Release固有の警告3件も合わせて修正した(`-O2`でのみ顕在化、
+    `build-Debug`では警告なしだった):
+    - `tests/test_burst_accept_real_epoll_thread.c`: `write()`の戻り値未チェック
+      (`-Wunused-result`)。同じシナリオを持つ`tests/test_burst_accept_idle_sweep.c`の
+      既存パターン(戻り値を`ssize_t n`で受けて`CHECK`する)に合わせた。
+    - `src/core/keyring.c`(2箇所): `strncpy`の`-Wstringop-truncation`
+      (コピー先とコピー元の長さがちょうど一致しうる場合にGCCが警告する)。`memset`済み
+      バッファへの`strncpy`+手動nul終端という元のロジックは実害がなかったが、静的解析上の
+      警告を消すため`snprintf(dst, LEN, "%s", src)`に置き換えた。
+    - `tests/test_peer_registry_evict.c`: 項目27で`uintptr_t`経由に回避したはずの
+      `-Wuse-after-free`が、`-O2`最適化下でGCCの変数追跡が復元されて再度検出された。
+      このテストの意図(dereferenceされないことの検証)自体は変えず、該当1行だけ
+      `#pragma GCC diagnostic push/ignored "-Wuse-after-free"/pop`で抑制した。
+      `-Wuse-after-free`はGCC固有(clangには存在しない)警告のため、`#if defined(__GNUC__)
+      && !defined(__clang__)`でガードし、clang環境で「未知の警告オプション」という
+      別の警告が新たに出ないようにした。
+
+    `build-Debug`・`build-Release`双方をclean+再ビルドしてビルド警告ゼロ、ctest 45件
+    全通過を確認済み(このプロジェクトは現状GCC専用、CIもclangは使っていない。clangでの
+    追加検証は将来の任意タスクとしてbacklog化を検討)。

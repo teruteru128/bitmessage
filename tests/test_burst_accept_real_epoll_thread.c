@@ -144,7 +144,8 @@ int main(void)
     memset(garbage, 0xAB, sizeof(garbage));
     for (int i = 0; i < BURST_SIZE; i++)
     {
-        write(client_fds[i], garbage, sizeof(garbage));
+        ssize_t n = write(client_fds[i], garbage, sizeof(garbage));
+        CHECK(n == (ssize_t)sizeof(garbage), "writing garbage payload to client fd should succeed");
         close(client_fds[i]);
     }
 

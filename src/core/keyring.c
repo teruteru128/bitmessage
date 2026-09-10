@@ -157,7 +157,7 @@ static int unlock_with_kek(bm_keyring_t *kr, const struct bm_identity_row *row, 
         return -1;
     }
     memset(entry, 0, sizeof(*entry));
-    strncpy(entry->address, row->address, BM_KEYRING_MAX_ADDRESS_LEN - 1);
+    snprintf(entry->address, BM_KEYRING_MAX_ADDRESS_LEN, "%s", row->address);
     memcpy(entry->priv_signing, priv_signing, 32);
     memcpy(entry->priv_encryption, priv_encryption, 32);
     memcpy(entry->pub_signing, row->signing_pubkey, 65);
@@ -740,8 +740,7 @@ int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
         {
             bm_log_debug("[keyring] %zu identities processing...\n", i + 1);
         }
-        strncpy(results[i].address, list[i].address, BM_KEYRING_MAX_ADDRESS_LEN - 1);
-        results[i].address[BM_KEYRING_MAX_ADDRESS_LEN - 1] = '\0';
+        snprintf(results[i].address, BM_KEYRING_MAX_ADDRESS_LEN, "%s", list[i].address);
 
         struct bm_unlocked_identity dummy;
         if (bm_keyring_find_by_address(kr, list[i].address, &dummy))

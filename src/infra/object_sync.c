@@ -36,6 +36,21 @@
  * このくらいの間隔を置く(厳密である必要はない) */
 #define BM_OBJECT_SYNC_GC_INTERVAL_SECONDS 300
 
+/* §11 2026-09-10: 受信時の期限切れ猶予(PyBitmessage本家 network/bmobject.py の
+ * BMObject.minTTL = -3600 に合わせた値)。expires_timeを過ぎた直後のobjectは、
+ * 伝播が遅れた相手がまだ期限内だと思って送ってきただけの可能性があるため、
+ * この猶予内なら受け入れる。「object already expired, ignoring」ログが本番daemon Aで
+ * そこそこの頻度(受信-expiresの差が数分程度)で出ていたことから発覚した、猶予なしで
+ * 即座に拒否していたバグの修正。 */
+#define BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS 3600
+
+/* §11 2026-09-10: GC削除時の期限切れ猶予(PyBitmessage本家 storage/sqlite.py の
+ * SqliteInventory.clean、`now - 60*60*3` に合わせた値)。受信時の猶予より長く、
+ * GCで消えた直後のobjectについても、少しの間はgetdata応答や重複判定に使えるようにする。
+ * 受信時の猶予(BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS=1時間)とは値が異なる点に注意
+ * (本家でもこの2箇所は別々の値になっている)。 */
+#define BM_OBJECT_GC_GRACE_PERIOD_SECONDS (3 * 60 * 60)
+
 /* 再送チェックの間引き間隔(§11)。next_resend_time自体は分単位以上の粒度なので、
  * これくらいの頻度で十分 */
 #define BM_OBJECT_SYNC_RESEND_CHECK_INTERVAL_SECONDS 300
@@ -87,7 +102,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now)
 {
     ctx->last_gc = (time_t)now;
-    return bm_object_store_delete_expired(ctx->object_pool_db, now);
+    return bm_object_store_delete_expired(ctx->object_pool_db, now - BM_OBJECT_GC_GRACE_PERIOD_SECONDS);
 }
 
 static void maybe_run_gc(struct bm_object_sync_ctx *ctx)
@@ -213,7 +228,7 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
     }
 
     int64_t now = (int64_t)time(NULL);
-    if ((int64_t)hdr.expires_time <= now)
+    if ((int64_t)hdr.expires_time < now - BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS)
     {
         bm_free_message(msg);
         return;
@@ -555,9 +570,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     }
 
     int64_t now0 = (int64_t)time(NULL);
-    if ((int64_t)hdr.expires_time <= now0)
+    if ((int64_t)hdr.expires_time < now0 - BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS)
     {
-        /* already expired objectがそこそこ見られるためデバッグのために時刻を追加。 */
+        /* §11 2026-09-10: 猶予期間(BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS)を過ぎて
+         * 本当に古いobjectのみここに来る。調査用に残していた時刻ログはそのまま維持する。 */
         bm_log_debug("[object_sync] object already expired, ignoring(%"PRId64")\n", (int64_t)hdr.expires_time);
         return;
     }
