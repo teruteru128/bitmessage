@@ -295,6 +295,9 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
+        /* §11 2026-09-12: 8段階化に伴う移行。default_dispatchはテスト専用スタブ
+         * (このファイル冒頭のdocコメント参照)なので実運用の出力量には影響しないが、
+         * 一貫性のためproduction側(object_sync.c)の対応するログと同じ無番号のDEBUGにする。 */
         bm_log_debug("[network] verack received\n");
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
@@ -714,8 +717,12 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * ではidle_sweep自体は正しく動作しており再現できなかったため、本番環境固有の
          * 何かを特定する目的で、handshake未完了の接続(通常は個体数が少なく、正常なら
          * 20秒以内に消えるはず)についてのみ、この判定が呼ばれるたびの状態を記録する。
-         * 原因特定後は削除する想定の一時的なログ。 */
-        bm_log_debug("[network] idle_sweep(handshake未完了): fd=%d %s idle=%" PRId64 "s threshold=%ds\n", conn->fd,
+         * 原因特定後は削除する想定の一時的なログ。
+         * §11 2026-09-12: 8段階化に伴う移行。handshake未完了の接続についてidle_sweepが
+         * 呼ばれるたび(1秒間隔ポーリング)に出る調査専用ログだが、対象は通常個体数が
+         * 少ないハンドシェイク未完了接続に限られる(object_sync.cの重複object受信ログ等、
+         * 全接続・全objectを対象にするDEBUG3ほどの量にはならない)ためDEBUG2にした。 */
+        bm_log_debug2("[network] idle_sweep(handshake未完了): fd=%d %s idle=%" PRId64 "s threshold=%ds\n", conn->fd,
                 conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds,
                 BM_HANDSHAKE_TIMEOUT_SECONDS);
         if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)
@@ -787,10 +794,12 @@ void *bm_network_epoll_thread(void *arg)
              * 配送したかどうか(events bitmask込み)を記録する。もしゴースト化した接続の
              * fdが、accept直後を最後に二度とこのログへ現れなくなるなら、epoll_wait自体が
              * そのfdへイベントを配送していないことの直接証拠になる。原因特定後は削除する
-             * 想定の一時的なログ。 */
+             * 想定の一時的なログ。
+             * §11 2026-09-12: 8段階化に伴う移行。epoll_waitが返すたび(handshake未完了の
+             * 接続がある限り毎ループ)出るため、idle_sweep側の調査ログと同様DEBUG2にした。 */
             if (!conn->handshake_complete)
             {
-                bm_log_debug("[network] epoll_wait event: fd=%d %s events=0x%x\n", conn->fd,
+                bm_log_debug2("[network] epoll_wait event: fd=%d %s events=0x%x\n", conn->fd,
                         conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", events[i].events);
             }
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);

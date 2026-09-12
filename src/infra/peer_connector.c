@@ -489,6 +489,8 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
 
         const struct bm_socks_proxy_config *socks_proxy =
                 is_onion_host(candidates[i].ip_address) ? &socks_proxy_onion : &socks_proxy_clearnet;
+        /* §11 2026-09-12: 8段階化に伴う移行。接続試行1回につき1行のサマリなので
+         * 無番号のDEBUGにした。 */
         bm_log_debug("[peer_connector] connecting to %s%s...\n", addr_buf,
                 socks_proxy->enabled ? " (via SOCKS5)" : "");
         int sock = open_peer_connection(candidates[i].ip_address, candidates[i].port, CONNECT_TIMEOUT_SEC,
@@ -597,7 +599,10 @@ void *bm_peer_connector_thread(void *arg)
         int connected = bm_peer_connector_connect_initial(&args->config);
         if (connected > 0)
         {
-            bm_log_info("[peer_connector] %d new outbound connection(s) established\n", connected);
+            /* §11 2026-09-12: 8段階化に伴う移行。再接続サイクルの成功サマリであり、
+             * DESIGN.md §11 backlog項目28のNOTICE設計方針で挙げた「再接続成功」の
+             * 具体例そのものなのでNOTICEにした。 */
+            bm_log_notice("[peer_connector] %d new outbound connection(s) established\n", connected);
         }
 
         for (int waited = 0; waited < RECONNECT_INTERVAL_SECONDS && *args->stop_flag == 0; waited++)

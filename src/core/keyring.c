@@ -708,6 +708,10 @@ int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
         return -1;
     }
 
+    /* §11 2026-09-12: 8段階化に伴う移行。一括unlockの開始・進捗・完了サマリは
+     * (何万件ものidentityを一度に扱う運用があるため)デバッグ時に常時見たい情報として
+     * 無番号のDEBUG(BM_LOG_LEVEL=DEBUGだけで見える最も粗い階層)にした。個別キーの
+     * unlock失敗は「進捗」より詳細寄りなので一段詳細なDEBUG1にした(下記参照)。 */
     bm_log_debug("[keyring] unlock all: %zu identitie(s)\n", count);
 
     struct bm_unlock_all_entry *results = malloc(sizeof(*results) * (count > 0 ? count : 1));
@@ -763,7 +767,10 @@ int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
             results[i].unlocked = (have_master_kek && unlock_with_vault(kr, &row, master_kek) == 0) ? 1 : 0;
             if (results[i].unlocked == 0)
             {
-                bm_log_debug("[keyring] unlock failed (key number %zu)\n", i + 1);
+                /* §11 2026-09-12: 一括unlock中の個別失敗は、パスフレーズ不一致等で
+                 * 対象件数分(最大で全件)出うるため進捗ログ(無番号DEBUG)より一段詳細な
+                 * DEBUG1にした。 */
+                bm_log_debug1("[keyring] unlock failed (key number %zu)\n", i + 1);
             }
             continue;
         }

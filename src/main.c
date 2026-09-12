@@ -594,7 +594,11 @@ int main(int argc, char **argv)
     _Atomic sig_atomic_t peer_connector_stop = 0; /* §11 2026-08-24 backlog項目9、api_server_stopと同じ理由 */
     if (env_flag_or("BM_NO_CONNECT", cfg.no_connect))
     {
-        bm_log_info("[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
+        /* §11 2026-09-12: 8段階化に伴う移行。BM_NO_CONNECT=1は通常運用からの意図的な
+         * 逸脱(接続を全くしない特殊モード)であり、INFOの大量出力に紛れて見落とされると
+         * 「なぜ全く繋がらないのか」の調査で遠回りになるため、DESIGN.md §11 backlog項目28の
+         * NOTICE設計方針(設定値のフォールバック/特殊モード発動)に沿ってNOTICEにした。 */
+        bm_log_notice("[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
     }
     else
     {
@@ -627,7 +631,10 @@ int main(int argc, char **argv)
      * (理由は同所のコメント参照)。ここではブロック済みのsetに対してsigwaitで待つだけ。 */
     int sig = 0;
     sigwait(&set, &sig);
-    bm_log_info("シグナル %d を受信、終了処理を開始します\n", sig);
+    /* §11 2026-09-12: 8段階化に伴う移行。プロセス生存期間で1回しか出ない終了処理開始の
+     * 節目であり、意図した終了(シグナル)かクラッシュかを見分ける手掛かりとして他のINFOより
+     * 目立たせたいのでNOTICEにした。 */
+    bm_log_notice("シグナル %d を受信、終了処理を開始します\n", sig);
 
     queues_shutdown(&queues);
     peer_connector_stop = 1;

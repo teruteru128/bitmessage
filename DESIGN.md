@@ -2447,8 +2447,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     全通過を確認済み(このプロジェクトは現状GCC専用、CIもclangは使っていない。clangでの
     追加検証は将来の任意タスクとしてbacklog化を検討)。
 
-28. **ログレベルを4段階(DEBUG/INFO/WARN/ERROR)から8段階へ拡張(enum定義のみ、既存
-    約140箇所の呼び出し移行は未着手)**: 2026-09-12、運用が進みログの出力量・種類が
+28. **ログレベルを4段階(DEBUG/INFO/WARN/ERROR)から8段階へ拡張**: 2026-09-12、運用が進みログの出力量・種類が
     増えたことで、DEBUG一段階では「常時見たい詳細情報」と「特定の調査時にしか要らない
     大量トレース」を分離できなくなってきたため、ユーザー発案でログレベルを8段階に
     拡張した。`logging.h`のenum定義と`logging.c`の`parse_log_level`/`level_tag`のみを
@@ -2471,5 +2470,39 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     抑制されること、DEBUG3指定で3段階とも出ること)とNOTICE/NOTIFYエイリアスの検証を
     追加した。ビルド警告ゼロ、ctest 45件全通過。
 
-    残作業(未着手): 既存約140箇所の`bm_log_debug/info/warn/error`呼び出しをどの
-    新レベルへ割り当て直すかの判断・移行。
+    **既存呼び出し箇所の移行(2026-09-12、同日追記)**: 上記コミット時点では未着手だった
+    約140箇所の`bm_log_debug/info/warn/error`呼び出しの再割り当てを完了した。移行対象は
+    `bm_log_debug`(26箇所、無番号DEBUG・DEBUG1/2/3の4段階への再分配)と`bm_log_info`
+    (32箇所、一部をNOTICEへ)の2つのみで、WARN/ERROR(63+31箇所)は8段階化前後で境界
+    (INFOとWARNの間にNOTICEが挟まっただけ)が変わっていないため移行不要と判断した。
+
+    §11 2026-09-12実装時のミス訂正: 当初、無番号DEBUGを一切使わずDEBUG1/2/3の3分割だけで
+    26箇所を割り振ってしまった(enumの大小関係を「DEBUG1が最も粗い基本階層」と誤読し、
+    `BM_LOG_DEBUG3 < BM_LOG_DEBUG2 < BM_LOG_DEBUG1 < BM_LOG_DEBUG`という実際の並び
+    ―`bm_log_leveled`の`level < g_min_level`足切りにより、無番号DEBUGは`BM_LOG_LEVEL=DEBUG`
+    だけで表示される最も粗い(控えめな)デバッグ階層であり、DEBUG1/2/3はそこからさらに
+    詳細化した3段階―を踏まえていなかった)。ユーザー指摘で発覚し、4段階(無番号DEBUGを
+    最も粗い階層、DEBUG1→DEBUG2→DEBUG3の順に詳細化)へ組み直した。
+
+    DEBUG→無番号DEBUG/DEBUG1/2/3の判断基準: 「1メッセージ・1接続・1回の呼び出しにつき
+    1行」のサマリ系ログ(受信/送信イベントの件数集計、接続確立、handshake完了等、19箇所)は
+    無番号DEBUG(`BM_LOG_LEVEL=DEBUG`だけで見える最も粗い階層)。個別アイテム単位の失敗や
+    調査用ログのうち出現頻度が中程度のもの(`keyring.c`の一括unlock個別失敗、
+    `object_sync.c`の期限切れobject受信、計2箇所)はDEBUG1。`network.c`のhandshake未完了
+    接続に対する調査専用ログ(`idle_sweep`/`epoll_wait event`、1秒間隔ポーリングのたび
+    出力されるが対象は個体数の少ないhandshake未完了接続に限られる、計2箇所)はDEBUG2。
+    inv/getdata内の1hashごとの相関ログ(`object_sync.c`の`sent getdata item`/
+    `getdata not found`)、重複object受信ログ(通常のflooding gossipで全接続・全objectに
+    対して出る、このファイル内で最も出現頻度が高い部類、計3箇所)は「特定の調査時にしか
+    要らない大量トレース」としてDEBUG3にした。
+
+    INFO→NOTICE: 全32箇所のうち、通常運用からの逸脱・特殊モード発動・リトライ
+    (`main.c`の`BM_NO_CONNECT=1`スキップ、シグナル受信による終了処理開始、
+    `object_sync.c`の未ack再送、`peer_connector.c`の新規outbound接続確立サマリ)の
+    4箇所をNOTICEへ昇格した。起動時の設定表示・DB初期化完了・メッセージ復号・
+    pubkeyキャッシュ等、通常運用で定常的に発生する残り28箇所はINFOのまま維持した
+    (NOTICEを「INFOの大量出力で見落とされては困る、通常運用からの逸脱」に限定する
+    ことで、NOTICEの希少性=注目に値する信号としての価値を保つ狙い)。
+
+    ビルド警告ゼロ、`build-Debug`でctest 45件全通過を確認済み(レベル再割り当てのみで
+    ログ本文・出力条件自体は変更していないため、既存テストの追加は不要と判断)。

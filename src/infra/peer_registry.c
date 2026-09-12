@@ -356,6 +356,8 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
      * (pending_count==0)場合は出さない。 */
     if (pending_count > 0)
     {
+        /* §11 2026-09-12: 8段階化に伴う移行。broadcast呼び出し1回につき1行のサマリなので
+         * 無番号のDEBUGにした。 */
         bm_log_debug(
                 "[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s), evicted "
                 "%zu dead peer(s)\n",

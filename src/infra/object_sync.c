@@ -159,7 +159,10 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
                     }
                 }
             }
-            bm_log_info("[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
+            /* §11 2026-09-12: 8段階化に伴う移行。ackが返ってこず再送(リトライ)している
+             * という、INFOの大量出力に紛れさせたくない事象なのでNOTICEにした
+             * (DESIGN.md §11 backlog項目28のNOTICE設計方針「再接続成功など」と同種)。 */
+            bm_log_notice("[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
             free(object);
         }
         else
@@ -319,6 +322,8 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL);
         }
+        /* §11 2026-09-12: 8段階化に伴う移行。getpubkey応答1回につき1行のサマリなので
+         * 無番号のDEBUG(常時見たい詳細情報)にした。 */
         bm_log_debug(
                 "[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
                 address_version);
@@ -573,8 +578,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     if ((int64_t)hdr.expires_time < now0 - BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS)
     {
         /* §11 2026-09-10: 猶予期間(BM_OBJECT_EXPIRE_GRACE_PERIOD_SECONDS)を過ぎて
-         * 本当に古いobjectのみここに来る。調査用に残していた時刻ログはそのまま維持する。 */
-        bm_log_debug("[object_sync] object already expired, ignoring(%"PRId64")\n", (int64_t)hdr.expires_time);
+         * 本当に古いobjectのみここに来る。調査用に残していた時刻ログはそのまま維持する。
+         * §11 2026-09-12: 8段階化に伴う移行。猶予期間追加後は発生頻度自体は下がったはず
+         * だが元々調査用途のログのため、常時出す無番号DEBUGより一段詳細なDEBUG1にした。 */
+        bm_log_debug1("[object_sync] object already expired, ignoring(%"PRId64")\n", (int64_t)hdr.expires_time);
         return;
     }
     /* §11: ネットワーク既定の最低難易度を満たさないobjectは受け入れない(悪意ある相手に
@@ -606,8 +613,12 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
          * 以降はここで無言returnしていたため「本当にobjectが届かなかった」のか「届いたが
          * 重複として捨てられた」のか区別できなかった。hashを出すことでsent getdata item
          * ログと突き合わせ、"objectは届いていたが集計上見えていなかっただけ"のケースを
-         * 定量化する。 */
-        bm_log_debug("[object_sync] received object: hash=%s already known (duplicate), ignoring\n", hash_hex_str);
+         * 定量化する。
+         * §11 2026-09-12: 8段階化に伴う移行。通常のflooding gossipで重複受信するのは
+         * 正常系であり、対象object数×接続peer数の分だけ出うる(このファイル内で最も
+         * 出現頻度が高い部類のログ)ため、特定の調査時にしか要らない大量トレースとして
+         * DEBUG3にした。 */
+        bm_log_debug3("[object_sync] received object: hash=%s already known (duplicate), ignoring\n", hash_hex_str);
         return; /* 既知object。以降の保存・型別処理は再実行しない(通常のflooding gossipで
                  * 重複受信するのは正常) */
     }
@@ -624,7 +635,10 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
      * sent getdata」の続き(実際にobjectが届いて保存された)が追えなかった
      * (ユーザー指摘)。型に関わらず、受理・保存した時点で一律にDEBUGログを出す。
      * §11 2026-09-07: hashも出すようにした(sent getdata itemログとの突き合わせ用、
-     * 経緯は直前のduplicateログのコメント参照)。 */
+     * 経緯は直前のduplicateログのコメント参照)。
+     * §11 2026-09-12: 8段階化に伴う移行。重複は既に上のDEBUG3で弾かれた後の「新規に
+     * 保存されたobject」だけがここに来るため、常時見たい詳細情報として無番号DEBUGに
+     * した。 */
     bm_log_debug("[object_sync] received object: hash=%s type=%d stream=%d %u bytes, stored to object_pool.db\n",
                  hash_hex_str, (int)hdr.object_type, (int)hdr.stream, msg->length);
 
@@ -776,6 +790,8 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
     /* §11 2026-08-23: これまで正常系(パース成功・上限内)には一切ログが無く、malformed/上限超過
      * といった異常系のログしか出ていなかった(listConnections調査中にユーザーが発見した
      * 「無言の切断」と同種の穴)。受信件数・未所持(=getdataを送る)件数を可視化する。 */
+    /* §11 2026-09-12: 8段階化に伴う移行。inv/dinv受信1回につき1行のサマリなので
+     * 無番号のDEBUGにした。 */
     bm_log_debug("[object_sync] received %s: %" PRIu64 " item(s), %zu missing\n", msg->command, received_count,
             missing_count);
 
@@ -795,6 +811,9 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
                 /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
                  * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
                  * 受信側の可視化と同種の穴、ユーザー指摘)。 */
+                /* §11 2026-09-12: 8段階化に伴う移行。getdata送信1回につき1行のサマリ
+                 * なので無番号のDEBUGにした(直後のhash単位ログは調査用途でDEBUG3、
+                 * 下記参照)。 */
                 bm_log_debug("[object_sync] sent getdata: %zu item(s)\n", missing_count);
                 /* §11 2026-09-07: not_found大量発生・sent getdataに対するreceived object
                  * 不足の調査用計測。従来は件数の集計しかできず、個々のhashが「いつ・どの
@@ -811,7 +830,10 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
                 {
                     char hex[65];
                     hash_hex(missing[j], hex);
-                    bm_log_debug("[object_sync] sent getdata item: hash=%s peer=%s:%d fd=%d\n", hex, ip, port,
+                    /* §11 2026-09-12: 8段階化に伴う移行。not_found調査用のhash単位ログ
+                     * (getdata 1件ごとに出るため、上のサマリ行より1桁以上多い)なので
+                     * DEBUG3にした。 */
+                    bm_log_debug3("[object_sync] sent getdata item: hash=%s peer=%s:%d fd=%d\n", hex, ip, port,
                                  conn->fd);
                 }
             }
@@ -854,7 +876,9 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
             not_found_count++;
             char hex[65];
             hash_hex(inv_msg.items[i], hex);
-            bm_log_debug("[object_sync] getdata not found: hash=%s requester=%s:%d fd=%d\n", hex, requester_ip,
+            /* §11 2026-09-12: 8段階化に伴う移行。sent getdata itemと対になる調査用の
+             * hash単位ログなので同じくDEBUG3にした。 */
+            bm_log_debug3("[object_sync] getdata not found: hash=%s requester=%s:%d fd=%d\n", hex, requester_ip,
                          requester_port, conn->fd);
             continue; /* 持っていない要求は黙って無視(切断まではしない) */
         }
@@ -880,6 +904,8 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
     /* §11 2026-08-23: inv受信の正常系ログ追加と同じ理由(ユーザーの指摘: 「外部から
      * getdataを1回でも受信したか、ログから確認できない」)。受信件数・実際に送れた件数・
      * 持っていなかった件数を可視化する。 */
+    /* §11 2026-09-12: 8段階化に伴う移行。getdata受信1回につき1行のサマリなので
+     * 無番号のDEBUGにした。 */
     bm_log_debug("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu sent, %zu not found\n",
             requested_count, sent_count, not_found_count);
 }
@@ -975,6 +1001,8 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
             }
             else
             {
+                /* §11 2026-09-12: 8段階化に伴う移行。verack受信時に1回だけ送るaddrの
+                 * サマリなので無番号のDEBUGにした。 */
                 bm_log_debug("[object_sync] sent addr (%d entries)\n", n);
                 conn->bytes_sent += (uint64_t)packet_len;
             }
@@ -1087,6 +1115,8 @@ static void flush_verack_reply_one(struct bm_fd_data *conn, void *user_data)
     struct flush_verack_reply_ctx *f = user_data;
     if (conn->pending_verack_reply_at != 0 && f->now >= conn->pending_verack_reply_at)
     {
+        /* §11 2026-09-12: 8段階化に伴う移行。接続1本につき1回だけの遅延verack返信
+         * イベントなので無番号のDEBUGにした。 */
         bm_log_debug("[object_sync] flushing deferred verack reply after BM_VERACK_REPLY_DELAY_SECONDS\n");
         send_verack_reply(f->ctx, conn);
         conn->pending_verack_reply_at = 0;
@@ -1214,6 +1244,8 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "verack", 12) == 0)
     {
+        /* §11 2026-09-12: 8段階化に伴う移行。接続1本につき1回のhandshakeイベントなので
+         * 無番号のDEBUGにした。 */
         bm_log_debug("[object_sync] verack received\n");
         /* §11 2026-08-23: inbound/outbound問わず、verack受信時点で双方向のversion/verack
          * 交換が完了している(相手も既にこちらのversionを受け取っている)。
@@ -1304,6 +1336,8 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
              * "received getdata:...")と違い、この行だけ"received"を含んでいなかった。
              * ユーザーが"recv"でgrepしていて実際にこの行を見逃した実例があったため、
              * 文言を揃えた。 */
+            /* §11 2026-09-12: 8段階化に伴う移行。addr受信1回につき1行のサマリなので
+             * 無番号のDEBUGにした。 */
             bm_log_debug(
                     "[object_sync] received addr: %" PRIu64 " entries (%d registered to peers.db, %d filtered)\n",
                     addr_msg.count, registered, filtered);
