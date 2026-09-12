@@ -4,6 +4,12 @@
  *
  * §11 2026-08-24 backlog項目8: ログレベル(DEBUG/INFO/WARN/ERROR)のタグ付与・
  * BM_LOG_LEVELによるフィルタリング(既定はBM_LOG_INFO、DEBUGを抑制)を追加で検証する。
+ *
+ * §11 2026-09-12: DEBUGをDEBUG1/DEBUG2/DEBUG3の3段階に分割し、INFOとWARNの間に
+ * NOTICEを追加して計8段階にした変更を検証する。DEBUG1/2/3は数字が大きいほど詳細
+ * (sshの-v/-vv/-vvvに倣った)なので、BM_LOG_LEVEL=DEBUG1ではDEBUG2/DEBUG3は
+ * 抑制され、DEBUG3では3段階とも出ることを確認する。またNOTICEのエイリアス"NOTIFY"
+ * (旧綴りの"NOTIFICATE"を修正したもの)も検証する。
  */
 
 #include <pthread.h>
@@ -102,6 +108,21 @@ static void emit_all_levels(void)
     bm_log_info("info-msg\n");
     bm_log_warn("warn-msg\n");
     bm_log_error("error-msg\n");
+}
+
+/* §11 2026-09-12: 8段階全てを出す。文字列は既存のemit_all_levelsのメッセージと
+ * strstrで誤って一致しないよう("debug-msg"が"debug1-msg"の部分文字列にならない
+ * ように)区別できる名前にしてある */
+static void emit_all_8_levels(void)
+{
+    bm_log_debug3("d3-msg\n");
+    bm_log_debug2("d2-msg\n");
+    bm_log_debug1("d1-msg\n");
+    bm_log_debug("d-msg\n");
+    bm_log_info("i-msg\n");
+    bm_log_notice("n-msg\n");
+    bm_log_warn("w-msg\n");
+    bm_log_error("e-msg\n");
 }
 
 int main(void)
@@ -234,6 +255,74 @@ int main(void)
             CHECK(strstr(out, "[INFO] info-msg\n") != NULL,
                   "an unrecognized BM_LOG_LEVEL should still show INFO messages (default level)");
             free(out);
+        }
+        unsetenv("BM_LOG_LEVEL");
+    }
+
+    /* --- 8b. §11 2026-09-12: BM_LOG_LEVEL=DEBUG1では、DEBUG1自体は出るが、より詳細な
+     * DEBUG2/DEBUG3は抑制される(sshの-v/-vv/-vvvと同じく数字が大きいほど詳細、という
+     * 向きにするためenum値をDEBUG3<DEBUG2<DEBUG1<DEBUGの順にした)。DEBUG以上
+     * (DEBUG/INFO/NOTICE/WARN/ERROR)は当然すべて出る --- */
+    {
+        setenv("BM_LOG_TIMESTAMPS", "0", 1);
+        setenv("BM_LOG_LEVEL", "DEBUG1", 1);
+        bm_log_init();
+        char *out = capture_log_output(emit_all_8_levels);
+        CHECK(out != NULL, "capturing 8-level output should succeed");
+        if (out != NULL)
+        {
+            CHECK(strstr(out, "d3-msg") == NULL, "BM_LOG_LEVEL=DEBUG1 should suppress the more detailed DEBUG3");
+            CHECK(strstr(out, "d2-msg") == NULL, "BM_LOG_LEVEL=DEBUG1 should suppress the more detailed DEBUG2");
+            CHECK(strstr(out, "[DEBUG1] d1-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG1 should still show DEBUG1 itself");
+            CHECK(strstr(out, "[DEBUG] d-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG1 should still show the plain DEBUG level");
+            CHECK(strstr(out, "[NOTICE] n-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG1 should still show NOTICE");
+            free(out);
+        }
+    }
+
+    /* --- 8c. §11 2026-09-12: BM_LOG_LEVEL=DEBUG3(最も詳細)では、DEBUG1/2/3の3段階
+     * すべてが出る --- */
+    {
+        setenv("BM_LOG_LEVEL", "DEBUG3", 1);
+        bm_log_init();
+        char *out = capture_log_output(emit_all_8_levels);
+        CHECK(out != NULL, "capturing 8-level output should succeed");
+        if (out != NULL)
+        {
+            CHECK(strstr(out, "[DEBUG3] d3-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG3 should show DEBUG3");
+            CHECK(strstr(out, "[DEBUG2] d2-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG3 should show DEBUG2");
+            CHECK(strstr(out, "[DEBUG1] d1-msg\n") != NULL, "BM_LOG_LEVEL=DEBUG3 should show DEBUG1");
+            free(out);
+        }
+    }
+
+    /* --- 8d. §11 2026-09-12: NOTICEはINFOとWARNの間に位置する。BM_LOG_LEVEL=NOTICEを
+     * 指定すると、INFO以下(DEBUG系/INFO)は抑制され、NOTICE以上(NOTICE/WARN/ERROR)は
+     * 出る。またエイリアス"NOTIFY"(旧綴り"NOTIFICATE"を2026-09-12に修正)でも
+     * 同じ結果になることを確認する --- */
+    {
+        setenv("BM_LOG_LEVEL", "NOTICE", 1);
+        bm_log_init();
+        char *out = capture_log_output(emit_all_8_levels);
+        CHECK(out != NULL, "capturing 8-level output should succeed");
+        if (out != NULL)
+        {
+            CHECK(strstr(out, "i-msg") == NULL, "BM_LOG_LEVEL=NOTICE should suppress INFO");
+            CHECK(strstr(out, "[NOTICE] n-msg\n") != NULL, "BM_LOG_LEVEL=NOTICE should show NOTICE itself");
+            CHECK(strstr(out, "[WARN] w-msg\n") != NULL, "BM_LOG_LEVEL=NOTICE should still show WARN");
+            free(out);
+        }
+
+        setenv("BM_LOG_LEVEL", "NOTIFY", 1);
+        bm_log_init();
+        char *out2 = capture_log_output(emit_all_8_levels);
+        CHECK(out2 != NULL, "capturing 8-level output should succeed");
+        if (out2 != NULL)
+        {
+            CHECK(strstr(out2, "i-msg") == NULL, "BM_LOG_LEVEL=NOTIFY (alias of NOTICE) should suppress INFO");
+            CHECK(strstr(out2, "[NOTICE] n-msg\n") != NULL,
+                  "BM_LOG_LEVEL=NOTIFY (alias of NOTICE) should show the NOTICE-tagged message");
+            free(out2);
         }
         unsetenv("BM_LOG_LEVEL");
     }

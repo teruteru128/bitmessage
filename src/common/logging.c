@@ -19,10 +19,18 @@ static const char *level_tag(enum bm_log_level level)
 {
     switch (level)
     {
+        case BM_LOG_DEBUG3:
+            return "DEBUG3";
+        case BM_LOG_DEBUG2:
+            return "DEBUG2";
+        case BM_LOG_DEBUG1:
+            return "DEBUG1";
         case BM_LOG_DEBUG:
             return "DEBUG";
         case BM_LOG_INFO:
             return "INFO";
+        case BM_LOG_NOTICE:
+            return "NOTICE";
         case BM_LOG_WARN:
             return "WARN";
         case BM_LOG_ERROR:
@@ -37,6 +45,21 @@ static const char *level_tag(enum bm_log_level level)
  * (誤った値でログが完全に沈黙する事故を避けるため、安全側に倒す)。 */
 static int parse_log_level(const char *s, enum bm_log_level *out)
 {
+    if (strcasecmp(s, "DEBUG3") == 0)
+    {
+        *out = BM_LOG_DEBUG3;
+        return 0;
+    }
+    if (strcasecmp(s, "DEBUG2") == 0)
+    {
+        *out = BM_LOG_DEBUG2;
+        return 0;
+    }
+    if (strcasecmp(s, "DEBUG1") == 0)
+    {
+        *out = BM_LOG_DEBUG1;
+        return 0;
+    }
     if (strcasecmp(s, "DEBUG") == 0)
     {
         *out = BM_LOG_DEBUG;
@@ -45,6 +68,14 @@ static int parse_log_level(const char *s, enum bm_log_level *out)
     if (strcasecmp(s, "INFO") == 0)
     {
         *out = BM_LOG_INFO;
+        return 0;
+    }
+    /* §11 2026-09-12: "NOTIFY"はNOTICEの別名。他のレベルの別名(WARN/WARNING等)に
+     * 倣ってエイリアスを用意したが、"NOTIFICATE"という非標準の綴り("notificate"という
+     * 英単語は存在しない)で書いてしまっていたため"NOTIFY"に修正した。 */
+    if (strcasecmp(s, "NOTICE") == 0 || strcasecmp(s, "NOTIFY") == 0)
+    {
+        *out = BM_LOG_NOTICE;
         return 0;
     }
     if (strcasecmp(s, "WARN") == 0 || strcasecmp(s, "WARNING") == 0)

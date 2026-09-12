@@ -2446,3 +2446,30 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `build-Debug`・`build-Release`双方をclean+再ビルドしてビルド警告ゼロ、ctest 45件
     全通過を確認済み(このプロジェクトは現状GCC専用、CIもclangは使っていない。clangでの
     追加検証は将来の任意タスクとしてbacklog化を検討)。
+
+28. **ログレベルを4段階(DEBUG/INFO/WARN/ERROR)から8段階へ拡張(enum定義のみ、既存
+    約140箇所の呼び出し移行は未着手)**: 2026-09-12、運用が進みログの出力量・種類が
+    増えたことで、DEBUG一段階では「常時見たい詳細情報」と「特定の調査時にしか要らない
+    大量トレース」を分離できなくなってきたため、ユーザー発案でログレベルを8段階に
+    拡張した。`logging.h`のenum定義と`logging.c`の`parse_log_level`/`level_tag`のみを
+    変更し、既存呼び出し箇所の移行はbacklog項目8の時と同様に1箇所ずつ判断してから
+    行う方針のため、このコミットでは未着手(挙動・出力内容は変わらない)。
+
+    設計: DEBUGをDEBUG1/DEBUG2/DEBUG3の3段階に分割し、INFOとWARNの間にNOTICEを
+    追加した。DEBUG1/2/3は数字が大きいほど詳細(sshの`-v`/`-vv`/`-vvv`に倣った)に
+    しており、`bm_log_leveled`の`level < g_min_level`で足切りする既存ロジックは
+    変更していないため、この向きに合わせてenum値を`BM_LOG_DEBUG3`=0を最小として
+    `DEBUG3 < DEBUG2 < DEBUG1 < DEBUG < INFO < NOTICE < WARN < ERROR`の順に割り当てた
+    (`BM_LOG_LEVEL=DEBUG1`ならDEBUG2/DEBUG3のみ抑制、`DEBUG3`なら3段階とも出る)。
+    NOTICEはINFOより注目してほしいがWARNほど異常ではない事象(設定値のフォールバック
+    発動、再接続成功など)用に追加した。
+
+    ついでに、`parse_log_level`に元々あったNOTICEのエイリアス`"NOTIFICATE"`
+    (英語として非標準の綴り、タイポと判断)を`"NOTIFY"`に修正した。
+
+    テスト: `tests/test_logging.c`に8段階のフィルタ順序(DEBUG1指定でDEBUG2/DEBUG3が
+    抑制されること、DEBUG3指定で3段階とも出ること)とNOTICE/NOTIFYエイリアスの検証を
+    追加した。ビルド警告ゼロ、ctest 45件全通過。
+
+    残作業(未着手): 既存約140箇所の`bm_log_debug/info/warn/error`呼び出しをどの
+    新レベルへ割り当て直すかの判断・移行。
