@@ -887,15 +887,28 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         free(payload);
         if (packet != NULL)
         {
-            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) != 0)
+            char reason[BUFSIZ];
+            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason,
+                        BUFSIZ)
+                != 0)
             {
-                bm_log_warn("[object_sync] failed to send object for getdata\n");
+                /* §11 2026-09-13 項目29: このハンドラはnetwork_epoll_thread単一スレッド内
+                 * (bm_object_sync_dispatch経由)でのみ呼ばれるため、broadcast_inv
+                 * (network.hのconn->pending_evictionのdoc参照)のような別スレッドからの
+                 * evict_if_current(generation照合)は不要で、単にこのフラグを立てるだけで
+                 * 良い。実際のclose_connectionはこれまで通りidle_sweep_one(最大5秒後、
+                 * 通常は次の1秒間隔ポーリングで即座)が行う。書き込みに1回失敗した接続は
+                 * 以後のitemも送れない可能性が高いため、残りをnot_found扱いにせず
+                 * ループを抜けて無駄な失敗ログの連発(2026-09-12 05:43に観測した単一
+                 * peer切断で145件連続、DESIGN.md参照)を防ぐ。 */
+                bm_log_warn("[object_sync] failed to send object for getdata to fd=%d(%s), evicting\n", conn->fd,
+                        reason);
+                conn->pending_eviction = 1;
+                free(packet);
+                break;
             }
-            else
-            {
-                sent_count++;
-                conn->bytes_sent += (uint64_t)packet_len;
-            }
+            sent_count++;
+            conn->bytes_sent += (uint64_t)packet_len;
             free(packet);
         }
     }

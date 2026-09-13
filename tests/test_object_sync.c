@@ -13,6 +13,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,6 +159,11 @@ static unsigned char *build_version_packet_with_timestamp(const char *user_agent
 
 int main(void)
 {
+    /* §11 2026-09-13 項目29: シナリオ18(相手を先にcloseしてからのgetdata応答write失敗)が
+     * デフォルトのSIGPIPEでテストプロセスごと落ちるのを防ぐ。main.cが本番で行っているのと
+     * 同じ対策(SIGPIPE無視、write()の戻り値でエラー処理する)をテストにも適用する。 */
+    signal(SIGPIPE, SIG_IGN);
+
     sqlite3 *object_pool_db = open_fresh_db(TEST_OBJECT_POOL_DB, bm_object_store_init_schema);
     sqlite3 *identity_db = open_fresh_db(TEST_IDENTITY_DB, bm_identity_store_init_schema);
     sqlite3 *messages_db = open_fresh_db(TEST_MESSAGES_DB, bm_messages_store_init_schema);
@@ -1562,6 +1568,53 @@ int main(void)
         close(fds17[0]);
         close(fds17[1]);
         bm_fd_data_free(conn17);
+    }
+
+    /* --- 18. §11 2026-09-13 項目29: handle_getdataがobjectの送信(write)に失敗したら、
+     * broadcast_inv(peer_registry.c)と同様にconn->pending_evictionを立てて能動的に
+     * 接続を除去対象にすること。ただしこちらはnetwork_epoll_thread単一スレッド内
+     * (bm_object_sync_dispatch経由)でしか呼ばれないため、generation照合は不要で直接
+     * 代入するだけでよい(network.hのdoc参照)。peer側のfdを先に閉じてから、保有している
+     * objectのgetdataを要求し、書き込み失敗が起きることを確認する --- */
+    {
+        unsigned char hash_18[32];
+        memset(hash_18, 0xC7, sizeof(hash_18));
+        unsigned char dummy_payload18[16] = {0};
+        int64_t now18 = (int64_t)time(NULL);
+        CHECK(bm_object_store_insert(object_pool_db, hash_18, BM_OBJECT_MSG, 1, dummy_payload18,
+                                      sizeof(dummy_payload18), now18 + 86400, now18)
+                  == 0,
+              "seed object for getdata write-failure scenario");
+
+        int fds18[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds18) == 0, "socketpair for getdata write-failure scenario");
+        struct bm_fd_data *conn18 = bm_fd_data_new(BM_FD_CLIENT_SOCKET, fds18[0]);
+        CHECK(conn18 != NULL, "bm_fd_data_new for getdata write-failure scenario");
+        CHECK(conn18->pending_eviction == 0, "pending_eviction should start unset");
+
+        /* 相手側を先に閉じておく。以後conn18->fdへのwrite()はEPIPEで失敗するはず。 */
+        close(fds18[1]);
+
+        unsigned char req_hashes18[1][32];
+        memcpy(req_hashes18[0], hash_18, sizeof(hash_18));
+        size_t getdata_req_len18 = 0;
+        unsigned char *getdata_req_packet18 = bm_create_inventory_message("getdata", req_hashes18, 1, &getdata_req_len18);
+        struct bm_message *getdata_req_msg18 = NULL;
+        size_t getdata_req_consumed18 = 0;
+        CHECK(bm_parse_message(getdata_req_packet18, getdata_req_len18, &getdata_req_msg18, &getdata_req_consumed18)
+                  == BM_PARSE_OK,
+              "parse getdata request packet for write-failure scenario");
+        free(getdata_req_packet18);
+
+        bm_object_sync_dispatch(conn18, getdata_req_msg18, &ctx);
+        bm_free_message(getdata_req_msg18);
+
+        CHECK(conn18->pending_eviction == 1,
+              "write failure while sending object for getdata should mark the connection for eviction");
+        CHECK(conn18->bytes_sent == 0, "no bytes should be counted as sent when the write failed");
+
+        close(fds18[0]);
+        bm_fd_data_free(conn18);
     }
 
     close(fds[0]);

@@ -115,7 +115,13 @@ struct bm_fd_data
      * 発生しないようにすることでdouble freeを構造的に防ぐ。generation照合の下でreg->lock
      * を保持したまま書き込む(peer_registry.c参照)一方、読み取り側(idle_sweep_one)は
      * ロック無しで読む。int型の読み書き自体は破損しない(x86でアトミック)ため、
-     * 最悪でも次のidle_sweep(最大5秒後)まで検出が遅れるだけで安全性上の問題は無い。 */
+     * 最悪でも次のidle_sweep(最大5秒後)まで検出が遅れるだけで安全性上の問題は無い。
+     *
+     * §11 2026-09-13 項目29: object_sync.cのhandle_getdata(getdata応答のwrite失敗)も
+     * このフラグを立てるようになった。ただしこちらはbm_object_sync_dispatch経由で
+     * network_epoll_thread単一スレッド内からのみ呼ばれるため、上記のgeneration照合
+     * (別スレッドからの呼び出し前提)は不要で、conn->pending_eviction = 1を直接代入
+     * するだけで良い。 */
     int pending_eviction;
     /* §11 2026-08-23 backlog項目5: listConnections API(core/api_server.c)用。相手から
      * 受信したversion messageのuser agent文字列(malloc済み、NUL終端)。

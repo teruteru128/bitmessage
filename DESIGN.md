@@ -2506,3 +2506,41 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
 
     ビルド警告ゼロ、`build-Debug`でctest 45件全通過を確認済み(レベル再割り当てのみで
     ログ本文・出力条件自体は変更していないため、既存テストの追加は不要と判断)。
+
+29. **`handle_getdata`(object_sync.c)にもwrite失敗時の能動的接続除去を追加**: 2026-09-13、
+    daemon Aのjournalctl/syslog調査で、`[peer_registry] failed to send inv`ログが
+    2026-08-末に1日270件超のピークから項目27の`evict_if_current`導入(2026-09-05、
+    commit 2ec2393)を境にほぼゼロへ激減していた一方、`[object_sync] failed to send
+    object for getdata`ログも同時期に同様の推移(8/30-9/1ピーク時635件→9/6以降は
+    9/12の単発バースト143件を除き実質4件のみ→9/13以降0件)を辿っていたことが分かった。
+    ただし後者はevict_if_currentが呼ばれるbroadcast_inv(peer_registry.c)とは別の
+    コードパス(handle_getdata、getdata要求への応答書き込み)であり、この期間
+    `object_sync.c`・`network.c`とも該当箇所への修正コミットは一切無かった(投機的な
+    調査用ログ追加のみ)。つまり「evict_if_currentと一緒に直った」わけではなく、原因
+    不明のまま自然に収まっていたことが判明した(ユーザー指摘、根拠のない安心は
+    危険という所感で一致)。
+
+    原因不明の減少そのものを追うのは費用対効果が低いと判断し、代わりに`handle_getdata`
+    側にも同種の安全網を追加することにした。`bm_object_sync_dispatch`(→`handle_getdata`)
+    は`main.c`で`net_args->handler`として登録され、常に`bm_network_epoll_thread`
+    単一スレッド内から呼ばれる(broadcast_invのように別スレッド(object_sync_broadcast_
+    thread)からconnを触るわけではない)ため、ABA問題対策のgeneration照合は不要で、
+    write失敗を検知したその場で`conn->pending_eviction = 1`を直接代入するだけでよい。
+    実際のclose_connectionは既存のidle_sweep_one(network.c、1秒間隔ポーリング)が
+    次回走査時に行う。あわせて、1件書き込みに失敗した接続はそれ以降のitemも送れない
+    可能性が高いため、残りのitemをnot_found扱いにせずループを抜けるようにした
+    (2026-09-12 05:43に観測した「peer切断とgetdata応答の競合で145件連続warn」のような
+    無駄なログ連発を今後は1件で止める)。
+
+    `tests/test_object_sync.c`にシナリオ18を追加し、相手側socketを先にcloseした状態で
+    保有objectのgetdataを受けた際、`conn->pending_eviction`が立つこと・`bytes_sent`が
+    0のままであることを検証した。標準の`write()`はSIGPIPEでプロセスごと落ちるため
+    (`main.c`が本番で`signal(SIGPIPE, SIG_IGN)`している対策と同じ理由)、テスト内でも
+    同様に無視するよう追加した。ビルド警告ゼロ、`build-Debug`でctest 45件全通過。
+
+    なお、`failed to send inv`側の減少はcommit 2ec2393という明確なコードレベルの
+    原因があるのに対し、`failed to send object for getdata`側の8月末→9月上旬の
+    自然な激減については根本原因が未解明のまま残っている。ネットワーク側の一時的な
+    事情(不安定なpeerの入れ替わり等)による可能性はあるが確証はなく、今回追加した
+    安全網はあくまで「発生した場合に素早く刈り取る」ものであり、なぜ発生頻度自体が
+    下がったのかという問いには答えていない点に注意。
