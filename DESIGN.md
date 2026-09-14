@@ -2749,3 +2749,70 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     優先度は中程度。本番で再発しているわけではなく、構造的な対策は既に入っているため
     緊急ではないが、項目27のような「事故ってから原因究明」を繰り返さないための投資として
     意味がある。
+
+32. **起動直後のonionpeer自己announceがbroadcast_invの空振りに終わり、広告がsend_big_invという
+    別経路へ暗黙に依存している(未着手)**: 2026-09-15、ユーザーから「起動2時間経過以降の
+    `announced our onion peer`で、dinvで1ピアに対してのみ広告した直後にinvで接続している全ピアに
+    広告しているように見えるが気のせいか」という指摘があり、本番daemon(daemon A)の直近20時間の
+    journalを調査した。
+
+    **まず指摘そのものは気のせいではなく、かつバグでもなくDandelion++の設計通りだった。**
+    `bm_object_sync_announce_onion_peer`(`src/infra/object_sync.c`)はobject_pool.dbへinsert後に
+    `bm_peer_registry_broadcast_inv`を呼ぶが、自分発のobjectなので`bm_dandelion_decide`がSTEM判定し、
+    stem successor 1本にだけdinvが出る(ログの`inv to 0 peer(s), dinv to 1 peer(s)`)。その後
+    `bm_dandelion_expire_and_refluff`(`src/infra/dandelion.c`)が`peer_connector_thread`の1秒
+    ポーリング経由で`fluff_deadline`(= `BM_DANDELION_TIMEOUT_BASE_SECONDS`(10秒) +
+    平均30秒の指数分布)の到来を検出し、同じhashを通常のinvで全ピアへ再ブロードキャストする。
+    つまりDandelion++として振る舞うのは最初の「10秒 + α」だけで、fluff後(`fluffed_at != 0`)は
+    以降の`bm_dandelion_decide`が常にFLUFFを返し、通常のobjectと完全に同じ扱いになる。
+
+    実測(9/14 05:40〜9/15 01:37の20時間、announce 9件。onionアドレスはマスク済み):
+    dinv送出からその直後のinvブロードキャストまでの間隔は+10s/+10s/+14s/+18s/+19s/+21s/+22s/
+    +28s/+37s/+50sで、平均24.3秒・**最小値がちょうど10秒**と、`10 + Exp(平均30)`の分布に整合する。
+    同期間のinvブロードキャストの背景レートは94.3秒に1回なので、無関係なinvがたまたま
+    [+10s, +50s]の窓に入る確率は1件あたり0.35、dinv 35件全部で7×10⁻¹⁷。偶然ではない。
+
+    **本題(この項目で残す課題)は、その調査の副産物として見つかった起動直後の挙動。**
+    9/15 01:04:22の再起動直後のannounceには、`[peer_registry] broadcast inv:`のログが1行も
+    出ていない。`bm_peer_registry_broadcast_inv`は`pending_count > 0`のときだけサマリを出す
+    (§11 2026-08-24)ので、これは**接続ピア数0の状態でannounceした**ことを意味する(直後の行が
+    最初の`peer_connector connecting to ...`)。それでも`src/main.c`は
+    `object_sync_ctx.last_onion_announce = time(NULL)`を無条件にセットするため、
+    `bm_object_sync_maybe_reannounce_onion_peer`による次の能動的な広告機会は
+    `BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS`(7380秒 = 約2時間3分)後になる。
+
+    ただし**実際には広告は届いている**。`send_big_inv`(`src/infra/object_sync.c`)が新規ピアとの
+    handshakeごとにobject_pool.dbの保有hash全件をinvで送るため、announce済みのonionpeer
+    objectもそこに含まれる。実ログでも01:05:18〜01:05:24に7本の
+    `queued big inv for new peer: 11842 of 11842 (excluded 0 still-stemming)`が出ており、
+    起動時のannounceから約1分で接続先全ピアへ渡っている。`excluded 0`なのは、announce時に
+    `reg->count == 0`で`bm_dandelion_decide`が一度も呼ばれずdandelionエントリ自体が作られて
+    おらず、副作用の無い`bm_dandelion_is_stemming`が0を返すため。
+
+    **したがってこれは現時点の実害ではなく、「壊れやすい暗黙の依存」として残す項目。**
+    問題は以下3点:
+    - `announce` → `broadcast_inv`が空振りしたことを呼び出し側が検知できず、ログ上は
+      `announced our onion peer`だけが出るので「広告できた」ように見える(可視性の欠如)。
+    - 起動直後の広告の成立が`send_big_inv`が全件送っていることに完全に依存している。
+      `send_big_inv`は元々「新規ピアへ自分の保有物一覧を知らせる」ための処理であって、
+      自己announceを配送する意図で書かれていない。保有hash数が既に11842件あり、将来
+      「big invで送る件数を直近N件に絞る」「TTLの短いobjectを除外する」といった素直な
+      最適化を入れた瞬間に、起動直後の自己announceが誰にも届かない状態へ静かに退行する。
+    - 起動直後のannounceはDandelion++のstemフェーズを完全にバイパスして通常invで拡散される
+      (dandelionエントリが作られないため)。onionpeer objectは自分のonionアドレスの公表が
+      目的なので匿名性上の実害は無いが、「自分発のobjectは必ずstemを経る」という§9の
+      不変条件が起動直後だけ成立していない点は記録しておく。
+
+    **対策案**: `bm_peer_registry_broadcast_inv`に「実際に何ピアへ送ったか」の戻り値を持たせ、
+    `main.c`の起動時announceが0だった場合は`last_onion_announce`をセットしない(0のままにする)。
+    そうすれば`bm_object_sync_maybe_reannounce_onion_peer`の次の1秒ポーリングで
+    「`last_onion_announce == 0`なので即座にannounce」の既存パスが自然に再試行に使える
+    (`tests/test_object_sync.c`シナリオ16が既にこの初回即時announceの挙動を検証している)。
+    ただしこの再試行はPoW計算をやり直すことになるため、objectを作り直さず既存hashだけ
+    再broadcastする形にするか、announce自体を「最初のピア接続が確立してから」へ遅延させるかは
+    設計判断が要る。後者の場合、`peer_connector`が最初のhandshake完了を検知する仕組みが
+    現状無いので、`last_onion_announce = 0`のまま放置して1秒ポーリングに任せる前者の方が
+    既存の構造には素直。
+
+    優先度は低め。現状カバーされており、daemon Aは再起動頻度も低い。ただし`send_big_inv`に
+    手を入れる作業が発生したときは、この依存関係を必ず思い出すこと。
