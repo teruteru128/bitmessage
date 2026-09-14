@@ -1496,7 +1496,9 @@ int main(void)
      * §11 2026-08-24 backlog項目6)。PyBitmessage本家(class_singleCleaner.pyの約2時間おき
      * チェック)に合わせ、BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS(7380秒)未満の間隔での
      * 呼び出しは実際にはannounceしないこと、間隔が明ければ実際にannounceされること、
-     * onion_addressがNULL/空文字列なら常にスキップされることを確認する --- */
+     * onion_addressがNULL/空文字列なら常にスキップされることを確認する。
+     * §11 2026-09-15 backlog項目32: 接続ピアが0本の間はannounceせずlast_onion_announceも
+     * 進めないこと、ピアが繋がった最初の呼び出しで初回announceが成立することも確認する --- */
     {
         const char *reannounce_onion = "f4bouzoomfsvlcx4bfrj36zkcecbr6xlp4np4v7v4gdbgaebrvgfd3id.onion";
 
@@ -1536,6 +1538,35 @@ int main(void)
         bm_object_sync_maybe_reannounce_onion_peer(&ctx, "", 8444, 1000 + 7380 * 100);
         CHECK(ONIONPEER_COUNT16() == before_null16,
               "NULL/empty onion_address should always be a no-op regardless of elapsed time");
+
+        /* §11 2026-09-15 backlog項目32: 接続ピアが1本も無い間はannounceせず、
+         * last_onion_announceも進めないこと。これが無いと、起動直後(peer_connector_threadが
+         * まだ最初の接続を確立していない時点)のannounceが誰にも届かないまま次の広告機会だけが
+         * BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS後へ飛ばされる。 */
+        {
+            struct bm_peer_registry empty_reg16;
+            bm_peer_registry_init(&empty_reg16);
+            struct bm_peer_registry *saved_reg16 = ctx.registry;
+            ctx.registry = &empty_reg16;
+
+            ctx.last_onion_announce = 0;
+            int before_empty16 = ONIONPEER_COUNT16();
+            bm_object_sync_maybe_reannounce_onion_peer(&ctx, reannounce_onion, 8444, 2000);
+            CHECK(ONIONPEER_COUNT16() == before_empty16,
+                  "an empty peer registry should suppress the announce entirely");
+            CHECK(ctx.last_onion_announce == 0,
+                  "last_onion_announce must stay 0 so the next poll retries once a peer connects");
+
+            /* ピアが1本でも繋がれば、同じlast_onion_announce==0の状態から即announceされる
+             * (起動直後の初回announceがこの経路で成立することの確認) */
+            ctx.registry = saved_reg16;
+            bm_object_sync_maybe_reannounce_onion_peer(&ctx, reannounce_onion, 8444, 2000);
+            CHECK(ONIONPEER_COUNT16() == before_empty16 + 1,
+                  "once a peer is registered the pending first announce should go out");
+            CHECK(ctx.last_onion_announce == 2000, "last_onion_announce should advance only on a real announce");
+
+            bm_peer_registry_destroy(&empty_reg16);
+        }
 
 #undef ONIONPEER_COUNT16
         sqlite3_finalize(count_stmt16);

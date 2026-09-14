@@ -538,8 +538,44 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
     return 0;
 }
 
+int bm_object_sync_validate_onion_address(const char *onion_address, int port)
+{
+    if (onion_address == NULL || onion_address[0] == '\0')
+    {
+        return -1;
+    }
+    /* §11 2026-09-15: bm_build_onionpeerの長さ・文字種検証をそのまま流用する(検証ロジックを
+     * 二重に持つとannounce側と条件がずれうるため)。expires_time/streamはここでは意味を
+     * 持たないが、payloadの組み立て自体が成功するかどうかを見るために形だけ渡す。 */
+    size_t payload_len = 0;
+    unsigned char *payload = bm_build_onionpeer(onion_address, (uint16_t)port, 1, 0, &payload_len);
+    if (payload == NULL)
+    {
+        return -1;
+    }
+    free(payload);
+    return 0;
+}
+
 /* §11 2026-08-24: PyBitmessage本家(class_singleCleaner.pyの
- * `timeWeLastClearedInventoryAndPubkeysTables < tick - 7380`)準拠の再送チェック間隔。 */
+ * `timeWeLastClearedInventoryAndPubkeysTables < tick - 7380`)準拠の再送チェック間隔。
+ *
+ * §11 2026-09-15: この「本家準拠」の妥当性をユーザーの指摘で実測から再確認した。本家の
+ * class_singleWorker.py:sendOnionPeerObjには
+ * `if state.Inventory.by_type_and_tag(objectType, tag): return  # not expired`
+ * という早期returnがあり(tagはport+hostのみのhashで時刻を含まないため自ノードでは不変)、
+ * ソースだけ読むと「TTL(本家は7日)が切れるまで再announceしない=実効間隔は約7日」に見える。
+ * 一度はその読みに基づいて「本家より約80倍頻繁」と判断しかけたが、本番daemonのjournalを
+ * 20時間分集計すると、2つの外部ノードがいずれもちょうど125分(≒7500秒)間隔で同一アドレスの
+ * onionpeer objectを再announceし続けていた(`discovered v3 onion peer`が10回・9回、
+ * 間隔のばらつきは秒単位)。125分は本家singleCleanerのループがcycleLength(300秒)ごとに
+ * `tick - 7380`を判定する構造から来る値(7380を300の倍数へ切り上げると7500)と一致する。
+ * つまり早期returnは実ネットワーク上では効いておらず、本家の実挙動はこの7380秒間隔と
+ * ほぼ同じ。早期returnが効かない理由はソースからは特定できていない(by_type_and_tagのSQL
+ * 経路もflushのtag書き込みも正しく見える)。参考までにMiNode-Refined
+ * (minode/manager.py:publish_tor_onion)はTTL 7日 + REFRESH_MARGIN 45分で明示的に
+ * スキップしており、実装ごとに方針が割れている。以上より、この間隔を「本家に合わせて」
+ * 延ばす変更は行わない。ソースの字面だけで本家準拠を判断すると誤るという実例。 */
 #define BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS 7380
 
 void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
@@ -551,6 +587,17 @@ void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, 
     }
     if (ctx->last_onion_announce != 0
         && now - (int64_t)ctx->last_onion_announce < BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS)
+    {
+        return;
+    }
+    /* §11 2026-09-15 backlog項目32: 接続ピアが1本も無い間はannounceしない(last_onion_announceも
+     * 進めない)。bm_peer_registry_countが返すreg->countは、bm_peer_registry_broadcast_invが
+     * 実際にループする対象そのものなので、「broadcastが空振りになる条件」と過不足なく一致する。
+     * これが無いと、起動直後(peer_connector_threadがまだ最初の接続を確立していない時点)の
+     * announceが誰にも届かないまま、last_onion_announceだけが進んで次の広告機会が
+     * BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS後になる(object_sync.hのdoc参照)。
+     * registry==NULL(ネットワークを張らないDBレベルのテスト等)は従来通り素通りさせる。 */
+    if (ctx->registry != NULL && bm_peer_registry_count(ctx->registry) == 0)
     {
         return;
     }

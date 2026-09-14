@@ -2818,5 +2818,74 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     現状無いので、`last_onion_announce = 0`のまま放置して1秒ポーリングに任せる前者の方が
     既存の構造には素直。
 
-    優先度は低め。現状カバーされており、daemon Aは再起動頻度も低い。ただし`send_big_inv`に
-    手を入れる作業が発生したときは、この依存関係を必ず思い出すこと。
+    **対応済み(2026-09-15、同日中にユーザー承認のうえ実装)**: 上記「対策案」のうち、
+    `broadcast_inv`に戻り値を持たせる案ではなく、より単純な次の形を採った。
+
+    - `bm_object_sync_validate_onion_address`(object_sync.h/.c)を新設。`bm_build_onionpeer`を
+      呼んで`free`するだけの、PoWもDB登録もbroadcastもしない形式検証専用の関数。
+    - `main.c`の起動時処理2箇所から`bm_object_sync_announce_onion_peer`の呼び出しを除去した。
+      `manual_onion_address`分岐は、announceの成否を`bm_peer_manager_mark_self`と
+      `self_onion_address`のセットのゲートにも使っていた(§11 2026-08-23のバグ修正)ため、
+      そのゲートを上記の検証関数へ置き換えてゲート自体は維持している。Tor ControlPort分岐は
+      アドレスがADD_ONION応答由来で元々ゲートが無いので、announce呼び出しを消すだけ。
+      どちらも`object_sync_ctx.last_onion_announce = time(NULL)`を削除し、0のままにする。
+    - `bm_object_sync_maybe_reannounce_onion_peer`に
+      `if (ctx->registry != NULL && bm_peer_registry_count(ctx->registry) == 0) return;`を追加。
+      `bm_peer_registry_count`が返す`reg->count`は`bm_peer_registry_broadcast_inv`が実際に
+      ループする対象そのものなので、「broadcastが空振りになる条件」と過不足なく一致する。
+      `registry == NULL`(ネットワークを張らないDBレベルのテスト)は従来通り素通りさせる。
+
+    これにより、`peer_connector_thread`の1秒間隔ポーリングが最初のピア確立を検出した時点で、
+    既存の「`last_onion_announce == 0`なら即announce」パスがそのまま初回announceとして働く。
+    新しい状態機械もスレッドもフラグも増えていない(増えたのは`if`1つと検証関数1つ)。
+    起動直後だけDandelion++をバイパスしていた状態も構造的に解消された(ピアが居る
+    ⇒`bm_dandelion_decide`が呼ばれる⇒stemエントリが必ず作られる)。副次効果として起動時の
+    PoWが`main()`から無くなり、起動が速くなる。
+
+    検証は`tests/test_object_sync.c`シナリオ16へ追記(空のregistryではannounceされず
+    `last_onion_announce`も0のまま、その直後にピアのあるregistryへ戻すと同じ
+    `last_onion_announce == 0`の状態から初回announceが成立すること)。ガードを一時的に
+    `if (0)`へ潰すと当該2件が実際にFAILすることを確認済み(テストが空振りでないことの確認)。
+    ビルド警告ゼロ、ctest 46件100%通過。
+
+    **不採用にした案**: 「起動直後もstemを徹底する」(ピアが繋がるまでstem待ちのエントリを
+    保持し、最初のoutbound接続が確立した時点でそれをstem先に割り当てて送る)は見送った。
+    本家PyBitmessageは実際にこれをやっており(`network/dandelion.py`の`maybeAddStem`が
+    `child=None`のstemエントリを保持し、新規接続時に割り当てて`invQueue`へ再投入、対になる
+    `maybeRemoveStem`が切断時にchildをNoneへ戻してタイムアウトを引き直す)、移植は可能。
+    しかし我々の`bm_dandelion_decide`は「接続ごとに呼ばれてその場で判定する」設計なので、
+    「エントリを先に作ってchildを後から埋める」構造を持ち込むとエントリの生存期間管理が
+    丸ごと増える。これは項目27のdouble-free事故と同じ領域で、得られるのは再起動時1回分の
+    stem保護のみ。ユーザーからも「複雑になってそこの部分が逆に安全から遠ざかりそう」という
+    懸念が出ており、同意して不採用とした。
+
+    **併せて調査し、変更しないと決めた件(再announce間隔)**: 実装作業の前に、
+    `BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS`(7380秒)が本家より過剰ではないかを検討した。
+    本家の`sendOnionPeerObj`には
+    `if state.Inventory.by_type_and_tag(objectType, tag): return  # not expired`
+    という早期returnがあり(tagは`port + host`のみのhashで時刻を含まないため自ノードでは不変)、
+    ソースだけ読むと実効間隔はTTL(本家は7日)相当に見える。これを根拠に一度は
+    「我々は本家の約80倍の頻度で流している」と判断しかけたが、**ユーザーから
+    「journalctlで見る限り`discovered v3 onion peer`で同じアドレスが2時間おきに飛んできている、
+    実態では早期リターンしていないのでは」との指摘があり、実測で否定された。**
+    直近20時間のjournalをアドレス別に集計すると、外部2ノードがいずれもちょうど125分
+    (≒7500秒)間隔で同一アドレスを再announceし続けていた(10回・9回)。125分は本家
+    `singleCleaner`のループが`cycleLength`(300秒)ごとに`tick - 7380`を判定する構造から
+    出る値(7380を300の倍数へ切り上げると7500)と一致する。つまり早期returnは実ネットワーク上
+    では効いておらず、本家の実挙動は我々の7380秒とほぼ同じ。早期returnが効かない理由は
+    ソースからは特定できていない(`by_type_and_tag`のSQL経路も`flush`のtag書き込みも
+    正しく見える)。参考までにMiNode-Refined(`minode/manager.py:publish_tor_onion`)は
+    TTL 7日 + `REFRESH_MARGIN` 45分で明示的にスキップしており、実装ごとに方針が割れている。
+    以上より間隔は7380秒のまま変更しない。CLAUDE.mdの「本家との一致・不一致は必ず実ソースを
+    確認してから判断する」について、**実ソースを読んでもなお実挙動とは異なりうる**という
+    実例として記録しておく(この経緯は`object_sync.c`の当該`#define`のコメントにも残した)。
+
+    なお`bm_peer_registry_pick_random_dandelion_peer`は既に`BM_SERVICE_NODE_DANDELION`と
+    outbound(`BM_FD_CLIENT_SOCKET`)で絞っており、本家invthread.pyの「stem先がNODE_DANDELION
+    非対応ならfluffへフォールバック」という意図と揃っている。こちらは変更不要。
+
+    **残件**: 上記対応後も`send_big_inv`が新規ピアへ保有hash全件を送る挙動自体は変えていない
+    ため、起動直後のannounceは「最初のピア確立時のannounce」と「そのピアへのbig inv」の両方に
+    乗りうる(重複はhashが同じなので受信側で吸収される)。また`bm_dandelion_expire_and_refluff`
+    のfluffは`except=NULL`で呼ばれており、直前にdinvを送ったstem successorにも改めてinvが
+    飛ぶ(相手は通常getdata済みなので無害だが1パケット無駄)。どちらも優先度は低い。

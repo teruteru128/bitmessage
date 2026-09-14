@@ -459,8 +459,12 @@ int main(int argc, char **argv)
     const char *manual_onion_address = env_or_str("BM_ONION_ADDRESS", onion_address_from_file);
     if (listen_conn != NULL && manual_onion_address != NULL)
     {
-        if (bm_object_sync_announce_onion_peer(&object_sync_ctx, manual_onion_address, virtual_port,
-                                                (int64_t)time(NULL)) == 0)
+        /* §11 2026-09-15 backlog項目32: 以前はここでbm_object_sync_announce_onion_peerを呼び、
+         * その成否をmark_self等のゲートにしていた。しかしこの時点ではpeer_connector_threadが
+         * まだ起動しておらずregistryが空なので、announceのbroadcast_invは必ず空振りしていた。
+         * 形式検証だけを行う関数へ差し替え、実際のannounceは最初のピアが繋がってから
+         * bm_object_sync_maybe_reannounce_onion_peerに任せる(object_sync.hのdoc参照)。 */
+        if (bm_object_sync_validate_onion_address(manual_onion_address, virtual_port) == 0)
         {
             bm_log_info(
                     "[tor_control] using statically configured onion address: %s:%d -> 127.0.0.1:%d "
@@ -475,9 +479,14 @@ int main(int argc, char **argv)
              * 長さ検証に落ちる、まさにそのケース)。実害は無い(list_topはis_self=0でしか
              * 選ばないため接続候補には影響しない)が、announce成功時のみ呼ぶよう修正した。 */
             bm_peer_manager_mark_self(peers_db, manual_onion_address, virtual_port, 1);
-            /* §11 2026-08-24 backlog項目6: 上でannounce済みなので、peer_connector_threadの
-             * 定期reannounceゲートが起動直後の1回目で即座に二重announceしないよう、
-             * last_onion_announceを今セットしておく。
+            /* §11 2026-08-24 backlog項目6 / 2026-09-15 backlog項目32: 以前はここで
+             * last_onion_announce=time(NULL)をセットしていた(上でannounce済みなので
+             * peer_connector_threadの定期reannounceゲートが起動直後の1回目で即座に
+             * 二重announceしないようにするため)。現在は上がannounceではなく形式検証のみに
+             * なったため、last_onion_announceは0のままにしておく。こうすると
+             * bm_object_sync_maybe_reannounce_onion_peerの「last_onion_announce==0なら
+             * 即announce」パスが、最初のピア確立を検出した最初のポーリングでそのまま
+             * 初回announceとして働く(object_sync.hのdoc参照)。
              * §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚した重大バグ: 以前は
              * strncpyのみでNUL終端していなかった。self_onion_addressは宣言直後に
              * self_onion_address[0]='\0'しかしていない(配列全体のゼロ初期化ではない)ため、
@@ -486,8 +495,8 @@ int main(int argc, char **argv)
              * (63文字)以上だと、NUL終端されないまま未初期化のスタック領域を読む
              * 文字列として扱われてしまう(正規のv3 onionアドレスは62文字なので通常は
              * 踏まないが、設定ミスがあれば容易に踏みうるバッファオーバーリード)。
-             * snprintfなら常にNUL終端されるため安全(この時点でbm_object_sync_announce_
-             * onion_peerが既に成功しており、manual_onion_addressはbm_build_onionpeerの
+             * snprintfなら常にNUL終端されるため安全(この時点でbm_object_sync_validate_
+             * onion_addressが既に成功しており、manual_onion_addressはbm_build_onionpeerの
              * 検証を通過済み=正規のv3 onionアドレス(62文字)であることが保証されている
              * ため実際には切り詰めは発生しないが、-Wformat-truncationはその保証を
              * 追跡できず、cfg.onion_address[256]相当の宣言サイズだけを見て「255byte書き
@@ -495,7 +504,6 @@ int main(int argc, char **argv)
              * ことを明示し、警告を解消する)。 */
             snprintf(self_onion_address, sizeof(self_onion_address), "%.*s",
                      (int)(sizeof(self_onion_address) - 1), manual_onion_address);
-            object_sync_ctx.last_onion_announce = time(NULL);
         }
     }
     /* §11 inbound接続 Stage 2: Tor ControlPort連携。BM_TOR_CONTROL=1が設定されており、かつ
@@ -548,19 +556,23 @@ int main(int argc, char **argv)
                 bm_log_info("[tor_control] hidden service ready: %s:%d -> 127.0.0.1:%d\n", onion_address,
                         virtual_port, inbound_port);
 
-                /* §11 onionpeer objectでの自己announce(送信側)。registryはこの時点では
-                 * まだ空(peer_connector_threadはこの後起動する)だが、object_pool.dbへ
-                 * 登録しておけば以後getdataで配れる状態になる(他の自己生成object、
-                 * getpubkey応答等と同じ扱い、object_sync.h参照)。 */
-                bm_object_sync_announce_onion_peer(&object_sync_ctx, onion_address, virtual_port,
-                                                    (int64_t)time(NULL));
+                /* §11 onionpeer objectでの自己announce(送信側)。
+                 * §11 2026-09-15 backlog項目32: 以前はここでbm_object_sync_announce_onion_peerを
+                 * 呼んでいた。「registryはこの時点ではまだ空(peer_connector_threadはこの後
+                 * 起動する)だが、object_pool.dbへ登録しておけば以後getdataで配れる状態になる」
+                 * という意図だったが、getdataは相手がinvでhashを知っていて初めて飛んでくるもので、
+                 * そのinvを送る手段(broadcast_inv)がまさに空振りしていたため、この経路単体では
+                 * 誰にも広告できていなかった(実際にはsend_big_invが新規ピアへ保有hash全件を
+                 * 送るので結果的に届いていた)。announceは最初のピアが繋がってから
+                 * bm_object_sync_maybe_reannounce_onion_peerに任せ、ここでは何もしない。
+                 * なおこちらの経路のonion_addressはTorのADD_ONION応答由来なので、
+                 * manual_onion_address分岐のような形式検証のゲートは元々置いていない。 */
                 /* §11 2026-08-22: 自分自身のonionアドレスをpeers.dbへis_self=1としてマークし、
                  * 接続候補選定から除外する(peer_manager.h参照)。 */
                 bm_peer_manager_mark_self(peers_db, onion_address, virtual_port, 1);
                 /* §11 2026-08-24 backlog項目6: manual_onion_address分岐と同じ理由で、
                  * onion_addressはこの直後freeされるため生存する自前バッファへ控えておく。 */
                 strncpy(self_onion_address, onion_address, sizeof(self_onion_address) - 1);
-                object_sync_ctx.last_onion_announce = time(NULL);
             }
             free(onion_address);
             free(new_private_key);

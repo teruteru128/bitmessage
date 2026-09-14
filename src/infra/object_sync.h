@@ -137,6 +137,26 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
                                         int64_t now);
 
 /*
+ * §11 2026-09-15: onion_address/portがonionpeer objectとして組み立て可能な形式かどうかだけを
+ * 判定する(PoWもobject_pool.dbへの登録もbroadcastも一切行わない)。形式が正しければ0、
+ * 不正なら-1。
+ *
+ * これはmain.cの起動時処理のために切り出したもの。起動時のannounceは接続ピア数0の状態で
+ * 実行されるためbm_peer_registry_broadcast_invが空振りし、誰にも広告できていなかった
+ * (DESIGN.md §11 backlog項目32)。一方でmain.cは「announceが成功したか」を
+ * bm_peer_manager_mark_self(is_self=1の書き込み)とself_onion_addressのセットのゲートにも
+ * 使っており(§11 2026-08-23のバグ修正、不正な値でpeers.dbへ壊れた行が入るのを防ぐ目的)、
+ * announce呼び出しを単純に削除するとその検証まで失われる。そこで「検証」と「announce」を
+ * 分離し、起動時は検証のみ・実際のannounceはピアが1本以上繋がってから
+ * bm_object_sync_maybe_reannounce_onion_peerに任せる形にした。
+ *
+ * 副次効果として、起動時のPoWがmain()から無くなるため起動が速くなる
+ * (BM_ONIONPEER_ANNOUNCE_TTL_SECONDSのコメントが意図していた「main()を長時間ブロック
+ * しにくくする」のと同じ方向)。
+ */
+int bm_object_sync_validate_onion_address(const char *onion_address, int port);
+
+/*
  * §11 2026-08-24 backlog項目6: onionpeer自己announceの定期再送(PyBitmessage本家
  * class_singleCleaner.pyの約2時間おきの周期処理に相当)。以前は起動時に1回
  * bm_object_sync_announce_onion_peerを呼ぶだけで、TTL(BM_ONIONPEER_ANNOUNCE_TTL_SECONDS、
@@ -144,9 +164,28 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
  * 基準に、BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS未満の間隔での呼び出しは即returnする
  * (呼び出し元は間引き無しで毎回呼んでよい、peer_connector.cの1秒間隔ポーリングループ
  * からの利用を想定)。onion_addressがNULLまたは空文字列なら何もしない(Tor未使用の
- * 構成向け)。main.cが起動時に直接announce_onion_peerを呼んだ直後は、呼び出し側が
- * ctx->last_onion_announceを現在時刻にセットしておくことで、この関数の初回呼び出しでの
- * 二重announceを避ける想定(main.c参照)。
+ * 構成向け)。
+ *
+ * §11 2026-09-15 backlog項目32の対応: 以前はmain.cが起動時に直接announce_onion_peerを呼び、
+ * その直後にctx->last_onion_announceを現在時刻へセットすることでこの関数の初回呼び出しでの
+ * 二重announceを避けていた。しかし起動時点ではpeer_connector_threadがまだ起動しておらず
+ * registryが空なので、そのannounceはbm_peer_registry_broadcast_invが空振りし
+ * (pending_count==0でサマリログすら出ない)、誰にも広告できていなかった。それでも
+ * last_onion_announceだけは進むため、能動的な広告の次の機会は
+ * BM_ONIONPEER_REANNOUNCE_INTERVAL_SECONDS後になっていた(実際にはsend_big_invが新規ピアへ
+ * 保有hash全件を送るため結果的に届いており実害は出ていなかったが、send_big_inv側の仕様変更で
+ * 静かに壊れる暗黙の依存だった)。
+ *
+ * 現在はmain.cは起動時にbm_object_sync_validate_onion_addressで形式検証だけを行い、
+ * last_onion_announceは0のままにしておく。この関数が「接続ピアが1本も無ければ何もせず
+ * return(last_onion_announceも更新しない)」ようになったため、peer_connector_threadの
+ * 1秒間隔ポーリングが最初のピア確立を検出した時点で、既存の「last_onion_announce==0なら
+ * 即announce」パスがそのまま初回announceとして働く。これにより起動直後だけDandelion++を
+ * バイパスしていた状態(registryが空だとbm_dandelion_decideが一度も呼ばれずstemエントリすら
+ * 作られない)も構造的に解消される。
+ *
+ * ピア数の判定はctx->registryが非NULLのときだけ行う。registry==NULL(ネットワークを張らない
+ * DBレベルのテスト等)は従来通り素通りさせる。
  */
 void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
                                                  int64_t now);
