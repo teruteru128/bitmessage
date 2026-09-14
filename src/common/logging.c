@@ -124,6 +124,14 @@ void bm_log_init(void)
 
 void bm_log_leveled(enum bm_log_level level, const char *fmt, ...)
 {
+    va_list ap;
+    va_start(ap, fmt);
+    bm_log_vleveled(level, fmt, ap);
+    va_end(ap);
+}
+
+void bm_log_vleveled(enum bm_log_level level, const char *fmt, va_list ap)
+{
     if (level < g_min_level)
     {
         return;
@@ -139,10 +147,7 @@ void bm_log_leveled(enum bm_log_level level, const char *fmt, ...)
      * 組み立ててから、時刻・レベルタグ込みで単一のfprintf呼び出しにまとめることで、
      * 1行分の出力が他スレッドの出力と混ざらないようにする。 */
     char msg[4096];
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
 
     if (g_include_timestamp)
     {

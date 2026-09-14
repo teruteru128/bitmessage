@@ -55,18 +55,16 @@ struct bm_api_server_config
     struct bm_peer_registry *registry;
 };
 
-/* bind+listenする。成功時0、*out_listen_fdにfdを設定。失敗時(ポート使用中等)は非0 */
-int bm_api_server_listen(const struct bm_api_server_config *config, int *out_listen_fd);
-
-/* accept済みの1コネクションに対して1リクエスト処理する(処理後closeする) */
-void bm_api_server_handle_connection(int client_fd, const struct bm_api_server_config *config);
+/*
+ * §11 2026-09-15 libmicrohttpdへの移行でbm_api_server_listen()/
+ * bm_api_server_handle_connection()/bm_api_server_serve_forever()は削除した。
+ * bind/listen/accept/HTTPパースは全てMHDの内部に入り、外から個別に呼ぶ意味が無くなったため
+ * (いずれも公開はされていたがbm_api_server_thread以外からは呼ばれていなかった)。
+ * §3.5の「公開ヘッダに外部ライブラリの型を露出させない」規律に倣い、このヘッダには
+ * struct MHD_Daemon*もcJSON*も出さない。
+ */
 
 /*
- * listen_fdに対してaccept loopを回し続ける(呼び出し元スレッドをブロックする)。
- * accept()を直接ブロッキングでは呼ばず、poll()に1秒のタイムアウトを与えて*stop_flagを
- * 定期的に再チェックすることでグレースフルシャットダウンに対応する(peer_connector_thread
- * と同じポーリング方式、§11)。*stop_flagが非0になれば次のタイムアウトで抜ける。
- *
  * §11 2026-08-24 backlog項目9(TSan導入)で発覚: 以前は`volatile sig_atomic_t`だったが、
  * これは「同一スレッド内でのシグナルハンドラとの安全な読み書き」を保証するだけで、
  * スレッド間の可視性・順序(happens-before関係)は一切保証しない。main()はsigwait経由で

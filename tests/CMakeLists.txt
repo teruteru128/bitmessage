@@ -40,6 +40,14 @@ add_executable(test_api_server test_api_server.c)
 target_link_libraries(test_api_server PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME api_server COMMAND test_api_server)
 
+# §11 2026-09-15 libmicrohttpd + cJSON移行に伴うHTTPトランスポート/JSON-RPCディスパッチ層の
+# テスト。応答JSONの検証にcJSONを直接使うのでPkgConfig::CJSONを明示的にリンクする
+# (bm_coreはPRIVATEでリンクしているためインクルードパスが伝播しない)。
+add_executable(test_api_transport test_api_transport.c)
+target_link_libraries(test_api_transport PRIVATE bm_core bm_infra bm_pow Threads::Threads
+                      PkgConfig::CJSON OpenSSL::Crypto)
+add_test(NAME api_transport COMMAND test_api_transport)
+
 add_test(NAME cli_integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)

@@ -68,6 +68,15 @@ v1.1で実装済み)
 - CMake 3.25以降、Ninja(または他のCMake対応ビルドシステム)
 - Cコンパイラ(GCC/Clang、C11)
 - OpenSSL、SQLite3、pthread
+- libmicrohttpd、cJSON(JSON-RPC APIサーバーのHTTPトランスポートとJSON処理、
+  `pkg-config`経由で検出する。DESIGN.md §6.3参照)
+
+Debian/Ubuntu系なら以下で揃う。
+
+```sh
+sudo apt install cmake ninja-build build-essential pkg-config \
+                 libssl-dev libsqlite3-dev libmicrohttpd-dev libcjson-dev
+```
 
 ```sh
 cmake -B build-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug

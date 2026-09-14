@@ -1,6 +1,8 @@
 #ifndef BM_COMMON_LOGGING_H
 #define BM_COMMON_LOGGING_H
 
+#include <stdarg.h> /* bm_log_vleveledのva_list */
+
 /*
  * §11 2026-08-23: fprintf(stderr, ...)による診断ログには時刻が無く、実際にどの起動
  * (どのrun)のログなのか行番号とrunの区切り("DB初期化完了"等)から推測するしかなかった
@@ -64,6 +66,21 @@ void bm_log_init(void);
 void bm_log_leveled(enum bm_log_level level, const char *fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 2, 3)))
+#endif
+    ;
+
+/*
+ * bm_log_leveledのva_list版。§11 2026-09-15 libmicrohttpdへの移行で追加した。
+ * MHDの内部エラーログはMHD_OPTION_EXTERNAL_LOGGERで
+ * `void (*)(void *cls, const char *fmt, va_list ap)`型のコールバックへ流す仕様で、
+ * 可変長引数をva_listのまま受け取る入口が必要だったため。これが無いと
+ * MHD_USE_ERROR_LOGで素のstderrへ直接書かれ、タイムスタンプもレベルタグも付かない
+ * 行がjournalに混ざる(しかもローカルの任意プロセスが接続/切断を繰り返すだけで
+ * 出力させられる)。通常の呼び出しには従来通りbm_log_debug/info等のマクロを使うこと。
+ */
+void bm_log_vleveled(enum bm_log_level level, const char *fmt, va_list ap)
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 0)))
 #endif
     ;
 

@@ -1,22 +1,22 @@
 #include "api_server.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cjson/cJSON.h>
+#include <limits.h>
+#include <microhttpd.h>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
-#include <openssl/evp.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "../common/broadcast_item.h"
 #include "../common/hash.h"
-#include "../common/json.h"
 #include "../common/logging.h"
 #include "../infra/network.h"
 #include "../infra/object_sync.h"
@@ -52,37 +52,14 @@ static char *dup_cstr(const char *s)
 
 /* --- HTTP Basic認証 --- */
 
-static int base64_decode(const char *b64, unsigned char *out, size_t out_cap, size_t *out_len)
-{
-    size_t in_len = strlen(b64);
-    if (in_len == 0 || in_len % 4 != 0)
-    {
-        return -1;
-    }
-    size_t max_out = (in_len / 4) * 3;
-    if (max_out > out_cap)
-    {
-        return -1;
-    }
-    int n = EVP_DecodeBlock(out, (const unsigned char *)b64, (int)in_len);
-    if (n < 0)
-    {
-        return -1;
-    }
-    size_t actual = (size_t)n;
-    if (in_len >= 1 && b64[in_len - 1] == '=' && actual > 0)
-    {
-        actual--;
-    }
-    if (in_len >= 2 && b64[in_len - 2] == '=' && actual > 0)
-    {
-        actual--;
-    }
-    *out_len = actual;
-    return 0;
-}
-
-/* 定数時間比較(タイミング攻撃対策) */
+/*
+ * 定数時間比較(タイミング攻撃対策)。
+ *
+ * §11 2026-09-15 libmicrohttpd移行後もこれは残す。Authorizationヘッダの探索とbase64の
+ * デコード(以前はEVP_DecodeBlockで自前実装していた)はMHD_basic_auth_get_username_password3()
+ * が肩代わりするが、MHDが提供するのはそこまでで、照合そのものはアプリ側の責任だからである。
+ * §6.1で「比較は定数時間で行う」と決めているため、単純なstrcmpに退化させてはならない。
+ */
 static int constant_time_equal(const char *a, size_t a_len, const char *b, size_t b_len)
 {
     if (a_len != b_len)
@@ -97,33 +74,91 @@ static int constant_time_equal(const char *a, size_t a_len, const char *b, size_
     return diff == 0;
 }
 
-static int check_basic_auth(const struct bm_api_server_config *config, const char *auth_header)
+/*
+ * §11 2026-09-15 config->usernameがNULLなら認証不要(テスト用、従来通り)。
+ * ユーザー名とパスワードを"user:pass"に連結してから1回比較していた旧実装と違い、MHDが
+ * 最初の':'で切り分けた各要素を個別に比較する(結果は同じだが、連結用の固定長bufferと
+ * snprintfによる切り詰めの可能性が無くなる。旧実装はexpected[256]に収まらない長い
+ * apipasswordを設定すると静かに切り詰められ、切り詰め後の値でも認証が通ってしまった)。
+ * ユーザー名が違っていてもパスワードの比較を省略しない(&=で両方必ず評価する)のは、
+ * 応答時間からユーザー名の当たり外れを推測されないようにするため。
+ */
+static int check_basic_auth(const struct bm_api_server_config *config, struct MHD_Connection *connection)
 {
     if (config->username == NULL)
     {
         return 1; /* 認証設定なし(テスト用) */
     }
-    if (auth_header == NULL || strncmp(auth_header, "Basic ", 6) != 0)
+    struct MHD_BasicAuthInfo *info = MHD_basic_auth_get_username_password3(connection);
+    if (info == NULL)
     {
-        return 0;
+        return 0; /* Authorizationヘッダが無い、またはBasicとして解釈できない */
     }
-    unsigned char decoded[256];
-    size_t decoded_len = 0;
-    if (base64_decode(auth_header + 6, decoded, sizeof(decoded) - 1, &decoded_len) != 0)
-    {
-        return 0;
-    }
-    decoded[decoded_len] = '\0';
+    /* passwordはクライアントが':'以降を送らなかった場合NULLになりうる(microhttpd.hの
+     * struct MHD_BasicAuthInfoのコメント参照)ので空文字として扱う */
+    const char *password = info->password != NULL ? info->password : "";
+    size_t password_len = info->password != NULL ? info->password_len : 0;
+    const char *expected_password = config->password != NULL ? config->password : "";
 
-    char expected[256];
-    snprintf(expected, sizeof(expected), "%s:%s", config->username, config->password);
-    return constant_time_equal((const char *)decoded, decoded_len, expected, strlen(expected));
+    int ok = constant_time_equal(info->username, info->username_len, config->username,
+                                  strlen(config->username));
+    ok &= constant_time_equal(password, password_len, expected_password, strlen(expected_password));
+
+    MHD_free(info);
+    return ok;
+}
+
+/* --- cJSONヘルパー(旧自前bm_json APIとの意味差を吸収する、§11 2026-09-15) --- */
+
+/*
+ * paramsが配列でなければNULLを返す。cJSON_GetArrayItem()はオブジェクトを渡されると
+ * そのメンバを添字順に返してしまい、「型が違えばNULL」だった旧bm_json_array_getと
+ * 挙動が変わる(params={"0":"..."}のようなリクエストで引数が通ってしまう)。配列要素の
+ * 取得は必ずこのラッパー経由で行うこと。
+ */
+static const cJSON *param_at(const cJSON *params, size_t i)
+{
+    if (!cJSON_IsArray(params) || i > (size_t)INT_MAX)
+    {
+        return NULL;
+    }
+    return cJSON_GetArrayItem(params, (int)i);
+}
+
+/* 旧bm_json_as_string互換: 文字列でなければNULL */
+static const char *json_cstr(const cJSON *v)
+{
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+/* 旧bm_json_as_number互換: 数値でなければ0 */
+static double json_num(const cJSON *v)
+{
+    return cJSON_IsNumber(v) ? v->valuedouble : 0.0;
+}
+
+/* 旧bm_json_object_get互換。cJSON_GetObjectItem()は大文字小文字を区別しないので、
+ * 区別する方(旧実装と同じstrcmp相当)を明示的に使う */
+static cJSON *json_obj_get(const cJSON *obj, const char *key)
+{
+    return cJSON_GetObjectItemCaseSensitive(obj, key);
+}
+
+/*
+ * 旧bm_json_new_string互換だが、NULLを空文字として扱う。cJSON_CreateString(NULL)はNULLを
+ * 返し、それをcJSON_AddItemToObject()へ渡すとキーごと黙って落ちる(旧bm_json_new_stringは
+ * NULLでクラッシュしたので「NULLは来ない」前提のコードだが、DBのlabelがNULLになる等の
+ * 想定外が起きたときにレスポンスのキーが消えるより空文字が入る方が呼び出し側に優しい)。
+ */
+static cJSON *json_str(const char *s)
+{
+    return cJSON_CreateString(s != NULL ? s : "");
 }
 
 /* --- ハンドラ辞書(§6.0-6.1) --- */
 
-typedef bm_json_value_t *(*bm_api_handler_fn)(const struct bm_api_server_config *config,
-                                               const bm_json_value_t *params, char **out_error);
+typedef cJSON *(*bm_api_handler_fn)(const struct bm_api_server_config *config,
+                                               const cJSON *params, char **out_error);
 
 struct bm_api_method
 {
@@ -131,9 +166,9 @@ struct bm_api_method
     bm_api_handler_fn handler;
 };
 
-static const char *param_str(const bm_json_value_t *params, size_t i)
+static const char *param_str(const cJSON *params, size_t i)
 {
-    return bm_json_as_string(bm_json_array_get(params, i));
+    return json_cstr(param_at(params, i));
 }
 
 static void hex_encode(const unsigned char *data, size_t len, char *out)
@@ -166,8 +201,8 @@ static int hex_decode_fixed(const char *hex, unsigned char *out, size_t out_len)
     return 0;
 }
 
-static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *passphrase = param_str(params, 1);
@@ -192,7 +227,7 @@ static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *confi
          * object_sync.hのbm_object_sync_backfill_trial_decryptコメント参照)。 */
         bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address);
     }
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
 /*
@@ -202,8 +237,8 @@ static bm_json_value_t *h_unlockAddress(const struct bm_api_server_config *confi
  * [{address, unlocked}]の配列にし、呼び出し側が「どのアドレスが別passphraseだったか」を
  * 判別できるようにしてある。
  */
-static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *config,
-                                              const bm_json_value_t *params, char **out_error)
+static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
+                                              const cJSON *params, char **out_error)
 {
     const char *passphrase = param_str(params, 0);
     if (passphrase == NULL)
@@ -233,13 +268,13 @@ static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *
      * 規模の一括unlockでは省略する判断とした(単体のunlockAddressでは1identity分のコスト
      * で済むため、これまで通りbackfillを継続する)。
      */
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "address", bm_json_new_string(results[i].address));
-        bm_json_object_set(entry, "unlocked", bm_json_new_bool(results[i].unlocked));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(results[i].address));
+        cJSON_AddItemToObject(entry, "unlocked", cJSON_CreateBool(results[i].unlocked));
+        cJSON_AddItemToArray(arr, entry);
     }
     free(results);
     return arr;
@@ -252,8 +287,8 @@ static bm_json_value_t *h_unlockAllAddresses(const struct bm_api_server_config *
  * 返すだけの一回性操作にする。呼び出し元はレスポンスのWIFを渡したら即座に破棄すること
  * (ログ・エラーメッセージには絶対に載せない)。
  */
-static bm_json_value_t *h_exportAddress(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_exportAddress(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *passphrase = param_str(params, 1);
@@ -284,16 +319,16 @@ static bm_json_value_t *h_exportAddress(const struct bm_api_server_config *confi
         return NULL;
     }
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "signingWIF", bm_json_new_string(signing_wif));
-    bm_json_object_set(result, "encryptionWIF", bm_json_new_string(encryption_wif));
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "signingWIF", json_str(signing_wif));
+    cJSON_AddItemToObject(result, "encryptionWIF", json_str(encryption_wif));
     free(signing_wif);
     free(encryption_wif);
     return result;
 }
 
-static bm_json_value_t *h_lockAddress(const struct bm_api_server_config *config,
-                                       const bm_json_value_t *params, char **out_error)
+static cJSON *h_lockAddress(const struct bm_api_server_config *config,
+                                       const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     if (address == NULL)
@@ -302,20 +337,20 @@ static bm_json_value_t *h_lockAddress(const struct bm_api_server_config *config,
         return NULL;
     }
     int rc = bm_keyring_lock(config->keyring, address);
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
-static bm_json_value_t *h_lockAllAddresses(const struct bm_api_server_config *config,
-                                            const bm_json_value_t *params, char **out_error)
+static cJSON *h_lockAllAddresses(const struct bm_api_server_config *config,
+                                            const cJSON *params, char **out_error)
 {
     (void)params;
     (void)out_error;
     bm_keyring_lock_all(config->keyring);
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
-static bm_json_value_t *h_deleteAddress(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_deleteAddress(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     if (address == NULL)
@@ -324,11 +359,11 @@ static bm_json_value_t *h_deleteAddress(const struct bm_api_server_config *confi
         return NULL;
     }
     int rc = bm_keyring_delete_identity(config->keyring, config->identity_db, address);
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
-static bm_json_value_t *h_listAddresses(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_listAddresses(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     (void)params;
     struct bm_identity_summary *list = NULL;
@@ -339,31 +374,31 @@ static bm_json_value_t *h_listAddresses(const struct bm_api_server_config *confi
         return NULL;
     }
 
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
         struct bm_unlocked_identity dummy;
         int unlocked = bm_keyring_find_by_address(config->keyring, list[i].address, &dummy) ? 1 : 0;
 
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
-        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
-        bm_json_object_set(entry, "enabled", bm_json_new_bool(list[i].enabled));
-        bm_json_object_set(entry, "unlocked", bm_json_new_bool(unlocked));
-        bm_json_object_set(entry, "isChan", bm_json_new_bool(list[i].is_chan));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(list[i].address));
+        cJSON_AddItemToObject(entry, "label", json_str(list[i].label));
+        cJSON_AddItemToObject(entry, "enabled", cJSON_CreateBool(list[i].enabled));
+        cJSON_AddItemToObject(entry, "unlocked", cJSON_CreateBool(unlocked));
+        cJSON_AddItemToObject(entry, "isChan", cJSON_CreateBool(list[i].is_chan));
+        cJSON_AddItemToArray(arr, entry);
     }
     free(list);
     return arr;
 }
 
-static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_config *config,
-                                                       const bm_json_value_t *params, char **out_error)
+static cJSON *h_createDeterministicAddress(const struct bm_api_server_config *config,
+                                                       const cJSON *params, char **out_error)
 {
     const char *passphrase = param_str(params, 0);
-    const bm_json_value_t *version_v = bm_json_array_get(params, 1);
-    const bm_json_value_t *stream_v = bm_json_array_get(params, 2);
-    const bm_json_value_t *null_bytes_v = bm_json_array_get(params, 3);
+    const cJSON *version_v = param_at(params, 1);
+    const cJSON *stream_v = param_at(params, 2);
+    const cJSON *null_bytes_v = param_at(params, 3);
     const char *label = param_str(params, 4);
     const char *store_passphrase = param_str(params, 5);
 
@@ -375,9 +410,9 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
         return NULL;
     }
 
-    uint64_t version = (uint64_t)bm_json_as_number(version_v);
-    uint64_t stream = (uint64_t)bm_json_as_number(stream_v);
-    int null_bytes = (int)bm_json_as_number(null_bytes_v);
+    uint64_t version = (uint64_t)json_num(version_v);
+    uint64_t stream = (uint64_t)json_num(stream_v);
+    int null_bytes = (int)json_num(null_bytes_v);
     if (version < 3 || version > 4)
     {
         *out_error = dup_cstr("addressVersion must be 3 or 4");
@@ -409,7 +444,7 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
         return NULL;
     }
 
-    bm_json_value_t *result = bm_json_new_string(address);
+    cJSON *result = json_str(address);
     free(address);
     return result;
 }
@@ -421,8 +456,8 @@ static bm_json_value_t *h_createDeterministicAddress(const struct bm_api_server_
  * (identities.labelカラムのみ更新)。keys.datインポート時のUTF-8文字化けバグ修正後、
  * 既にインポート済みのラベルを正しい値へ再設定する用途を主に想定している。
  */
-static bm_json_value_t *h_setAddressLabel(const struct bm_api_server_config *config,
-                                           const bm_json_value_t *params, char **out_error)
+static cJSON *h_setAddressLabel(const struct bm_api_server_config *config,
+                                           const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *label = param_str(params, 1);
@@ -436,7 +471,7 @@ static bm_json_value_t *h_setAddressLabel(const struct bm_api_server_config *con
         *out_error = dup_cstr("address not found");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
 /*
@@ -454,17 +489,17 @@ static bm_json_value_t *h_setAddressLabel(const struct bm_api_server_config *con
  * 含まれる場合、is_chanフラグ(§11 chan仕様、暗号的には無意味だがUI/listAddressesの表示用
  * 識別フラグ)を再現できないと片手落ちになるため追加した。省略時false(通常アドレス扱い)。
  */
-static bm_json_value_t *h_importAddress(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_importAddress(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *signing_wif = param_str(params, 1);
     const char *encryption_wif = param_str(params, 2);
     const char *label = param_str(params, 3);
     const char *store_passphrase = param_str(params, 4);
-    const bm_json_value_t *nonce_trials_v = bm_json_array_get(params, 5);
-    const bm_json_value_t *payload_extra_v = bm_json_array_get(params, 6);
-    const bm_json_value_t *is_chan_v = bm_json_array_get(params, 7);
+    const cJSON *nonce_trials_v = param_at(params, 5);
+    const cJSON *payload_extra_v = param_at(params, 6);
+    const cJSON *is_chan_v = param_at(params, 7);
 
     if (address == NULL || signing_wif == NULL || encryption_wif == NULL || store_passphrase == NULL)
     {
@@ -509,9 +544,9 @@ static bm_json_value_t *h_importAddress(const struct bm_api_server_config *confi
     }
 
     uint64_t nonce_trials = (nonce_trials_v != NULL)
-        ? (uint64_t)bm_json_as_number(nonce_trials_v) : config->default_nonce_trials_per_byte;
+        ? (uint64_t)json_num(nonce_trials_v) : config->default_nonce_trials_per_byte;
     uint64_t payload_extra = (payload_extra_v != NULL)
-        ? (uint64_t)bm_json_as_number(payload_extra_v) : config->default_payload_length_extra_bytes;
+        ? (uint64_t)json_num(payload_extra_v) : config->default_payload_length_extra_bytes;
 
     /* §11 2026-08-29 実測でscrypt(N=2^15)は1回161msかかり、5000件規模のkeys.datインポートを
      * bm_keyring_create_identity(個別scrypt)で行うと約17分かかることが判明したため、
@@ -526,11 +561,11 @@ static bm_json_value_t *h_importAddress(const struct bm_api_server_config *confi
                               "does not match the existing vault passphrase?)");
         return NULL;
     }
-    if (is_chan_v != NULL && is_chan_v->type == BM_JSON_BOOL && is_chan_v->boolean)
+    if (cJSON_IsTrue(is_chan_v))
     {
         bm_keyring_mark_as_chan(config->identity_db, address);
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
 /*
@@ -547,12 +582,12 @@ static bm_json_value_t *h_importAddress(const struct bm_api_server_config *confi
  * 1MiB上限(MAX_REQUEST_SIZE)に収まるようentriesを数百件単位のチャンクに分けて
  * このAPIを複数回呼ぶ想定。
  */
-static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config *config,
-                                               const bm_json_value_t *params, char **out_error)
+static cJSON *h_importAddressesBulk(const struct bm_api_server_config *config,
+                                               const cJSON *params, char **out_error)
 {
-    const bm_json_value_t *entries = bm_json_array_get(params, 0);
+    const cJSON *entries = param_at(params, 0);
     const char *store_passphrase = param_str(params, 1);
-    if (entries == NULL || entries->type != BM_JSON_ARRAY || store_passphrase == NULL)
+    if (!cJSON_IsArray(entries) || store_passphrase == NULL)
     {
         *out_error = dup_cstr("importAddressesBulk requires [entries, storePassphrase]");
         return NULL;
@@ -565,20 +600,20 @@ static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config 
         return NULL;
     }
 
-    bm_json_value_t *results = bm_json_new_array();
-    for (size_t i = 0; i < entries->item_count; i++)
+    cJSON *results = cJSON_CreateArray();
+    for (size_t i = 0; i < (size_t)cJSON_GetArraySize(entries); i++)
     {
-        const bm_json_value_t *entry = bm_json_array_get(entries, i);
-        const char *address = bm_json_as_string(bm_json_object_get(entry, "address"));
-        const char *signing_wif = bm_json_as_string(bm_json_object_get(entry, "signingWIF"));
-        const char *encryption_wif = bm_json_as_string(bm_json_object_get(entry, "encryptionWIF"));
-        const char *label = bm_json_as_string(bm_json_object_get(entry, "label"));
-        const bm_json_value_t *nonce_v = bm_json_object_get(entry, "nonceTrialsPerByte");
-        const bm_json_value_t *payload_v = bm_json_object_get(entry, "payloadLengthExtraBytes");
-        const bm_json_value_t *is_chan_v = bm_json_object_get(entry, "isChan");
+        const cJSON *entry = param_at(entries, i);
+        const char *address = json_cstr(json_obj_get(entry, "address"));
+        const char *signing_wif = json_cstr(json_obj_get(entry, "signingWIF"));
+        const char *encryption_wif = json_cstr(json_obj_get(entry, "encryptionWIF"));
+        const char *label = json_cstr(json_obj_get(entry, "label"));
+        const cJSON *nonce_v = json_obj_get(entry, "nonceTrialsPerByte");
+        const cJSON *payload_v = json_obj_get(entry, "payloadLengthExtraBytes");
+        const cJSON *is_chan_v = json_obj_get(entry, "isChan");
 
-        bm_json_value_t *result_entry = bm_json_new_object();
-        bm_json_object_set(result_entry, "address", bm_json_new_string(address != NULL ? address : "(missing)"));
+        cJSON *result_entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(result_entry, "address", json_str(address != NULL ? address : "(missing)"));
 
         const char *err = NULL;
         uint64_t version = 0;
@@ -619,9 +654,9 @@ static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config 
 
         if (err == NULL)
         {
-            uint64_t nonce_trials = (nonce_v != NULL) ? (uint64_t)bm_json_as_number(nonce_v)
+            uint64_t nonce_trials = (nonce_v != NULL) ? (uint64_t)json_num(nonce_v)
                                                         : config->default_nonce_trials_per_byte;
-            uint64_t payload_extra = (payload_v != NULL) ? (uint64_t)bm_json_as_number(payload_v)
+            uint64_t payload_extra = (payload_v != NULL) ? (uint64_t)json_num(payload_v)
                                                             : config->default_payload_length_extra_bytes;
             int rc = bm_keyring_import_identity_with_master_kek(
                 config->identity_db, address, label != NULL ? label : "", (int)version, (int)stream, pub_signing,
@@ -630,18 +665,18 @@ static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config 
             {
                 err = "failed to store identity (duplicate address?)";
             }
-            else if (is_chan_v != NULL && is_chan_v->type == BM_JSON_BOOL && is_chan_v->boolean)
+            else if (cJSON_IsTrue(is_chan_v))
             {
                 bm_keyring_mark_as_chan(config->identity_db, address);
             }
         }
 
-        bm_json_object_set(result_entry, "success", bm_json_new_bool(err == NULL));
+        cJSON_AddItemToObject(result_entry, "success", cJSON_CreateBool(err == NULL));
         if (err != NULL)
         {
-            bm_json_object_set(result_entry, "error", bm_json_new_string(err));
+            cJSON_AddItemToObject(result_entry, "error", json_str(err));
         }
-        bm_json_array_append(results, result_entry);
+        cJSON_AddItemToArray(results, result_entry);
     }
 
     OPENSSL_cleanse(master_kek, sizeof(master_kek));
@@ -663,8 +698,8 @@ static bm_json_value_t *h_importAddressesBulk(const struct bm_api_server_config 
  * chan用の鍵をunlockしてさえいれば新規の受信処理は不要で、他メンバーの投稿も自動的に
  * inboxへ復号される。
  */
-static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
-                                    const bm_json_value_t *params, char **out_error)
+static cJSON *h_joinChan(const struct bm_api_server_config *config,
+                                    const cJSON *params, char **out_error)
 {
     const char *passphrase = param_str(params, 0);
     const char *label = param_str(params, 1);
@@ -702,7 +737,7 @@ static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
     }
     bm_keyring_mark_as_chan(config->identity_db, address);
 
-    bm_json_value_t *result = bm_json_new_string(address);
+    cJSON *result = json_str(address);
     free(address);
     return result;
 }
@@ -729,8 +764,8 @@ static bm_json_value_t *h_joinChan(const struct bm_api_server_config *config,
  * pubkey_cache経由でしか宛先の鍵を解決しない(toPubEncryptionHex直接指定は廃止)ため、
  * 既に知っている相手の公開鍵を送信前に登録しておく唯一の手段になった。
  */
-static bm_json_value_t *h_cachePubkey(const struct bm_api_server_config *config,
-                                       const bm_json_value_t *params, char **out_error)
+static cJSON *h_cachePubkey(const struct bm_api_server_config *config,
+                                       const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *signing_hex = param_str(params, 1);
@@ -769,18 +804,18 @@ static bm_json_value_t *h_cachePubkey(const struct bm_api_server_config *config,
         *out_error = dup_cstr("failed to store pubkey cache entry");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
-static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
-                                       const bm_json_value_t *params, char **out_error)
+static cJSON *h_sendMessage(const struct bm_api_server_config *config,
+                                       const cJSON *params, char **out_error)
 {
     const char *from_address = param_str(params, 0);
     const char *to_address = param_str(params, 1);
     const char *subject = param_str(params, 2);
     const char *body = param_str(params, 3);
-    const bm_json_value_t *ttl_v = bm_json_array_get(params, 4);
-    const bm_json_value_t *stealth_v = bm_json_array_get(params, 5);
+    const cJSON *ttl_v = param_at(params, 4);
+    const cJSON *stealth_v = param_at(params, 5);
 
     if (from_address == NULL || to_address == NULL || subject == NULL || body == NULL)
     {
@@ -841,8 +876,8 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
         }
     }
 
-    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
-    int ack_stealth_level = stealth_v != NULL ? (int)bm_json_as_number(stealth_v) : 1;
+    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)json_num(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
+    int ack_stealth_level = stealth_v != NULL ? (int)json_num(stealth_v) : 1;
 
     unsigned char *object = NULL;
     size_t object_len = 0;
@@ -883,27 +918,27 @@ static bm_json_value_t *h_sendMessage(const struct bm_api_server_config *config,
     char inv_hex[65];
     hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "objectLength", bm_json_new_number((double)object_len));
-    bm_json_object_set(result, "inventoryHash", bm_json_new_string(inv_hex));
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "objectLength", cJSON_CreateNumber((double)object_len));
+    cJSON_AddItemToObject(result, "inventoryHash", json_str(inv_hex));
     return result;
 }
 
 /* sendBroadcast: [fromAddress, subject, body, ttlSeconds?]。§5.4/§11 */
-static bm_json_value_t *h_sendBroadcast(const struct bm_api_server_config *config,
-                                         const bm_json_value_t *params, char **out_error)
+static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
+                                         const cJSON *params, char **out_error)
 {
     const char *from_address = param_str(params, 0);
     const char *subject = param_str(params, 1);
     const char *body = param_str(params, 2);
-    const bm_json_value_t *ttl_v = bm_json_array_get(params, 3);
+    const cJSON *ttl_v = param_at(params, 3);
 
     if (from_address == NULL || subject == NULL || body == NULL)
     {
         *out_error = dup_cstr("sendBroadcast requires [fromAddress, subject, body, ttlSeconds?]");
         return NULL;
     }
-    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)bm_json_as_number(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
+    uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)json_num(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
 
     unsigned char *object = NULL;
     size_t object_len = 0;
@@ -933,15 +968,15 @@ static bm_json_value_t *h_sendBroadcast(const struct bm_api_server_config *confi
     char inv_hex[65];
     hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "objectLength", bm_json_new_number((double)object_len));
-    bm_json_object_set(result, "inventoryHash", bm_json_new_string(inv_hex));
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "objectLength", cJSON_CreateNumber((double)object_len));
+    cJSON_AddItemToObject(result, "inventoryHash", json_str(inv_hex));
     return result;
 }
 
 /* getInboxMessages: [folder?](省略時は全件、'inbox'/'trash'等で絞り込み可) */
-static bm_json_value_t *h_addSubscription(const struct bm_api_server_config *config,
-                                           const bm_json_value_t *params, char **out_error)
+static cJSON *h_addSubscription(const struct bm_api_server_config *config,
+                                           const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *label = param_str(params, 1);
@@ -961,11 +996,11 @@ static bm_json_value_t *h_addSubscription(const struct bm_api_server_config *con
     }
 
     int rc = bm_messages_store_add_subscription(config->messages_db, address, label != NULL ? label : "");
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
-static bm_json_value_t *h_removeSubscription(const struct bm_api_server_config *config,
-                                              const bm_json_value_t *params, char **out_error)
+static cJSON *h_removeSubscription(const struct bm_api_server_config *config,
+                                              const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     if (address == NULL)
@@ -974,11 +1009,11 @@ static bm_json_value_t *h_removeSubscription(const struct bm_api_server_config *
         return NULL;
     }
     int rc = bm_messages_store_remove_subscription(config->messages_db, address);
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
-static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *config,
-                                             const bm_json_value_t *params, char **out_error)
+static cJSON *h_listSubscriptions(const struct bm_api_server_config *config,
+                                             const cJSON *params, char **out_error)
 {
     (void)params;
 
@@ -990,13 +1025,13 @@ static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *c
         return NULL;
     }
 
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
-        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(list[i].address));
+        cJSON_AddItemToObject(entry, "label", json_str(list[i].label));
+        cJSON_AddItemToArray(arr, entry);
     }
     bm_subscription_list_free(list);
     return arr;
@@ -1008,8 +1043,8 @@ static bm_json_value_t *h_listSubscriptions(const struct bm_api_server_config *c
  * 本実装のJSON-RPCでは不要なため省略)。addAddressBookEntryは本家同様、既に同じaddressが
  * あればエラーにする(UPSERTしない)。
  */
-static bm_json_value_t *h_addAddressBookEntry(const struct bm_api_server_config *config,
-                                               const bm_json_value_t *params, char **out_error)
+static cJSON *h_addAddressBookEntry(const struct bm_api_server_config *config,
+                                               const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     const char *label = param_str(params, 1);
@@ -1033,11 +1068,11 @@ static bm_json_value_t *h_addAddressBookEntry(const struct bm_api_server_config 
         *out_error = dup_cstr("address already exists in address book");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
-static bm_json_value_t *h_deleteAddressBookEntry(const struct bm_api_server_config *config,
-                                                  const bm_json_value_t *params, char **out_error)
+static cJSON *h_deleteAddressBookEntry(const struct bm_api_server_config *config,
+                                                  const cJSON *params, char **out_error)
 {
     const char *address = param_str(params, 0);
     if (address == NULL)
@@ -1046,11 +1081,11 @@ static bm_json_value_t *h_deleteAddressBookEntry(const struct bm_api_server_conf
         return NULL;
     }
     int rc = bm_messages_store_remove_address_book_entry(config->messages_db, address);
-    return bm_json_new_bool(rc == 0);
+    return cJSON_CreateBool(rc == 0);
 }
 
-static bm_json_value_t *h_listAddressBookEntries(const struct bm_api_server_config *config,
-                                                  const bm_json_value_t *params, char **out_error)
+static cJSON *h_listAddressBookEntries(const struct bm_api_server_config *config,
+                                                  const cJSON *params, char **out_error)
 {
     (void)params;
 
@@ -1062,13 +1097,13 @@ static bm_json_value_t *h_listAddressBookEntries(const struct bm_api_server_conf
         return NULL;
     }
 
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "address", bm_json_new_string(list[i].address));
-        bm_json_object_set(entry, "label", bm_json_new_string(list[i].label));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(list[i].address));
+        cJSON_AddItemToObject(entry, "label", json_str(list[i].label));
+        cJSON_AddItemToArray(arr, entry);
     }
     bm_address_book_list_free(list);
     return arr;
@@ -1084,7 +1119,7 @@ static bm_json_value_t *h_listAddressBookEntries(const struct bm_api_server_conf
 typedef int (*socks_proxy_getter_t)(sqlite3 *, struct bm_socks_proxy_config *);
 typedef int (*socks_proxy_setter_t)(sqlite3 *, const struct bm_socks_proxy_config *);
 
-static bm_json_value_t *get_socks_proxy_common(const struct bm_api_server_config *config,
+static cJSON *get_socks_proxy_common(const struct bm_api_server_config *config,
                                                 socks_proxy_getter_t getter, char **out_error)
 {
     if (config->config_db == NULL)
@@ -1100,15 +1135,15 @@ static bm_json_value_t *get_socks_proxy_common(const struct bm_api_server_config
         return NULL;
     }
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "enabled", bm_json_new_bool(proxy.enabled));
-    bm_json_object_set(result, "host", bm_json_new_string(proxy.host));
-    bm_json_object_set(result, "port", bm_json_new_number((double)proxy.port));
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "enabled", cJSON_CreateBool(proxy.enabled));
+    cJSON_AddItemToObject(result, "host", json_str(proxy.host));
+    cJSON_AddItemToObject(result, "port", cJSON_CreateNumber((double)proxy.port));
     return result;
 }
 
-static bm_json_value_t *set_socks_proxy_common(const struct bm_api_server_config *config,
-                                                const bm_json_value_t *params, socks_proxy_setter_t setter,
+static cJSON *set_socks_proxy_common(const struct bm_api_server_config *config,
+                                                const cJSON *params, socks_proxy_setter_t setter,
                                                 const char *usage_error, char **out_error)
 {
     if (config->config_db == NULL)
@@ -1117,9 +1152,9 @@ static bm_json_value_t *set_socks_proxy_common(const struct bm_api_server_config
         return NULL;
     }
 
-    const bm_json_value_t *enabled_v = bm_json_array_get(params, 0);
+    const cJSON *enabled_v = param_at(params, 0);
     const char *host = param_str(params, 1);
-    const bm_json_value_t *port_v = bm_json_array_get(params, 2);
+    const cJSON *port_v = param_at(params, 2);
     if (enabled_v == NULL || host == NULL || port_v == NULL)
     {
         *out_error = dup_cstr(usage_error);
@@ -1128,14 +1163,14 @@ static bm_json_value_t *set_socks_proxy_common(const struct bm_api_server_config
 
     struct bm_socks_proxy_config proxy;
     memset(&proxy, 0, sizeof(proxy));
-    proxy.enabled = (bm_json_as_number(enabled_v) != 0.0) ? 1 : 0;
+    proxy.enabled = (json_num(enabled_v) != 0.0) ? 1 : 0;
     if (strlen(host) == 0 || strlen(host) >= sizeof(proxy.host))
     {
         *out_error = dup_cstr("host must be non-empty and shorter than 256 bytes");
         return NULL;
     }
     strncpy(proxy.host, host, sizeof(proxy.host) - 1);
-    proxy.port = (int)bm_json_as_number(port_v);
+    proxy.port = (int)json_num(port_v);
     if (proxy.port <= 0 || proxy.port > 65535)
     {
         *out_error = dup_cstr("port must be between 1 and 65535");
@@ -1147,12 +1182,12 @@ static bm_json_value_t *set_socks_proxy_common(const struct bm_api_server_config
         *out_error = dup_cstr("failed to store socks proxy config");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
 /* getSocksProxyOnion: [] -> {enabled, host, port}(onion peer(.onion宛)専用) */
-static bm_json_value_t *h_getSocksProxyOnion(const struct bm_api_server_config *config,
-                                              const bm_json_value_t *params, char **out_error)
+static cJSON *h_getSocksProxyOnion(const struct bm_api_server_config *config,
+                                              const cJSON *params, char **out_error)
 {
     (void)params;
     return get_socks_proxy_common(config, bm_config_store_get_socks_proxy_onion, out_error);
@@ -1164,24 +1199,24 @@ static bm_json_value_t *h_getSocksProxyOnion(const struct bm_api_server_config *
  * たびconfig.dbを読み直すため(§11設定変更の動的リロード)、daemon再起動なしで次の
  * 再接続サイクル(既定30秒以内)から反映される。
  */
-static bm_json_value_t *h_setSocksProxyOnion(const struct bm_api_server_config *config,
-                                              const bm_json_value_t *params, char **out_error)
+static cJSON *h_setSocksProxyOnion(const struct bm_api_server_config *config,
+                                              const cJSON *params, char **out_error)
 {
     return set_socks_proxy_common(config, params, bm_config_store_set_socks_proxy_onion,
                                    "setSocksProxyOnion requires [enabled, host, port]", out_error);
 }
 
 /* getSocksProxyClearnet: [] -> {enabled, host, port}(クリアネットIP宛専用、既定disabled=直結) */
-static bm_json_value_t *h_getSocksProxyClearnet(const struct bm_api_server_config *config,
-                                                 const bm_json_value_t *params, char **out_error)
+static cJSON *h_getSocksProxyClearnet(const struct bm_api_server_config *config,
+                                                 const cJSON *params, char **out_error)
 {
     (void)params;
     return get_socks_proxy_common(config, bm_config_store_get_socks_proxy_clearnet, out_error);
 }
 
 /* setSocksProxyClearnet: [enabled, host, port](クリアネットIP宛専用) */
-static bm_json_value_t *h_setSocksProxyClearnet(const struct bm_api_server_config *config,
-                                                 const bm_json_value_t *params, char **out_error)
+static cJSON *h_setSocksProxyClearnet(const struct bm_api_server_config *config,
+                                                 const cJSON *params, char **out_error)
 {
     return set_socks_proxy_common(config, params, bm_config_store_set_socks_proxy_clearnet,
                                    "setSocksProxyClearnet requires [enabled, host, port]", out_error);
@@ -1203,8 +1238,8 @@ static bm_json_value_t *h_setSocksProxyClearnet(const struct bm_api_server_confi
  * スタートする。手動追加だからといって無条件に信用するわけではなく、他の候補と同じく
  * 実際の接続実績でratingを積み上げていく。
  */
-static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
-                                   const bm_json_value_t *params, char **out_error)
+static cJSON *h_addPeer(const struct bm_api_server_config *config,
+                                   const cJSON *params, char **out_error)
 {
     if (config->peers_db == NULL)
     {
@@ -1213,8 +1248,8 @@ static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
     }
 
     const char *ip_address = param_str(params, 0);
-    const bm_json_value_t *port_v = bm_json_array_get(params, 1);
-    const bm_json_value_t *stream_v = bm_json_array_get(params, 2);
+    const cJSON *port_v = param_at(params, 1);
+    const cJSON *stream_v = param_at(params, 2);
     if (ip_address == NULL || port_v == NULL)
     {
         *out_error = dup_cstr("addPeer requires [ipAddress, port, stream?]");
@@ -1226,13 +1261,13 @@ static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
         return NULL;
     }
 
-    int port = (int)bm_json_as_number(port_v);
+    int port = (int)json_num(port_v);
     if (port <= 0 || port > 65535)
     {
         *out_error = dup_cstr("port must be between 1 and 65535");
         return NULL;
     }
-    int stream = stream_v != NULL ? (int)bm_json_as_number(stream_v) : 1;
+    int stream = stream_v != NULL ? (int)json_num(stream_v) : 1;
 
     if (bm_peer_manager_upsert_learned(config->peers_db, ip_address, port, stream, 1,
                                         (int64_t)time(NULL), "manual") != 0)
@@ -1240,7 +1275,7 @@ static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
         *out_error = dup_cstr("failed to store peer");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
 /*
@@ -1250,8 +1285,8 @@ static bm_json_value_t *h_addPeer(const struct bm_api_server_config *config,
  */
 struct list_connections_ctx
 {
-    bm_json_value_t *inbound;
-    bm_json_value_t *outbound;
+    cJSON *inbound;
+    cJSON *outbound;
 };
 
 static void list_connections_one(struct bm_fd_data *conn, void *user_data)
@@ -1266,30 +1301,30 @@ static void list_connections_one(struct bm_fd_data *conn, void *user_data)
     int port = 0;
     bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
 
-    bm_json_value_t *entry = bm_json_new_object();
-    bm_json_object_set(entry, "host", bm_json_new_string(ip));
-    bm_json_object_set(entry, "port", bm_json_new_number((double)port));
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddItemToObject(entry, "host", json_str(ip));
+    cJSON_AddItemToObject(entry, "port", cJSON_CreateNumber((double)port));
     /* §11 2026-09-05: デバッグ用にregistry上の実fd番号を追加(ユーザー要望、"failed to send
      * inv to fd=N"ログ調査中に必要になった)。broadcast_inv側のログに出るfdはpeer_registry.c
      * のdup()で複製した使い捨て番号(書き込み後すぐclose()される)であり、この値とは無関係
      * なので、他の接続と誤って対応付けないよう混同しないこと。 */
-    bm_json_object_set(entry, "fd", bm_json_new_number((double)conn->fd));
-    bm_json_object_set(entry, "fullyEstablished", bm_json_new_bool(conn->handshake_complete));
-    bm_json_object_set(entry, "userAgent", bm_json_new_string(conn->user_agent != NULL ? conn->user_agent : ""));
+    cJSON_AddItemToObject(entry, "fd", cJSON_CreateNumber((double)conn->fd));
+    cJSON_AddItemToObject(entry, "fullyEstablished", cJSON_CreateBool(conn->handshake_complete));
+    cJSON_AddItemToObject(entry, "userAgent", json_str(conn->user_agent != NULL ? conn->user_agent : ""));
     /* §11 2026-08-23 backlog項目5(送受信バイト数、後半分)。PyBitmessage自体には
      * 無い機能(本家のadvanceddispatcher.pyのsentBytes/receivedBytesはどこからも
      * 参照・表示されない実質デッドなフィールドだった、DESIGN.md参照)。受信バイト数は
      * 全経路を正確に集計できるが、送信バイト数はbroadcast_inv経由(dup()したfdへの
      * 書き込み、connを持たない)の分だけこの接続の集計に含められない(ユーザー了承済み、
      * 全体累積のgetNetworkStatsには含まれる)。 */
-    bm_json_object_set(entry, "sentBytes", bm_json_new_number((double)conn->bytes_sent));
-    bm_json_object_set(entry, "receivedBytes", bm_json_new_number((double)conn->bytes_received));
+    cJSON_AddItemToObject(entry, "sentBytes", cJSON_CreateNumber((double)conn->bytes_sent));
+    cJSON_AddItemToObject(entry, "receivedBytes", cJSON_CreateNumber((double)conn->bytes_received));
 
-    bm_json_array_append(conn->type == BM_FD_SERVER_SOCKET ? ctx->inbound : ctx->outbound, entry);
+    cJSON_AddItemToArray(conn->type == BM_FD_SERVER_SOCKET ? ctx->inbound : ctx->outbound, entry);
 }
 
-static bm_json_value_t *h_listConnections(const struct bm_api_server_config *config,
-                                           const bm_json_value_t *params, char **out_error)
+static cJSON *h_listConnections(const struct bm_api_server_config *config,
+                                           const cJSON *params, char **out_error)
 {
     (void)params;
     if (config->registry == NULL)
@@ -1299,16 +1334,16 @@ static bm_json_value_t *h_listConnections(const struct bm_api_server_config *con
     }
 
     struct list_connections_ctx ctx;
-    ctx.inbound = bm_json_new_array();
-    ctx.outbound = bm_json_new_array();
+    ctx.inbound = cJSON_CreateArray();
+    ctx.outbound = cJSON_CreateArray();
     /* §11 2026-08-23: for_each_locked(APIサーバスレッドからの呼び出し専用の変種)を使う。
      * 通常のfor_eachはロックを早期解放するため、network_epoll_thread側で該当connが
      * close_connection経由でfree()されるuse-after-freeを起こしうる(peer_registry.h参照)。 */
     bm_peer_registry_for_each_locked(config->registry, list_connections_one, &ctx);
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "inbound", ctx.inbound);
-    bm_json_object_set(result, "outbound", ctx.outbound);
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "inbound", ctx.inbound);
+    cJSON_AddItemToObject(result, "outbound", ctx.outbound);
     return result;
 }
 
@@ -1320,8 +1355,8 @@ static bm_json_value_t *h_listConnections(const struct bm_api_server_config *con
  * 合わない)。PyBitmessage自体には無いAPI(本家はGUIのNetwork Statusタブの
  * スループット表示にのみ内部的に使っている、DESIGN.md参照)。
  */
-static bm_json_value_t *h_getNetworkStats(const struct bm_api_server_config *config,
-                                           const bm_json_value_t *params, char **out_error)
+static cJSON *h_getNetworkStats(const struct bm_api_server_config *config,
+                                           const cJSON *params, char **out_error)
 {
     (void)config;
     (void)params;
@@ -1331,14 +1366,14 @@ static bm_json_value_t *h_getNetworkStats(const struct bm_api_server_config *con
     uint64_t bytes_received = 0;
     bm_network_get_stats(&bytes_sent, &bytes_received);
 
-    bm_json_value_t *result = bm_json_new_object();
-    bm_json_object_set(result, "sentBytes", bm_json_new_number((double)bytes_sent));
-    bm_json_object_set(result, "receivedBytes", bm_json_new_number((double)bytes_received));
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "sentBytes", cJSON_CreateNumber((double)bytes_sent));
+    cJSON_AddItemToObject(result, "receivedBytes", cJSON_CreateNumber((double)bytes_received));
     return result;
 }
 
-static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *config,
-                                            const bm_json_value_t *params, char **out_error)
+static cJSON *h_getInboxMessages(const struct bm_api_server_config *config,
+                                            const cJSON *params, char **out_error)
 {
     const char *folder = param_str(params, 0);
 
@@ -1350,22 +1385,22 @@ static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *co
         return NULL;
     }
 
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
         char msg_id_hex[65];
         hex_encode(list[i].msg_id, sizeof(list[i].msg_id), msg_id_hex);
 
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "msgId", bm_json_new_string(msg_id_hex));
-        bm_json_object_set(entry, "toAddress", bm_json_new_string(list[i].to_address));
-        bm_json_object_set(entry, "fromAddress", bm_json_new_string(list[i].from_address));
-        bm_json_object_set(entry, "subject", bm_json_new_string(list[i].subject));
-        bm_json_object_set(entry, "body", bm_json_new_string(list[i].body));
-        bm_json_object_set(entry, "receivedTime", bm_json_new_number((double)list[i].received_time));
-        bm_json_object_set(entry, "read", bm_json_new_bool(list[i].read));
-        bm_json_object_set(entry, "folder", bm_json_new_string(list[i].folder));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "msgId", json_str(msg_id_hex));
+        cJSON_AddItemToObject(entry, "toAddress", json_str(list[i].to_address));
+        cJSON_AddItemToObject(entry, "fromAddress", json_str(list[i].from_address));
+        cJSON_AddItemToObject(entry, "subject", json_str(list[i].subject));
+        cJSON_AddItemToObject(entry, "body", json_str(list[i].body));
+        cJSON_AddItemToObject(entry, "receivedTime", cJSON_CreateNumber((double)list[i].received_time));
+        cJSON_AddItemToObject(entry, "read", cJSON_CreateBool(list[i].read));
+        cJSON_AddItemToObject(entry, "folder", json_str(list[i].folder));
+        cJSON_AddItemToArray(arr, entry);
     }
     bm_inbox_message_list_free(list, count);
     return arr;
@@ -1374,8 +1409,8 @@ static bm_json_value_t *h_getInboxMessages(const struct bm_api_server_config *co
 /* §11 2026-08-25: getSentMessages: [] -> [{msgId,toAddress,fromAddress,subject,body,status,
  * sentTime,ttl,resendCount}, ...]。sentテーブルはこれまでack追跡専用でユーザー向けの一覧
  * 手段が無かった(getInboxMessagesに相当するものが未実装だった)ため追加。 */
-static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *config,
-                                           const bm_json_value_t *params, char **out_error)
+static cJSON *h_getSentMessages(const struct bm_api_server_config *config,
+                                           const cJSON *params, char **out_error)
 {
     (void)params;
 
@@ -1387,23 +1422,23 @@ static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *con
         return NULL;
     }
 
-    bm_json_value_t *arr = bm_json_new_array();
+    cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < count; i++)
     {
         char msg_id_hex[65];
         hex_encode(list[i].msg_id, sizeof(list[i].msg_id), msg_id_hex);
 
-        bm_json_value_t *entry = bm_json_new_object();
-        bm_json_object_set(entry, "msgId", bm_json_new_string(msg_id_hex));
-        bm_json_object_set(entry, "toAddress", bm_json_new_string(list[i].to_address));
-        bm_json_object_set(entry, "fromAddress", bm_json_new_string(list[i].from_address));
-        bm_json_object_set(entry, "subject", bm_json_new_string(list[i].subject));
-        bm_json_object_set(entry, "body", bm_json_new_string(list[i].body));
-        bm_json_object_set(entry, "status", bm_json_new_string(list[i].status));
-        bm_json_object_set(entry, "sentTime", bm_json_new_number((double)list[i].sent_time));
-        bm_json_object_set(entry, "ttl", bm_json_new_number((double)list[i].ttl));
-        bm_json_object_set(entry, "resendCount", bm_json_new_number((double)list[i].resend_count));
-        bm_json_array_append(arr, entry);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "msgId", json_str(msg_id_hex));
+        cJSON_AddItemToObject(entry, "toAddress", json_str(list[i].to_address));
+        cJSON_AddItemToObject(entry, "fromAddress", json_str(list[i].from_address));
+        cJSON_AddItemToObject(entry, "subject", json_str(list[i].subject));
+        cJSON_AddItemToObject(entry, "body", json_str(list[i].body));
+        cJSON_AddItemToObject(entry, "status", json_str(list[i].status));
+        cJSON_AddItemToObject(entry, "sentTime", cJSON_CreateNumber((double)list[i].sent_time));
+        cJSON_AddItemToObject(entry, "ttl", cJSON_CreateNumber((double)list[i].ttl));
+        cJSON_AddItemToObject(entry, "resendCount", cJSON_CreateNumber((double)list[i].resend_count));
+        cJSON_AddItemToArray(arr, entry);
     }
     bm_sent_message_list_free(list, count);
     return arr;
@@ -1414,8 +1449,8 @@ static bm_json_value_t *h_getSentMessages(const struct bm_api_server_config *con
  * 意識しなくてよいよう、両テーブルに対してfolder='trash'更新を無条件に試みる(該当行が
  * 無くてもエラーにしない、「存在したと仮定して削除した」という本家と同じ応答仕様)。
  * SQL自体が失敗した場合(DBエラー等)のみエラーを返す。 */
-static bm_json_value_t *h_trashMessage(const struct bm_api_server_config *config,
-                                        const bm_json_value_t *params, char **out_error)
+static cJSON *h_trashMessage(const struct bm_api_server_config *config,
+                                        const cJSON *params, char **out_error)
 {
     const char *msg_id_hex = param_str(params, 0);
     if (msg_id_hex == NULL)
@@ -1437,7 +1472,7 @@ static bm_json_value_t *h_trashMessage(const struct bm_api_server_config *config
         *out_error = dup_cstr("failed to trash message");
         return NULL;
     }
-    return bm_json_new_bool(1);
+    return cJSON_CreateBool(1);
 }
 
 static const struct bm_api_method METHODS[] = {
@@ -1475,69 +1510,94 @@ static const struct bm_api_method METHODS[] = {
 };
 #define METHOD_COUNT (sizeof(METHODS) / sizeof(METHODS[0]))
 
+
 /* --- JSON-RPC 2.0処理 --- */
 
-static char *build_response(const bm_json_value_t *id, bm_json_value_t *result, const char *error_msg)
+/*
+ * §11 2026-09-15 エラーコードを仕様(JSON-RPC 2.0 Specification §5.1)の予約値へ整理した。
+ * 以前は全て-32000(実装定義のServer error)を返していたため、クライアント側が
+ * 「JSONが壊れている」「メソッド名を間違えた」「メソッドは正しいが引数が不正」を
+ * コードで区別できなかった。ハンドラが返すアプリケーション由来のエラーだけは引き続き
+ * -32000とする(仕様上-32000〜-32099が実装定義用に予約されている)。
+ */
+#define BM_JSONRPC_ERR_PARSE (-32700)
+#define BM_JSONRPC_ERR_INVALID_REQUEST (-32600)
+#define BM_JSONRPC_ERR_METHOD_NOT_FOUND (-32601)
+#define BM_JSONRPC_ERR_SERVER (-32000)
+
+/*
+ * §11 2026-09-15 バッチリクエスト1件あたりの上限。仕様に上限の定めは無いが、ボディの
+ * 1MiB上限(MAX_REQUEST_SIZE)いっぱいまで最小サイズのリクエストを詰めると3万件強が入り、
+ * それが全てunlockAddress(1件あたりscryptで約161ms)だと1リクエストでRPCサーバーを
+ * 1時間以上占有できてしまう(ハンドラは直列実行のため、その間他のAPI呼び出しは待たされる)。
+ * 認証済みクライアントしか到達できない経路とはいえ、事故(スクリプトのループミス)でも
+ * 起きうるので上限を設ける。数千件規模の一括処理には専用のimportAddressesBulkのように
+ * 「1メソッド呼び出しで多件数を扱う」設計を使うこと。
+ */
+#define BM_JSONRPC_MAX_BATCH_SIZE 256
+
+/* 応答オブジェクトを1つ組み立てる。resultの所有権はこの関数が受け取る(error_msgが
+ * 非NULLなら破棄される)。idはリクエストの値を複製して返す */
+static cJSON *build_response(const cJSON *id, cJSON *result, int error_code, const char *error_msg)
 {
-    bm_json_value_t *resp = bm_json_new_object();
-    bm_json_object_set(resp, "jsonrpc", bm_json_new_string("2.0"));
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddItemToObject(resp, "jsonrpc", json_str("2.0"));
     if (error_msg != NULL)
     {
-        bm_json_value_t *err = bm_json_new_object();
-        bm_json_object_set(err, "code", bm_json_new_number(-32000));
-        bm_json_object_set(err, "message", bm_json_new_string(error_msg));
-        bm_json_object_set(resp, "error", err);
-        bm_json_free(result);
+        cJSON *err = cJSON_CreateObject();
+        cJSON_AddItemToObject(err, "code", cJSON_CreateNumber(error_code));
+        cJSON_AddItemToObject(err, "message", json_str(error_msg));
+        cJSON_AddItemToObject(resp, "error", err);
+        cJSON_Delete(result);
     }
     else
     {
-        bm_json_object_set(resp, "result", result != NULL ? result : bm_json_new_null());
-    }
-    if (id != NULL)
-    {
-        /* idはリクエストの値をそのまま複製して返す(number/string/nullいずれか) */
-        if (id->type == BM_JSON_STRING)
-        {
-            bm_json_object_set(resp, "id", bm_json_new_string(id->string));
-        }
-        else if (id->type == BM_JSON_NUMBER)
-        {
-            bm_json_object_set(resp, "id", bm_json_new_number(id->number));
-        }
-        else
-        {
-            bm_json_object_set(resp, "id", bm_json_new_null());
-        }
-    }
-    else
-    {
-        bm_json_object_set(resp, "id", bm_json_new_null());
+        cJSON_AddItemToObject(resp, "result", result != NULL ? result : cJSON_CreateNull());
     }
 
-    char *text = bm_json_serialize(resp);
-    bm_json_free(resp);
-    return text;
+    /* idはリクエストの値をそのまま複製して返す(仕様上string/number/nullのみ。
+     * それ以外の型が来た場合はnullにする) */
+    if (cJSON_IsString(id) || cJSON_IsNumber(id))
+    {
+        cJSON_AddItemToObject(resp, "id", cJSON_Duplicate(id, 1));
+    }
+    else
+    {
+        cJSON_AddItemToObject(resp, "id", cJSON_CreateNull());
+    }
+    return resp;
 }
 
-static char *process_jsonrpc_request(const struct bm_api_server_config *config,
-                                      const char *body, size_t body_len)
+/*
+ * リクエストオブジェクト1件を処理する。応答オブジェクトを返す。
+ *
+ * §11 2026-09-15 通知(notification)対応。JSON-RPC 2.0では"id"メンバを持たないリクエストは
+ * 通知であり、サーバーは応答を返してはならない(仕様§4.1)。以前は"id"が無くても
+ * "id":nullを付けた応答を返していた。通知の場合はNULLを返し、呼び出し側が応答を
+ * 組み立てないようにする。なお"id":nullは「idを明示的にnullにしたリクエスト」であって
+ * 通知ではないため、従来通り応答する(cJSONでは前者はメンバ自体が無く、後者は
+ * cJSON_NULL型のメンバとして存在するので区別できる)。
+ */
+static cJSON *process_one_request(const struct bm_api_server_config *config, const cJSON *req)
 {
-    bm_json_value_t *req = bm_json_parse(body, body_len);
-    if (req == NULL || req->type != BM_JSON_OBJECT)
+    if (!cJSON_IsObject(req))
     {
-        bm_json_free(req);
-        return build_response(NULL, NULL, "Parse error: invalid JSON");
+        return build_response(NULL, NULL, BM_JSONRPC_ERR_INVALID_REQUEST,
+                               "Invalid request: not a JSON object");
     }
 
-    const bm_json_value_t *id = bm_json_object_get(req, "id");
-    const char *method = bm_json_as_string(bm_json_object_get(req, "method"));
-    const bm_json_value_t *params = bm_json_object_get(req, "params");
+    const cJSON *id = json_obj_get(req, "id");
+    int is_notification = (id == NULL);
+    const char *method = json_cstr(json_obj_get(req, "method"));
+    const cJSON *params = json_obj_get(req, "params");
 
     if (method == NULL)
     {
-        char *resp = build_response(id, NULL, "Invalid request: missing method");
-        bm_json_free(req);
-        return resp;
+        if (is_notification)
+        {
+            return NULL;
+        }
+        return build_response(id, NULL, BM_JSONRPC_ERR_INVALID_REQUEST, "Invalid request: missing method");
     }
 
     for (size_t i = 0; i < METHOD_COUNT; i++)
@@ -1545,276 +1605,321 @@ static char *process_jsonrpc_request(const struct bm_api_server_config *config,
         if (strcmp(METHODS[i].name, method) == 0)
         {
             char *error_msg = NULL;
-            bm_json_value_t *result = METHODS[i].handler(config, params, &error_msg);
-            char *resp = build_response(id, result, error_msg);
+            cJSON *result = METHODS[i].handler(config, params, &error_msg);
+            if (is_notification)
+            {
+                /* 通知でも副作用(ハンドラの実行)は起こした上で、応答だけを捨てる */
+                cJSON_Delete(result);
+                free(error_msg);
+                return NULL;
+            }
+            cJSON *resp = build_response(id, result, BM_JSONRPC_ERR_SERVER, error_msg);
             free(error_msg);
-            bm_json_free(req);
             return resp;
         }
     }
 
-    char *resp = build_response(id, NULL, "Method not found");
-    bm_json_free(req);
-    return resp;
+    if (is_notification)
+    {
+        return NULL;
+    }
+    return build_response(id, NULL, BM_JSONRPC_ERR_METHOD_NOT_FOUND, "Method not found");
 }
 
-/* --- HTTPトランスポート --- */
-
-static ssize_t read_until_double_crlf(int fd, unsigned char **buf, size_t *buf_len, size_t *buf_cap)
+/*
+ * リクエストボディ全体を処理し、応答本文(cJSONのアロケータで確保されたNUL終端文字列、
+ * 呼び出し側がcJSON_freeで解放)を返す。応答を返してはならない場合(全て通知だった
+ * バッチ、および単一の通知)はNULLを返す。
+ *
+ * §11 2026-09-15 バッチリクエスト対応(JSON-RPC 2.0 Specification §6)。以前はボディが
+ * JSONオブジェクトであることを要求しており、仕様で定められたバッチ(リクエストオブジェクトの
+ * 配列)を送ると"Parse error: invalid JSON"で拒否していた。libmicrohttpd + cJSONへの
+ * 移行でディスパッチ層を書き直すのに合わせて実装した。応答は仕様通り、通知を除いた
+ * 各リクエストの応答オブジェクトを要素とする配列で返す(順序はリクエスト順。仕様上
+ * 順不同でよいがクライアント側の突き合わせが楽なので揃えておく)。
+ */
+static char *process_jsonrpc_request(const struct bm_api_server_config *config,
+                                      const char *body, size_t body_len)
 {
-    static const char needle[] = "\r\n\r\n";
-    const size_t needle_len = 4;
-
-    for (;;)
+    cJSON *root = cJSON_ParseWithLength(body, body_len);
+    if (root == NULL)
     {
-        if (*buf_len >= needle_len)
+        /* cJSONは構文エラーのほかCJSON_NESTING_LIMIT(既定1000)を超える深いネストでも
+         * NULLを返す。自前パーサ時代はここに深さ制限が無く、深いネストを送りつけると
+         * 再帰でスタックオーバーフローしdaemonごと落とせた(§11参照) */
+        cJSON *resp = build_response(NULL, NULL, BM_JSONRPC_ERR_PARSE, "Parse error: invalid JSON");
+        char *text = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        return text;
+    }
+
+    if (!cJSON_IsArray(root))
+    {
+        cJSON *resp = process_one_request(config, root);
+        cJSON_Delete(root);
+        if (resp == NULL)
         {
-            for (size_t i = 0; i + needle_len <= *buf_len; i++)
+            return NULL; /* 単一の通知: 応答なし */
+        }
+        char *text = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        return text;
+    }
+
+    int count = cJSON_GetArraySize(root);
+    if (count == 0 || count > BM_JSONRPC_MAX_BATCH_SIZE)
+    {
+        /* 空配列は仕様上Invalid Request(単一の応答オブジェクトを返す、配列では包まない) */
+        char msg_buf[96];
+        const char *msg;
+        if (count == 0)
+        {
+            msg = "Invalid request: empty batch";
+        }
+        else
+        {
+            snprintf(msg_buf, sizeof(msg_buf), "Invalid request: batch too large (max %d requests)",
+                      BM_JSONRPC_MAX_BATCH_SIZE);
+            msg = msg_buf;
+        }
+        cJSON *resp = build_response(NULL, NULL, BM_JSONRPC_ERR_INVALID_REQUEST, msg);
+        cJSON_Delete(root);
+        char *text = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        return text;
+    }
+
+    cJSON *responses = cJSON_CreateArray();
+    for (int i = 0; i < count; i++)
+    {
+        cJSON *resp = process_one_request(config, cJSON_GetArrayItem(root, i));
+        if (resp != NULL)
+        {
+            cJSON_AddItemToArray(responses, resp);
+        }
+    }
+    cJSON_Delete(root);
+
+    if (cJSON_GetArraySize(responses) == 0)
+    {
+        /* 全て通知だった場合、仕様上サーバーは何も返してはならない */
+        cJSON_Delete(responses);
+        return NULL;
+    }
+    char *text = cJSON_PrintUnformatted(responses);
+    cJSON_Delete(responses);
+    return text;
+}
+
+/* --- HTTPトランスポート(libmicrohttpd) --- */
+
+/*
+ * §11 2026-09-15 自前HTTP実装(ブロッキングread+自前のヘッダ探索)からlibmicrohttpdへ移行した。
+ * 動機は「自前なので依存が減る」という抽象論ではなく、実際に確認できた次の2件の欠陥:
+ *
+ *  (1) 認証前DoS。旧read_until_double_crlf()はaccept済みfdに読み取りタイムアウトを一切
+ *      設定せずread()でブロックし、accept loopもシングルスレッドだったため、TCP接続だけ
+ *      して1バイトも送らないクライアント1つでRPCサーバー全体が無期限に停止した。しかも
+ *      この停止はBasic認証の検証より手前で起きるので、apiusername/apipasswordを知らない
+ *      相手でも発動できた。
+ *  (2) Transfer-Encoding: chunked非対応。Content-Lengthヘッダが無いリクエストは
+ *      400で拒否していたため、chunkedで送る汎用HTTPクライアントから使えなかった。
+ *
+ * MHDはノンブロッキングI/O+接続タイムアウト(MHD_OPTION_CONNECTION_TIMEOUT)でこれらを
+ * 解決する。加えてkeep-alive・同時接続数制限(MHD_OPTION_CONNECTION_LIMIT)も得られる。
+ *
+ * スレッドモデルはMHD_USE_INTERNAL_POLLING_THREAD単独とし、MHD_USE_THREAD_PER_CONNECTIONも
+ * スレッドプール(MHD_OPTION_THREAD_POOL_SIZE)も使わない。これはMHDが内部スレッド1本で
+ * poll/epollループを回して複数接続を多重化しつつ、コールバックは常にその1本から直列に
+ * 呼ぶモデルで、「同時に処理するリクエストは常に1件」という旧実装の前提をそのまま維持できる。
+ * METHODS[]の各ハンドラはkeyring・registry・各DBハンドルといった共有状態を触っており、
+ * 並列化するならそれら全ての排他制御を見直す必要があるため、今回の移行では意図的に
+ * 直列のままにした(将来並列化したくなったら、このフラグを変える前に全ハンドラの
+ * スレッド安全性を検証すること)。
+ *
+ * なお、これによりkeep-aliveが有効になったため「レスポンスを読んだ後EOFまで読む」実装の
+ * クライアントは接続タイムアウトまで待たされる。本リポジトリのbitmessage-cli
+ * (cli/http_client.c)とテストのHTTPヘルパーがまさにその実装だったので、リクエストに
+ * Connection: closeを付けるよう合わせて修正してある。
+ */
+
+/* 接続がアイドルのまま維持される上限。keep-aliveで繋ぎっぱなしのクライアントを
+ * 無制限に抱え込まないための値で、旧実装(1リクエストごとにclose)より厳しくはならない */
+#define BM_API_CONNECTION_TIMEOUT_SECONDS 30
+/* 同時接続数の上限。ローカルのフロントエンド/CLIしか繋がない想定なので小さめでよい */
+#define BM_API_CONNECTION_LIMIT 64
+/* stop_flagを見に行く間隔。MHDは内部スレッドで動くので、api_server_threadはこの間隔で
+ * 停止指示だけを監視する(旧実装のpoll()タイムアウト1秒より短くし、停止を早めた) */
+#define BM_API_STOP_POLL_INTERVAL_MS 250
+
+/* リクエストごとの状態。MHDはボディを複数回のコールバックに分けて渡してくるので、
+ * ここに連結して溜めてから一括でJSON-RPC処理へ回す */
+struct api_request_ctx
+{
+    char *body;
+    size_t body_len;
+    size_t body_cap;
+    int too_large; /* MAX_REQUEST_SIZE超過を検出したら1(以後のボディは捨てて413を返す) */
+};
+
+static enum MHD_Result queue_text_response(struct MHD_Connection *connection, unsigned int status,
+                                            const char *body)
+{
+    /* MHD_RESPMEM_MUST_COPYなのでbodyが静的文字列でなくても安全 */
+    struct MHD_Response *response =
+        MHD_create_response_from_buffer(strlen(body), (void *)(uintptr_t)body, MHD_RESPMEM_MUST_COPY);
+    if (response == NULL)
+    {
+        return MHD_NO;
+    }
+    MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "text/plain");
+    enum MHD_Result rc = MHD_queue_response(connection, status, response);
+    MHD_destroy_response(response);
+    return rc;
+}
+
+static enum MHD_Result queue_auth_required(struct MHD_Connection *connection)
+{
+    struct MHD_Response *response = MHD_create_response_from_buffer(
+        strlen("Unauthorized\n"), (void *)(uintptr_t) "Unauthorized\n", MHD_RESPMEM_PERSISTENT);
+    if (response == NULL)
+    {
+        return MHD_NO;
+    }
+    MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "text/plain");
+    /* WWW-Authenticateヘッダの付与と401の設定はMHD側が行う(realmのクォート等も含めて
+     * RFC 7617準拠に組み立ててくれるので自前で書式を作らない)。prefer_utf8=MHD_YESで
+     * charset="UTF-8"を付け、非ASCIIのapipasswordでもクライアントの解釈が揺れないようにする */
+    enum MHD_Result rc = MHD_queue_basic_auth_required_response3(connection, "bitmessage", MHD_YES, response);
+    MHD_destroy_response(response);
+    return rc;
+}
+
+static enum MHD_Result api_access_handler(void *cls, struct MHD_Connection *connection,
+                                           const char *url, const char *method, const char *version,
+                                           const char *upload_data, size_t *upload_data_size,
+                                           void **req_cls)
+{
+    const struct bm_api_server_config *config = cls;
+    (void)url;     /* パスは見ない(旧実装同様、どのパスでもJSON-RPCとして受ける) */
+    (void)version;
+
+    struct api_request_ctx *ctx = *req_cls;
+    if (ctx == NULL)
+    {
+        /*
+         * MHDはリクエストごとに、まずヘッダだけが揃った時点で1回このコールバックを呼ぶ
+         * (この時点ではボディは未受信)。ここで応答をqueueすればボディの受信完了を待たずに
+         * 返せるので、405・401はこのタイミングで返す。
+         */
+        if (strcmp(method, MHD_HTTP_METHOD_POST) != 0)
+        {
+            return queue_text_response(connection, MHD_HTTP_METHOD_NOT_ALLOWED, "POST only\n");
+        }
+        if (!check_basic_auth(config, connection))
+        {
+            return queue_auth_required(connection);
+        }
+        ctx = calloc(1, sizeof(*ctx));
+        if (ctx == NULL)
+        {
+            return MHD_NO;
+        }
+        *req_cls = ctx;
+        return MHD_YES;
+    }
+
+    if (*upload_data_size > 0)
+    {
+        size_t chunk = *upload_data_size;
+        *upload_data_size = 0; /* 受け取った分は消費したとMHDへ伝える */
+        if (ctx->too_large || ctx->body_len + chunk > MAX_REQUEST_SIZE)
+        {
+            ctx->too_large = 1;
+            return MHD_YES;
+        }
+        if (ctx->body_len + chunk + 1 > ctx->body_cap)
+        {
+            size_t new_cap = ctx->body_cap == 0 ? 4096 : ctx->body_cap;
+            while (new_cap < ctx->body_len + chunk + 1)
             {
-                if (memcmp(*buf + i, needle, needle_len) == 0)
-                {
-                    return (ssize_t)(i + needle_len);
-                }
+                new_cap *= 2;
             }
-        }
-        if (*buf_len + 4096 > *buf_cap)
-        {
-            *buf_cap = (*buf_cap == 0 ? 4096 : *buf_cap * 2);
-            *buf = realloc(*buf, *buf_cap);
-        }
-        ssize_t n = read(fd, *buf + *buf_len, *buf_cap - *buf_len);
-        if (n <= 0)
-        {
-            return -1;
-        }
-        *buf_len += (size_t)n;
-        if (*buf_len > MAX_REQUEST_SIZE)
-        {
-            return -1;
-        }
-    }
-}
-
-static long find_header_value_long(const char *headers, size_t headers_len, const char *name)
-{
-    size_t name_len = strlen(name);
-    for (size_t i = 0; i + name_len < headers_len; i++)
-    {
-        if (strncasecmp(headers + i, name, name_len) == 0 && headers[i + name_len] == ':')
-        {
-            const char *value = headers + i + name_len + 1;
-            while (*value == ' ')
+            char *grown = realloc(ctx->body, new_cap);
+            if (grown == NULL)
             {
-                value++;
+                ctx->too_large = 1; /* 確保できないほど大きい、として413で返す */
+                return MHD_YES;
             }
-            return strtol(value, NULL, 10);
+            ctx->body = grown;
+            ctx->body_cap = new_cap;
         }
+        memcpy(ctx->body + ctx->body_len, upload_data, chunk);
+        ctx->body_len += chunk;
+        return MHD_YES;
     }
-    return -1;
+
+    /* upload_data_size == 0 かつ2回目以降の呼び出し = ボディ受信完了 */
+    if (ctx->too_large)
+    {
+        return queue_text_response(connection, MHD_HTTP_CONTENT_TOO_LARGE, "request body too large\n");
+    }
+
+    char *response_json = process_jsonrpc_request(config, ctx->body != NULL ? ctx->body : "", ctx->body_len);
+    if (response_json == NULL)
+    {
+        /* JSON-RPCの通知のみだった場合、仕様上ボディを返してはならない(§6) */
+        struct MHD_Response *response =
+            MHD_create_response_from_buffer(0, (void *)(uintptr_t) "", MHD_RESPMEM_PERSISTENT);
+        if (response == NULL)
+        {
+            return MHD_NO;
+        }
+        enum MHD_Result rc = MHD_queue_response(connection, MHD_HTTP_NO_CONTENT, response);
+        MHD_destroy_response(response);
+        return rc;
+    }
+
+    struct MHD_Response *response = MHD_create_response_from_buffer(
+        strlen(response_json), response_json, MHD_RESPMEM_MUST_COPY);
+    cJSON_free(response_json); /* cJSON_PrintUnformattedの戻り値はcJSONのアロケータ管理 */
+    if (response == NULL)
+    {
+        return MHD_NO;
+    }
+    MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "application/json");
+    enum MHD_Result rc = MHD_queue_response(connection, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return rc;
 }
 
-static char *find_header_value_str(const char *headers, size_t headers_len, const char *name)
+/*
+ * MHDの内部エラーログをbm_logへ流す(MHD_OPTION_EXTERNAL_LOGGER)。MHD_USE_ERROR_LOGだけを
+ * 指定するとMHDが素のstderrへ直接書き、タイムスタンプもレベルタグも付かない行が
+ * journalに混ざる。しかもその大半は"Connection was closed by remote side with incomplete
+ * request."のような、ローカルの任意プロセスが接続と切断を繰り返すだけで出させられる
+ * 内容なので、運用時のログを汚さないようDEBUGレベルへ落としてある(起動失敗のような
+ * 本当に重要な事象はMHD_start_daemon()のNULL戻り値として別途bm_log_errorしている)。
+ * MHDのメッセージは末尾に改行を含むため、こちらでは付け足さない。
+ */
+static void api_mhd_logger(void *cls, const char *fmt, va_list ap)
 {
-    size_t name_len = strlen(name);
-    for (size_t i = 0; i + name_len < headers_len; i++)
-    {
-        if (strncasecmp(headers + i, name, name_len) == 0 && headers[i + name_len] == ':')
-        {
-            const char *value = headers + i + name_len + 1;
-            while (*value == ' ')
-            {
-                value++;
-            }
-            const char *line_end = memchr(value, '\r', headers_len - (size_t)(value - headers));
-            size_t len = line_end != NULL ? (size_t)(line_end - value) : strlen(value);
-            char *out = malloc(len + 1);
-            memcpy(out, value, len);
-            out[len] = '\0';
-            return out;
-        }
-    }
-    return NULL;
+    (void)cls;
+    bm_log_vleveled(BM_LOG_DEBUG, fmt, ap);
 }
 
-static void write_http_response(int fd, int status, const char *status_text,
-                                 const char *content_type, const char *body,
-                                 const char *extra_header)
+static void api_request_completed(void *cls, struct MHD_Connection *connection, void **req_cls,
+                                   enum MHD_RequestTerminationCode toe)
 {
-    char header[512];
-    size_t body_len = body != NULL ? strlen(body) : 0;
-    int header_len = snprintf(header, sizeof(header),
-                               "HTTP/1.1 %d %s\r\n"
-                               "Content-Type: %s\r\n"
-                               "Content-Length: %zu\r\n"
-                               "Connection: close\r\n"
-                               "%s"
-                               "\r\n",
-                               status, status_text, content_type, body_len,
-                               extra_header != NULL ? extra_header : "");
-    /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: 生のwrite()は
-     * warn_unused_result属性が付いており、戻り値を無視すると-Wunused-resultが警告する
-     * (-O2で有効化される_FORTIFY_SOURCE経由)。加えて生write()は部分書き込みの可能性も
-     * 元々ハンドリングしていなかったため、既存のbm_network_write_all(部分書き込み対応・
-     * タイムアウト付き、peer_registry.c等で使っているのと同じヘルパー)へ置き換えた。
-     * レスポンス送信の失敗自体はこの後すぐclose(client_fd)するだけなので、戻り値は
-     * 意図的に無視する(bm_network_write_all自体にはwarn_unused_result属性が無い)。 */
-    bm_network_write_all(fd, (const unsigned char *)header, (size_t)header_len,
-                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
-    if (body_len > 0)
+    (void)cls;
+    (void)connection;
+    (void)toe;
+    struct api_request_ctx *ctx = *req_cls;
+    if (ctx != NULL)
     {
-        bm_network_write_all(fd, (const unsigned char *)body, body_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
-    }
-}
-
-void bm_api_server_handle_connection(int client_fd, const struct bm_api_server_config *config)
-{
-    unsigned char *buf = NULL;
-    size_t buf_len = 0;
-    size_t buf_cap = 0;
-
-    ssize_t header_end = read_until_double_crlf(client_fd, &buf, &buf_len, &buf_cap);
-    if (header_end < 0)
-    {
-        free(buf);
-        close(client_fd);
-        return;
-    }
-
-    /* リクエストラインの検証(POSTのみ受け付ける) */
-    if (buf_len < 4 || memcmp(buf, "POST", 4) != 0)
-    {
-        write_http_response(client_fd, 405, "Method Not Allowed", "text/plain", "POST only\n", NULL);
-        free(buf);
-        close(client_fd);
-        return;
-    }
-
-    char *headers = (char *)buf;
-    size_t headers_len = (size_t)header_end;
-
-    char *auth_header = find_header_value_str(headers, headers_len, "Authorization");
-    int authorized = check_basic_auth(config, auth_header);
-    free(auth_header);
-    if (!authorized)
-    {
-        write_http_response(client_fd, 401, "Unauthorized", "text/plain", "Unauthorized\n",
-                             "WWW-Authenticate: Basic realm=\"bitmessage\"\r\n");
-        free(buf);
-        close(client_fd);
-        return;
-    }
-
-    long content_length = find_header_value_long(headers, headers_len, "Content-Length");
-    if (content_length < 0 || (size_t)content_length > MAX_REQUEST_SIZE)
-    {
-        write_http_response(client_fd, 400, "Bad Request", "text/plain", "invalid Content-Length\n", NULL);
-        free(buf);
-        close(client_fd);
-        return;
-    }
-
-    size_t body_already = buf_len - (size_t)header_end;
-    size_t body_needed = (size_t)content_length;
-    if (body_already < body_needed)
-    {
-        size_t to_read = body_needed - body_already;
-        if (buf_len + to_read > buf_cap)
-        {
-            buf_cap = buf_len + to_read;
-            buf = realloc(buf, buf_cap);
-        }
-        size_t got = 0;
-        while (got < to_read)
-        {
-            ssize_t n = read(client_fd, buf + buf_len + got, to_read - got);
-            if (n <= 0)
-            {
-                free(buf);
-                close(client_fd);
-                return;
-            }
-            got += (size_t)n;
-        }
-        buf_len += got;
-    }
-
-    const char *body = (const char *)buf + header_end;
-    char *response_json = process_jsonrpc_request(config, body, body_needed);
-    write_http_response(client_fd, 200, "OK", "application/json", response_json, NULL);
-    free(response_json);
-
-    free(buf);
-    close(client_fd);
-}
-
-int bm_api_server_listen(const struct bm_api_server_config *config, int *out_listen_fd)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-    {
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)config->port);
-    if (inet_pton(AF_INET, config->bind_address, &addr.sin_addr) != 1)
-    {
-        close(fd);
-        return -1;
-    }
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-    {
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 16) != 0)
-    {
-        close(fd);
-        return -1;
-    }
-
-    *out_listen_fd = fd;
-    return 0;
-}
-
-void bm_api_server_serve_forever(int listen_fd, const struct bm_api_server_config *config,
-                                  _Atomic sig_atomic_t *stop_flag)
-{
-    struct pollfd pfd;
-    pfd.fd = listen_fd;
-    pfd.events = POLLIN;
-
-    while (*stop_flag == 0)
-    {
-        int rc = poll(&pfd, 1, 1000); /* 1秒タイムアウトでstop_flagを再チェックする */
-        if (rc < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            break;
-        }
-        if (rc == 0)
-        {
-            continue; /* タイムアウト、stop_flagを再チェックするだけ */
-        }
-
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            break;
-        }
-        bm_api_server_handle_connection(client_fd, config);
+        free(ctx->body);
+        free(ctx);
+        *req_cls = NULL;
     }
 }
 
@@ -1826,16 +1931,53 @@ void *bm_api_server_thread(void *arg)
     char addr_buf[80];
     bm_network_format_host_port(config->bind_address, config->port, addr_buf, sizeof(addr_buf));
 
-    int listen_fd = -1;
-    if (bm_api_server_listen(config, &listen_fd) != 0)
+    /* MHD_OPTION_SOCK_ADDRで明示的にbindアドレスを指定する(省略するとINADDR_ANYになり、
+     * 既定の127.0.0.1バインドという§6.1の決定を破ってしまう)。MHDはMHD_start_daemon()の
+     * 実行中にこのsockaddrをbind()へ渡すだけでポインタを保持しないので、スタック変数でよい */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)config->port);
+    if (inet_pton(AF_INET, config->bind_address, &addr.sin_addr) != 1)
+    {
+        bm_log_error("[api_server] invalid bind address %s\n", config->bind_address);
+        free(args);
+        return NULL;
+    }
+
+    struct MHD_Daemon *daemon =
+        MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG, (uint16_t)config->port,
+                          NULL, NULL, &api_access_handler, (void *)(uintptr_t)config,
+                          /* EXTERNAL_LOGGERは必ず先頭に置く。後ろに置くと
+                           * 「MHD_OPTION_EXTERNAL_LOGGER is not the first option specified
+                           * for the daemon. Some messages may be printed by the standard
+                           * MHD logger.」という警告が出て、それ以前の処理で出たメッセージは
+                           * 素のstderrへ流れてしまう */
+                          MHD_OPTION_EXTERNAL_LOGGER, &api_mhd_logger, NULL,
+                          MHD_OPTION_SOCK_ADDR, (struct sockaddr *)&addr,
+                          MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)BM_API_CONNECTION_TIMEOUT_SECONDS,
+                          MHD_OPTION_CONNECTION_LIMIT, (unsigned int)BM_API_CONNECTION_LIMIT,
+                          MHD_OPTION_NOTIFY_COMPLETED, &api_request_completed, NULL,
+                          MHD_OPTION_END);
+    if (daemon == NULL)
     {
         bm_log_error("[api_server] failed to listen on %s\n", addr_buf);
         free(args);
         return NULL;
     }
     bm_log_info("[api_server] listening on %s\n", addr_buf);
-    bm_api_server_serve_forever(listen_fd, config, args->stop_flag);
-    close(listen_fd);
+
+    /*
+     * MHDは内部スレッドで動くので、このスレッド自身はstop_flagの監視だけを行う
+     * (peer_connector_thread等と同じポーリング方式)。poll(NULL, 0, ms)を単なるsleepとして
+     * 使っている。EINTRで早く起きても次のループでstop_flagを見直すだけなので害はない。
+     */
+    while (*args->stop_flag == 0)
+    {
+        poll(NULL, 0, BM_API_STOP_POLL_INTERVAL_MS);
+    }
+
+    MHD_stop_daemon(daemon);
     bm_log_info("[api_server] stopped\n");
     free(args);
     return NULL;

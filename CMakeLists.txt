@@ -12,6 +12,18 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
 
+# §11 2026-09-15 API層(core/api_server.c)のHTTPトランスポートとJSONを自前実装から
+# libmicrohttpd + cJSONへ移行した際に追加(DESIGN.md §6.1・§11参照)。自前実装には
+# (1) 受理済みソケットに読み取りタイムアウトが無くaccept loopが1接続で無期限停止する
+# 認証前DoS、(2) 自前JSONパーサに再帰深さ制限が無く深いネストでスタックオーバーフロー
+# する認証後クラッシュ、という2つの実害があり、いずれも枯れたライブラリ側で解決済み
+# だったため。どちらもDebian/Ubuntu・Fedora・Arch等の標準リポジトリにある小さな
+# Cライブラリで、ライセンスはlibmicrohttpdがLGPL-2.1+(動的リンクのためMITの本体を
+# 汚染しない)、cJSONがMIT。
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(MICROHTTPD REQUIRED IMPORTED_TARGET libmicrohttpd)
+pkg_check_modules(CJSON REQUIRED IMPORTED_TARGET libcjson)
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra)
 endif()

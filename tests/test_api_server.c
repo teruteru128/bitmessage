@@ -95,14 +95,14 @@ static char *do_request(const char *body, const char *auth_user, const char *aut
         int enc_len = EVP_EncodeBlock(encoded, (const unsigned char *)credentials, (int)strlen(credentials));
         encoded[enc_len] = '\0';
         req_len = snprintf(request, sizeof(request),
-                            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\n"
+                            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\nConnection: close\r\n"
                             "Content-Length: %zu\r\n\r\n%s",
                             encoded, strlen(body), body);
     }
     else
     {
         req_len = snprintf(request, sizeof(request),
-                            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\n%s",
+                            "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
                             strlen(body), body);
     }
     /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: -O2では戻り値無視の
@@ -165,7 +165,7 @@ static int is_unauthorized(const char *body, const char *auth_user, const char *
 
     char request[8192];
     int req_len = snprintf(request, sizeof(request),
-                            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\n"
+                            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\nConnection: close\r\n"
                             "Content-Length: %zu\r\n\r\n%s",
                             encoded, strlen(body), body);
     CHECK(write(fd, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");

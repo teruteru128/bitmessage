@@ -61,9 +61,14 @@ char *bm_http_post_json(const char *host, int port, const char *username, const 
      * サイズ計算へ加え、sprintf()もsnprintf()へ置き換えて二重に安全側にした。 */
     size_t request_cap = strlen(host) + strlen(body) + strlen(auth_header) + 256;
     char *request = malloc(request_cap);
+    /* §11 2026-09-15 Connection: closeを明示する。サーバー(core/api_server.c)をlibmicrohttpdへ
+     * 移行したことでHTTP/1.1の既定であるkeep-aliveが効くようになったが、下の応答読み取りは
+     * read()がEOF(n<=0)を返すまで回す実装なので、接続を維持されると応答を受け取った後も
+     * サーバー側の接続タイムアウト(30秒)まで待たされてしまう。このクライアントは1回の
+     * 起動で1リクエストしか投げないため、素直にcloseを要求する。 */
     int req_len = snprintf(request, request_cap,
                             "POST / HTTP/1.1\r\nHost: %s\r\n%sContent-Type: application/json\r\n"
-                            "Content-Length: %zu\r\n\r\n%s",
+                            "Connection: close\r\nContent-Length: %zu\r\n\r\n%s",
                             host, auth_header, strlen(body), body);
     ssize_t written = write(fd, request, (size_t)req_len);
     free(request);

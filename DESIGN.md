@@ -767,6 +767,9 @@ testnetの実イベント到達間隔と噛み合わず今回は個別確認で�
 
 ## 6. API層(フロント⇄コア暗号層)方針決定
 
+**2026-09-15: HTTPトランスポートとJSONを自前実装からlibmicrohttpd + cJSONへ移行した(§6.3)。
+以下の「自前HTTP/1.1」「自前JSON」に関する記述は移行前の状態を示す歴史的な記録として残してある。**
+
 **実装済み(`src/core/api_server.c`)。自前JSON-RPC 2.0(`src/common/json.c`、外部JSONライブラリ非依存の
 最小実装)+HTTP/1.1(自前、ブロッキングI/O、1接続1リクエスト)。HTTP Basic認証、`§6.2`の
 `unlockAddress`/`lockAddress`/`lockAllAddresses`/`deleteAddress`/`listAddresses`/
@@ -812,6 +815,10 @@ PyBitmessageは「メソッドディスパッチテーブル」と「トラン�
 
 ### 6.1 本実装での決定
 
+**2026-09-15: 以下の「トランスポートは自前実装」の決定はlibmicrohttpd + cJSONへの移行により
+撤回した(経緯と根拠は§6.3)。「ハンドラ辞書とトランスポートを分離した設計」の方は移行後も
+維持しており、`METHODS[]`は手付かずのままトランスポート側だけを差し替えられた。**
+
 PyBitmessage自身が推奨する方向性(JSON-RPC)にそのまま合わせ、**トランスポートは自前実装のJSON-RPC 2.0の
 みをv1スコープとする**(xmlrpc-c依存は持たない。既存`bm_api.h`のxmlrpc-cベースコードは不採用)。ただし
 PyBitmessage同様「ハンドラ辞書とトランスポートを分離した設計」を踏襲し、`struct api_method { const char *name;
@@ -842,6 +849,124 @@ api_handler_fn handler; }`の配列をコア層が持ち、HTTPレイヤーとJS
 | `unlockAllAddresses` | passphrase | §7.4参照。数千件規模の一括unlock(vault方式) |
 | `importAddress` | address, signingWIF, encryptionWIF, label, storePassphrase, nonceTrialsPerByte?, payloadLengthExtraBytes? | 2026-08-29実装。当初案は`address`を含まなかったが、WIFは秘密鍵のみでaddressVersion/streamを含まないため確定時に追加した(§11参照)。addressから復元したripeとWIFの公開鍵ripeが一致するか検証してから保存する |
 | `exportAddress` | address, passphrase | 2026-08-29実装。importAddressと対称。その場でpassphrase復号しsigningWIF/encryptionWIFを返す一回性操作(keyringには触れない) |
+
+
+### 6.3 libmicrohttpd + cJSONへの移行(2026-09-15)
+
+§6.1で「トランスポートは自前実装のJSON-RPC 2.0のみをv1スコープとする」と決めていたが、
+これを撤回し、**HTTPトランスポートを[libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/)、
+JSONのパース/シリアライズを[cJSON](https://github.com/DaveGamble/cJSON)へ移行した。**
+自前実装(`bm_json_*`、`src/common/json.c`)はCLI(`src/cli/main.c`)側で引き続き使っており、
+削除はしていない(§11の残件参照)。
+
+#### 移行の動機(抽象論ではなく、実際に確認できた2件の欠陥)
+
+1. **認証前DoS。** 旧`read_until_double_crlf()`はaccept済みのfdに読み取りタイムアウトを
+   一切設定せず`read()`でブロックし、accept loop(`bm_api_server_serve_forever`)も
+   シングルスレッドだった。このためTCP接続だけして1バイトも送らないクライアントが1つ
+   居るだけでRPCサーバー全体が無期限に停止した。しかもこの停止はHTTP Basic認証の検証より
+   手前で起きるため、`apiusername`/`apipassword`を知らない相手でも発動できた
+   (`nc 127.0.0.1 8442`を実行して放置するだけ)。bindが`127.0.0.1`固定なのでリモートからは
+   到達できないが、同一ホスト上の任意のプロセスから仕掛けられる。
+2. **認証後のプロセスクラッシュ。** 自前JSONパーサ(`bm_json_parse`)は再帰下降で、
+   ネストの深さに上限を設けていなかった。移行前に実測したところ、`[`を10万個並べただけの
+   入力でスタックオーバーフローによりSIGSEGVした(深さ5万では成功、10万で落ちる)。
+   リクエストボディの上限が1MiB(`MAX_REQUEST_SIZE`)なので、深さ約100万まで送り込める。
+   JSONのパースはBasic認証より後段なので資格情報は必要だが、`bitmessaged`プロセス全体が
+   落ちるため影響は大きい。cJSONは`CJSON_NESTING_LIMIT`(既定1000)を超えると`NULL`を返す
+   だけなので、これは構造的に起こらない。
+
+副次的に、**Transfer-Encoding: chunked非対応**(旧実装は`Content-Length`が無いと400を返した)、
+**keep-alive非対応**、**同時1リクエスト**という制約も解消された。自前のHTTPパース約280行と
+base64デコード/Authorizationヘッダ探索約80行を削除できている。
+
+#### 「本家準拠か、意図的な逸脱か」の切り分け
+
+CLAUDE.mdの規律に従い本家`src/api.py`を確認した。PyBitmessageのAPIサーバーはPython標準
+ライブラリの`SimpleXMLRPCServer`(または`jsonrpclib.SimpleJSONRPCServer`)であり、
+`SimpleXMLRPCRequestHandler.protocol_version`は`BaseHTTPRequestHandler`の既定値
+`HTTP/1.0`のまま(実測確認)、`socketserver.TCPServer`なので同時に1リクエストしか処理しない。
+つまり**旧自前実装の挙動は結果的に本家と一致しており、今回の移行は本家からの逸脱にあたる。**
+
+それでも逸脱を選んだのは、**本家準拠が必要なのは「他ノードから観測できる挙動」に限る**
+という切り分けによる。P2Pのワイヤーフォーマット・PoWのtarget計算式・rating更新・peerから
+見えるタイムアウト値は、ズレれば相互運用が壊れるかbanされるので本家準拠が絶対である。
+一方このAPI層は自ノードのローカルクライアント(`bitmessage-cli`や将来のフロントエンド)しか
+見ないため、本家に権威が無い。加えて本家の`HTTP/1.0`は設計判断として選ばれたものではなく、
+`BaseHTTPRequestHandler`のクラス変数の既定値を誰も見直していないだけであり、
+本家`api.py`のdocstring自身が「`apivariant=xml`は後方互換のための現行デフォルトだが
+`json`を推奨」と書いてAPI層をレガシー扱いしている。真似るべき判断が存在しない。
+
+#### 実装上の決定
+
+- **スレッドモデルは`MHD_USE_INTERNAL_POLLING_THREAD`単独**とし、
+  `MHD_USE_THREAD_PER_CONNECTION`もスレッドプール(`MHD_OPTION_THREAD_POOL_SIZE`)も使わない。
+  MHDが内部スレッド1本でpoll/epollループを回して複数接続を多重化しつつ、コールバックは
+  常にその1本から直列に呼ぶモデルなので、「同時に処理するリクエストは常に1件」という
+  旧実装の前提をそのまま維持できる。`METHODS[]`の各ハンドラはkeyring・registry・各DB
+  ハンドルといった共有状態を触っており、並列化するならそれら全ての排他制御を見直す必要が
+  あるため、今回の移行では意図的に直列のままにした。並列化したくなったら、フラグを変える
+  前に全ハンドラのスレッド安全性を検証すること。
+- **Basic認証の照合は引き続き自前の定数時間比較で行う。** `MHD_basic_auth_get_username_password3()`が
+  肩代わりするのはAuthorizationヘッダの探索とbase64デコードとユーザー名/パスワードの
+  切り分けまでで、照合自体はアプリの責任であるため。§6.1の「比較は定数時間で行う」は維持。
+  なお旧実装は`"user:pass"`を`char expected[256]`へ`snprintf`で連結してから比較していたため、
+  256バイトを超える長い`apipassword`を設定すると黙って切り詰められ、切り詰め後の値でも
+  認証が通る状態だった(移行のついでに解消)。
+- **keep-aliveが有効になった。** HTTP/1.1の既定動作なので許容するが、「応答を読んだ後EOFまで
+  読む」実装のクライアントはサーバー側の接続タイムアウト(`BM_API_CONNECTION_TIMEOUT_SECONDS`
+  =30秒)まで待たされる。本リポジトリの`bitmessage-cli`(`src/cli/http_client.c`)とテストの
+  HTTPヘルパーがまさにその実装だったため、リクエストに`Connection: close`を付けるよう修正した。
+  外部のクライアントを書く場合も同様の注意が要る。
+- **MHDの内部エラーログは`MHD_OPTION_EXTERNAL_LOGGER`で`bm_log`へ流す(DEBUGレベル)。**
+  `MHD_USE_ERROR_LOG`だけを指定するとMHDが素のstderrへ直接書き、タイムスタンプもレベルタグも
+  付かない行がjournalに混ざる。しかもその大半は「Connection was closed by remote side with
+  incomplete request.」のような、ローカルの任意プロセスが接続と切断を繰り返すだけで出させられる
+  内容なので、運用時のログを汚さないようDEBUGへ落としてある(起動失敗のような本当に重要な
+  事象は`MHD_start_daemon()`のNULL戻り値として別途`bm_log_error`している)。この配線のために
+  `bm_log_vleveled()`(`bm_log_leveled`の`va_list`版)を`common/logging.*`へ追加した。
+  なお`MHD_OPTION_EXTERNAL_LOGGER`は**オプション列の先頭に置かないと**MHD自身が
+  「not the first option specified」と警告し、それ以前のメッセージは標準ロガーへ流れてしまう。
+- **公開ヘッダ(`api_server.h`)には`struct MHD_Daemon *`も`cJSON *`も露出させない**
+  (§3.5の暗号バックエンドと同じ規律)。移行に伴い`bm_api_server_listen()`/
+  `bm_api_server_handle_connection()`/`bm_api_server_serve_forever()`は削除した
+  (いずれも公開されていたが`bm_api_server_thread`以外からは呼ばれていなかった)。
+- **ライセンス。** libmicrohttpdはLGPL-2.1+だが動的リンクのため本体(MIT)を汚染しない。
+  cJSONはMIT。どちらもDebian/Ubuntu・Fedora・Arch等の標準リポジトリにある小さなCライブラリで、
+  ビルド要件としてはOpenSSL/SQLite3に1段積む形になる(CMakeでは`pkg_check_modules`で検出)。
+
+### 6.4 JSON-RPC 2.0仕様への準拠度の向上(2026-09-15)
+
+§6.3の移行でディスパッチ層を書き直すのに合わせ、それまで未対応だった仕様項目を実装した。
+
+- **バッチリクエスト(Specification §6)。** 旧実装はボディがJSONオブジェクトであることを
+  要求しており、仕様で定められたバッチ(リクエストオブジェクトの配列)を送ると
+  「Parse error: invalid JSON」で拒否していた。応答は仕様通り、通知を除いた各リクエストの
+  応答オブジェクトを要素とする配列で返す(順序は仕様上は問わないが、クライアント側の
+  突き合わせが楽なのでリクエスト順に揃えてある)。空配列はInvalid Requestとして
+  単一の応答オブジェクトで返す。
+  なお**1バッチあたり256件の上限(`BM_JSONRPC_MAX_BATCH_SIZE`)を設けた。** 仕様に上限の定めは
+  無いが、1MiBのボディいっぱいまで最小サイズのリクエストを詰めると3万件強が入り、それが全て
+  `unlockAddress`(1件あたりscryptで約161ms)だと1リクエストでRPCサーバーを1時間以上占有できて
+  しまう(ハンドラは直列実行のため、その間他のAPI呼び出しは待たされる)。認証済みクライアント
+  しか到達できない経路とはいえ、スクリプトのループミスでも起きうるので上限を設ける。
+  数千件規模の一括処理には`importAddressesBulk`のような「1メソッド呼び出しで多件数を扱う」
+  専用メソッドを使うこと。
+- **通知(notification、Specification §4.1)。** `id`メンバを持たないリクエストには応答を
+  返してはならない。旧実装は`id`が無くても`"id":null`を付けた応答を返していた。現在は
+  単一の通知・全て通知のバッチともHTTP 204 No Contentで本文なしを返す。副作用(ハンドラの
+  実行)は通常通り起こした上で応答だけを捨てる。`"id":null`は「idを明示的にnullにした
+  リクエスト」であって通知ではないため、従来通り応答する。
+- **エラーコードの整理(Specification §5.1)。** 旧実装は全て`-32000`(実装定義のServer error)を
+  返しており、クライアント側が「JSONが壊れている」「メソッド名を間違えた」「そもそも
+  リクエストの形になっていない」を区別できなかった。現在はParse error=`-32700`、
+  Invalid Request=`-32600`、Method not found=`-32601`を使い分ける。ハンドラが返す
+  アプリケーション由来のエラーだけは引き続き`-32000`(仕様上`-32000`〜`-32099`が実装定義用に
+  予約されている)。
+
+検証は`tests/test_api_transport.c`(新設)で行っている。バッチ・通知・エラーコードに加え、
+移行の動機になった欠陥が実際に直っていること(放置された接続がサーバーを占有しないこと、
+深さ10万のネストでプロセスが落ちないこと、chunkedで送れること)も実HTTPリクエストで確認する。
 
 ## 7. 鍵ライフサイクル管理設計(§8-1、ユーザー要望による独自拡張)
 
@@ -2544,3 +2669,33 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     事情(不安定なpeerの入れ替わり等)による可能性はあるが確証はなく、今回追加した
     安全網はあくまで「発生した場合に素早く刈り取る」ものであり、なぜ発生頻度自体が
     下がったのかという問いには答えていない点に注意。
+
+30. **API層のHTTP/JSONを自前実装からlibmicrohttpd + cJSONへ移行**: 2026-09-15、ユーザーからの
+    「HTTPパースとBASIC認証を独自実装しているが、libmicrohttpdとcJSONに書き換えるべきか」
+    という問いから着手した。設計・根拠の本体は§6.3・§6.4に記述したので、ここには経緯と
+    残件のみ記す。
+
+    「書き換えるべきか」を好みで答えないため、まず自前実装の実害を実測した。(1)
+    `read_until_double_crlf()`が受理済みfdに読み取りタイムアウトを設定しておらず、
+    接続だけして何も送らないクライアント1つでRPCサーバー全体が無期限停止する(Basic認証の
+    検証より手前なので資格情報不要)、(2) 自前JSONパーサ`bm_json_parse`に再帰深さ制限が無く、
+    `[`を10万個並べた入力で実際にSIGSEGVする(ボディ上限1MiBなので深さ約100万まで送れる)、
+    の2点を確認できたため「書き換えるべき」と判断した。どちらもライブラリ側では解決済みの
+    問題(MHDはノンブロッキングI/O+接続タイムアウト、cJSONは`CJSON_NESTING_LIMIT`)である。
+
+    移行の副産物として、ディスパッチ層を書き直すのに合わせJSON-RPC 2.0のバッチリクエストと
+    通知(notification)に対応し、エラーコードを仕様の予約値へ整理した(§6.4)。バッチ対応は
+    ユーザーからの「特に指定してないがバッチリクエストにも対応できているのか」という
+    問いがきっかけで、確認したところ未対応(ボディがJSONオブジェクトであることを要求して
+    いた)だったため、この機会に入れた。
+
+    `tests/test_api_transport.c`を新設(46件目)。ビルド警告ゼロ、`build-Debug`でctest 46件全通過。
+
+    **残件**: 自前JSON実装(`src/common/json.c`、803行)はCLI(`src/cli/main.c`、約130箇所)と
+    一部のテストが引き続き使っており、削除していない。今回の移行スコープを
+    「daemon側のAPIサーバー」に限定したのは、(a) ユーザーの依頼がHTTPパースとBASIC認証、
+    すなわちサーバー側を対象にしていたこと、(b) 上記2件の実害はいずれもサーバー側(外部から
+    任意の入力を受け取る側)にしか存在せず、CLIがパースするのはローカルのdaemonが返した
+    応答であること、(c) CLIはユーザーが数千件規模の一括操作に日常的に使っており、機能上の
+    利得が無い機械的な置換で回帰を招くリスクの方が大きいこと、による。CLIも
+    cJSONへ寄せてツリーからJSON実装を1つに減らすのは、優先度は低いが妥当な後続作業。
