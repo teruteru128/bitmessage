@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [master]
 
+# §11 2026-09-15 API層をlibmicrohttpd + cJSONへ移行した際(DESIGN.md §6.3)、このワークフロー
+# への依存追加を忘れており、全4ジョブがConfigure段階(pkg_check_modules(... REQUIRED))で
+# 落ちる状態になっていた(ユーザーの指摘で発覚)。ライブラリ依存を増やすときはCMakeLists.txtと
+# README.mdの「依存」節に加えて、ここも必ず同時に更新すること。
+# pkg-config自体はubuntu-latestイメージにはプリインストールされているが、Fedoraコンテナには
+# 入っていないため明示的にインストールする(暗黙のイメージ依存を作らないよう、Ubuntu側でも
+# 省略せず書いておく)。
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -15,7 +22,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libssl-dev libsqlite3-dev
+          sudo apt-get install -y cmake build-essential pkg-config \
+                                  libssl-dev libsqlite3-dev \
+                                  libmicrohttpd-dev libcjson-dev
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -40,7 +49,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libssl-dev libsqlite3-dev
+          sudo apt-get install -y cmake build-essential pkg-config \
+                                  libssl-dev libsqlite3-dev \
+                                  libmicrohttpd-dev libcjson-dev
 
       - name: Configure (ASan+UBSan)
         run: cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON
@@ -71,7 +82,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libssl-dev libsqlite3-dev
+          sudo apt-get install -y cmake build-essential pkg-config \
+                                  libssl-dev libsqlite3-dev \
+                                  libmicrohttpd-dev libcjson-dev
 
       - name: Configure (TSan)
         run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_TSAN=ON
@@ -100,7 +113,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: dnf install -y cmake gcc make openssl-devel sqlite-devel git
+        run: dnf install -y cmake gcc make git pkgconf-pkg-config \
+                            openssl-devel sqlite-devel \
+                            libmicrohttpd-devel cjson-devel
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
