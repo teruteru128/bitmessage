@@ -113,9 +113,15 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: dnf install -y cmake gcc make git pkgconf-pkg-config \
-                            openssl-devel sqlite-devel \
-                            libmicrohttpd-devel cjson-devel
+        # run:は「|」のブロックスカラーにすること。プレーンスカラー(run: 1行)のまま
+        # 行末「\」で折り返すと、YAMLが複数行を空白1つに畳んだ結果「\ 」が改行ではなく
+        # 空白のエスケープになり、次の引数が先頭に空白を持つ別物(" openssl-devel")として
+        # dnfへ渡って"No match for argument"で落ちる(2026-09-15に実際に踏んだ。
+        # 上のUbuntu側3ジョブは元から「run: |」なので同じ書き方でも問題なかった)。
+        run: |
+          dnf install -y cmake gcc make git pkgconf-pkg-config \
+                         openssl-devel sqlite-devel \
+                         libmicrohttpd-devel cjson-devel
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
