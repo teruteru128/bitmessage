@@ -2889,3 +2889,38 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     乗りうる(重複はhashが同じなので受信側で吸収される)。また`bm_dandelion_expire_and_refluff`
     のfluffは`except=NULL`で呼ばれており、直前にdinvを送ったstem successorにも改めてinvが
     飛ぶ(相手は通常getdata済みなので無害だが1パケット無駄)。どちらも優先度は低い。
+
+33. **`bm_peer_manager_seed_bootstrap`が`BM_TOR_CONTROL`利用時の真の新規インストールで
+    空振りするバグを修正**: 2026-09-15、項目23(ゴースト接続調査)の再現実験用に、
+    `git worktree add`で報告当時のコミット(`8b96ada`)を別worktreeへ切り出し、
+    `BM_TOR_CONTROL=1`で独自のephemeral onionサービスを作らせて実ネットワークへ
+    接続を試みたところ、**起動後何十秒経ってもoutbound接続が1本も試みられない**
+    (`connecting to ...`のDEBUGログすら出ない)現象に遭遇し、副産物として発見した。
+
+    原因は`bm_peer_manager_seed_bootstrap`(`src/core/peer_manager.c`)の「`hosts`
+    テーブルが空の時だけmainnet seed 9件+`observed_nodes.txt`3件を投入する」という
+    ガード(`SELECT COUNT(*) FROM hosts;`)。`main.c`は`BM_TOR_CONTROL`で作成した
+    自分自身のonionアドレスを`bm_peer_manager_mark_self`で`is_self=1`として`hosts`へ
+    登録するが、この登録は`peer_connector_thread`(この関数の唯一の呼び出し元)の
+    起動より必ず先に走る。そのため真に新規(DBファイルが存在しない)インストールでは、
+    seed_bootstrapが呼ばれた時点で既に自分自身の1行が入っており`existing > 0`が
+    真になるため、mainnet seed/observed nodesが一切投入されない。接続候補が
+    自分自身(`list_top`で`is_self=0`により除外される)しか無い状態になり、
+    `peer_connector`は永久に候補ゼロのまま何もしない。
+
+    daemon Aは既にpeers.dbが確立済みなので実害は無いが、`BM_TOR_CONTROL=1`で
+    真っさらな状態から起動する新規ユーザー(またはDBを作り直したテスト環境)は
+    確実にこれを踏む。
+
+    **修正**: ガードのSQLを`SELECT COUNT(*) FROM hosts WHERE is_self = 0;`に変更した。
+    `is_self=1`の行は元々`list_top`の候補選定からも除外されている(2026-08-22、
+    項目未採番)のと同じ理由で、空判定でも無視するのが一貫している。1行の修正で
+    済んだため、`main.c`側の初期化順序(mark_selfとpeer_connector_thread起動の
+    前後関係)には手を付けていない。ビルド警告ゼロ、ctest 46件100%通過。
+
+    なお、この副産物の発見に至った項目23再現実験そのもの(旧worktreeでの実測)では、
+    一時「単一スレッドが1接続の大量受信処理に占有され、他接続のidle_sweep/epoll_wait
+    ディスパッチが長時間止まる」という仮説を有力視しかけたが、これは`idle_sweep_one`/
+    `bm_network_epoll_thread`の調査用ログが両方とも`!conn->handshake_complete`の
+    時にしか出力されない条件付きログであることを見落とした誤読と判明し(ユーザー
+    指摘により発覚)、撤回した。項目23の根本原因は本項目時点でも依然未解決のまま。

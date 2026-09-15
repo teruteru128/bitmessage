@@ -253,8 +253,17 @@ int bm_peer_manager_load_observed_nodes(sqlite3 *db, const char *path)
 
 int bm_peer_manager_seed_bootstrap(sqlite3 *db, int testnet, const char *observed_nodes_path)
 {
+    /* §11 2026-09-15発覚のバグ修正: BM_TOR_CONTROL=1(またはBM_ONION_ADDRESS/[tor]
+     * onion_address)利用時、main()がbm_peer_manager_mark_selfで自分自身のonionアドレスを
+     * is_self=1としてhostsテーブルへ登録する処理が、peer_connector_thread(この関数の
+     * 唯一の呼び出し元)の起動より必ず先に走る。そのため「COUNT(*) FROM hosts」で空判定
+     * すると、真に新規(DBファイルが存在しない)インストールでは自分自身の1行が既に
+     * 入っているせいで常にexisting>0となり、mainnet seed/observed nodesが一切投入されず、
+     * outbound接続を1本も試みられないままネットワークに繋がらなくなっていた
+     * (ghost-connection調査用の別worktree検証中に発覚、ユーザー指摘)。is_self=1の行は
+     * 候補選定(list_top)から元々除外されているのと同じ理由で、この空判定でも無視する。 */
     sqlite3_stmt *count_stmt = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM hosts;", -1, &count_stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM hosts WHERE is_self = 0;", -1, &count_stmt, NULL) != SQLITE_OK)
     {
         return -1;
     }
