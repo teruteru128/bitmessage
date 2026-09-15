@@ -1,15 +1,36 @@
 #include "peer_registry.h"
 
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../common/logging.h"
 #include "object.h"
 #include "protocol.h"
+
+/* §11 2026-09-15: DESIGN.md §11項目23(ゴースト接続調査)向けの計測。「新規object受信のたび
+ * handle_objectがこの関数を呼び、詰まったpeerが混じっているとbm_network_write_allの
+ * select()タイムアウト(BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS)分だけnetwork_epoll_thread
+ * (この関数の主な呼び出し元、object_sync.cのhandle_object参照)が同期的にブロックしうる」
+ * という仮説を検証するため、1回のbroadcast呼び出しの所要時間を計測する。CLAUDE.mdの
+ * 「time(NULL)を直接呼ばない」方針は決定ロジック(タイムアウト判定等)の決定性確保が目的で、
+ * ここでの計測値はログ出力のみに使い制御フローに一切影響しないため、この方針の対象外と
+ * 判断した(bm_log_leveled自体が内部でタイムスタンプ取得している既存パターンと同様)。
+ * 壁時計(time())ではなくCLOCK_MONOTONICを使うのは、NTP補正等で時刻が巻き戻る影響を
+ * 受けずに経過時間だけを正確に測るため。 */
+#define BM_BROADCAST_INV_SLOW_WARN_MS 500
+
+static int64_t monotonic_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 void bm_peer_registry_init(struct bm_peer_registry *reg)
 {
@@ -290,6 +311,7 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
     size_t dinv_sent_peers = 0;
     size_t evicted_peers = 0;
     char reason[BUFSIZ];
+    int64_t write_loop_start_ms = monotonic_now_ms();
     for (size_t i = 0; i < pending_count; i++)
     {
         /* §11 2026-09-05: fluff/stemいずれかのwriteが失敗したら、ループの最後でこの接続を
@@ -356,12 +378,24 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
      * (pending_count==0)場合は出さない。 */
     if (pending_count > 0)
     {
+        int64_t elapsed_ms = monotonic_now_ms() - write_loop_start_ms;
         /* §11 2026-09-12: 8段階化に伴う移行。broadcast呼び出し1回につき1行のサマリなので
          * 無番号のDEBUGにした。 */
         bm_log_debug(
                 "[peer_registry] broadcast inv: %zu hash(es) inv to %zu peer(s), dinv to %zu peer(s), evicted "
-                "%zu dead peer(s)\n",
-                count, inv_sent_peers, dinv_sent_peers, evicted_peers);
+                "%zu dead peer(s), took %" PRId64 "ms\n",
+                count, inv_sent_peers, dinv_sent_peers, evicted_peers, elapsed_ms);
+        /* §11 2026-09-15: 項目23の「単一スレッドが詰まったpeerへのwriteで長時間ブロックする」
+         * 仮説の検証用。DEBUGを有効にしなくても異常な遅さだけは見えるよう、閾値超過時は
+         * WARNでも重ねて出す(handshake_complete等の状態に一切依存しない無条件ログ、
+         * 2026-09-15に一度この条件付きログの罠で誤った結論を出した反省を踏まえた設計)。 */
+        if (elapsed_ms >= BM_BROADCAST_INV_SLOW_WARN_MS)
+        {
+            bm_log_warn(
+                    "[peer_registry] broadcast inv took %" PRId64 "ms (%zu peer(s) attempted, %zu evicted) - "
+                    "possible network_epoll_thread stall while a peer's write buffer was stuck\n",
+                    elapsed_ms, pending_count, evicted_peers);
+        }
     }
     free(pending);
 }

@@ -2924,3 +2924,38 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `bm_network_epoll_thread`の調査用ログが両方とも`!conn->handshake_complete`の
     時にしか出力されない条件付きログであることを見落とした誤読と判明し(ユーザー
     指摘により発覚)、撤回した。項目23の根本原因は本項目時点でも依然未解決のまま。
+
+34. **`bm_peer_registry_broadcast_inv`に所要時間計測を追加(項目23の別仮説の検証用計装)**:
+    2026-09-15、項目33の調査の副産物として、`handle_object`(object_sync.c)が**新規object
+    受信のたび毎回同期的に`bm_peer_registry_broadcast_inv`を呼んでいる**ことに気付いた
+    (ユーザー指摘で発覚)。この関数は主にnetwork_epoll_thread自身から呼ばれるため、
+    宛先peerの中に送信バッファが詰まった(TCP的にはまだ生きているが応答が返らない)ものが
+    混じっていると、`bm_network_write_all`が`select()`で最大`BM_NETWORK_WRITE_TIMEOUT_
+    SHORT_SECONDS`(2秒)ブロックしうる。新規objectを受信するたびにこれが繰り返されると、
+    詰まったpeer数×2秒がobject受信のたびに積み上がり、network_epoll_threadがepoll_wait/
+    idle_sweepへ戻れない時間が伸びる、という項目23の別の(項目33直前で撤回した「単一
+    read()バースト」仮説とは異なる)有力候補が浮上した。実際に項目23の2026-09-05調査では
+    `ss`コマンドで該当peerがCLOSE-WAIT・Recv-Q=130バイト残留という「TCP的にはまだ生きて
+    いるが応答が無い」状態だったことを確認済みで、この仮説と整合する。
+
+    ただし実測でしか確証は得られないため、`bm_peer_registry_broadcast_inv`の書き込み
+    ループ(`CLOCK_MONOTONIC`、壁時計time()はNTP補正で巻き戻りうるため使わない)の所要
+    時間を計測し、既存のサマリログ(`broadcast inv: ...`)へ`took Nms`を追記した。加えて
+    `BM_BROADCAST_INV_SLOW_WARN_MS`(500ms)以上かかった場合はDEBUGを有効にしなくても
+    見えるようWARNでも出す。2026-09-15にidle_sweep/epoll_wait調査ログが`!handshake_
+    complete`時にしか出ない条件付きログだったと気付かず誤った結論を出した反省を踏まえ、
+    今回の計測ログは接続の状態に一切依存しない無条件のログにした。
+
+    計測コード自体はログ出力のみに使い戻り値・分岐等の制御フローには一切影響しないため、
+    CLAUDE.mdの「time(NULL)を直接呼ばない」方針(決定ロジックの決定性確保が目的)の対象外と
+    判断し、`clock_gettime`を直接呼んだ(コメントで根拠を明記)。
+
+    **テストは追加しなかった**(ユーザーと合意の上)。正確に検証しようとすると小さい
+    `SO_SNDBUF`のsocketpair等で実際に`BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS`(2秒)分
+    ブロックさせる統合テストが必要になり、ctest全体を2秒以上延ばしてまで足すほどの
+    リスクではない(hash数・evicted数等の既存ロジックは一切変更していない)と判断した。
+    既存の`test_peer_registry_evict`等が引き続き全通過することで、この既存ロジックへの
+    非破壊は確認済み。ビルド警告ゼロ、ctest 46件100%通過。
+
+    次に本番daemon Aまたは試験用インスタンス(項目23参照)で長時間ログ途絶が再発した際、
+    この`took Nms`ログとWARNの有無を確認することで、本仮説を直接検証できる。
