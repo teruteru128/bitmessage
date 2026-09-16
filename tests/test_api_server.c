@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../src/common/json.h"
+#include "../src/common/message_limits.h"
 #include "../src/core/address.h"
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
@@ -82,7 +83,12 @@ static char *do_request(const char *body, const char *auth_user, const char *aut
         return NULL;
     }
 
-    char request[8192];
+    /* §11 2026-09-16 本文長上限(BM_MAX_SUBJECT_PLUS_BODY_LEN)のテストで256KiB級の
+     * リクエストを送るため、固定長のchar request[8192]からヒープ確保へ変えた。
+     * 固定長のままだとsnprintfが黙って切り詰め、壊れたリクエストを送ってしまう */
+    size_t request_cap = strlen(body) + 1024;
+    char *request = malloc(request_cap);
+    CHECK(request != NULL, "allocating the HTTP request buffer should succeed");
     int req_len;
     if (auth_user != NULL)
     {
@@ -94,14 +100,14 @@ static char *do_request(const char *body, const char *auth_user, const char *aut
         extern int EVP_EncodeBlock(unsigned char *, const unsigned char *, int);
         int enc_len = EVP_EncodeBlock(encoded, (const unsigned char *)credentials, (int)strlen(credentials));
         encoded[enc_len] = '\0';
-        req_len = snprintf(request, sizeof(request),
+        req_len = snprintf(request, request_cap,
                             "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic %s\r\nConnection: close\r\n"
                             "Content-Length: %zu\r\n\r\n%s",
                             encoded, strlen(body), body);
     }
     else
     {
-        req_len = snprintf(request, sizeof(request),
+        req_len = snprintf(request, request_cap,
                             "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
                             strlen(body), body);
     }
@@ -110,6 +116,7 @@ static char *do_request(const char *body, const char *auth_user, const char *aut
      * 部分書き込みになることは実質無いが、CHECKで検証することで警告を解消しつつ
      * 万一の部分書き込みもテスト失敗として可視化する。 */
     CHECK(write(fd, request, (size_t)req_len) == req_len, "writing the HTTP request should not short-write");
+    free(request);
 
     char *resp = malloc(65536);
     size_t resp_len = 0;
@@ -569,6 +576,103 @@ int main(void)
             }
             bm_json_free(v);
             free(resp);
+        }
+
+        /*
+         * §11 2026-09-16 subject+bodyの長さ上限。CLIの--body-file追加とセットで、
+         * sendMessage/sendBroadcastのどちらにも本文長の検査が無かったのを直した
+         * (上限の根拠はsrc/common/message_limits.h、PyBitmessage本家 src/api.py:1212/1258)。
+         *
+         * CLI側(src/cli/main.c)でもHTTPへ載せる前に同じ基準で弾いているが、API直叩きの
+         * 経路が残るのでサーバー側の検査が本体。ここではpubkey_cache登録済みの宛先
+         * (=長さ検査さえ通れば送信が成功する状態)へ送り、「長すぎるという理由だけで」
+         * エラーになることを確認する。
+         */
+        {
+            size_t too_long_body_len = BM_MAX_SUBJECT_PLUS_BODY_LEN + 1;
+            char *too_long_body = malloc(too_long_body_len + 1);
+            CHECK(too_long_body != NULL, "allocate an over-limit body");
+            memset(too_long_body, 'a', too_long_body_len);
+            too_long_body[too_long_body_len] = '\0';
+
+            size_t req_cap = too_long_body_len + 512;
+            char *send_req_too_long = malloc(req_cap);
+            CHECK(send_req_too_long != NULL, "allocate the over-limit sendMessage request");
+            snprintf(send_req_too_long, req_cap,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
+                     "\"params\":[\"%s\",\"%s\",\"\",\"%s\",3600,1],\"id\":16}",
+                     sender_address, recv_address, too_long_body);
+            resp = do_request(send_req_too_long, "testuser", "testpass");
+            CHECK(resp != NULL, "sendMessage(too long) HTTP request");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+                CHECK(err != NULL, "sendMessage over the length limit returns an error");
+                if (err != NULL)
+                {
+                    const char *msg = bm_json_as_string(bm_json_object_get(err, "message"));
+                    CHECK(msg != NULL && strstr(msg, "too long") != NULL,
+                          "sendMessage(too long) error message mentions the length");
+                }
+                bm_json_free(v);
+                free(resp);
+            }
+
+            /*
+             * 上限ちょうど(subject 0バイト + body 上限ぴったり)は長さ検査を通ること
+             * =オフバイワンで1バイト厳しくなっていないことの確認。
+             *
+             * ただし実際に送信まで通してしまうと、256KiB級のpayloadに対してPoWが走り
+             * テストが現実的な時間で終わらない(PoWの必要試行回数はpayload長にほぼ比例する)。
+             * そこでfromAddressだけをidentity.dbに無いアドレスにして、長さ検査を通過した先の
+             * send_pipelineで(PoWより手前で)失敗させ、「長すぎる」以外の理由のエラーに
+             * なることをもって長さ検査の通過を判定する。
+             */
+            too_long_body[BM_MAX_SUBJECT_PLUS_BODY_LEN] = '\0';
+            snprintf(send_req_too_long, req_cap,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"sendMessage\","
+                     "\"params\":[\"BM-2cWzSnwjJ7yRP3nLEWUV5LisTZyREWSzUK\",\"%s\",\"\",\"%s\",3600,1],"
+                     "\"id\":17}",
+                     recv_address, too_long_body);
+            resp = do_request(send_req_too_long, "testuser", "testpass");
+            CHECK(resp != NULL, "sendMessage(exactly at the limit) HTTP request");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+                CHECK(err != NULL, "sendMessage(exactly at the limit) still fails on the unknown sender");
+                if (err != NULL)
+                {
+                    const char *msg = bm_json_as_string(bm_json_object_get(err, "message"));
+                    CHECK(msg != NULL && strstr(msg, "too long") == NULL,
+                          "a body exactly at the limit must not be rejected as too long");
+                }
+                bm_json_free(v);
+                free(resp);
+            }
+
+            /* sendBroadcastにも同じ検査が入っていること(こちらはfromAddressがunlock済みなので
+             * 長さ検査を通れば送信できる状態) */
+            too_long_body[BM_MAX_SUBJECT_PLUS_BODY_LEN] = 'a';
+            too_long_body[too_long_body_len] = '\0';
+            snprintf(send_req_too_long, req_cap,
+                     "{\"jsonrpc\":\"2.0\",\"method\":\"sendBroadcast\","
+                     "\"params\":[\"%s\",\"\",\"%s\",3600],\"id\":18}",
+                     sender_address, too_long_body);
+            resp = do_request(send_req_too_long, "testuser", "testpass");
+            CHECK(resp != NULL, "sendBroadcast(too long) HTTP request");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                bm_json_value_t *err = v != NULL ? bm_json_object_get(v, "error") : NULL;
+                CHECK(err != NULL, "sendBroadcast over the length limit returns an error");
+                bm_json_free(v);
+                free(resp);
+            }
+
+            free(send_req_too_long);
+            free(too_long_body);
         }
 
         free(recv_address);

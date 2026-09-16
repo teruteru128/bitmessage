@@ -171,18 +171,24 @@ $CLI list-addresses
 
 # 相手の公開鍵が未取得でも送信すればgetpubkeyが自動発行される(その回の送信は失敗するので、
 # pubkeyが届いてから再送する)
-$CLI send-message BM-fromAddress BM-toAddress - "subject" "body" 3600 1
+$CLI send-message BM-fromAddress BM-toAddress "subject" "body" 3600 1
 $CLI get-inbox
 $CLI get-sent
+
+# 長文・改行を含む本文は--body-fileでファイル(pathが"-"なら標準入力)から読ませる。
+# 位置引数で渡すと本文がps(1)から他ユーザーに見え、シェル履歴にも残る
+$CLI send-message --body-file ./body.txt BM-fromAddress BM-toAddress "subject" 3600 1
+$CLI send-message --body-file - BM-fromAddress BM-toAddress "subject" < ./body.txt
 
 # broadcast購読・送信
 $CLI add-subscription BM-someAddress "label"
 $CLI send-broadcast BM-fromAddress "subject" "body" 3600
+$CLI send-broadcast --body-file ./body.txt BM-fromAddress "subject" 3600
 
 # chan(私設グループチャンネル): 同じpassphraseで呼んだ全員が同じアドレス・鍵を共有する
 CHAN=$($CLI join-chan "my chan passphrase" "my chan" "store passphrase" | tr -d '"')
 $CLI unlock "$CHAN" "store passphrase"
-$CLI send-message "$CHAN" "$CHAN" - "subject" "body" 3600 1
+$CLI send-message "$CHAN" "$CHAN" "subject" "body" 3600 1
 
 # onion peer(.onion宛)向けのoutbound接続をSOCKS5プロキシ(Tor等)経由にする。クリアネットIP
 # 宛は既定disabled(直結)のまま維持される。次の再接続サイクル(既定30秒以内)でdaemon

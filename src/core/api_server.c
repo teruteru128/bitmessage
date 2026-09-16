@@ -18,6 +18,7 @@
 #include "../common/broadcast_item.h"
 #include "../common/hash.h"
 #include "../common/logging.h"
+#include "../common/message_limits.h"
 #include "../infra/network.h"
 #include "../infra/object_sync.h"
 #include "../infra/peer_registry.h"
@@ -807,6 +808,31 @@ static cJSON *h_cachePubkey(const struct bm_api_server_config *config,
     return cJSON_CreateBool(1);
 }
 
+/*
+ * §11 2026-09-16 subject+bodyの長さ検査(sendMessage/sendBroadcast共通)。上限の値と
+ * 「subjectとbodyの合計で見る」という判定方法の根拠はcommon/message_limits.h参照
+ * (PyBitmessage本家 src/api.py:1212/1258 と同じ)。
+ *
+ * 上限超過を「PoWを回した後にobject_sync側で弾く」のではなくここで弾くのが要点で、
+ * 本家がAPIError(27, 'Message is too long.')を返すのと同じ段階にあたる。エラーメッセージに
+ * 実測値と上限を入れているのは、CLIの--body-fileで大きなファイルを指定してしまった場合に
+ * 「どれだけ削ればよいか」がその場で分かるようにするため。
+ */
+static int check_subject_body_length(const char *subject, const char *body, char **out_error)
+{
+    size_t total = strlen(subject) + strlen(body);
+    if (total <= BM_MAX_SUBJECT_PLUS_BODY_LEN)
+    {
+        return 0;
+    }
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "Message is too long. subject + body = %zu bytes, but the maximum is %zu bytes.",
+             total, BM_MAX_SUBJECT_PLUS_BODY_LEN);
+    *out_error = dup_cstr(msg);
+    return -1;
+}
+
 static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                                        const cJSON *params, char **out_error)
 {
@@ -822,6 +848,12 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
         *out_error = dup_cstr("sendMessage requires [fromAddress, toAddress, subject, body, "
                               "ttlSeconds?, ackStealthLevel?]. The recipient's public key is always "
                               "resolved from pubkey_cache; register it first via cachePubkey if needed.");
+        return NULL;
+    }
+    /* 長さ検査はgetpubkey要求の自動送出より前に行う。順序を逆にすると、送れないと分かって
+     * いるメッセージのためにネットワークへgetpubkeyを流してしまう */
+    if (check_subject_body_length(subject, body, out_error) != 0)
+    {
         return NULL;
     }
 
@@ -936,6 +968,10 @@ static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
     if (from_address == NULL || subject == NULL || body == NULL)
     {
         *out_error = dup_cstr("sendBroadcast requires [fromAddress, subject, body, ttlSeconds?]");
+        return NULL;
+    }
+    if (check_subject_body_length(subject, body, out_error) != 0)
+    {
         return NULL;
     }
     uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)json_num(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);

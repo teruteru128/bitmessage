@@ -5,11 +5,13 @@
  * (会話の中で「TUIよりCLIを優先、テストにも使いやすい」と決めた方針に沿う)。
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../common/json.h"
+#include "../common/message_limits.h"
 #include "http_client.h"
 
 struct bm_cli_env
@@ -64,11 +66,15 @@ static void print_usage(const char *prog)
             "      通常はsend-messageが未登録ならgetpubkey要求を自動送出し応答を自動キャッシュ\n"
             "      するため、本コマンドは事前に鍵を知っている場合や、その待ち時間を省きたい\n"
             "      場合の手動登録手段\n"
-            "  send-message <fromAddress> <toAddress> <subject> <body> "
+            "  send-message [--body-file <path>] <fromAddress> <toAddress> <subject> [<body>] "
             "[ttlSeconds] [ackStealthLevel]\n"
             "      宛先の公開暗号鍵は常にpubkey_cacheから解決する。未登録ならgetpubkey要求を\n"
             "      自動送出するので、応答を待ってから同じコマンドを再実行するか、先にcache-pubkeyで\n"
-            "      鍵を登録しておく\n"
+            "      鍵を登録しておく。\n"
+            "      --body-file <path>を付けると<body>の位置引数の代わりにファイルから本文を読む\n"
+            "      (pathが\"-\"なら標準入力)。長文・改行を含む本文はこちらを使うこと。位置引数で\n"
+            "      渡すと本文がps(1)から見えシェル履歴にも残る。subject+本文の合計は\n"
+            "      261644バイトまで(PyBitmessage本家と同じ2^18-500)\n"
             "  get-inbox [folder]\n"
             "  get-sent\n"
             "      送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
@@ -77,7 +83,8 @@ static void print_usage(const char *prog)
             "  trash-message <msgId(hex)>\n"
             "      inbox/sent両方に対してfolder='trash'化を試みる(PyBitmessage本家trashMessage準拠)。\n"
             "      該当が無くてもエラーにしない\n"
-            "  send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n"
+            "  send-broadcast [--body-file <path>] <fromAddress> <subject> [<body>] [ttlSeconds]\n"
+            "      --body-fileの意味はsend-messageと同じ(ファイル、\"-\"なら標準入力から本文を読む)\n"
             "  add-subscription <address> [label]\n"
             "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
             "      受信したらinboxへ保存する\n"
@@ -574,6 +581,244 @@ static int fix_labels_from_keys_dat(const struct bm_cli_env *env, const char *pa
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+/*
+ * §11 2026-09-16 --body-file: send-message/send-broadcastの本文をファイル(または標準入力)
+ * から読む。
+ *
+ * 動機は「長文をコマンドライン引数で渡せない」ことそのものより、渡せてしまった場合の実害:
+ *  (1) 本文が`ps aux`で他ユーザーから丸見えになる。メッセージ本文としてこれが一番まずい
+ *  (2) シェル履歴に本文が残る
+ *  (3) 改行を含む本文のクォートが現実的でなく、ARG_MAXの制約も残る
+ * 標準入力(`--body-file -`)に対応しているのは、(1)(2)を完全に回避できる経路を用意する
+ * ため(ファイル自体を置きたくない場合に`... --body-file - <<'EOF'`で渡せる)。
+ *
+ * curl流の「本文が@で始まったらファイル名とみなす」方式は採らなかった。`@teruteruさん、`の
+ * ように@で始まる本文はメッセージとして普通にあり得るので、既存の呼び出しの意味を黙って
+ * 変えてしまうため(ユーザーとの相談で明示オプション方式に決めた)。
+ */
+
+/* 一度のfreadで読む単位。本文の上限(BM_MAX_SUBJECT_PLUS_BODY_LEN)が256KiB弱なので、
+ * これで数回のループに収まる */
+#define BM_BODY_READ_CHUNK 65536
+
+/*
+ * ストリームを最後まで読み切り、NUL終端した新しいバッファ(呼び出し側でfree)を返す。
+ * 失敗時はNULLを返し、理由は既にstderrへ出力済み。pathはエラーメッセージ用の表示名。
+ */
+static char *read_stream_all(FILE *f, const char *path, size_t *out_len)
+{
+    size_t cap = BM_BODY_READ_CHUNK + 1;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (buf == NULL)
+    {
+        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        return NULL;
+    }
+
+    for (;;)
+    {
+        if (len + BM_BODY_READ_CHUNK + 1 > cap)
+        {
+            size_t new_cap = cap * 2;
+            char *grown = realloc(buf, new_cap);
+            if (grown == NULL)
+            {
+                fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+            cap = new_cap;
+        }
+        size_t n = fread(buf + len, 1, BM_BODY_READ_CHUNK, f);
+        len += n;
+        if (n < BM_BODY_READ_CHUNK)
+        {
+            if (ferror(f))
+            {
+                fprintf(stderr, "エラー: %s の読み込みに失敗しました\n", path);
+                free(buf);
+                return NULL;
+            }
+            break; /* EOF */
+        }
+        /* 上限を超えた時点で打ち切る。ここで止めないと、巨大なファイルや終わらない
+         * 標準入力を指定された場合に、エラーを出す前にメモリを食い尽くしてしまう
+         * (呼び出し側が長さを見て弾くので、1バイトでも超えていれば足りる) */
+        if (len > BM_MAX_SUBJECT_PLUS_BODY_LEN)
+        {
+            break;
+        }
+    }
+    buf[len] = '\0';
+
+    /* NULバイトを含むファイルはJSON文字列にもC文字列にも載らない。黙って切り詰めると
+     * 本文の一部だけが送信されてしまうので、ここで明示的に弾く */
+    if (strlen(buf) != len)
+    {
+        fprintf(stderr, "エラー: %s にNULバイトが含まれています(テキストファイルを指定してください)\n",
+                path);
+        free(buf);
+        return NULL;
+    }
+
+    *out_len = len;
+    return buf;
+}
+
+/* --body-fileの引数を読み込む。"-"なら標準入力。失敗時NULL(理由はstderrへ出力済み) */
+static char *load_body_file(const char *path, size_t *out_len)
+{
+    if (strcmp(path, "-") == 0)
+    {
+        return read_stream_all(stdin, "標準入力", out_len);
+    }
+    /* テキスト前提だが"rb"で開く。改行変換を挟まず、ファイルの内容をそのまま本文にする
+     * (末尾の改行も勝手に落とさない) */
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+    {
+        fprintf(stderr, "エラー: %s を開けません\n", path);
+        return NULL;
+    }
+    char *buf = read_stream_all(f, path, out_len);
+    fclose(f);
+    return buf;
+}
+
+/*
+ * argvから "--body-file <path>" を取り除き、読み込んだ本文をbody_indexの位置へ挿入した
+ * 新しいargvを *out_argc と *out_argv へ組み立てる。こうしておけば各コマンドのハンドラは
+ * 従来通りの位置引数だけを見ればよく、引数の数え方を二重に持たずに済む。
+ *
+ * 戻り値: 0=--body-fileが無いので何もしなかった(*out_argc と *out_argv は未変更)、
+ *         1=組み立てた、-1=エラー(理由はstderrへ出力済み)。
+ *
+ * 確保したargv配列と本文バッファはfreeしない。このCLIは1コマンド実行して即exitするので、
+ * プロセス終了時のOSによる回収に任せている(引数として使う以上、コマンドの処理が終わるまで
+ * 生かしておく必要があり、途中でfreeできる箇所も無い)。
+ */
+static int apply_body_file_option(int argc, char **argv, int subject_index, int body_index,
+                                   int *out_argc, char ***out_argv)
+{
+    int opt_index = -1;
+    for (int i = 2; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--body-file") == 0)
+        {
+            opt_index = i;
+            break;
+        }
+    }
+    if (opt_index < 0)
+    {
+        return 0;
+    }
+    if (opt_index + 1 >= argc)
+    {
+        fprintf(stderr, "エラー: --body-file にファイルパスが指定されていません\n");
+        return -1;
+    }
+    const char *path = argv[opt_index + 1];
+
+    /* --body-fileとそのパスを除いた位置引数の並びを作る */
+    char **rest = malloc(sizeof(char *) * (size_t)(argc + 1));
+    if (rest == NULL)
+    {
+        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        return -1;
+    }
+    int rest_argc = 0;
+    for (int i = 0; i < argc; i++)
+    {
+        if (i == opt_index || i == opt_index + 1)
+        {
+            continue;
+        }
+        rest[rest_argc++] = argv[i];
+    }
+
+    if (rest_argc < body_index)
+    {
+        fprintf(stderr, "エラー: --body-file を使う場合でも、本文より前の位置引数は全て指定してください\n");
+        free(rest);
+        return -1;
+    }
+
+    size_t body_len = 0;
+    char *body = load_body_file(path, &body_len);
+    if (body == NULL)
+    {
+        free(rest);
+        return -1;
+    }
+
+    /* subject+bodyの合計をサーバー側(core/api_server.cのcheck_subject_body_length)と同じ
+     * 基準で先に弾く。HTTPへ載せる前・PoWを回す前に落とせるので、大きすぎるファイルを
+     * 指定した際に待たされずに済む(上限の根拠はcommon/message_limits.h参照) */
+    size_t subject_len = strlen(rest[subject_index]);
+    if (subject_len + body_len > BM_MAX_SUBJECT_PLUS_BODY_LEN)
+    {
+        /* read_stream_allは上限を超えた時点で読むのをやめるので、body_lenが上限を超えている
+         * 場合の値はファイル全体の大きさとは限らない。「以上」を付けて実サイズだと
+         * 誤解させないようにする */
+        fprintf(stderr,
+                "エラー: 本文が長すぎます(subject %zuバイト + 本文 %zuバイト%s、上限は合計%zuバイト)\n",
+                subject_len, body_len,
+                body_len > BM_MAX_SUBJECT_PLUS_BODY_LEN ? "以上" : "",
+                BM_MAX_SUBJECT_PLUS_BODY_LEN);
+        free(body);
+        free(rest);
+        return -1;
+    }
+
+    char **result = malloc(sizeof(char *) * (size_t)(rest_argc + 2));
+    if (result == NULL)
+    {
+        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        free(body);
+        free(rest);
+        return -1;
+    }
+    for (int i = 0; i < body_index; i++)
+    {
+        result[i] = rest[i];
+    }
+    result[body_index] = body;
+    for (int i = body_index; i < rest_argc; i++)
+    {
+        result[i + 1] = rest[i];
+    }
+    result[rest_argc + 1] = NULL;
+    free(rest);
+
+    *out_argc = rest_argc + 1;
+    *out_argv = result;
+    return 1;
+}
+
+/*
+ * §11 2026-09-16 ttlSeconds等の数値引数のパース。従来はatof()をそのまま使っており、
+ * 数値でない文字列は黙って0になっていた。--body-fileの導入で「--body-fileを指定しつつ
+ * 位置引数の<body>も書いてしまった」場合に本文がttlSecondsの位置へずれ込むため、
+ * そのまま0として送ってしまわないよう明示的に弾く(この誤りは--body-file以前から
+ * 起こり得たので、結果としてtypo時の挙動も改善している)。
+ */
+static int parse_number_arg(const char *s, const char *name, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || errno == ERANGE)
+    {
+        fprintf(stderr, "エラー: %s には数値を指定してください(指定値: %s)\n", name, s);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct bm_cli_env env;
@@ -609,6 +854,31 @@ int main(int argc, char **argv)
 
     const char *cmd = argv[1];
     bm_json_value_t *params = bm_json_new_array();
+
+    /* §11 2026-09-16 --body-fileを受け付けるのはこの2コマンドだけ。argvから取り除いて
+     * 本文を位置引数の位置へ挿し込むので、以降のハンドラは従来の位置引数だけを見ればよい
+     * (詳細はapply_body_file_optionのコメント参照) */
+    if (strcmp(cmd, "send-message") == 0 || strcmp(cmd, "send-broadcast") == 0)
+    {
+        int is_send_message = strcmp(cmd, "send-message") == 0;
+        /* send-message:   argv[2]=from argv[3]=to      argv[4]=subject argv[5]=body
+         * send-broadcast: argv[2]=from argv[3]=subject argv[4]=body */
+        int subject_index = is_send_message ? 4 : 3;
+        int body_index = is_send_message ? 5 : 4;
+        int new_argc = 0;
+        char **new_argv = NULL;
+        int rc = apply_body_file_option(argc, argv, subject_index, body_index, &new_argc, &new_argv);
+        if (rc < 0)
+        {
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        if (rc > 0)
+        {
+            argc = new_argc;
+            argv = new_argv;
+        }
+    }
 
     if (strcmp(cmd, "list-addresses") == 0)
     {
@@ -800,8 +1070,8 @@ int main(int argc, char **argv)
         if (argc < 6 || argc > 8)
         {
             fprintf(stderr,
-                    "使い方: %s send-message <fromAddress> <toAddress> "
-                    "<subject> <body> [ttlSeconds] [ackStealthLevel]\n",
+                    "使い方: %s send-message [--body-file <path>] <fromAddress> <toAddress> "
+                    "<subject> [<body>] [ttlSeconds] [ackStealthLevel]\n",
                     argv[0]);
             bm_json_free(params);
             return EXIT_FAILURE;
@@ -812,11 +1082,23 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[5]));
         if (argc >= 7)
         {
-            bm_json_array_append(params, bm_json_new_number(atof(argv[6])));
+            double ttl = 0;
+            if (parse_number_arg(argv[6], "ttlSeconds", &ttl) != 0)
+            {
+                bm_json_free(params);
+                return EXIT_FAILURE;
+            }
+            bm_json_array_append(params, bm_json_new_number(ttl));
         }
         if (argc >= 8)
         {
-            bm_json_array_append(params, bm_json_new_number(atof(argv[7])));
+            double stealth = 0;
+            if (parse_number_arg(argv[7], "ackStealthLevel", &stealth) != 0)
+            {
+                bm_json_free(params);
+                return EXIT_FAILURE;
+            }
+            bm_json_array_append(params, bm_json_new_number(stealth));
         }
         return call_rpc(&env, "sendMessage", params);
     }
@@ -863,7 +1145,10 @@ int main(int argc, char **argv)
     {
         if (argc < 5 || argc > 6)
         {
-            fprintf(stderr, "使い方: %s send-broadcast <fromAddress> <subject> <body> [ttlSeconds]\n", argv[0]);
+            fprintf(stderr,
+                    "使い方: %s send-broadcast [--body-file <path>] <fromAddress> <subject> "
+                    "[<body>] [ttlSeconds]\n",
+                    argv[0]);
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -872,7 +1157,13 @@ int main(int argc, char **argv)
         bm_json_array_append(params, bm_json_new_string(argv[4]));
         if (argc == 6)
         {
-            bm_json_array_append(params, bm_json_new_number(atof(argv[5])));
+            double ttl = 0;
+            if (parse_number_arg(argv[5], "ttlSeconds", &ttl) != 0)
+            {
+                bm_json_free(params);
+                return EXIT_FAILURE;
+            }
+            bm_json_array_append(params, bm_json_new_number(ttl));
         }
         return call_rpc(&env, "sendBroadcast", params);
     }

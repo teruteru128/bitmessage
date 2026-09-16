@@ -237,4 +237,77 @@ echo "$DUP_AB_OUTPUT" | grep -q "エラー" \
 "$CLI" delete-address-book-entry "$ADDR5" >/dev/null
 [ "$("$CLI" list-address-book-entries)" = "[]" ] || fail "address book should be empty after delete"
 
+# §11 2026-09-16 --body-file: 長文の本文をファイル/標準入力から渡す経路。
+# 本文が実際にそのまま届くことまで確認したいので、自分自身宛のsend-message(is_self)を使う。
+# send_pipeline.cはis_selfの場合に送信と同時に自分のinboxへコピーを入れる(PyBitmessage本家の
+# 挙動に合わせた実装、src/core/send_pipeline.c:273)ため、get-inboxで本文を読み返せる。
+# pubkey_cacheへの事前登録も要らない。
+ADDR6_JSON=$("$CLI" create-address "cli body-file test" 4 1 1 "sender6" "storepass6")
+ADDR6=$(echo "$ADDR6_JSON" | tr -d '"')
+[ "$("$CLI" unlock "$ADDR6" "storepass6")" = "true" ] || fail "unlock sender6 for --body-file test"
+
+# 改行・引用符・バックスラッシュ・マルチバイト文字を含む本文。位置引数では渡しづらく、
+# JSONエスケープ(common/json.cのsb_append_escaped_string)も通る組み合わせを狙っている。
+cat > body_multiline.txt <<'EOF'
+まず1行目(日本語のマルチバイト文字)。
+次の行には "引用符" と \ バックスラッシュを含む。
+BODYFILEMARKER
+EOF
+
+SEND_BODY_FILE_OUTPUT=$("$CLI" send-message --body-file body_multiline.txt "$ADDR6" "$ADDR6" "body-file subject")
+echo "$SEND_BODY_FILE_OUTPUT" | grep -q '"inventoryHash"' \
+    || fail "send-message --body-file should succeed (got: $SEND_BODY_FILE_OUTPUT)"
+
+INBOX_AFTER_BODY_FILE=$("$CLI" get-inbox)
+echo "$INBOX_AFTER_BODY_FILE" | grep -q 'BODYFILEMARKER' \
+    || fail "--body-file body should reach the inbox (got: $INBOX_AFTER_BODY_FILE)"
+echo "$INBOX_AFTER_BODY_FILE" | grep -q '引用符' \
+    || fail "--body-file body should keep multibyte characters (got: $INBOX_AFTER_BODY_FILE)"
+# 改行がJSONの\nとして保たれていること(ファイルの中身を1行に潰していないことの確認)
+echo "$INBOX_AFTER_BODY_FILE" | grep -q '\\n次の行には' \
+    || fail "--body-file body should keep line breaks (got: $INBOX_AFTER_BODY_FILE)"
+
+# --body-file - で標準入力から読む(本文をファイルにもコマンドラインにも置かない経路)
+printf 'STDINBODYMARKER from stdin\n' > body_stdin.txt
+SEND_STDIN_OUTPUT=$("$CLI" send-message --body-file - "$ADDR6" "$ADDR6" "stdin subject" < body_stdin.txt)
+echo "$SEND_STDIN_OUTPUT" | grep -q '"inventoryHash"' \
+    || fail "send-message --body-file - should succeed (got: $SEND_STDIN_OUTPUT)"
+echo "$("$CLI" get-inbox)" | grep -q 'STDINBODYMARKER' \
+    || fail "--body-file - should read the body from stdin"
+
+# send-broadcastでも同じオプションが効くこと(こちらはinboxへ戻らないので成功応答のみ確認)
+BCAST_BODY_FILE_OUTPUT=$("$CLI" send-broadcast --body-file body_multiline.txt "$ADDR6" "bcast subject")
+echo "$BCAST_BODY_FILE_OUTPUT" | grep -q '"inventoryHash"' \
+    || fail "send-broadcast --body-file should succeed (got: $BCAST_BODY_FILE_OUTPUT)"
+
+# エラー系: 存在しないファイル
+BODY_FILE_MISSING_OUTPUT=$("$CLI" send-message --body-file no_such_file.txt "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
+echo "$BODY_FILE_MISSING_OUTPUT" | grep -q "開けません" \
+    || fail "--body-file with a missing file should fail (got: $BODY_FILE_MISSING_OUTPUT)"
+
+# エラー系: パスを書き忘れた
+BODY_FILE_NOPATH_OUTPUT=$("$CLI" send-message --body-file 2>&1 || true)
+echo "$BODY_FILE_NOPATH_OUTPUT" | grep -q "ファイルパスが指定されていません" \
+    || fail "--body-file without a path should fail (got: $BODY_FILE_NOPATH_OUTPUT)"
+
+# エラー系: NULバイトを含むファイル(黙って切り詰めず弾くこと)
+printf 'abc\0def' > body_with_nul.bin
+BODY_FILE_NUL_OUTPUT=$("$CLI" send-message --body-file body_with_nul.bin "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
+echo "$BODY_FILE_NUL_OUTPUT" | grep -q "NULバイト" \
+    || fail "--body-file with NUL bytes should fail (got: $BODY_FILE_NUL_OUTPUT)"
+
+# エラー系: 上限(subject+本文で2^18-500バイト)超過。CLI側でHTTPへ載せる前に弾く
+head -c 262000 /dev/zero | tr '\0' 'a' > body_too_long.txt
+BODY_FILE_TOOLONG_OUTPUT=$("$CLI" send-message --body-file body_too_long.txt "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
+echo "$BODY_FILE_TOOLONG_OUTPUT" | grep -q "本文が長すぎます" \
+    || fail "--body-file over the size limit should fail (got: $BODY_FILE_TOOLONG_OUTPUT)"
+
+# エラー系: --body-fileを指定しつつ位置引数の<body>も書いてしまった場合。本文がttlSecondsの
+# 位置へずれ込むので、数値でないと分かった時点で弾く(従来のatof()では黙って0になっていた)
+BODY_FILE_DUP_OUTPUT=$("$CLI" send-message --body-file body_multiline.txt "$ADDR6" "$ADDR6" "subj" "positional body" 2>&1 || true)
+echo "$BODY_FILE_DUP_OUTPUT" | grep -q "ttlSeconds には数値を指定してください" \
+    || fail "--body-file plus a positional body should be rejected (got: $BODY_FILE_DUP_OUTPUT)"
+
+"$CLI" delete "$ADDR6" >/dev/null
+
 echo "ALL OK"
