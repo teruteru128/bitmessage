@@ -133,8 +133,14 @@ dispatchに流す→sent.statusがackreceivedへ遷移」までのack往復をen
 `decrypt_worker_thread`/`pow_worker_thread`はそれぞれ独立スレッドではなく、`object_sync_thread`
 (`network_epoll_thread`のハンドラとして動作)から`trial_decrypt`/`pow_engine`を直接関数呼び出しする
 形に単純化されている(1プロセス内スレッド分離という前提上、キュー越しの非同期化より直接呼び出しの
-方がシンプルで、v1では並列度より実装の見通しを優先した)。`pow_worker_thread`の並列化(NumCPU本)は
-§11のTODO。
+方がシンプルで、v1では並列度より実装の見通しを優先した)。`pow_worker_thread`の非同期化は
+§11項目38のTODO。
+
+**上記の`pow_worker_thread × NumCPU`という記述は誤りなので、実装時に踏襲しないこと
+(2026-09-18追記)**。`bm_pow_run`が既に内部で`sysconf(_SC_NPROCESSORS_ONLN)`本へ探索空間を
+stride分割しているため、ワーカースレッドをNumCPU本立てると`NumCPU × NumCPU`スレッドに
+なり過剰購読する。**ワーカーは1本**にしてジョブを直列に処理するのが正しい(1ジョブの内部で
+全コアを使い切るので、ジョブを並列化しても総スループットは上がらない)。詳細は§11項目38。
 
 ### 1.2 層間キュー
 
@@ -3108,3 +3114,65 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     効果が0.06%しかないうえ、署名鍵をstart_nonceだけで決めると同じstart_nonceで
     null_bytesを変えた2本のアドレスが署名鍵を共有し公開的に紐付け可能になる穴があった
     ため。結果、決定性・ランダムの両経路ともv4と同じ作法に収束した。
+
+
+38. **PoWをワーカースレッドへ追い出す(呼び出し元スレッドをブロックしない形にする)**: 2026-09-18に
+    規模を見積もり、backlogへ登録。現状`bm_pow_run`は全て同期呼び出しで、**呼び出し元スレッドを
+    PoWが終わるまで止める**。特に`object_sync.c`のpubkey自応答は`network_epoll_thread`を止めるため、
+    その間すべてのピア接続が停止する(§5.1の既知の制限。v4で実測20秒超)。
+    **ポスト量子v5ではこれが期待141秒になり許容できなくなるため、v5実装の前提条件**
+    ([DESIGN-PQ.md](DESIGN-PQ.md) §8.4・§9.3)。ただしv4でも20秒のブロックが消えるので、
+    **v5とは独立に価値がある**。
+
+    設計は既にある(§1.1の`pow_worker_thread`、§1.2の`pow_request_queue`/`pow_result_queue`。
+    `main.c`の`struct bm_queues`に両キューが定義・init済みで未使用。`bm_queue_t`は
+    `broadcast_queue`で実績あり。`bm_send_pipeline_thread()`もスタブとして存在する)。
+    したがって新規設計ではなく**配線が主**。
+
+    呼び出し箇所は6つで、性質が2つに割れる:
+
+    | 箇所 | ブロックするスレッド | 分類 |
+    |---|---|---|
+    | `object_sync.c` pubkey自応答 | **network_epoll_thread** | A |
+    | `object_sync.c` onionpeer announce | peer_connector_thread | A |
+    | `api_server.c` getpubkey自動要求 | api_server_thread | A |
+    | `send_pipeline.c` ack object | api_server_thread | B |
+    | `send_pipeline.c` msg | api_server_thread | B |
+    | `send_pipeline.c` broadcast | api_server_thread | B |
+
+    **A: 撃ちっぱなし系(3箇所)。** 戻り値を待つ呼び出し元が無く、PoW後の処理も
+    ほぼ同一(`nonce前置 → inventory_hash → object_store_insert → broadcast_inv`。
+    pubkeyのみ`bm_pubkey_cache_set_self_response`が1行増える)。ジョブ+完了フックの形に
+    すれば素直に非同期化できる。
+
+    **B: send_pipeline(3箇所)。** 2つの厄介さがある。(1) **ackのPoWがmsgのPoWの前段に
+    必要**(ackPayloadは暗号化されるmsg本文の中に埋まるため)。つまりsendMessageは依存関係の
+    ある2段PoWで、ジョブ1本では表現できない。(2) `h_sendMessage`が現在
+    `{objectLength, inventoryHash}`を**同期で返している**ので、非同期化するとAPIの契約が変わる。
+    本家PyBitmessageはsendMessageが`ackData`を即返してsingleWorkerが裏でPoWする形なので、
+    寄せるならその契約になる。
+
+    **段階と規模の見積もり:**
+
+    - **Tier 1(v5のブロッカー解消に必要な最小、300〜450行、1セッション)**: Aの3箇所だけ。
+      実害のあるバグは「network/peer_connectorが止まる」であって、APIスレッドが止まるのは
+      不細工だがピア接続は落ちない。`src/pow/pow_queue.[ch]`(新規、ジョブ構造体+ワーカー
+      スレッド+完了フック)、`object_sync.c` 2箇所と`api_server.c` 1箇所の差し替え、
+      `main.c`へのスレッド起動/join、テスト1本(低難易度で「最終的にobject_pool.dbへ入る」
+      ことを確認、既存テストと同じ手法)。
+    - **Tier 2(send_pipelineも非同期化、さらに400〜600行、1〜2セッション)**:
+      `send_request_queue`の結線と`bm_send_pipeline_thread`の実装、ack→msgの2段チェーン、
+      sentテーブルのstatus遷移追加。**コード量より既存テストの改修が主コスト**で、
+      `test_send_pipeline`/`test_api_server`/`test_broadcast`/`test_getpubkey_automation`/
+      `cli_integration`が同期完了を前提にしているため全てに待ち合わせが要る。
+
+    **実装時の注意2点:**
+
+    - **ワーカーは1本にする。** §1.1の`pow_worker_thread × NumCPU`という記述は誤り
+      (同節の2026-09-18追記参照)。`bm_pow_run`が内部で既に全コアへstride分割しているため、
+      ワーカーをNumCPU本立てると過剰購読になる。
+    - **キャンセル手段を足す。** v5 pubkeyの141秒PoWが走行中だとshutdownのjoinがそれだけ
+      待たされる。`bm_pow_run`は既に`atomic_bool *found`で早期打ち切りする作りなので、
+      `cancel`フラグを追加するのは10行程度。
+    - (既知の割り切り)ジョブは直列処理なので、長いジョブ(v5 pubkey)が先行すると後続の
+      msgが待たされる。v1では優先度キューまでは作らない。
