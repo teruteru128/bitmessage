@@ -3060,3 +3060,14 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `--body-file`の例を追記した。
 
     ビルド警告ゼロ、ctest 46件100%通過。
+
+36. **User Agent文字列を`BitmessageC`から`CBitmessage`へ変更**: 2026-09-17、ユーザー指摘。
+    2026-08-26(項目未採番、本コメント直上参照)に`bitmessage-c`から`BitmessageC`へ変更した
+    際、本家`PyBitmessage`(言語プレフィックス+Bitmessage)の命名パターンと語順が逆になって
+    いることに気づかなかった。本家のUA検証正規表現`^/[a-zA-Z]+:[0-9]+...`は語順を区別しない
+    (`BitmessageC`/`CBitmessage`どちらも`[a-zA-Z]+`のみで満たす)ため、当時の変更はハイフン
+    除去だけが目的で語順は単なる選択ミスだった。長期運用前提のプロジェクトなので、今のうちに
+    一貫性のため修正した(`src/main.c`の`BM_USER_AGENT`定義1箇所のみ)。相互運用性への実害は
+    無い(UA文字列の中身を見て挙動を分岐させる処理は無い)、純粋に見た目の一貫性のための変更。
+    ビルド警告ゼロ、ctest 46件100%通過。daemon Aへのデプロイはbuild-RelWithDebInfoで別途行う
+    (メモリfeedback_deploy_relwithdebinfo.md参照)。

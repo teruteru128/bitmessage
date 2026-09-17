@@ -49,8 +49,13 @@
  * のため、これにマッチせず"/INVALID:0/"扱いされていた(実害の有無は未確認、外部ノード
  * からの即時切断の原因はverack直後の送信タイミングだと判明済み、DESIGN-LOG.md参照)。
  * 正規表現にマッチする名前にしておく方が今後の相互運用性診断がしやすいため、
- * ハイフンを除いた"BitmessageC"へ変更した。 */
-#define BM_USER_AGENT "/BitmessageC:" BM_PROJECT_VERSION "/"
+ * ハイフンを除いた"BitmessageC"へ変更した。
+ * §11 2026-09-17: "BitmessageC"は語順が本家"PyBitmessage"(言語プレフィックス+
+ * Bitmessage)の命名パターンと逆だった(ユーザー指摘)。正規表現制約は語順とは無関係
+ * (どちらも[a-zA-Z]+のみで満たす)だったため、単なる語呂の選択ミス。長期運用前提
+ * なので"CBitmessage"へ直す。相互運用性への実害は無い(名前文字列を見て挙動を変える
+ * 処理は無い)、単なる一貫性のための変更。 */
+#define BM_USER_AGENT "/CBitmessage:" BM_PROJECT_VERSION "/"
 
 /* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */
 struct bm_queues
