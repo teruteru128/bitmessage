@@ -2836,7 +2836,7 @@ PyBitmessage本家の`bm_command_pong`も"Ignore it"とコメントされたNOP�
 daemon A自体は2026-08-26 21:21起動でそれより前のため、起動直後〜00:12台のログだけは
 今回参照できなかったが、原因特定には影響しなかった)。
 
-`journalctl`でdaemon A(PID 1753465)のログを追ったところ、直近の新規outbound確立は
+`journalctl`でdaemon Aのログを追ったところ、直近の新規outbound確立は
 `13:51:47`が最後で、その後`17:41:35`にoutbound1件が切断されて以降(調査時点で6時間
 以上)一切再接続されていなかった。一方で同時間帯にinbound接続のaccept/closeは継続的に
 発生しており(00:00以降だけでaccept19件・close17件、差し引き2件以上が生存中と推定)、

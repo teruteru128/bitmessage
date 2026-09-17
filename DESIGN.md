@@ -2280,8 +2280,8 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     済み、`systemctl daemon-reload`だけで反映できる)。既存の`bitmessage.conf`(アプリ本体の
     設定、INI形式)とは役割・形式が異なる別ファイルとして`/etc/bitmessage/`配下に並置した。
 
-    追記(2026-09-08、`/loop`による継続監視中に疑わしい接続を捕捉): 本番daemon A
-    (PID 2358197)のjournalctlを30分間隔で監視していたところ、inbound fd=38
+    追記(2026-09-08、`/loop`による継続監視中に疑わしい接続を捕捉): 本番daemon Aの
+    journalctlを30分間隔で監視していたところ、inbound fd=38
     (Tor hidden service経由、`127.0.0.1:8444`⇔`127.0.0.1:56270`のrendezvous接続)で
     以下の挙動を観測した。
 
@@ -2898,10 +2898,10 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
 
 33. **`bm_peer_manager_seed_bootstrap`が`BM_TOR_CONTROL`利用時の真の新規インストールで
     空振りするバグを修正**: 2026-09-15、項目23(ゴースト接続調査)の再現実験用に、
-    `git worktree add`で報告当時のコミット(`8b96ada`)を別worktreeへ切り出し、
-    `BM_TOR_CONTROL=1`で独自のephemeral onionサービスを作らせて実ネットワークへ
-    接続を試みたところ、**起動後何十秒経ってもoutbound接続が1本も試みられない**
-    (`connecting to ...`のDEBUGログすら出ない)現象に遭遇し、副産物として発見した。
+    報告当時のコミット(`8b96ada`)を、**DBファイルが存在しない真の新規インストール
+    状態**かつ`BM_TOR_CONTROL=1`で起動したところ、**起動後何十秒経っても
+    outbound接続が1本も試みられない**(`connecting to ...`のDEBUGログすら出ない)
+    現象に遭遇し、副産物として発見した。
 
     原因は`bm_peer_manager_seed_bootstrap`(`src/core/peer_manager.c`)の「`hosts`
     テーブルが空の時だけmainnet seed 9件+`observed_nodes.txt`3件を投入する」という
@@ -2924,7 +2924,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     済んだため、`main.c`側の初期化順序(mark_selfとpeer_connector_thread起動の
     前後関係)には手を付けていない。ビルド警告ゼロ、ctest 46件100%通過。
 
-    なお、この副産物の発見に至った項目23再現実験そのもの(旧worktreeでの実測)では、
+    なお、この副産物の発見に至った項目23再現実験そのものでは、
     一時「単一スレッドが1接続の大量受信処理に占有され、他接続のidle_sweep/epoll_wait
     ディスパッチが長時間止まる」という仮説を有力視しかけたが、これは`idle_sweep_one`/
     `bm_network_epoll_thread`の調査用ログが両方とも`!conn->handshake_complete`の
