@@ -25,35 +25,19 @@ static unsigned char *put_varint(unsigned char *p, uint64_t v)
     return p + bm_varint_size(v);
 }
 
-void bm_pqv5_calc_id(uint64_t version, uint64_t stream,
-                      const unsigned char sig_pk[BM_PQV5_SIG_PK_LEN],
+void bm_pqv5_calc_id(const unsigned char sig_pk[BM_PQV5_SIG_PK_LEN],
                       const unsigned char kem_pk[BM_PQV5_KEM_PK_LEN],
                       unsigned char out_id[BM_PQV5_ID_LEN])
 {
-    size_t label_len = strlen(BM_PQV5_LABEL_ID);
-    size_t total = label_len + bm_varint_size(version) + bm_varint_size(stream) +
-                   BM_PQV5_SIG_PK_LEN + BM_PQV5_KEM_PK_LEN;
-    unsigned char *buf = malloc(total);
-    unsigned char *p;
+    /* 入力は固定長(1984 + 1216)で区切りの曖昧性が無いため、長さ前置もラベルも不要。
+     * 単段ハッシュで十分なのは、SHA-3がスポンジ構造でlength extension攻撃が
+     * 原理的に効かないため(SHA-2系のsha256d・ripemd160(sha512)のような
+     * 二重化の動機がそもそも無い)。DESIGN-PQ.md §4.1。 */
+    unsigned char buf[BM_PQV5_SIG_PK_LEN + BM_PQV5_KEM_PK_LEN];
 
-    if (buf == NULL)
-    {
-        /* 呼び出し側にエラーを返す経路が無い(v4のbm_address_calc_ripeと同じくvoid)。
-         * 全0のidを返すと「たまたま衝突するアドレス」を作ってしまうので、
-         * ここは確保できない=続行不能として扱う */
-        abort();
-    }
-    p = buf;
-    memcpy(p, BM_PQV5_LABEL_ID, label_len);
-    p += label_len;
-    p = put_varint(p, version);
-    p = put_varint(p, stream);
-    memcpy(p, sig_pk, BM_PQV5_SIG_PK_LEN);
-    p += BM_PQV5_SIG_PK_LEN;
-    memcpy(p, kem_pk, BM_PQV5_KEM_PK_LEN);
-
-    bm_pq_sha3_256(buf, total, out_id);
-    free(buf);
+    memcpy(buf, sig_pk, BM_PQV5_SIG_PK_LEN);
+    memcpy(buf + BM_PQV5_SIG_PK_LEN, kem_pk, BM_PQV5_KEM_PK_LEN);
+    bm_pq_sha3_256(buf, sizeof(buf), out_id);
 }
 
 void bm_pqv5_derive_secret_and_tag(uint64_t version, uint64_t stream,
@@ -61,13 +45,12 @@ void bm_pqv5_derive_secret_and_tag(uint64_t version, uint64_t stream,
                                     unsigned char out_seed[BM_PQV5_SEED_LEN],
                                     unsigned char out_tag[32])
 {
-    unsigned char buf[64 + BM_PQV5_ID_LEN];
+    /* v4のSHA512(varint(version)||varint(stream)||ripe)と同じ形(ハッシュだけSHA3-512)。
+     * 前半がアドレス由来KEM鍵のX-Wing seed、後半がtag。 */
+    unsigned char buf[18 + BM_PQV5_ID_LEN];
     unsigned char digest[64];
-    size_t label_len = strlen(BM_PQV5_LABEL_TAG);
     unsigned char *p = buf;
 
-    memcpy(p, BM_PQV5_LABEL_TAG, label_len);
-    p += label_len;
     p = put_varint(p, version);
     p = put_varint(p, stream);
     memcpy(p, id, BM_PQV5_ID_LEN);
@@ -221,29 +204,7 @@ out:
     return rc;
 }
 
-int bm_pqv5_identity_from_seeds(uint64_t stream,
-                                 const unsigned char sig_seed[BM_PQV5_SEED_LEN],
-                                 const unsigned char kem_seed[BM_PQV5_SEED_LEN],
-                                 struct bm_pqv5_identity *out)
-{
-    memset(out, 0, sizeof(*out));
-    out->version = BM_PQV5_ADDRESS_VERSION;
-    out->stream = stream;
-    if (bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0)
-    {
-        return -1;
-    }
-    if (bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
-    {
-        return -1;
-    }
-    bm_pqv5_calc_id(out->version, out->stream, out->sig_pk, out->kem_pk, out->id);
-    return 0;
-}
-
-/*
- * id先頭のnull_bytesバイトが0x00かを判定する。
- */
+/* id先頭のnull_bytesバイトが0x00かを判定する */
 static int id_has_leading_nulls(const unsigned char id[BM_PQV5_ID_LEN], int null_bytes)
 {
     int i;
@@ -257,156 +218,79 @@ static int id_has_leading_nulls(const unsigned char id[BM_PQV5_ID_LEN], int null
     return 1;
 }
 
-/* 成分ごとのドメイン分離ラベル(address_v5.hのenum bm_pqv5_componentと同じ順) */
-static const char *const g_component_labels[BM_PQV5_COMP_COUNT] = {
-    "mldsa", "ed25519", "mlkem", "x25519"
-};
-
-/* sub_seed = SHAKE128(root || component_label || 0x00 || varint(counter), out_len) */
-static int derive_component_seed(const unsigned char root[BM_PQV5_ROOT_LEN], int component,
-                                  uint32_t counter, unsigned char *out, size_t out_len)
+int bm_pqv5_identity_from_seeds(uint64_t stream,
+                                 const unsigned char sig_seed[BM_PQV5_SEED_LEN],
+                                 const unsigned char kem_seed[BM_PQV5_SEED_LEN],
+                                 struct bm_pqv5_identity *out)
 {
-    unsigned char buf[BM_PQV5_ROOT_LEN + 16 + 9];
-    size_t label_len = strlen(g_component_labels[component]);
-    unsigned char *p = buf;
-
-    memcpy(p, root, BM_PQV5_ROOT_LEN);
-    p += BM_PQV5_ROOT_LEN;
-    memcpy(p, g_component_labels[component], label_len);
-    p += label_len;
-    *p++ = 0x00;
-    p = put_varint(p, counter);
-
-    return bm_pq_shake128(buf, (size_t)(p - buf), out, out_len);
-}
-
-/* 1成分だけを作り直して鍵ブロブへ書き込む。探索ループの1候補分のコストがこれ */
-static int apply_component(struct bm_pqv5_identity *id, const unsigned char root[BM_PQV5_ROOT_LEN],
-                            int component, uint32_t counter)
-{
-    unsigned char seed[64];
-    int rc = -1;
-
-    switch (component)
-    {
-    case BM_PQV5_COMP_MLDSA:
-        if (derive_component_seed(root, component, counter, seed, 32) == 0)
-        {
-            rc = bm_pqv5_sig_set_mldsa(seed, id->sig_pk, id->sig_sk);
-        }
-        break;
-    case BM_PQV5_COMP_ED25519:
-        if (derive_component_seed(root, component, counter, seed, 32) == 0)
-        {
-            rc = bm_pqv5_sig_set_ed25519(seed, id->sig_pk, id->sig_sk);
-        }
-        break;
-    case BM_PQV5_COMP_MLKEM:
-        if (derive_component_seed(root, component, counter, seed, 64) == 0)
-        {
-            rc = bm_pqv5_kem_set_mlkem(seed, id->kem_pk, id->kem_sk);
-        }
-        break;
-    case BM_PQV5_COMP_X25519:
-        if (derive_component_seed(root, component, counter, seed, 32) == 0)
-        {
-            rc = bm_pqv5_kem_set_x25519(seed, id->kem_pk, id->kem_sk);
-        }
-        break;
-    default:
-        break;
-    }
-    OPENSSL_cleanse(seed, sizeof(seed));
-    return rc;
-}
-
-int bm_pqv5_identity_from_root(uint64_t stream, const unsigned char root[BM_PQV5_ROOT_LEN],
-                                const uint32_t counters[BM_PQV5_COMP_COUNT],
-                                struct bm_pqv5_identity *out)
-{
-    int c;
-
     memset(out, 0, sizeof(*out));
     out->version = BM_PQV5_ADDRESS_VERSION;
     out->stream = stream;
-    for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
+    if (bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0 ||
+        bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
     {
-        out->counters[c] = counters[c];
-        if (apply_component(out, root, c, counters[c]) != 0)
-        {
-            return -1;
-        }
+        return -1;
     }
-    bm_pqv5_calc_id(out->version, out->stream, out->sig_pk, out->kem_pk, out->id);
+    bm_pqv5_calc_id(out->sig_pk, out->kem_pk, out->id);
     return 0;
 }
 
 /*
- * 探索本体。rootは固定で、modeで指定された成分のカウンタだけを1ずつ進めながら
- * その成分の鍵を作り直す。ALLは4成分とも進める(v4のペア増加に相当)。
+ * ランダム生成: 署名鍵とML-KEM鍵は1回だけ引き、X25519鍵だけを毎回引き直して探索する。
+ * 乱数由来なのでX-Wingの32byte seed表現を保つ必要が無く、一番安い成分だけを回せる
+ * (address_v5.hの説明、およびv4のcreateRandomAddressが署名鍵を固定して暗号化鍵だけを
+ * 引き直しているのと同じ考え方)。
  */
-static int search_from_root(uint64_t stream, const unsigned char root[BM_PQV5_ROOT_LEN],
-                             int null_bytes, enum bm_pqv5_search_mode mode,
-                             struct bm_pqv5_identity *out)
+int bm_pqv5_identity_generate_random(uint64_t stream, int null_bytes,
+                                      struct bm_pqv5_identity *out)
 {
-    uint32_t counters[BM_PQV5_COMP_COUNT] = { 0, 0, 0, 0 };
-    int c;
+    unsigned char seed[64];
+    int rc = -1;
 
     if (null_bytes < 0 || null_bytes > BM_PQV5_ID_LEN)
     {
         return -1;
     }
-    if (bm_pqv5_identity_from_root(stream, root, counters, out) != 0)
+    memset(out, 0, sizeof(*out));
+    out->version = BM_PQV5_ADDRESS_VERSION;
+    out->stream = stream;
+
+    if (RAND_bytes(seed, 32) != 1 ||
+        bm_pqv5_sig_keypair_from_seed(seed, out->sig_pk, out->sig_sk) != 0)
     {
-        return -1;
+        goto out;
+    }
+    if (RAND_bytes(seed, 64) != 1 || bm_pqv5_kem_set_mlkem(seed, out->kem_pk, out->kem_sk) != 0)
+    {
+        goto out;
     }
     for (;;)
     {
+        if (RAND_bytes(seed, 32) != 1 || bm_pqv5_kem_set_x25519(seed, out->kem_pk, out->kem_sk) != 0)
+        {
+            goto out;
+        }
+        bm_pqv5_calc_id(out->sig_pk, out->kem_pk, out->id);
         if (id_has_leading_nulls(out->id, null_bytes))
         {
             break;
         }
-        for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
-        {
-            if (mode != BM_PQV5_SEARCH_ALL && c != (int)mode)
-            {
-                continue;
-            }
-            counters[c]++;
-            out->counters[c] = counters[c];
-            if (apply_component(out, root, c, counters[c]) != 0)
-            {
-                return -1;
-            }
-        }
-        bm_pqv5_calc_id(out->version, out->stream, out->sig_pk, out->kem_pk, out->id);
     }
-    return 0;
-}
+    rc = 0;
 
-int bm_pqv5_identity_generate_random(uint64_t stream, int null_bytes,
-                                      enum bm_pqv5_search_mode mode,
-                                      struct bm_pqv5_identity *out)
-{
-    unsigned char root[BM_PQV5_ROOT_LEN];
-    int rc;
-
-    if (RAND_bytes(root, sizeof(root)) != 1)
-    {
-        return -1;
-    }
-    rc = search_from_root(stream, root, null_bytes, mode, out);
-    OPENSSL_cleanse(root, sizeof(root));
+out:
+    OPENSSL_cleanse(seed, sizeof(seed));
     return rc;
 }
 
-/* root = SHA3-512(label || 0x00 || passphrase || varint(nonce)) */
-static int derive_root(const char *passphrase, uint64_t nonce, unsigned char out_root[BM_PQV5_ROOT_LEN])
+/* seed = SHA3-512(label || 0x00 || passphrase || varint(nonce))[0:32] */
+static int derive_seed(const char *passphrase, uint64_t nonce, unsigned char out_seed[BM_PQV5_SEED_LEN])
 {
     size_t label_len = strlen(BM_PQV5_LABEL_DETERMINISTIC);
     size_t pass_len = strlen(passphrase);
     size_t total = label_len + 1 + pass_len + bm_varint_size(nonce);
     unsigned char *buf = malloc(total);
+    unsigned char digest[64];
     unsigned char *p;
 
     if (buf == NULL)
@@ -421,29 +305,69 @@ static int derive_root(const char *passphrase, uint64_t nonce, unsigned char out
     p += pass_len;
     p = put_varint(p, nonce);
 
-    bm_pq_sha3_512(buf, (size_t)(p - buf), out_root);
+    bm_pq_sha3_512(buf, (size_t)(p - buf), digest);
+    memcpy(out_seed, digest, BM_PQV5_SEED_LEN);
+    OPENSSL_cleanse(digest, sizeof(digest));
     OPENSSL_cleanse(buf, total);
     free(buf);
     return 0;
 }
 
+/*
+ * 決定性生成: 署名鍵nonce(偶数側)は固定し、KEM鍵nonce(奇数側)だけを2ずつ進める。
+ * KEM鍵はX-Wing仕様通り32byteのseed 1本から生成する(ML-KEMとX25519に分解しない)。
+ * v4は両方のnonceを進めていたが、片方で十分であり、そのぶん1候補あたりのコストが
+ * 半分以下になる(0.489→0.169 ms/候補、DESIGN-PQ.md §8.2)。
+ */
 int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t stream,
-                                             uint64_t nonce, int null_bytes,
-                                             enum bm_pqv5_search_mode mode,
+                                             uint64_t start_nonce, int null_bytes,
                                              struct bm_pqv5_identity *out)
 {
-    unsigned char root[BM_PQV5_ROOT_LEN];
-    int rc;
+    unsigned char sig_seed[BM_PQV5_SEED_LEN];
+    unsigned char kem_seed[BM_PQV5_SEED_LEN];
+    uint64_t kem_nonce = start_nonce + 1;
+    int rc = -1;
 
-    if (derive_root(passphrase, nonce, root) != 0)
+    if (null_bytes < 0 || null_bytes > BM_PQV5_ID_LEN)
     {
         return -1;
     }
-    rc = search_from_root(stream, root, null_bytes, mode, out);
-    if (rc == 0)
+    memset(out, 0, sizeof(*out));
+    out->version = BM_PQV5_ADDRESS_VERSION;
+    out->stream = stream;
+
+    if (derive_seed(passphrase, start_nonce, sig_seed) != 0 ||
+        bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0)
     {
-        out->nonce = nonce;
+        goto out;
     }
-    OPENSSL_cleanse(root, sizeof(root));
+    for (;;)
+    {
+        if (derive_seed(passphrase, kem_nonce, kem_seed) != 0 ||
+            bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
+        {
+            goto out;
+        }
+        bm_pqv5_calc_id(out->sig_pk, out->kem_pk, out->id);
+        if (id_has_leading_nulls(out->id, null_bytes))
+        {
+            break;
+        }
+        kem_nonce += 2;
+    }
+    out->sig_nonce = start_nonce;
+    out->kem_nonce = kem_nonce;
+    rc = 0;
+
+out:
+    OPENSSL_cleanse(sig_seed, sizeof(sig_seed));
+    OPENSSL_cleanse(kem_seed, sizeof(kem_seed));
     return rc;
+}
+
+uint64_t bm_pqv5_next_start_nonce(const struct bm_pqv5_identity *previous)
+{
+    /* kem_nonceは常に奇数(奇数側の割り当て)なので、+1で次の偶数=次の署名鍵nonceになる。
+     * これで前のアドレスが消費したnonce域と重ならない */
+    return previous->kem_nonce + 1;
 }

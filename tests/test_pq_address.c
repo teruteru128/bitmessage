@@ -7,10 +7,9 @@
  *     依存するため、v4と同じく最優先で担保する
  *   - encode→decodeの往復、およびv4アドレス・チェックサム破壊・非正規エンコーディング
  *     (先頭0x00を残したもの)を拒否すること
- *   - idがversion/streamと公開鍵の全てに依存すること。ここが漏れていると
- *     「別のstreamの同じ鍵」が同じアドレスになってしまう
- *     (実際、開発中にvarintの書き込みポインタを進め損ねてversion/streamが
- *      ハッシュ入力から抜け落ちるバグを出しており、その再発検知も兼ねる)
+ *   - idが公開鍵だけに依存し、version/streamには依存しないこと(2026-09-18に
+ *     version/streamを混ぜる設計を取り下げた。v3/v4のripeと同じ意味論に戻した)。
+ *     逆にtagはversion/streamに依存すること
  *   - アドレス由来のKEM鍵が「アドレスを知っていれば誰でも同じものを作れる」こと
  */
 
@@ -27,9 +26,9 @@ static int test_deterministic_generation(void)
     struct bm_pqv5_identity b;
     struct bm_pqv5_identity c;
 
-    if (bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 0, 0, BM_PQV5_SEARCH_X25519, &a) != 0 ||
-        bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 0, 0, BM_PQV5_SEARCH_X25519, &b) != 0 ||
-        bm_pqv5_identity_generate_deterministic("another passphrase", 1, 0, 0, BM_PQV5_SEARCH_X25519, &c) != 0)
+    if (bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 0, 0, &a) != 0 ||
+        bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 0, 0, &b) != 0 ||
+        bm_pqv5_identity_generate_deterministic("another passphrase", 1, 0, 0, &c) != 0)
     {
         fprintf(stderr, "FAIL: deterministic generation\n");
         return 1;
@@ -51,16 +50,16 @@ static int test_deterministic_generation(void)
         fprintf(stderr, "FAIL: version/stream not set\n");
         return 1;
     }
-    /* null_bytes=0なので探索は起きず、全成分のカウンタが0のまま確定する */
-    if (a.nonce != 0 || a.counters[BM_PQV5_COMP_MLDSA] != 0 || a.counters[BM_PQV5_COMP_ED25519] != 0 ||
-        a.counters[BM_PQV5_COMP_MLKEM] != 0 || a.counters[BM_PQV5_COMP_X25519] != 0)
+    /* null_bytes=0なので探索は起きず、最初のnonceペアで確定する */
+    if (a.sig_nonce != 0 || a.kem_nonce != 1)
     {
-        fprintf(stderr, "FAIL: unexpected counters without a search\n");
+        fprintf(stderr, "FAIL: unexpected nonces %llu/%llu\n", (unsigned long long)a.sig_nonce,
+                (unsigned long long)a.kem_nonce);
         return 1;
     }
 
-    /* nonceを変えれば同じパスフレーズから別のアドレスが得られる(複数アドレス運用) */
-    if (bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 2, 0, BM_PQV5_SEARCH_X25519, &b) != 0 ||
+    /* start_nonceを変えれば同じパスフレーズから別のアドレスが得られる(複数アドレス運用) */
+    if (bm_pqv5_identity_generate_deterministic("passphrase for v5 test", 1, 2, 0, &b) != 0 ||
         memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0)
     {
         fprintf(stderr, "FAIL: start_nonce did not change the identity\n");
@@ -69,48 +68,65 @@ static int test_deterministic_generation(void)
     return 0;
 }
 
-static int test_id_depends_on_version_and_stream(void)
+static int test_id_depends_only_on_keys(void)
 {
     struct bm_pqv5_identity a;
-    unsigned char id_stream1[BM_PQV5_ID_LEN];
-    unsigned char id_stream2[BM_PQV5_ID_LEN];
-    unsigned char id_version6[BM_PQV5_ID_LEN];
+    unsigned char id1[BM_PQV5_ID_LEN];
+    unsigned char id2[BM_PQV5_ID_LEN];
+    unsigned char tag1[32];
+    unsigned char tag2[32];
 
-    if (bm_pqv5_identity_generate_deterministic("id binding test", 1, 0, 0, BM_PQV5_SEARCH_X25519, &a) != 0)
+    if (bm_pqv5_identity_generate_deterministic("id binding test", 1, 0, 0, &a) != 0)
     {
         fprintf(stderr, "FAIL: generation\n");
         return 1;
     }
-    bm_pqv5_calc_id(5, 1, a.sig_pk, a.kem_pk, id_stream1);
-    bm_pqv5_calc_id(5, 2, a.sig_pk, a.kem_pk, id_stream2);
-    bm_pqv5_calc_id(6, 1, a.sig_pk, a.kem_pk, id_version6);
-
-    if (memcmp(id_stream1, a.id, BM_PQV5_ID_LEN) != 0)
+    bm_pqv5_calc_id(a.sig_pk, a.kem_pk, id1);
+    if (memcmp(id1, a.id, BM_PQV5_ID_LEN) != 0)
     {
         fprintf(stderr, "FAIL: calc_id does not reproduce the identity's id\n");
         return 1;
     }
-    if (memcmp(id_stream1, id_stream2, BM_PQV5_ID_LEN) == 0 ||
-        memcmp(id_stream1, id_version6, BM_PQV5_ID_LEN) == 0)
-    {
-        fprintf(stderr, "FAIL: id does not depend on version/stream\n");
-        return 1;
-    }
 
-    /* 公開鍵1bitの違いでidが変わること */
+    /* 公開鍵1bitの違いでidが変わること(署名鍵側・KEM鍵側の両方) */
     a.sig_pk[0] ^= 0x01;
-    bm_pqv5_calc_id(5, 1, a.sig_pk, a.kem_pk, id_stream2);
-    if (memcmp(id_stream1, id_stream2, BM_PQV5_ID_LEN) == 0)
+    bm_pqv5_calc_id(a.sig_pk, a.kem_pk, id2);
+    if (memcmp(id1, id2, BM_PQV5_ID_LEN) == 0)
     {
         fprintf(stderr, "FAIL: id does not depend on the signing public key\n");
         return 1;
     }
     a.sig_pk[0] ^= 0x01;
     a.kem_pk[BM_PQV5_KEM_PK_LEN - 1] ^= 0x01;
-    bm_pqv5_calc_id(5, 1, a.sig_pk, a.kem_pk, id_stream2);
-    if (memcmp(id_stream1, id_stream2, BM_PQV5_ID_LEN) == 0)
+    bm_pqv5_calc_id(a.sig_pk, a.kem_pk, id2);
+    if (memcmp(id1, id2, BM_PQV5_ID_LEN) == 0)
     {
         fprintf(stderr, "FAIL: id does not depend on the KEM public key\n");
+        return 1;
+    }
+    a.kem_pk[BM_PQV5_KEM_PK_LEN - 1] ^= 0x01;
+
+    /* version/streamにはidが依存しないこと(v3/v4のripeと同じ性質。
+     * 同じ鍵を別version・別streamのアドレスとしても表現できる) */
+    bm_pqv5_calc_id(a.sig_pk, a.kem_pk, id2);
+    if (memcmp(id1, id2, BM_PQV5_ID_LEN) != 0)
+    {
+        fprintf(stderr, "FAIL: id is not stable\n");
+        return 1;
+    }
+
+    /* 一方tagはversion/streamに依存すること(束縛はこちらが担う) */
+    bm_pqv5_derive_secret_and_tag(5, 1, a.id, NULL, tag1);
+    bm_pqv5_derive_secret_and_tag(5, 2, a.id, NULL, tag2);
+    if (memcmp(tag1, tag2, sizeof(tag1)) == 0)
+    {
+        fprintf(stderr, "FAIL: tag does not depend on stream\n");
+        return 1;
+    }
+    bm_pqv5_derive_secret_and_tag(6, 1, a.id, NULL, tag2);
+    if (memcmp(tag1, tag2, sizeof(tag1)) == 0)
+    {
+        fprintf(stderr, "FAIL: tag does not depend on version\n");
         return 1;
     }
     return 0;
@@ -126,7 +142,7 @@ static int test_encode_decode(void)
     size_t len;
     int rc = 1;
 
-    if (bm_pqv5_identity_generate_deterministic("encode decode test", 1, 0, 0, BM_PQV5_SEARCH_X25519, &a) != 0)
+    if (bm_pqv5_identity_generate_deterministic("encode decode test", 1, 0, 0, &a) != 0)
     {
         fprintf(stderr, "FAIL: generation\n");
         return 1;
@@ -225,7 +241,7 @@ static int test_address_derived_kem_key(void)
     unsigned char tag1[32];
     unsigned char tag2[32];
 
-    if (bm_pqv5_identity_generate_deterministic("address derived key test", 1, 0, 0, BM_PQV5_SEARCH_X25519, &a) != 0)
+    if (bm_pqv5_identity_generate_deterministic("address derived key test", 1, 0, 0, &a) != 0)
     {
         fprintf(stderr, "FAIL: generation\n");
         return 1;
@@ -263,93 +279,142 @@ static int test_address_derived_kem_key(void)
  * いずれも条件を満たすidを返し、かつ決定性である(同じ入力で同じアドレスになる)ことを見る。
  * 既定値BM_PQV5_DEFAULT_NULL_BYTESが実際に効いていることの確認も兼ねる。
  */
+/*
+ * §11 2026-09-18 id先頭0x00の探索(既定null_bytes=1)を、決定性・ランダムの両経路で見る。
+ * 経路によって引き直す鍵が違う(決定性=KEM鍵ペアまるごと、ランダム=X25519だけ)ので、
+ * どちらも条件を満たすidを返すこと、決定性側は再現すること、アドレス長が53文字に
+ * 揃うことを確認する。
+ */
 static int test_null_byte_search(void)
 {
-    static const struct
-    {
-        enum bm_pqv5_search_mode mode;
-        enum bm_pqv5_component component;
-        const char *name;
-    } cases[] = {
-        { BM_PQV5_SEARCH_X25519, BM_PQV5_COMP_X25519, "x25519" },
-        { BM_PQV5_SEARCH_ED25519, BM_PQV5_COMP_ED25519, "ed25519" },
-        { BM_PQV5_SEARCH_MLKEM, BM_PQV5_COMP_MLKEM, "mlkem" },
-        { BM_PQV5_SEARCH_MLDSA, BM_PQV5_COMP_MLDSA, "mldsa" },
-    };
     struct bm_pqv5_identity a;
     struct bm_pqv5_identity b;
     char *address;
-    size_t i;
-    int c;
 
-    for (i = 0; i < sizeof(cases) / sizeof(cases[0]) + 1; i++)
+    if (bm_pqv5_identity_generate_deterministic("null byte search", 1, 0,
+                                                 BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0 ||
+        bm_pqv5_identity_generate_deterministic("null byte search", 1, 0,
+                                                 BM_PQV5_DEFAULT_NULL_BYTES, &b) != 0)
     {
-        int is_all = (i == sizeof(cases) / sizeof(cases[0]));
-        /* is_allのときcases[i]は範囲外なので、参照する値は先に退避しておく */
-        enum bm_pqv5_search_mode mode = is_all ? BM_PQV5_SEARCH_ALL : cases[i].mode;
-        int moved_component = is_all ? -1 : (int)cases[i].component;
-        const char *name = is_all ? "all" : cases[i].name;
-
-        if (bm_pqv5_identity_generate_deterministic("null byte search", 1, 0,
-                                                     BM_PQV5_DEFAULT_NULL_BYTES, mode, &a) != 0 ||
-            bm_pqv5_identity_generate_deterministic("null byte search", 1, 0,
-                                                     BM_PQV5_DEFAULT_NULL_BYTES, mode, &b) != 0)
-        {
-            fprintf(stderr, "FAIL: null byte search (%s)\n", name);
-            return 1;
-        }
-        if (a.id[0] != 0x00)
-        {
-            fprintf(stderr, "FAIL: leading null byte not satisfied (%s)\n", name);
-            return 1;
-        }
-        /* 同じ入力なら必ず同じアドレス・同じカウンタになること(決定性) */
-        if (memcmp(a.id, b.id, BM_PQV5_ID_LEN) != 0 ||
-            memcmp(a.counters, b.counters, sizeof(a.counters)) != 0)
-        {
-            fprintf(stderr, "FAIL: search is not deterministic (%s)\n", name);
-            return 1;
-        }
-        /* 回していない成分のカウンタが0のままであること */
-        for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
-        {
-            int expected_moved = is_all || c == moved_component;
-            if (!expected_moved && a.counters[c] != 0)
-            {
-                fprintf(stderr, "FAIL: %s search advanced component %d\n", name, c);
-                return 1;
-            }
-        }
-        /* カウンタからidentityを再構成できること(保存した値だけで復元できる保証) */
-        {
-            struct bm_pqv5_identity c2;
-            unsigned char root[BM_PQV5_ROOT_LEN];
-            /* rootは内部関数なので、ここでは同じ入力での再生成が一致することで代用する */
-            (void)root;
-            if (bm_pqv5_identity_generate_deterministic("null byte search", 1, 0, 0,
-                                                         BM_PQV5_SEARCH_X25519, &c2) != 0)
-            {
-                fprintf(stderr, "FAIL: regeneration\n");
-                return 1;
-            }
-            /* 探索なし(カウンタ全0)とは別のアドレスになっているはず */
-            if (memcmp(a.id, c2.id, BM_PQV5_ID_LEN) == 0 &&
-                (is_all || a.counters[moved_component] != 0))
-            {
-                fprintf(stderr, "FAIL: search did not change the id (%s)\n", name);
-                return 1;
-            }
-        }
-        /* 先頭0x00が1byte削られるので、アドレスは探索なしの場合より1文字短い53文字になる */
-        address = bm_pqv5_address_encode(a.version, a.stream, a.id);
-        if (address == NULL || strlen(address) != 53)
-        {
-            fprintf(stderr, "FAIL: unexpected address length %zu (%s)\n",
-                    address ? strlen(address) : 0, name);
-            free(address);
-            return 1;
-        }
+        fprintf(stderr, "FAIL: deterministic null byte search\n");
+        return 1;
+    }
+    if (a.id[0] != 0x00)
+    {
+        fprintf(stderr, "FAIL: leading null byte not satisfied (deterministic)\n");
+        return 1;
+    }
+    if (memcmp(a.id, b.id, BM_PQV5_ID_LEN) != 0 || a.sig_nonce != b.sig_nonce ||
+        a.kem_nonce != b.kem_nonce)
+    {
+        fprintf(stderr, "FAIL: deterministic search is not reproducible\n");
+        return 1;
+    }
+    /* 署名鍵nonceは固定(偶数側)、KEM鍵nonceだけが2ずつ進む(奇数側) */
+    if (a.sig_nonce != 0 || (a.kem_nonce % 2) != 1)
+    {
+        fprintf(stderr, "FAIL: unexpected nonce layout sig=%llu kem=%llu\n",
+                (unsigned long long)a.sig_nonce, (unsigned long long)a.kem_nonce);
+        return 1;
+    }
+    /* 探索したのだから、探索なしの場合とは別のアドレスになっているはず */
+    if (bm_pqv5_identity_generate_deterministic("null byte search", 1, 0, 0, &b) != 0)
+    {
+        fprintf(stderr, "FAIL: regeneration\n");
+        return 1;
+    }
+    if (a.kem_nonce != 1 && memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0)
+    {
+        fprintf(stderr, "FAIL: search did not change the id\n");
+        return 1;
+    }
+    /* 先頭0x00が1byte削られるので、アドレスは探索なしより1文字短い53文字になる */
+    address = bm_pqv5_address_encode(a.version, a.stream, a.id);
+    if (address == NULL || strlen(address) != 53)
+    {
+        fprintf(stderr, "FAIL: unexpected address length %zu\n", address ? strlen(address) : 0);
         free(address);
+        return 1;
+    }
+    free(address);
+
+    /* ランダム生成側(X25519だけを引き直す経路) */
+    if (bm_pqv5_identity_generate_random(1, BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0 ||
+        bm_pqv5_identity_generate_random(1, BM_PQV5_DEFAULT_NULL_BYTES, &b) != 0)
+    {
+        fprintf(stderr, "FAIL: random generation\n");
+        return 1;
+    }
+    if (a.id[0] != 0x00 || b.id[0] != 0x00)
+    {
+        fprintf(stderr, "FAIL: leading null byte not satisfied (random)\n");
+        return 1;
+    }
+    if (memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0)
+    {
+        fprintf(stderr, "FAIL: two random identities are identical\n");
+        return 1;
+    }
+    if (a.sig_nonce != 0 || a.kem_nonce != 0)
+    {
+        fprintf(stderr, "FAIL: random identity should not carry nonces\n");
+        return 1;
+    }
+    address = bm_pqv5_address_encode(a.version, a.stream, a.id);
+    if (address == NULL || strlen(address) != 53)
+    {
+        fprintf(stderr, "FAIL: unexpected random address length %zu\n", address ? strlen(address) : 0);
+        free(address);
+        return 1;
+    }
+    free(address);
+    return 0;
+}
+
+/*
+ * §11 2026-09-18 同じパスフレーズから複数アドレスを作るときのnonce領域の非重複。
+ * 探索がKEM鍵nonceを2ずつ進めるため、start_nonceを素朴に0,2,4,...とすると
+ * 別アドレスが同じKEM鍵を持ちうる(本家はnonceをアドレス間で継続させてこれを避けている)。
+ * bm_pqv5_next_start_nonceを使えば重ならないことを確認する。
+ */
+static int test_multiple_addresses_do_not_share_nonces(void)
+{
+    struct bm_pqv5_identity a;
+    struct bm_pqv5_identity b;
+    uint64_t next;
+
+    if (bm_pqv5_identity_generate_deterministic("multi address test", 1, 0,
+                                                 BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0)
+    {
+        fprintf(stderr, "FAIL: first address\n");
+        return 1;
+    }
+    next = bm_pqv5_next_start_nonce(&a);
+    if (next <= a.kem_nonce || (next % 2) != 0)
+    {
+        fprintf(stderr, "FAIL: next start nonce %llu is not a fresh even nonce\n",
+                (unsigned long long)next);
+        return 1;
+    }
+    if (bm_pqv5_identity_generate_deterministic("multi address test", 1, next,
+                                                 BM_PQV5_DEFAULT_NULL_BYTES, &b) != 0)
+    {
+        fprintf(stderr, "FAIL: second address\n");
+        return 1;
+    }
+    /* 2本目が使ったnonce域が1本目と重なっていないこと */
+    if (b.sig_nonce <= a.kem_nonce)
+    {
+        fprintf(stderr, "FAIL: nonce ranges overlap (a.kem=%llu b.sig=%llu)\n",
+                (unsigned long long)a.kem_nonce, (unsigned long long)b.sig_nonce);
+        return 1;
+    }
+    if (memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0 ||
+        memcmp(a.kem_pk, b.kem_pk, BM_PQV5_KEM_PK_LEN) == 0 ||
+        memcmp(a.sig_pk, b.sig_pk, BM_PQV5_SIG_PK_LEN) == 0)
+    {
+        fprintf(stderr, "FAIL: two addresses share keys\n");
+        return 1;
     }
     return 0;
 }
@@ -360,7 +425,7 @@ int main(void)
     {
         return 1;
     }
-    if (test_id_depends_on_version_and_stream() != 0)
+    if (test_id_depends_only_on_keys() != 0)
     {
         return 1;
     }
@@ -377,6 +442,10 @@ int main(void)
         return 1;
     }
     if (test_null_byte_search() != 0)
+    {
+        return 1;
+    }
+    if (test_multiple_addresses_do_not_share_nonces() != 0)
     {
         return 1;
     }

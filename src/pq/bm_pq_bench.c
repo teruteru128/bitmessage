@@ -198,13 +198,13 @@ struct hybrid_ctx
 static void hybrid_sign_fn(void *arg)
 {
     struct hybrid_ctx *c = arg;
-    bm_pqv5_sign("bench", c->msg, sizeof(c->msg), c->sig_sk, c->sig);
+    bm_pqv5_sign(c->msg, sizeof(c->msg), c->sig_sk, c->sig);
 }
 
 static void hybrid_verify_fn(void *arg)
 {
     struct hybrid_ctx *c = arg;
-    if (bm_pqv5_verify("bench", c->msg, sizeof(c->msg), c->sig, c->sig_pk) != 1)
+    if (bm_pqv5_verify(c->msg, sizeof(c->msg), c->sig, c->sig_pk) != 1)
     {
         fprintf(stderr, "hybrid verify failed\n");
         exit(1);
@@ -276,7 +276,7 @@ static void bench_primitives(void)
     RAND_bytes(hc.msg, sizeof(hc.msg));
     bm_pqv5_sig_keypair_from_seed(hc.seed, hc.sig_pk, hc.sig_sk);
     bm_pqv5_kem_keypair_from_seed(hc.seed, hc.kem_pk, hc.kem_sk);
-    bm_pqv5_sign("bench", hc.msg, sizeof(hc.msg), hc.sig_sk, hc.sig);
+    bm_pqv5_sign(hc.msg, sizeof(hc.msg), hc.sig_sk, hc.sig);
     bm_pqv5_seal(hc.kem_pk, NULL, 0, hc.msg, sizeof(hc.msg), hc.sealed, &hc.sealed_len);
     print_row("v5 hybrid", "sign", bench(hybrid_sign_fn, &hc, 2000, 0.3));
     print_row("v5 hybrid", "verify", bench(hybrid_verify_fn, &hc, 5000, 0.3));
@@ -305,35 +305,100 @@ static void bench_primitives(void)
 
 /* --- 2. アドレス生成 --- */
 
-static void bench_one_v5_address(const char *label, int null_bytes, enum bm_pqv5_search_mode mode,
-                                  struct bm_pqv5_identity *out)
+/*
+ * 実際に使う2経路(決定性・ランダム)のアドレス生成コスト。
+ * 決定性はKEM鍵ペアをX-Wing仕様通りseedから毎回作り直し、ランダムはX25519だけを
+ * 引き直す(address_v5.hの説明)。候補数は幾何分布なので単発ではぶれるため、
+ * 1候補あたりのコストと、そこから計算した期待所要時間を併記する。
+ */
+static void bench_v5_deterministic(const char *label, int null_bytes, struct bm_pqv5_identity *out)
 {
     double t0 = now_sec();
     double t1;
     char *addr;
-    uint64_t candidates = 1;
-    int c;
+    uint64_t candidates;
 
-    if (bm_pqv5_identity_generate_deterministic("bm-pq-bench passphrase", 1, 0, null_bytes, mode, out) != 0)
+    if (bm_pqv5_identity_generate_deterministic("bm-pq-bench passphrase", 1, 0, null_bytes, out) != 0)
     {
-        fprintf(stderr, "v5 address generation failed\n");
+        fprintf(stderr, "v5 deterministic address generation failed\n");
         exit(1);
     }
     t1 = now_sec();
-    /* 回した成分のカウンタ+1が試した候補数(ALLは全成分同時に進むので同じ値) */
-    for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
-    {
-        if (out->counters[c] + 1 > candidates)
-        {
-            candidates = out->counters[c] + 1;
-        }
-    }
+    candidates = (out->kem_nonce - 1) / 2 + 1;
     addr = bm_pqv5_address_encode(out->version, out->stream, out->id);
-    printf("  %-30s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%7.1f ms  %zu文字\n", label, candidates,
-           (t1 - t0) * 1e3, (t1 - t0) * 1e3 / (double)candidates,
+    printf("  %-32s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%8.1f ms  %zu文字\n", label,
+           candidates, (t1 - t0) * 1e3, (t1 - t0) * 1e3 / (double)candidates,
            (t1 - t0) * 1e3 / (double)candidates * (null_bytes == 0 ? 1.0 : (double)(1u << (8 * null_bytes))),
            strlen(addr));
     free(addr);
+}
+
+static void bench_v5_random(const char *label, int null_bytes)
+{
+    struct bm_pqv5_identity id;
+    double t0 = now_sec();
+    double elapsed;
+    int i;
+    const int rounds = 20;
+    char *addr;
+
+    /* ランダム生成は候補数を記録しないので、複数回まわして1本あたりの平均所要時間を出す */
+    for (i = 0; i < rounds; i++)
+    {
+        if (bm_pqv5_identity_generate_random(1, null_bytes, &id) != 0)
+        {
+            fprintf(stderr, "v5 random address generation failed\n");
+            exit(1);
+        }
+    }
+    elapsed = (now_sec() - t0) / rounds;
+    addr = bm_pqv5_address_encode(id.version, id.stream, id.id);
+    printf("  %-32s %6s %9s  %6s          実測%8.1f ms  %zu文字\n", label, "-", "-", "-",
+           elapsed * 1e3, strlen(addr));
+    free(addr);
+}
+
+/*
+ * 参考測定: 探索で「鍵ペアまるごと」「id計算だけ」を回した場合の1候補あたりコスト。
+ * 実際に採用した方式(決定性=X-Wing鍵まるごと、ランダム=X25519のみ)の位置づけを
+ * 示すための比較対象。DESIGN-PQ.md §8.2。
+ */
+static void bench_whole_keypair_redraw(const struct bm_pqv5_identity *base)
+{
+    unsigned char seed[BM_PQV5_SEED_LEN];
+    unsigned char pk[BM_PQV5_KEM_PK_LEN];
+    unsigned char sk[BM_PQV5_KEM_SK_LEN];
+    unsigned char sig_pk[BM_PQV5_SIG_PK_LEN];
+    unsigned char sig_sk[BM_PQV5_SIG_SK_LEN];
+    unsigned char id[BM_PQV5_ID_LEN];
+    double t0;
+    double per;
+    int i;
+    const int iters = 2000;
+
+    memset(seed, 0x33, sizeof(seed));
+
+    t0 = now_sec();
+    for (i = 0; i < iters; i++)
+    {
+        bm_pq_shake128(seed, sizeof(seed), seed, sizeof(seed));
+        bm_pqv5_sig_keypair_from_seed(seed, sig_pk, sig_sk);
+        bm_pqv5_calc_id(sig_pk, base->kem_pk, id);
+    }
+    per = (now_sec() - t0) * 1e3 / iters;
+    printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) 署名鍵まるごと", "-", "-",
+           per, per * 256.0);
+
+    t0 = now_sec();
+    for (i = 0; i < iters; i++)
+    {
+        bm_pqv5_calc_id(base->sig_pk, base->kem_pk, id);
+    }
+    per = (now_sec() - t0) * 1e3 / iters;
+    printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) id計算のみ=探索の下限", "-", "-",
+           per, per * 256.0);
+    (void)pk;
+    (void)sk;
 }
 
 static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated_address *out_v4)
@@ -343,7 +408,7 @@ static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated
     char *addr4;
     struct bm_pqv5_identity tmp;
 
-    printf("== 2. アドレス生成(決定性、null_bytes=id先頭に要求する0x00バイト数) ==\n");
+    printf("== 2. アドレス生成(null_bytes=id先頭に要求する0x00バイト数) ==\n");
 
     t0 = now_sec();
     if (bm_address_generate_deterministic("bm-pq-bench passphrase", 1, out_v4) != 0)
@@ -353,24 +418,17 @@ static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated
     }
     t1 = now_sec();
     addr4 = bm_address_encode(4, 1, out_v4->ripe, BM_RIPE_LEN);
-    printf("  %-30s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%7.1f ms  %zu文字\n",
-           "v4 null_bytes=1 (secp256k1×2)", out_v4->signing_nonce / 2 + 1, (t1 - t0) * 1e3,
+    printf("  %-32s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%8.1f ms  %zu文字\n",
+           "v4 決定性 null=1 (両鍵を引き直す)", out_v4->signing_nonce / 2 + 1, (t1 - t0) * 1e3,
            (t1 - t0) * 1e3 / (double)(out_v4->signing_nonce / 2 + 1),
            (t1 - t0) * 1e3 / (double)(out_v4->signing_nonce / 2 + 1) * 256.0, strlen(addr4));
     free(addr4);
 
-    /* 探索なし(参考)。アドレスは1文字長くなり、長さがばらつく */
-    bench_one_v5_address("v5 null_bytes=0 (探索なし)", 0, BM_PQV5_SEARCH_X25519, &tmp);
-
-    /* §11 2026-09-17: 「どの成分を引き直すか」の4方式+全部。成分ごとに鍵生成コストが
-     * 大きく違う(ML-DSA-65 224us / ML-KEM-768 83us / X25519・Ed25519はスカラー倍1回)
-     * ので、ここが探索コストの主要因になる */
-    bench_one_v5_address("v5 null_bytes=1 (X25519)", 1, BM_PQV5_SEARCH_X25519, out_v5);
-    bench_one_v5_address("v5 null_bytes=1 (Ed25519)", 1, BM_PQV5_SEARCH_ED25519, &tmp);
-    bench_one_v5_address("v5 null_bytes=1 (ML-KEM)", 1, BM_PQV5_SEARCH_MLKEM, &tmp);
-    bench_one_v5_address("v5 null_bytes=1 (ML-DSA)", 1, BM_PQV5_SEARCH_MLDSA, &tmp);
-    bench_one_v5_address("v5 null_bytes=1 (全成分)", 1, BM_PQV5_SEARCH_ALL, &tmp);
-    bench_one_v5_address("v5 null_bytes=2 (X25519)", 2, BM_PQV5_SEARCH_X25519, &tmp);
+    bench_v5_deterministic("v5 決定性 null=0 (探索なし)", 0, &tmp);
+    bench_v5_deterministic("v5 決定性 null=1 (X-Wing鍵まるごと)", BM_PQV5_DEFAULT_NULL_BYTES, out_v5);
+    bench_v5_deterministic("v5 決定性 null=2 (X-Wing鍵まるごと)", 2, &tmp);
+    bench_v5_random("v5 ランダム null=1 (X25519のみ)", BM_PQV5_DEFAULT_NULL_BYTES);
+    bench_whole_keypair_redraw(out_v5);
 
     printf("\n");
 }

@@ -22,10 +22,11 @@
 #include "address_v5.h"
 #include "pq_hybrid.h"
 
-/* オブジェクト種別ごとの署名ドメイン分離ラベル(DESIGN-PQ.md §5.3) */
-#define BM_PQ_SIGLABEL_PUBKEY "BitmessagePQ-v5-pubkey"
-#define BM_PQ_SIGLABEL_MSG "BitmessagePQ-v5-msg"
-#define BM_PQ_SIGLABEL_BROADCAST "BitmessagePQ-v5-broadcast"
+/*
+ * §11 2026-09-18 オブジェクト種別ごとの署名ドメイン分離ラベルは削除した(ユーザー指摘)。
+ * 署名対象には必ず共通ヘッダ(objectType 4byte + objectVersion)が含まれるので、
+ * 種別間の分離は既に達成されており重複だった。v4も同じ理屈でラベル無し。
+ */
 
 #define BM_PQ_MSG_OBJECT_VERSION 2
 #define BM_PQ_PUBKEY_OBJECT_VERSION 5

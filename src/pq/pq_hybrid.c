@@ -200,72 +200,31 @@ int bm_pqv5_sig_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
     return rc;
 }
 
-/*
- * 署名対象を label || 0x00 || msg として組み立てる。labelは短い固定文字列なので
- * mallocせずにmsgと2回に分けて渡したいところだが、ML-DSA参照実装のAPIが
- * 連続バッファしか受け取らない(Ed25519側のEVP_DigestSignも同様)ため連結する。
- */
-static unsigned char *build_signing_input(const char *label, const unsigned char *msg, size_t msg_len,
-                                           size_t *out_len)
-{
-    size_t label_len = strlen(label);
-    size_t total = label_len + 1 + msg_len;
-    unsigned char *buf = OPENSSL_malloc(total);
-    if (buf == NULL)
-    {
-        return NULL;
-    }
-    memcpy(buf, label, label_len);
-    buf[label_len] = 0x00;
-    memcpy(buf + label_len + 1, msg, msg_len);
-    *out_len = total;
-    return buf;
-}
-
-int bm_pqv5_sign(const char *label, const unsigned char *msg, size_t msg_len,
+int bm_pqv5_sign(const unsigned char *msg, size_t msg_len,
                   const unsigned char sk[BM_PQV5_SIG_SK_LEN],
                   unsigned char out_sig[BM_PQV5_SIG_LEN])
 {
-    size_t input_len = 0;
-    unsigned char *input = build_signing_input(label, msg, msg_len, &input_len);
     size_t mldsa_len = 0;
-    int rc = -1;
 
-    if (input == NULL)
+    if (bm_pq_sig_sign(PQV5_SIG_ALG, msg, msg_len, sk, out_sig, &mldsa_len) != 0 ||
+        mldsa_len != MLDSA_SIG_LEN)
     {
         return -1;
     }
-    if (bm_pq_sig_sign(PQV5_SIG_ALG, input, input_len, sk, out_sig, &mldsa_len) == 0 &&
-        mldsa_len == MLDSA_SIG_LEN &&
-        ed25519_sign(sk + MLDSA_SK_LEN, input, input_len, out_sig + MLDSA_SIG_LEN) == 0)
-    {
-        rc = 0;
-    }
-    OPENSSL_free(input);
-    return rc;
+    return ed25519_sign(sk + MLDSA_SK_LEN, msg, msg_len, out_sig + MLDSA_SIG_LEN);
 }
 
-int bm_pqv5_verify(const char *label, const unsigned char *msg, size_t msg_len,
+int bm_pqv5_verify(const unsigned char *msg, size_t msg_len,
                     const unsigned char sig[BM_PQV5_SIG_LEN],
                     const unsigned char pk[BM_PQV5_SIG_PK_LEN])
 {
-    size_t input_len = 0;
-    unsigned char *input = build_signing_input(label, msg, msg_len, &input_len);
-    int ok = 0;
-
-    if (input == NULL)
+    /* 両方通って初めて有効。片方でも落ちたら無効(ハイブリッドの意味がなくなるため
+     * 「どちらか通ればOK」には絶対にしない) */
+    if (bm_pq_sig_verify(PQV5_SIG_ALG, sig, MLDSA_SIG_LEN, msg, msg_len, pk) != 1)
     {
         return 0;
     }
-    /* 両方通って初めて有効。片方でも落ちたら無効(ハイブリッドの意味がなくなるため
-     * 「どちらか通ればOK」には絶対にしない) */
-    if (bm_pq_sig_verify(PQV5_SIG_ALG, sig, MLDSA_SIG_LEN, input, input_len, pk) == 1 &&
-        ed25519_verify(pk + MLDSA_PK_LEN, input, input_len, sig + MLDSA_SIG_LEN) == 1)
-    {
-        ok = 1;
-    }
-    OPENSSL_free(input);
-    return ok;
+    return ed25519_verify(pk + MLDSA_PK_LEN, msg, msg_len, sig + MLDSA_SIG_LEN);
 }
 
 /* --- X-Wing (ML-KEM-768 + X25519) --- */

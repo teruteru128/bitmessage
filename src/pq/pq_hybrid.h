@@ -68,16 +68,20 @@ int bm_pqv5_kem_set_mlkem(const unsigned char coins[64], unsigned char *out_pk, 
 int bm_pqv5_kem_set_x25519(const unsigned char sk32[32], unsigned char *out_pk, unsigned char *out_sk);
 
 /*
- * labelは用途ごとのドメイン分離文字列(NUL終端、pq_object.hのBM_PQ_SIGLABEL_*)。
- * 実際に署名される入力は label || 0x00 || msg で、ML-DSAとEd25519の両方に同じ
- * 入力を与える。成功時0。
+ * ML-DSAとEd25519の両方に**同じmsgをそのまま**与えて署名する。成功時0。
+ *
+ * §11 2026-09-18: 当初は用途ごとのドメイン分離ラベルをmsgの先頭に連結していたが、
+ * 削除した(ユーザー指摘)。オブジェクト署名の対象には必ず共通ヘッダ
+ * (objectType 4byte + objectVersion)が含まれるので、種別間の分離は既に達成されており
+ * ラベルは重複でしかない。v4(ECDSA)がラベル無しで済んでいるのと同じ理屈。
+ * ML-DSAのcontext string(FIPS 204 §5.2)も空のまま。
  */
-int bm_pqv5_sign(const char *label, const unsigned char *msg, size_t msg_len,
+int bm_pqv5_sign(const unsigned char *msg, size_t msg_len,
                   const unsigned char sk[BM_PQV5_SIG_SK_LEN],
                   unsigned char out_sig[BM_PQV5_SIG_LEN]);
 
 /* 両方の署名が検証できたときだけ1。片方でも失敗したら0 */
-int bm_pqv5_verify(const char *label, const unsigned char *msg, size_t msg_len,
+int bm_pqv5_verify(const unsigned char *msg, size_t msg_len,
                     const unsigned char sig[BM_PQV5_SIG_LEN],
                     const unsigned char pk[BM_PQV5_SIG_PK_LEN]);
 

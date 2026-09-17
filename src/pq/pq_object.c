@@ -230,7 +230,7 @@ unsigned char *bm_pq_build_pubkey(const struct bm_pq_sender_info *from, uint64_t
 
     signing_msg = build_signing_message(buf, plain_len, inner, inner_presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_sign(BM_PQ_SIGLABEL_PUBKEY, signing_msg, signing_len, id->sig_sk, sig) != 0)
+        bm_pqv5_sign(signing_msg, signing_len, id->sig_sk, sig) != 0)
     {
         goto fail;
     }
@@ -344,14 +344,14 @@ int bm_pq_parse_pubkey(const unsigned char *object, size_t object_len,
 
     signing_msg = build_signing_message(plain, plain_len, inner, presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_verify(BM_PQ_SIGLABEL_PUBKEY, signing_msg, signing_len, sig, out->sig_pk) != 1)
+        bm_pqv5_verify(signing_msg, signing_len, sig, out->sig_pk) != 1)
     {
         goto out;
     }
 
     /* 中の公開鍵から再計算したidが、要求していたアドレスと一致することを確認する
      * (別人の公開鍵を詰めたpubkeyを掴まされないための整合性チェック) */
-    bm_pqv5_calc_id(address_version, stream, out->sig_pk, out->kem_pk, recomputed_id);
+    bm_pqv5_calc_id(out->sig_pk, out->kem_pk, recomputed_id);
     if (memcmp(recomputed_id, id, BM_PQV5_ID_LEN) != 0)
     {
         goto out;
@@ -431,7 +431,7 @@ unsigned char *bm_pq_build_msg(const struct bm_pq_sender_info *from, uint64_t to
 
     signing_msg = build_signing_message(buf, plain_len, inner, inner_presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_sign(BM_PQ_SIGLABEL_MSG, signing_msg, signing_len, id->sig_sk, sig) != 0)
+        bm_pqv5_sign(signing_msg, signing_len, id->sig_sk, sig) != 0)
     {
         goto fail;
     }
@@ -580,12 +580,12 @@ int bm_pq_parse_msg(const unsigned char *object, size_t object_len,
 
     signing_msg = build_signing_message(plain, plain_len, inner, presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_verify(BM_PQ_SIGLABEL_MSG, signing_msg, signing_len, sig, out->from_sig_pk) != 1)
+        bm_pqv5_verify(signing_msg, signing_len, sig, out->from_sig_pk) != 1)
     {
         goto out;
     }
 
-    bm_pqv5_calc_id(version, stream, out->from_sig_pk, out->from_kem_pk, out->from_id);
+    bm_pqv5_calc_id(out->from_sig_pk, out->from_kem_pk, out->from_id);
     rc = 0;
 
 out:
@@ -672,7 +672,7 @@ unsigned char *bm_pq_build_broadcast(const struct bm_pq_sender_info *from,
 
     signing_msg = build_signing_message(buf, plain_len, inner, inner_presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_sign(BM_PQ_SIGLABEL_BROADCAST, signing_msg, signing_len, id->sig_sk, sig) != 0)
+        bm_pqv5_sign(signing_msg, signing_len, id->sig_sk, sig) != 0)
     {
         goto fail;
     }
@@ -800,15 +800,14 @@ int bm_pq_parse_broadcast(const unsigned char *object, size_t object_len,
 
     signing_msg = build_signing_message(plain, plain_len, inner, presig_len, &signing_len);
     if (signing_msg == NULL ||
-        bm_pqv5_verify(BM_PQ_SIGLABEL_BROADCAST, signing_msg, signing_len, sig, out->from_sig_pk) != 1)
+        bm_pqv5_verify(signing_msg, signing_len, sig, out->from_sig_pk) != 1)
     {
         goto out;
     }
 
     /* 送信元アドレス由来の鍵で開封できた以上、中の公開鍵もそのアドレスのものであるはず。
      * v4のbroadcast復号(core/broadcast_decrypt.c)と同じ整合性チェックを行う */
-    bm_pqv5_calc_id(out->from_address_version, out->from_stream, out->from_sig_pk, out->from_kem_pk,
-                    recomputed_id);
+    bm_pqv5_calc_id(out->from_sig_pk, out->from_kem_pk, recomputed_id);
     if (memcmp(recomputed_id, id, BM_PQV5_ID_LEN) != 0)
     {
         goto out;

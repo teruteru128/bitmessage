@@ -195,20 +195,22 @@ static int test_hybrid_signature(void)
         fprintf(stderr, "FAIL: hybrid keygen determinism\n");
         return 1;
     }
-    if (bm_pqv5_sign("label-a", msg, sizeof(msg), sk, sig) != 0)
+    if (bm_pqv5_sign(msg, sizeof(msg), sk, sig) != 0)
     {
         fprintf(stderr, "FAIL: hybrid sign\n");
         return 1;
     }
-    if (bm_pqv5_verify("label-a", msg, sizeof(msg), sig, pk) != 1)
+    if (bm_pqv5_verify(msg, sizeof(msg), sig, pk) != 1)
     {
         fprintf(stderr, "FAIL: hybrid verify\n");
         return 1;
     }
-    /* ドメイン分離: ラベルが違えば同じ署名は通らない */
-    if (bm_pqv5_verify("label-b", msg, sizeof(msg), sig, pk) != 0)
+    /* 別のメッセージでは通らないこと(オブジェクト署名のドメイン分離は、署名対象に
+     * 共通ヘッダ(objectType/objectVersion)が入ることで達成される。§11 2026-09-18に
+     * 専用ラベルは削除した) */
+    if (bm_pqv5_verify((const unsigned char *)"other", 5, sig, pk) != 0)
     {
-        fprintf(stderr, "FAIL: signature verified under a different label\n");
+        fprintf(stderr, "FAIL: signature verified for a different message\n");
         return 1;
     }
 
@@ -217,14 +219,14 @@ static int test_hybrid_signature(void)
     {
         size_t pos = (i == 0) ? 64 : (size_t)MLDSA65_SIG_LEN + 10;
         sig[pos] ^= 0x01;
-        if (bm_pqv5_verify("label-a", msg, sizeof(msg), sig, pk) != 0)
+        if (bm_pqv5_verify(msg, sizeof(msg), sig, pk) != 0)
         {
             fprintf(stderr, "FAIL: hybrid verify accepted a half-tampered signature (part %d)\n", i);
             return 1;
         }
         sig[pos] ^= 0x01;
     }
-    if (bm_pqv5_verify("label-a", msg, sizeof(msg), sig, pk) != 1)
+    if (bm_pqv5_verify(msg, sizeof(msg), sig, pk) != 1)
     {
         fprintf(stderr, "FAIL: restore check\n");
         return 1;
