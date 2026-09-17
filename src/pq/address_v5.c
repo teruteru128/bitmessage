@@ -314,10 +314,23 @@ static int derive_seed(const char *passphrase, uint64_t nonce, unsigned char out
 }
 
 /*
- * 決定性生成: 署名鍵nonce(偶数側)は固定し、KEM鍵nonce(奇数側)だけを2ずつ進める。
- * KEM鍵はX-Wing仕様通り32byteのseed 1本から生成する(ML-KEMとX25519に分解しない)。
- * v4は両方のnonceを進めていたが、片方で十分であり、そのぶん1候補あたりのコストが
- * 半分以下になる(0.489→0.169 ms/候補、DESIGN-PQ.md §8.2)。
+ * 決定性生成: v4(class_addressGenerator.py l.255-273)と同じく、署名鍵nonce(偶数側)と
+ * KEM鍵nonce(奇数側)を**両方**2ずつ進めて両方の鍵を作り直す。
+ *
+ * §11 2026-09-18: 一度は「安いKEM鍵側だけを回す」形にした(1候補0.172ms、期待44ms。
+ * 両方だと約0.5ms、期待127ms)。しかしユーザーの「署名鍵nonceを固定するのって
+ * なんでだったか」という問いをきっかけに再検討し、撤回した:
+ *
+ *   (1) 節約できるのは81ms。同じアドレスのpubkey告知に必要なPoWが141秒(DESIGN-PQ.md
+ *       §8.4)なので、アドレスを使える状態にする総コストの0.06%しか削っていない。
+ *   (2) 署名鍵をstart_nonceだけで決めると、**同じパスフレーズ・同じstart_nonceで
+ *       null_bytesだけ変えて生成した2本のアドレスが同じ署名鍵を共有する**。pk_sigは
+ *       pubkeyオブジェクトで公開されるため、その2本は第三者から公開的に紐付け可能に
+ *       なる。両方進める方式ならnull_bytesを変えれば署名鍵も変わるのでこの穴が無い。
+ *
+ * なおランダム生成(bm_pqv5_identity_generate_random)が署名鍵を固定してX25519だけを
+ * 引き直すのはそのままでよい。呼び出しごとに新しい乱数から署名鍵を引くので共有が
+ * 起きず、本家のcreateRandomAddressも同じ作法である。
  */
 int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t stream,
                                              uint64_t start_nonce, int null_bytes,
@@ -325,6 +338,7 @@ int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t str
 {
     unsigned char sig_seed[BM_PQV5_SEED_LEN];
     unsigned char kem_seed[BM_PQV5_SEED_LEN];
+    uint64_t sig_nonce = start_nonce;
     uint64_t kem_nonce = start_nonce + 1;
     int rc = -1;
 
@@ -336,14 +350,11 @@ int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t str
     out->version = BM_PQV5_ADDRESS_VERSION;
     out->stream = stream;
 
-    if (derive_seed(passphrase, start_nonce, sig_seed) != 0 ||
-        bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0)
-    {
-        goto out;
-    }
     for (;;)
     {
-        if (derive_seed(passphrase, kem_nonce, kem_seed) != 0 ||
+        if (derive_seed(passphrase, sig_nonce, sig_seed) != 0 ||
+            derive_seed(passphrase, kem_nonce, kem_seed) != 0 ||
+            bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0 ||
             bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
         {
             goto out;
@@ -353,9 +364,10 @@ int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t str
         {
             break;
         }
+        sig_nonce += 2;
         kem_nonce += 2;
     }
-    out->sig_nonce = start_nonce;
+    out->sig_nonce = sig_nonce;
     out->kem_nonce = kem_nonce;
     rc = 0;
 

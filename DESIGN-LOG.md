@@ -3293,6 +3293,28 @@ nonceを両方に+2して?」と確認があり、その通りであることを
 kem_nonce+1を返す)を追加してAPI上で規律を表現し、
 `tests/test_pq_address.c`に非重複の検査を追加した。
 
+**(8) 署名鍵nonceの固定を撤回(「署名鍵nonceを固定するのってなんででしたっけ」)。**
+(5)で決定性生成を「安いKEM鍵ペアだけ引き直す」形にしていたが、その理由を問われて
+再検討した結果、撤回して**v4と同じ「両方のnonceを2ずつ進める」に戻した**。
+
+理由は2つ。第一に、節約できるのは81ms(0.169→0.486 ms/候補、期待43.4→124.5ms)である
+一方、同じアドレスのpubkeyオブジェクトを告知するPoWが141秒かかる。アドレスを使える
+状態にする総コストの0.06%しか削っておらず、典型的な早すぎる最適化だった。
+
+第二に、これは問われて初めて気づいたことだが、署名鍵をstart_nonceだけで決めると
+**同じパスフレーズ・同じstart_nonceでnull_bytesだけ変えて生成した2本のアドレスが
+同じ署名鍵を持つ**。pk_sigはpubkeyオブジェクトで公開されるので、その2本は第三者から
+公開的に紐付け可能になる。両方のnonceを進める方式ならnull_bytesを変えれば署名鍵も
+変わるため、この穴が構造的に存在しない。`tests/test_pq_address.c`に
+「null_bytesだけ変えた2本が署名鍵を共有しないこと」の検査を追加した。
+
+ランダム生成側の「署名鍵を固定してX25519だけ引き直す」はそのまま維持した。呼び出し
+ごとに新しい乱数から署名鍵を引くので共有が起きず、本家のcreateRandomAddressも同じ
+作法である。結果として決定性・ランダムの両経路ともv4と同じ作法になった。
+
+この一連のやりとり((1)〜(8))で、初版に足していた独自要素はほぼ全て取り下がり、
+「v4の構造のまま、プリミティブだけをポスト量子化したもの」に収束した。
+
 ### ベンチマーク生出力(最終版、`bm-pq-bench --pow`、Ubuntu 24.04 / OpenSSL 3.0.13 / 16コア、Releaseビルド)
 
 ```
@@ -3300,40 +3322,41 @@ bm-pq-bench (DESIGN-PQ.md §8) — v5プロファイル: ML-DSA-65 + Ed25519 / X
 
 == 1. 暗号プリミティブ ==
   alg            op               time    throughput
-  ML-DSA-44      keygen          141.5 us          7066 ops/s
-  ML-DSA-44      sign            627.7 us          1593 ops/s
-  ML-DSA-44      verify          157.8 us          6337 ops/s
-  ML-DSA-65      keygen          248.1 us          4031 ops/s
-  ML-DSA-65      sign           1177.5 us           849 ops/s
-  ML-DSA-65      verify          251.2 us          3980 ops/s
-  ML-DSA-87      keygen          386.2 us          2589 ops/s
-  ML-DSA-87      sign           1254.5 us           797 ops/s
-  ML-DSA-87      verify          408.5 us          2448 ops/s
-  ML-KEM-512     keygen           49.7 us         20133 ops/s
-  ML-KEM-512     encaps           62.1 us         16104 ops/s
-  ML-KEM-512     decaps           78.8 us         12683 ops/s
-  ML-KEM-768     keygen           82.8 us         12082 ops/s
-  ML-KEM-768     encaps           97.1 us         10296 ops/s
-  ML-KEM-768     decaps          120.4 us          8307 ops/s
-  ML-KEM-1024    keygen          131.5 us          7605 ops/s
-  ML-KEM-1024    encaps          143.1 us          6989 ops/s
-  ML-KEM-1024    decaps          173.0 us          5782 ops/s
-  v5 hybrid      sign           1241.8 us           805 ops/s
+  ML-DSA-44      keygen          140.2 us          7131 ops/s
+  ML-DSA-44      sign            621.0 us          1610 ops/s
+  ML-DSA-44      verify          156.6 us          6386 ops/s
+  ML-DSA-65      keygen          247.8 us          4036 ops/s
+  ML-DSA-65      sign            971.0 us          1030 ops/s
+  ML-DSA-65      verify          250.7 us          3989 ops/s
+  ML-DSA-87      keygen          382.4 us          2615 ops/s
+  ML-DSA-87      sign           1202.0 us           832 ops/s
+  ML-DSA-87      verify          403.7 us          2477 ops/s
+  ML-KEM-512     keygen           49.6 us         20178 ops/s
+  ML-KEM-512     encaps           61.5 us         16266 ops/s
+  ML-KEM-512     decaps           78.6 us         12721 ops/s
+  ML-KEM-768     keygen           82.6 us         12107 ops/s
+  ML-KEM-768     encaps           96.6 us         10348 ops/s
+  ML-KEM-768     decaps          119.8 us          8347 ops/s
+  ML-KEM-1024    keygen          130.8 us          7645 ops/s
+  ML-KEM-1024    encaps          142.5 us          7019 ops/s
+  ML-KEM-1024    decaps          172.6 us          5794 ops/s
+  v5 hybrid      sign           1133.8 us           882 ops/s
   v5 hybrid      verify          445.6 us          2244 ops/s
-  v5 hybrid      seal            310.6 us          3220 ops/s
-  v5 hybrid      open            330.0 us          3030 ops/s
-  v4 secp256k1   sign           1294.8 us           772 ops/s
-  v4 secp256k1   verify          585.4 us          1708 ops/s
-  v4 ECIES       encrypt        1263.5 us           791 ops/s
-  v4 ECIES       decrypt         632.8 us          1580 ops/s
+  v5 hybrid      seal            308.2 us          3244 ops/s
+  v5 hybrid      open            329.1 us          3038 ops/s
+  v4 secp256k1   sign           1293.6 us           773 ops/s
+  v4 secp256k1   verify          575.0 us          1739 ops/s
+  v4 ECIES       encrypt        1264.9 us           791 ops/s
+  v4 ECIES       decrypt         631.3 us          1584 ops/s
 
 == 2. アドレス生成(null_bytes=id先頭に要求する0x00バイト数) ==
-  v4 決定性 null=1 (両鍵を引き直す)    368候補     463.0 ms   1.258 ms/候補  期待   322.1 ms  37文字
-  v5 決定性 null=0 (探索なし)      1候補       0.6 ms   0.567 ms/候補  期待     0.6 ms  54文字
-  v5 決定性 null=1 (X-Wing鍵まるごと)    280候補      48.3 ms   0.172 ms/候補  期待    44.1 ms  53文字
-  v5 決定性 null=2 (X-Wing鍵まるごと) 123268候補   21347.9 ms   0.173 ms/候補  期待 11349.7 ms  52文字
-  v5 ランダム null=1 (X25519のみ)      -         -       -          実測    15.5 ms  53文字
-  (参考) 署名鍵まるごと        -         -   0.340 ms/候補  期待    87.1 ms
+  v4 決定性 null=1 (両鍵を引き直す)    368候補     460.4 ms   1.251 ms/候補  期待   320.3 ms  37文字
+  v5 決定性 null=0 (探索なし)      1候補       0.6 ms   0.586 ms/候補  期待     0.6 ms  54文字
+  v5 決定性 null=1 (両鍵、v4と同じ)    407候補     201.9 ms   0.496 ms/候補  期待   127.0 ms  53文字
+  v5 決定性 null=2 (両鍵)      44913候補   22319.2 ms   0.497 ms/候補  期待 32567.7 ms  52文字
+  v5 ランダム null=1 (X25519のみ)      -         -       -          実測    20.7 ms  53文字
+  (参考) 署名鍵まるごと        -         -   0.336 ms/候補  期待    85.9 ms
+  (参考) KEM鍵まるごと(撤回案)      -         -   0.172 ms/候補  期待    43.9 ms
   (参考) id計算のみ=探索の下限      -         -   0.015 ms/候補  期待     3.7 ms
 
 == 3. オブジェクトサイズ(PoW nonce込み、byte) ==
@@ -3348,12 +3371,12 @@ bm-pq-bench (DESIGN-PQ.md §8) — v5プロファイル: ML-DSA-65 + Ed25519 / X
   msgの固定オーバーヘッド: v5=7781 byte → 2^18制限下での本文上限 254363 byte
 
 == 4. オブジェクト発行のPoW(nonceTrialsPerByte=1000, extraBytes=1000) ==
-  ハッシュレート: 単一スレッド 0.57 M/s、全16コア同時 2.34 M/s(単純な16倍より3.9倍低い: turbo低下とSMTのため)
+  ハッシュレート: 単一スレッド 0.58 M/s、全16コア同時 2.36 M/s(単純な16倍より3.9倍低い: turbo低下とSMTのため)
   オブジェクト          byte  期待試行  期待所要     実測(1回)   実効レート
-  v4 pubkey (TTL 28日)        396   5.293e+07       22.6 s        35.1 s    3.15 M/s
-  v5 pubkey (TTL 28日)       7776   3.327e+08      142.2 s        81.2 s    2.50 M/s
-  v4 msg 本文1000 (4日)    1404   1.508e+07        6.4 s         0.9 s    2.57 M/s
-  v5 msg 本文1000 (4日)    8783   6.137e+07       26.2 s        10.5 s    1.95 M/s
-  v5 getpubkey (28日)          54   3.996e+07       17.1 s        38.3 s    2.32 M/s
-  v5 broadcast 1000 (4日)    8782   6.137e+07       26.2 s         4.2 s    3.64 M/s
+  v4 pubkey (TTL 28日)        396   5.293e+07       22.5 s       140.7 s    2.47 M/s
+  v5 pubkey (TTL 28日)       7776   3.327e+08      141.1 s        38.6 s    2.30 M/s
+  v4 msg 本文1000 (4日)    1404   1.508e+07        6.4 s         3.4 s    2.53 M/s
+  v5 msg 本文1000 (4日)    8783   6.137e+07       26.0 s        99.3 s    2.28 M/s
+  v5 getpubkey (28日)          54   3.996e+07       17.0 s        13.8 s    2.19 M/s
+  v5 broadcast 1000 (4日)    8782   6.137e+07       26.0 s         1.2 s    2.57 M/s
 ```

@@ -310,8 +310,8 @@ static int test_null_byte_search(void)
         fprintf(stderr, "FAIL: deterministic search is not reproducible\n");
         return 1;
     }
-    /* 署名鍵nonceは固定(偶数側)、KEM鍵nonceだけが2ずつ進む(奇数側) */
-    if (a.sig_nonce != 0 || (a.kem_nonce % 2) != 1)
+    /* v4と同じく両方のnonceが2ずつ進み、署名鍵=偶数側・KEM鍵=奇数側の割り当てが保たれる */
+    if ((a.sig_nonce % 2) != 0 || a.kem_nonce != a.sig_nonce + 1)
     {
         fprintf(stderr, "FAIL: unexpected nonce layout sig=%llu kem=%llu\n",
                 (unsigned long long)a.sig_nonce, (unsigned long long)a.kem_nonce);
@@ -323,7 +323,7 @@ static int test_null_byte_search(void)
         fprintf(stderr, "FAIL: regeneration\n");
         return 1;
     }
-    if (a.kem_nonce != 1 && memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0)
+    if (a.sig_nonce != 0 && memcmp(a.id, b.id, BM_PQV5_ID_LEN) == 0)
     {
         fprintf(stderr, "FAIL: search did not change the id\n");
         return 1;
@@ -414,6 +414,20 @@ static int test_multiple_addresses_do_not_share_nonces(void)
         memcmp(a.sig_pk, b.sig_pk, BM_PQV5_SIG_PK_LEN) == 0)
     {
         fprintf(stderr, "FAIL: two addresses share keys\n");
+        return 1;
+    }
+
+    /* §11 2026-09-18: 同じstart_nonceでnull_bytesだけ変えても署名鍵を共有しないこと。
+     * 署名鍵nonceを固定する実装だとここが共有され、2本のアドレスが公開的に
+     * 紐付け可能になっていた(pk_sigはpubkeyオブジェクトで公開されるため) */
+    if (bm_pqv5_identity_generate_deterministic("multi address test", 1, 0, 0, &b) != 0)
+    {
+        fprintf(stderr, "FAIL: null_bytes=0 variant\n");
+        return 1;
+    }
+    if (memcmp(a.sig_pk, b.sig_pk, BM_PQV5_SIG_PK_LEN) == 0)
+    {
+        fprintf(stderr, "FAIL: addresses with different null_bytes share the signing key\n");
         return 1;
     }
     return 0;

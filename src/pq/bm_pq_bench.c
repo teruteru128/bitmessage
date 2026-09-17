@@ -339,10 +339,11 @@ static void bench_v5_random(const char *label, int null_bytes)
     double t0 = now_sec();
     double elapsed;
     int i;
-    const int rounds = 20;
+    const int rounds = 50;
     char *addr;
 
-    /* ランダム生成は候補数を記録しないので、複数回まわして1本あたりの平均所要時間を出す */
+    /* ランダム生成は候補数を記録しないので、複数回まわして1本あたりの平均所要時間を出す
+     * (1本あたりが幾何分布なので、少ない回数だと平均が大きくぶれる) */
     for (i = 0; i < rounds; i++)
     {
         if (bm_pqv5_identity_generate_random(1, null_bytes, &id) != 0)
@@ -359,9 +360,9 @@ static void bench_v5_random(const char *label, int null_bytes)
 }
 
 /*
- * 参考測定: 探索で「鍵ペアまるごと」「id計算だけ」を回した場合の1候補あたりコスト。
- * 実際に採用した方式(決定性=X-Wing鍵まるごと、ランダム=X25519のみ)の位置づけを
- * 示すための比較対象。DESIGN-PQ.md §8.2。
+ * 参考測定: 探索で片方の鍵ペアだけ / id計算だけを回した場合の1候補あたりコスト。
+ * 採用した方式(決定性=両鍵、ランダム=X25519のみ)の位置づけを示すための比較対象。
+ * 決定性側で「安いKEM鍵だけ回す」最適化を撤回した経緯はDESIGN-PQ.md §4.2.1。
  */
 static void bench_whole_keypair_redraw(const struct bm_pqv5_identity *base)
 {
@@ -392,13 +393,22 @@ static void bench_whole_keypair_redraw(const struct bm_pqv5_identity *base)
     t0 = now_sec();
     for (i = 0; i < iters; i++)
     {
+        bm_pq_shake128(seed, sizeof(seed), seed, sizeof(seed));
+        bm_pqv5_kem_keypair_from_seed(seed, pk, sk);
+        bm_pqv5_calc_id(base->sig_pk, pk, id);
+    }
+    per = (now_sec() - t0) * 1e3 / iters;
+    printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) KEM鍵まるごと(撤回案)", "-", "-",
+           per, per * 256.0);
+
+    t0 = now_sec();
+    for (i = 0; i < iters; i++)
+    {
         bm_pqv5_calc_id(base->sig_pk, base->kem_pk, id);
     }
     per = (now_sec() - t0) * 1e3 / iters;
     printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) id計算のみ=探索の下限", "-", "-",
            per, per * 256.0);
-    (void)pk;
-    (void)sk;
 }
 
 static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated_address *out_v4)
@@ -425,8 +435,8 @@ static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated
     free(addr4);
 
     bench_v5_deterministic("v5 決定性 null=0 (探索なし)", 0, &tmp);
-    bench_v5_deterministic("v5 決定性 null=1 (X-Wing鍵まるごと)", BM_PQV5_DEFAULT_NULL_BYTES, out_v5);
-    bench_v5_deterministic("v5 決定性 null=2 (X-Wing鍵まるごと)", 2, &tmp);
+    bench_v5_deterministic("v5 決定性 null=1 (両鍵、v4と同じ)", BM_PQV5_DEFAULT_NULL_BYTES, out_v5);
+    bench_v5_deterministic("v5 決定性 null=2 (両鍵)", 2, &tmp);
     bench_v5_random("v5 ランダム null=1 (X25519のみ)", BM_PQV5_DEFAULT_NULL_BYTES);
     bench_whole_keypair_redraw(out_v5);
 
