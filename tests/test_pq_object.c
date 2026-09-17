@@ -292,8 +292,8 @@ int main(void)
     struct bm_pqv5_identity alice;
     struct bm_pqv5_identity bob;
 
-    if (bm_pqv5_identity_generate_deterministic("alice v5", 1, 0, 0, &alice) != 0 ||
-        bm_pqv5_identity_generate_deterministic("bob v5", 1, 0, 0, &bob) != 0)
+    if (bm_pqv5_identity_generate_deterministic("alice v5", 1, 0, 0, BM_PQV5_SEARCH_X25519, &alice) != 0 ||
+        bm_pqv5_identity_generate_deterministic("bob v5", 1, 0, 0, BM_PQV5_SEARCH_X25519, &bob) != 0)
     {
         fprintf(stderr, "FAIL: identity generation\n");
         return 1;

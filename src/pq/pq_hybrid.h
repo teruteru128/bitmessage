@@ -51,6 +51,23 @@ int bm_pqv5_sig_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
                                    unsigned char out_sk[BM_PQV5_SIG_SK_LEN]);
 
 /*
+ * §11 2026-09-17 4成分それぞれを独立に作り直すための粒度の細かいAPI。
+ *
+ * アドレス生成の探索ループ(address_v5.h の enum bm_pqv5_search_mode)で
+ * 「どの鍵を引き直すか」を選べるようにするために必要。成分ごとに鍵生成コストが
+ * 大きく違う(実測: ML-DSA-65 224us / ML-KEM-768 83us / X25519・Ed25519は
+ * スカラー倍1回)ので、一番安い成分だけを回せば探索が最も安く済む。
+ *
+ * out_pk/out_skは完成した鍵ブロブで、該当成分のオフセットだけを書き換える。
+ * 4本を全部呼べばbm_pqv5_*_keypair_from_seedと同等の鍵ブロブになる(seedの
+ * 導出元が違うだけ)。成功時0。
+ */
+int bm_pqv5_sig_set_mldsa(const unsigned char xi[32], unsigned char *out_pk, unsigned char *out_sk);
+int bm_pqv5_sig_set_ed25519(const unsigned char seed[32], unsigned char *out_pk, unsigned char *out_sk);
+int bm_pqv5_kem_set_mlkem(const unsigned char coins[64], unsigned char *out_pk, unsigned char *out_sk);
+int bm_pqv5_kem_set_x25519(const unsigned char sk32[32], unsigned char *out_pk, unsigned char *out_sk);
+
+/*
  * labelは用途ごとのドメイン分離文字列(NUL終端、pq_object.hのBM_PQ_SIGLABEL_*)。
  * 実際に署名される入力は label || 0x00 || msg で、ML-DSAとEd25519の両方に同じ
  * 入力を与える。成功時0。

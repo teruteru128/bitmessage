@@ -14,6 +14,7 @@
  */
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,15 +305,45 @@ static void bench_primitives(void)
 
 /* --- 2. アドレス生成 --- */
 
+static void bench_one_v5_address(const char *label, int null_bytes, enum bm_pqv5_search_mode mode,
+                                  struct bm_pqv5_identity *out)
+{
+    double t0 = now_sec();
+    double t1;
+    char *addr;
+    uint64_t candidates = 1;
+    int c;
+
+    if (bm_pqv5_identity_generate_deterministic("bm-pq-bench passphrase", 1, 0, null_bytes, mode, out) != 0)
+    {
+        fprintf(stderr, "v5 address generation failed\n");
+        exit(1);
+    }
+    t1 = now_sec();
+    /* 回した成分のカウンタ+1が試した候補数(ALLは全成分同時に進むので同じ値) */
+    for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
+    {
+        if (out->counters[c] + 1 > candidates)
+        {
+            candidates = out->counters[c] + 1;
+        }
+    }
+    addr = bm_pqv5_address_encode(out->version, out->stream, out->id);
+    printf("  %-30s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%7.1f ms  %zu文字\n", label, candidates,
+           (t1 - t0) * 1e3, (t1 - t0) * 1e3 / (double)candidates,
+           (t1 - t0) * 1e3 / (double)candidates * (null_bytes == 0 ? 1.0 : (double)(1u << (8 * null_bytes))),
+           strlen(addr));
+    free(addr);
+}
+
 static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated_address *out_v4)
 {
     double t0;
     double t1;
     char *addr4;
-    char *addr5;
     struct bm_pqv5_identity tmp;
 
-    printf("== 2. アドレス生成 ==\n");
+    printf("== 2. アドレス生成(決定性、null_bytes=id先頭に要求する0x00バイト数) ==\n");
 
     t0 = now_sec();
     if (bm_address_generate_deterministic("bm-pq-bench passphrase", 1, out_v4) != 0)
@@ -322,52 +353,53 @@ static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated
     }
     t1 = now_sec();
     addr4 = bm_address_encode(4, 1, out_v4->ripe, BM_RIPE_LEN);
-    printf("  v4 決定性生成(null_bytes=1, nonce=%" PRIu64 "): %8.1f ms  address=%s (%zu文字)\n",
-           out_v4->signing_nonce, (t1 - t0) * 1e3, addr4, strlen(addr4));
-
-    t0 = now_sec();
-    if (bm_pqv5_identity_generate_deterministic("bm-pq-bench passphrase", 1, 0, 0, out_v5) != 0)
-    {
-        fprintf(stderr, "v5 address generation failed\n");
-        exit(1);
-    }
-    t1 = now_sec();
-    addr5 = bm_pqv5_address_encode(out_v5->version, out_v5->stream, out_v5->id);
-    printf("  v5 決定性生成(null_bytes=0, nonce=%" PRIu64 "): %8.1f ms  address=%s (%zu文字)\n",
-           out_v5->sig_nonce, (t1 - t0) * 1e3, addr5, strlen(addr5));
-
-    t0 = now_sec();
-    if (bm_pqv5_identity_generate_deterministic("bm-pq-bench passphrase", 1, 0, 1, &tmp) != 0)
-    {
-        fprintf(stderr, "v5 vanity address generation failed\n");
-        exit(1);
-    }
-    t1 = now_sec();
-    printf("  v5 決定性生成(null_bytes=1, nonce=%" PRIu64 "): %8.1f ms  (参考: v5では既定で要求しない)\n",
-           tmp.sig_nonce, (t1 - t0) * 1e3);
-
+    printf("  %-30s %6" PRIu64 "候補 %9.1f ms  %6.3f ms/候補  期待%7.1f ms  %zu文字\n",
+           "v4 null_bytes=1 (secp256k1×2)", out_v4->signing_nonce / 2 + 1, (t1 - t0) * 1e3,
+           (t1 - t0) * 1e3 / (double)(out_v4->signing_nonce / 2 + 1),
+           (t1 - t0) * 1e3 / (double)(out_v4->signing_nonce / 2 + 1) * 256.0, strlen(addr4));
     free(addr4);
-    free(addr5);
+
+    /* 探索なし(参考)。アドレスは1文字長くなり、長さがばらつく */
+    bench_one_v5_address("v5 null_bytes=0 (探索なし)", 0, BM_PQV5_SEARCH_X25519, &tmp);
+
+    /* §11 2026-09-17: 「どの成分を引き直すか」の4方式+全部。成分ごとに鍵生成コストが
+     * 大きく違う(ML-DSA-65 224us / ML-KEM-768 83us / X25519・Ed25519はスカラー倍1回)
+     * ので、ここが探索コストの主要因になる */
+    bench_one_v5_address("v5 null_bytes=1 (X25519)", 1, BM_PQV5_SEARCH_X25519, out_v5);
+    bench_one_v5_address("v5 null_bytes=1 (Ed25519)", 1, BM_PQV5_SEARCH_ED25519, &tmp);
+    bench_one_v5_address("v5 null_bytes=1 (ML-KEM)", 1, BM_PQV5_SEARCH_MLKEM, &tmp);
+    bench_one_v5_address("v5 null_bytes=1 (ML-DSA)", 1, BM_PQV5_SEARCH_MLDSA, &tmp);
+    bench_one_v5_address("v5 null_bytes=1 (全成分)", 1, BM_PQV5_SEARCH_ALL, &tmp);
+    bench_one_v5_address("v5 null_bytes=2 (X25519)", 2, BM_PQV5_SEARCH_X25519, &tmp);
+
     printf("\n");
 }
 
 /* --- 3. オブジェクトサイズ --- */
 
-static uint64_t pow_expected_trials(size_t payload_len, uint64_t ttl)
+static void fill_v4_identity(struct bm_identity_info *info, const struct bm_generated_address *v4)
 {
-    /* §4.1のtarget式の逆数。payload_lenはnonce込みの完成object長 */
-    double length = (double)payload_len + NETWORK_EXTRA_BYTES;
-    return (uint64_t)(NETWORK_NONCE_TRIALS * (length + ((double)ttl * length) / 65536.0));
+    memset(info, 0, sizeof(*info));
+    info->address_version = 4;
+    info->stream = 1;
+    memcpy(info->pub_signing, v4->pub_signing, 65);
+    memcpy(info->pub_encryption, v4->pub_encryption, 65);
+    memcpy(info->priv_signing, v4->priv_signing, 32);
+    info->nonce_trials_per_byte = NETWORK_NONCE_TRIALS;
+    info->payload_length_extra_bytes = NETWORK_EXTRA_BYTES;
+    info->does_ack = 1;
 }
 
-struct object_sizes
+static void fill_v5_sender(struct bm_pq_sender_info *info, const struct bm_pqv5_identity *v5)
 {
-    size_t v4_msg;
-    size_t v5_msg;
-};
+    memset(info, 0, sizeof(*info));
+    info->identity = v5;
+    info->bitfield = 1u << 1; /* DOESACK相当。v5のbitfield定義はDESIGN-PQ.md §7.2 */
+    info->nonce_trials_per_byte = NETWORK_NONCE_TRIALS;
+    info->payload_length_extra_bytes = NETWORK_EXTRA_BYTES;
+}
 
-static struct object_sizes bench_objects(const struct bm_pqv5_identity *v5,
-                                          const struct bm_generated_address *v4)
+static void bench_objects(const struct bm_pqv5_identity *v5, const struct bm_generated_address *v4)
 {
     static const size_t body_lens[] = { 0, 100, 1000, 10000 };
     struct bm_identity_info v4_info;
@@ -378,26 +410,11 @@ static struct object_sizes bench_objects(const struct bm_pqv5_identity *v5,
     size_t len5 = 0;
     size_t i;
     char *body;
-    struct object_sizes sizes;
     unsigned char to_kem_pk[BM_PQV5_KEM_PK_LEN];
     unsigned char to_kem_sk[BM_PQV5_KEM_SK_LEN];
 
-    memset(&sizes, 0, sizeof(sizes));
-    memset(&v4_info, 0, sizeof(v4_info));
-    v4_info.address_version = 4;
-    v4_info.stream = 1;
-    memcpy(v4_info.pub_signing, v4->pub_signing, 65);
-    memcpy(v4_info.pub_encryption, v4->pub_encryption, 65);
-    memcpy(v4_info.priv_signing, v4->priv_signing, 32);
-    v4_info.nonce_trials_per_byte = NETWORK_NONCE_TRIALS;
-    v4_info.payload_length_extra_bytes = NETWORK_EXTRA_BYTES;
-    v4_info.does_ack = 1;
-
-    memset(&v5_info, 0, sizeof(v5_info));
-    v5_info.identity = v5;
-    v5_info.bitfield = 1u << 1; /* DOESACK相当。v5のbitfield定義はDESIGN-PQ.md §7.2 */
-    v5_info.nonce_trials_per_byte = NETWORK_NONCE_TRIALS;
-    v5_info.payload_length_extra_bytes = NETWORK_EXTRA_BYTES;
+    fill_v4_identity(&v4_info, v4);
+    fill_v5_sender(&v5_info, v5);
 
     if (bm_pqv5_kem_keypair_from_seed(v5->id, to_kem_pk, to_kem_sk) != 0)
     {
@@ -437,11 +454,6 @@ static struct object_sizes bench_objects(const struct bm_pqv5_identity *v5,
         }
         printf("  body=%6zu       v4=%7zu  v5=%7zu  (x%.1f, +%zu)\n", body_lens[i], len4 + 8, len5 + 8,
                (double)(len5 + 8) / (double)(len4 + 8), (len5 + 8) - (len4 + 8));
-        if (body_lens[i] == 1000)
-        {
-            sizes.v4_msg = len4 + 8;
-            sizes.v5_msg = len5 + 8;
-        }
         free(obj4);
         free(obj5);
         free(body);
@@ -478,10 +490,9 @@ static struct object_sizes bench_objects(const struct bm_pqv5_identity *v5,
     }
     OPENSSL_cleanse(to_kem_sk, sizeof(to_kem_sk));
     printf("\n");
-    return sizes;
 }
 
-/* --- 4. PoW --- */
+/* --- 4. オブジェクト発行のPoW --- */
 
 struct pow_ctx
 {
@@ -495,53 +506,174 @@ static void pow_trial_fn(void *arg)
     bm_pow_trial_value(c->nonce++, c->initial_hash);
 }
 
-static void bench_pow(const struct object_sizes *sizes, int run_real_pow)
+/*
+ * 全コアを同時に回したときの合計ハッシュレートを測る。
+ *
+ * §11 2026-09-17: 当初は「1コアの実測値 × コア数」で推定していたが、実PoWの
+ * 所要時間と4倍ずれた。単一スレッド測定はturbo boostが効いた状態の値であり、
+ * 全コア負荷時のクロック低下・SMTによる実効コア数の目減りを無視していたため。
+ * PoWは常に全コアを使い切る処理なので、その条件で測らないと意味が無い。
+ */
+struct hashrate_worker
+{
+    pthread_t thread;
+    unsigned char initial_hash[64];
+    uint64_t start;
+    double duration;
+    uint64_t count;
+};
+
+static void *hashrate_worker_fn(void *arg)
+{
+    struct hashrate_worker *w = arg;
+    double t0 = now_sec();
+    uint64_t nonce = w->start;
+    uint64_t count = 0;
+
+    do
+    {
+        int i;
+        for (i = 0; i < 4096; i++)
+        {
+            bm_pow_trial_value(nonce++, w->initial_hash);
+        }
+        count += 4096;
+    } while (now_sec() - t0 < w->duration);
+    w->count = count;
+    return NULL;
+}
+
+static double measure_parallel_hashrate(long cores, double seconds)
+{
+    struct hashrate_worker *workers = calloc((size_t)cores, sizeof(*workers));
+    unsigned char initial_hash[64];
+    double t0;
+    double elapsed;
+    uint64_t total = 0;
+    long i;
+
+    RAND_bytes(initial_hash, sizeof(initial_hash));
+    t0 = now_sec();
+    for (i = 0; i < cores; i++)
+    {
+        memcpy(workers[i].initial_hash, initial_hash, sizeof(initial_hash));
+        workers[i].start = (uint64_t)i << 40;
+        workers[i].duration = seconds;
+        pthread_create(&workers[i].thread, NULL, hashrate_worker_fn, &workers[i]);
+    }
+    for (i = 0; i < cores; i++)
+    {
+        pthread_join(workers[i].thread, NULL);
+        total += workers[i].count;
+    }
+    elapsed = now_sec() - t0;
+    free(workers);
+    return (double)total / elapsed;
+}
+
+/* bm_pow_get_targetと同じ式の逆数(期待試行回数)。payload_lenはnonce抜きの長さ */
+static double pow_expected_trials(size_t payload_len, uint64_t ttl)
+{
+    double l = (double)payload_len + 8.0 + NETWORK_EXTRA_BYTES;
+    return NETWORK_NONCE_TRIALS * (l + ((double)ttl * l) / 65536.0);
+}
+
+/*
+ * 実オブジェクトに対してネットワーク既定難易度のPoWを実際に回す。
+ *
+ * 1回の所要時間は指数分布に従うので単発の実測値はぶれる(期待値の1/6から3倍程度は
+ * 普通に出る)。そこで実測時は「見つかったnonce ÷ 所要時間」を実効ハッシュレートとして
+ * 併記する。nonceは試した回数そのものなので、こちらは大数の法則が効いて安定した
+ * スループット指標になる。
+ */
+static void pow_one(const char *label, const unsigned char *payload, size_t payload_len,
+                     uint64_t ttl, double rate, int run_real_pow)
+{
+    double expected = pow_expected_trials(payload_len, ttl);
+
+    printf("  %-24s %7zu  %10.3e  %9.1f s", label, payload_len + 8, expected, expected / rate);
+    fflush(stdout);
+    if (run_real_pow)
+    {
+        uint64_t target = bm_pow_get_target(payload_len, ttl, NETWORK_NONCE_TRIALS, NETWORK_EXTRA_BYTES);
+        double t0 = now_sec();
+        uint64_t nonce = bm_pow_run(payload, payload_len, target);
+        double elapsed = now_sec() - t0;
+        printf("   %9.1f s  %6.2f M/s", elapsed, (double)nonce / elapsed / 1e6);
+    }
+    printf("\n");
+}
+
+static void bench_object_pow(const struct bm_pqv5_identity *v5, const struct bm_generated_address *v4,
+                              int run_real_pow)
 {
     struct pow_ctx pc;
     double usec;
-    double per_core;
+    double rate;
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
-    uint64_t trials4;
-    uint64_t trials5;
+    struct bm_identity_info v4_info;
+    struct bm_pq_sender_info v5_info;
+    unsigned char to_kem_pk[BM_PQV5_KEM_PK_LEN];
+    unsigned char to_kem_sk[BM_PQV5_KEM_SK_LEN];
+    unsigned char *obj;
+    size_t len = 0;
+    char *body = malloc(1001);
+    uint64_t now = (uint64_t)time(NULL);
 
     memset(&pc, 0, sizeof(pc));
     RAND_bytes(pc.initial_hash, sizeof(pc.initial_hash));
     usec = bench(pow_trial_fn, &pc, 2000000, 0.5);
-    per_core = 1e6 / usec;
     if (cores < 1)
     {
         cores = 1;
     }
+    rate = measure_parallel_hashrate(cores, 1.0);
 
-    printf("== 4. PoWコスト(nonceTrialsPerByte=%d, extraBytes=%d) ==\n", NETWORK_NONCE_TRIALS,
-           NETWORK_EXTRA_BYTES);
-    printf("  実測ハッシュレート: %.2f Mtrial/s/core × %ld core = %.2f Mtrial/s\n", per_core / 1e6,
-           cores, per_core * (double)cores / 1e6);
-
-    trials4 = pow_expected_trials(sizes->v4_msg, TTL_MSG);
-    trials5 = pow_expected_trials(sizes->v5_msg, TTL_MSG);
-    printf("  msg(本文1000, TTL 4日)  v4: %10" PRIu64 " trials → %6.1f 秒\n", trials4,
-           (double)trials4 / (per_core * (double)cores));
-    printf("                          v5: %10" PRIu64 " trials → %6.1f 秒  (x%.2f)\n", trials5,
-           (double)trials5 / (per_core * (double)cores), (double)trials5 / (double)trials4);
-
-    if (run_real_pow)
+    memset(body, 'a', 1000);
+    body[1000] = '\0';
+    fill_v4_identity(&v4_info, v4);
+    fill_v5_sender(&v5_info, v5);
+    if (bm_pqv5_kem_keypair_from_seed(v5->id, to_kem_pk, to_kem_sk) != 0)
     {
-        unsigned char payload[64];
-        double t0;
-        uint64_t target;
-        uint64_t nonce;
-        /* 実PoWは「同じ長さ・同じ難易度」なら中身に依らないので、長さだけ合わせた
-         * ダミーpayloadで測る(オブジェクトの中身はPoWの所要時間に影響しない) */
-        unsigned char *dummy = calloc(sizes->v5_msg - 8, 1);
-        RAND_bytes(payload, sizeof(payload));
-        RAND_bytes(dummy, 32);
-        target = bm_pow_get_target(sizes->v5_msg, TTL_MSG, NETWORK_NONCE_TRIALS, NETWORK_EXTRA_BYTES);
-        t0 = now_sec();
-        nonce = bm_pow_run(dummy, sizes->v5_msg - 8, target);
-        printf("  実測PoW(v5 msgサイズ): %.1f 秒 (nonce=%" PRIu64 ")\n", now_sec() - t0, nonce);
-        free(dummy);
+        fprintf(stderr, "recipient KEM keypair failed\n");
+        exit(1);
     }
+
+    printf("== 4. オブジェクト発行のPoW(nonceTrialsPerByte=%d, extraBytes=%d) ==\n",
+           NETWORK_NONCE_TRIALS, NETWORK_EXTRA_BYTES);
+    printf("  ハッシュレート: 単一スレッド %.2f M/s、全%ldコア同時 %.2f M/s"
+           "(単純な%ld倍より%.1f倍低い: turbo低下とSMTのため)\n",
+           1e6 / usec / 1e6, cores, rate / 1e6, cores, (1e6 / usec) * (double)cores / rate);
+    printf("  %-24s %7s  %10s  %11s%s\n", "オブジェクト", "byte", "期待試行", "期待所要",
+           run_real_pow ? "     実測(1回)   実効レート" : "  (--powで実測)");
+
+    obj = bm_build_pubkey_v4(&v4_info, v4->ripe, now + TTL_PUBKEY, &len);
+    pow_one("v4 pubkey (TTL 28日)", obj, len, TTL_PUBKEY, rate, run_real_pow);
+    free(obj);
+
+    obj = bm_pq_build_pubkey(&v5_info, now + TTL_PUBKEY, &len);
+    pow_one("v5 pubkey (TTL 28日)", obj, len, TTL_PUBKEY, rate, run_real_pow);
+    free(obj);
+
+    obj = bm_build_msg(&v4_info, 1, v4->ripe, v4->pub_encryption, "s", body, NULL, 0, now + TTL_MSG, &len);
+    pow_one("v4 msg 本文1000 (4日)", obj, len, TTL_MSG, rate, run_real_pow);
+    free(obj);
+
+    obj = bm_pq_build_msg(&v5_info, 1, v5->id, to_kem_pk, 2, (const unsigned char *)body, 1000, NULL, 0,
+                          now + TTL_MSG, &len);
+    pow_one("v5 msg 本文1000 (4日)", obj, len, TTL_MSG, rate, run_real_pow);
+    free(obj);
+
+    obj = bm_pq_build_getpubkey(v5->version, v5->stream, v5->id, now + TTL_PUBKEY, &len);
+    pow_one("v5 getpubkey (28日)", obj, len, TTL_PUBKEY, rate, run_real_pow);
+    free(obj);
+
+    obj = bm_pq_build_broadcast(&v5_info, 2, (const unsigned char *)body, 1000, now + TTL_MSG, &len);
+    pow_one("v5 broadcast 1000 (4日)", obj, len, TTL_MSG, rate, run_real_pow);
+    free(obj);
+
+    OPENSSL_cleanse(to_kem_sk, sizeof(to_kem_sk));
+    free(body);
     printf("\n");
 }
 
@@ -549,7 +681,6 @@ int main(int argc, char **argv)
 {
     struct bm_pqv5_identity v5;
     struct bm_generated_address v4;
-    struct object_sizes sizes;
     int run_real_pow = (argc > 1 && strcmp(argv[1], "--pow") == 0);
 
     /* 長時間走るので、パイプ/ファイルへリダイレクトされていても途中経過が見えるように行バッファへ */
@@ -560,7 +691,7 @@ int main(int argc, char **argv)
 
     bench_primitives();
     bench_addresses(&v5, &v4);
-    sizes = bench_objects(&v5, &v4);
-    bench_pow(&sizes, run_real_pow);
+    bench_objects(&v5, &v4);
+    bench_object_pow(&v5, &v4, run_real_pow);
     return 0;
 }

@@ -159,28 +159,45 @@ static int x25519_shared(const unsigned char sk[X25519_LEN], const unsigned char
 
 /* --- ハイブリッド署名 --- */
 
+int bm_pqv5_sig_set_mldsa(const unsigned char xi[32], unsigned char *out_pk, unsigned char *out_sk)
+{
+    return bm_pq_sig_keypair_from_seed(PQV5_SIG_ALG, xi, out_pk, out_sk);
+}
+
+int bm_pqv5_sig_set_ed25519(const unsigned char seed[32], unsigned char *out_pk, unsigned char *out_sk)
+{
+    memcpy(out_sk + MLDSA_SK_LEN, seed, ED25519_SK_LEN);
+    return ed25519_public_from_seed(seed, out_pk + MLDSA_PK_LEN);
+}
+
+int bm_pqv5_kem_set_mlkem(const unsigned char coins[64], unsigned char *out_pk, unsigned char *out_sk)
+{
+    return bm_pq_kem_keypair_from_seed(PQV5_KEM_ALG, coins, out_pk, out_sk);
+}
+
+int bm_pqv5_kem_set_x25519(const unsigned char sk32[32], unsigned char *out_pk, unsigned char *out_sk)
+{
+    memcpy(out_sk + MLKEM_SK_LEN, sk32, X25519_LEN);
+    return x25519_public_from_private(sk32, out_pk + MLKEM_PK_LEN);
+}
+
 int bm_pqv5_sig_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
                                    unsigned char out_pk[BM_PQV5_SIG_PK_LEN],
                                    unsigned char out_sk[BM_PQV5_SIG_SK_LEN])
 {
     unsigned char expanded[64];
+    int rc = -1;
     if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
     {
         return -1;
     }
-    if (bm_pq_sig_keypair_from_seed(PQV5_SIG_ALG, expanded, out_pk, out_sk) != 0)
+    if (bm_pqv5_sig_set_mldsa(expanded, out_pk, out_sk) == 0 &&
+        bm_pqv5_sig_set_ed25519(expanded + 32, out_pk, out_sk) == 0)
     {
-        OPENSSL_cleanse(expanded, sizeof(expanded));
-        return -1;
-    }
-    memcpy(out_sk + MLDSA_SK_LEN, expanded + 32, ED25519_SK_LEN);
-    if (ed25519_public_from_seed(expanded + 32, out_pk + MLDSA_PK_LEN) != 0)
-    {
-        OPENSSL_cleanse(expanded, sizeof(expanded));
-        return -1;
+        rc = 0;
     }
     OPENSSL_cleanse(expanded, sizeof(expanded));
-    return 0;
+    return rc;
 }
 
 /*
@@ -284,23 +301,18 @@ int bm_pqv5_kem_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
      * 「seedから毎回導出する」用途と、identityのように「保存した鍵を使う」用途の
      * 両方があり、後者で毎回ML-KEMのKeyGenをやり直すのを避けるため。 */
     unsigned char expanded[96];
+    int rc = -1;
     if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
     {
         return -1;
     }
-    if (bm_pq_kem_keypair_from_seed(PQV5_KEM_ALG, expanded, out_pk, out_sk) != 0)
+    if (bm_pqv5_kem_set_mlkem(expanded, out_pk, out_sk) == 0 &&
+        bm_pqv5_kem_set_x25519(expanded + 64, out_pk, out_sk) == 0)
     {
-        OPENSSL_cleanse(expanded, sizeof(expanded));
-        return -1;
-    }
-    memcpy(out_sk + MLKEM_SK_LEN, expanded + 64, X25519_LEN);
-    if (x25519_public_from_private(expanded + 64, out_pk + MLKEM_PK_LEN) != 0)
-    {
-        OPENSSL_cleanse(expanded, sizeof(expanded));
-        return -1;
+        rc = 0;
     }
     OPENSSL_cleanse(expanded, sizeof(expanded));
-    return 0;
+    return rc;
 }
 
 static int xwing_encaps(const unsigned char pk[BM_PQV5_KEM_PK_LEN],

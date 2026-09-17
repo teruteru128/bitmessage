@@ -3173,6 +3173,60 @@ v4の458msより速い。したがって「v5で先頭ゼロを要求するか�
 255/256が54文字・1/256が53文字以下とばらつく)。v5の既定値は未確定のままユーザーの判断に
 委ねることにし、DESIGN-PQ.md §4.2と§9.3へ記録した。
 
+### 追加のレビューと修正(同日、ユーザーとの往復)
+
+初版をコミットした後、ユーザーから3点の指摘・判断があり、それぞれ対応した。
+
+**(1) 古典側は25519系で確定。** 「secp256k1→ed25519/x25519で公開鍵が65バイトから
+32バイトになるんですね……25519でいいんじゃないでしょうか」との判断。DESIGN-PQ.md §3.2に
+確定として記録した。
+
+**(2) id先頭1byteの0x00は要求する。** 「長さは揃えたほうがいいでしょう。アドレス生成時の
+powにどの鍵をループさせるのかは議論の余地がありますけど」との判断で、既定を
+null_bytes=1へ変更(BM_PQV5_DEFAULT_NULL_BYTES)。
+
+続けて「x25519をループさせる方式を考えていたのですが?」との提案。当時の実装では
+X-Wingの鍵生成が32byte seed 1本からML-KEMとX25519の両方を導出する構造だったため、
+X25519だけを引き直すことができなかった。そこで**鍵導出を4成分独立に組み替えた**
+(root 64byte → SHAKE128で成分別サブseed。DESIGN-PQ.md §4.2)。これにより
+ML-DSA / Ed25519 / ML-KEM / X25519 のどれでもループできるようになった。
+
+実測(§8.2)では X25519 0.091 ms/候補・Ed25519 0.088・ML-KEM 0.109・ML-DSA 0.254・
+全成分 0.485 に対し、v4(secp256k1×2)は1.210。**ユーザーの提案通りX25519が最安**
+(Ed25519と同点)で、v4の13分の1のコストで済む。この水準になるとコストの大半は
+スカラー倍ではなくid計算のSHA3-256(入力3200byte)とEVPのオブジェクト生成である。
+
+なおこの改修の過程で、探索モードの列挙値と成分の列挙値を独立に定義していたため
+「X25519を指定するとML-DSAが回る」という取り違えバグを出した。
+`tests/test_pq_address.c` に入れておいた「回していない成分のカウンタが0のままであること」
+という検査が捕まえた。列挙値の定義をCOMP側に結び付けて再発しないようにした。
+
+**(3) オブジェクト発行のPoWの実測。** 「オブジェクト発行のpowってベンチマークしましたか?
+多分そこが一番の計算量的な難所ですよね?」との指摘。初版ではmsgの実測1件しか無く、
+pubkey v5(28日TTL)は推定値のままだった。実オブジェクト6種でPoWを実測するよう
+ベンチマークを拡張した。
+
+その過程で**初版の推定が4倍ずれていたことが判明した**。ハッシュレートを
+「単一スレッドの実測値 × コア数」で外挿していたが、単一スレッド測定はturbo boostが
+効いた状態の値であり、全コア負荷時のクロック低下とSMT(論理16=物理8)を無視していた。
+単一スレッド0.59 M/s に対し全16コア同時では合計2.31 M/sで、4.1倍の開きがある。
+全コアを回した状態で測る関数(`measure_parallel_hashrate`)に差し替えた。
+
+校正後の期待値は、v4 pubkey(28日TTL)が22.9秒。これはDESIGN.md §5.1が実運用で
+観測していた「実測20秒超」と一致しており、校正が正しいことの裏付けになった。
+v5 pubkeyは**144秒(約2.4分)**。
+
+この数字から、**v5を実装するにはPoWを専用ワーカーへ追い出す改修が前提条件**という
+結論になった(DESIGN-PQ.md §9.3)。現在の実装ではgetpubkeyへの自応答PoWが
+`network_epoll_thread`をブロックするため、2分半のあいだ全ピア接続が止まってしまう。
+v4では「許容できるトレードオフ」として既知の制限に留めていたものが、v5では
+許容できなくなる。
+
+なお単発のPoW実測値は指数分布のため大きくぶれる(v5 pubkeyは期待144秒に対し
+この回は28.7秒で終わった)。そこで実測時は「見つかったnonce ÷ 所要時間」を
+実効レートとして併記するようにした。こちらは試行回数が大きいので安定しており、
+6件とも2.1〜2.8 M/sで校正値とよく一致している。
+
 ### ベンチマーク生出力(`bm-pq-bench --pow`、Ubuntu 24.04 / OpenSSL 3.0.13 / 16コア、Releaseビルド)
 
 ```
@@ -3180,37 +3234,42 @@ bm-pq-bench (DESIGN-PQ.md §8) — v5プロファイル: ML-DSA-65 + Ed25519 / X
 
 == 1. 暗号プリミティブ ==
   alg            op               time    throughput
-  ML-DSA-44      keygen          139.1 us          7188 ops/s
-  ML-DSA-44      sign            615.7 us          1624 ops/s
-  ML-DSA-44      verify          156.5 us          6390 ops/s
-  ML-DSA-65      keygen          245.5 us          4073 ops/s
-  ML-DSA-65      sign           1073.8 us           931 ops/s
-  ML-DSA-65      verify          248.1 us          4030 ops/s
-  ML-DSA-87      keygen          390.8 us          2559 ops/s
-  ML-DSA-87      sign           1193.8 us           838 ops/s
-  ML-DSA-87      verify          411.1 us          2432 ops/s
-  ML-KEM-512     keygen           48.9 us         20463 ops/s
-  ML-KEM-512     encaps           61.3 us         16323 ops/s
-  ML-KEM-512     decaps           77.6 us         12883 ops/s
-  ML-KEM-768     keygen           82.9 us         12064 ops/s
-  ML-KEM-768     encaps           96.2 us         10390 ops/s
-  ML-KEM-768     decaps          119.2 us          8391 ops/s
-  ML-KEM-1024    keygen          129.2 us          7740 ops/s
-  ML-KEM-1024    encaps          142.7 us          7008 ops/s
-  ML-KEM-1024    decaps          171.1 us          5843 ops/s
-  v5 hybrid      sign           1090.6 us           917 ops/s
-  v5 hybrid      verify          439.6 us          2275 ops/s
-  v5 hybrid      seal            305.8 us          3271 ops/s
-  v5 hybrid      open            327.3 us          3055 ops/s
-  v4 secp256k1   sign           1278.0 us           782 ops/s
-  v4 secp256k1   verify          585.3 us          1709 ops/s
-  v4 ECIES       encrypt        1257.3 us           795 ops/s
-  v4 ECIES       decrypt         628.5 us          1591 ops/s
+  ML-DSA-44      keygen          135.2 us          7397 ops/s
+  ML-DSA-44      sign            627.4 us          1594 ops/s
+  ML-DSA-44      verify          153.2 us          6526 ops/s
+  ML-DSA-65      keygen          237.8 us          4205 ops/s
+  ML-DSA-65      sign            933.8 us          1071 ops/s
+  ML-DSA-65      verify          241.9 us          4134 ops/s
+  ML-DSA-87      keygen          374.7 us          2669 ops/s
+  ML-DSA-87      sign           1260.6 us           793 ops/s
+  ML-DSA-87      verify          397.6 us          2515 ops/s
+  ML-KEM-512     keygen           47.6 us         21021 ops/s
+  ML-KEM-512     encaps           59.2 us         16881 ops/s
+  ML-KEM-512     decaps           75.8 us         13196 ops/s
+  ML-KEM-768     keygen           80.8 us         12370 ops/s
+  ML-KEM-768     encaps           93.8 us         10657 ops/s
+  ML-KEM-768     decaps          117.3 us          8525 ops/s
+  ML-KEM-1024    keygen          126.0 us          7938 ops/s
+  ML-KEM-1024    encaps          138.2 us          7238 ops/s
+  ML-KEM-1024    decaps          167.4 us          5974 ops/s
+  v5 hybrid      sign           1196.3 us           836 ops/s
+  v5 hybrid      verify          432.2 us          2314 ops/s
+  v5 hybrid      seal            298.5 us          3350 ops/s
+  v5 hybrid      open            319.6 us          3129 ops/s
+  v4 secp256k1   sign           1240.8 us           806 ops/s
+  v4 secp256k1   verify          562.7 us          1777 ops/s
+  v4 ECIES       encrypt        1222.7 us           818 ops/s
+  v4 ECIES       decrypt         609.8 us          1640 ops/s
 
-== 2. アドレス生成 ==
-  v4 決定性生成(null_bytes=1, nonce=734):    458.1 ms  address=BM-2cVLBa9WeKtVtwMGuMRMVEfHZkNaUNDKDR (37文字)
-  v5 決定性生成(null_bytes=0, nonce=0):      0.6 ms  address=BM-jxw6mz2KpifZkgXrW58dtVvS3ErANmEi6om4A8BAvJTSsFxeEjX (54文字)
-  v5 決定性生成(null_bytes=1, nonce=276):     68.0 ms  (参考: v5では既定で要求しない)
+== 2. アドレス生成(決定性、null_bytes=id先頭に要求する0x00バイト数) ==
+  v4 null_bytes=1 (secp256k1×2)    368候補     445.1 ms   1.210 ms/候補  期待  309.7 ms  37文字
+  v5 null_bytes=0 (探索なし)      1候補       0.6 ms   0.566 ms/候補  期待    0.6 ms  54文字
+  v5 null_bytes=1 (X25519)           75候補       6.8 ms   0.091 ms/候補  期待   23.2 ms  53文字
+  v5 null_bytes=1 (Ed25519)         209候補      18.3 ms   0.088 ms/候補  期待   22.4 ms  53文字
+  v5 null_bytes=1 (ML-KEM)           28候補       3.1 ms   0.109 ms/候補  期待   28.0 ms  53文字
+  v5 null_bytes=1 (ML-DSA)         1070候補     271.4 ms   0.254 ms/候補  期待   64.9 ms  53文字
+  v5 null_bytes=1 (全成分)         7候補       3.4 ms   0.485 ms/候補  期待  124.3 ms  53文字
+  v5 null_bytes=2 (X25519)        39677候補    3363.3 ms   0.085 ms/候補  期待 5555.2 ms  52文字
 
 == 3. オブジェクトサイズ(PoW nonce込み、byte) ==
   pubkey            v4=    396  v5=   7776  (x19.6)
@@ -3223,9 +3282,13 @@ bm-pq-bench (DESIGN-PQ.md §8) — v5プロファイル: ML-DSA-65 + Ed25519 / X
   getpubkey         v4=     54  v5=     54
   msgの固定オーバーヘッド: v5=7781 byte → 2^18制限下での本文上限 254363 byte
 
-== 4. PoWコスト(nonceTrialsPerByte=1000, extraBytes=1000) ==
-  実測ハッシュレート: 0.58 Mtrial/s/core × 16 core = 9.25 Mtrial/s
-  msg(本文1000, TTL 4日)  v4:   15081343 trials →    1.6 秒
-                          v5:   61373039 trials →    6.6 秒  (x4.07)
-  実測PoW(v5 msgサイズ): 4.3 秒 (nonce=9960769)
+== 4. オブジェクト発行のPoW(nonceTrialsPerByte=1000, extraBytes=1000) ==
+  ハッシュレート: 単一スレッド 0.59 M/s、全16コア同時 2.31 M/s(単純な16倍より4.1倍低い: turbo低下とSMTのため)
+  オブジェクト          byte  期待試行  期待所要     実測(1回)   実効レート
+  v4 pubkey (TTL 28日)        396   5.293e+07       22.9 s        36.7 s    2.35 M/s
+  v5 pubkey (TTL 28日)       7776   3.327e+08      144.1 s        28.7 s    2.53 M/s
+  v4 msg 本文1000 (4日)    1404   1.508e+07        6.5 s         2.2 s    4.71 M/s
+  v5 msg 本文1000 (4日)    8783   6.137e+07       26.6 s        15.1 s    2.79 M/s
+  v5 getpubkey (28日)          54   3.996e+07       17.3 s         4.3 s    1.86 M/s
+  v5 broadcast 1000 (4日)    8782   6.137e+07       26.6 s        34.5 s    2.13 M/s
 ```

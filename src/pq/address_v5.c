@@ -241,30 +241,172 @@ int bm_pqv5_identity_from_seeds(uint64_t stream,
     return 0;
 }
 
-int bm_pqv5_identity_generate_random(uint64_t stream, struct bm_pqv5_identity *out)
+/*
+ * id先頭のnull_bytesバイトが0x00かを判定する。
+ */
+static int id_has_leading_nulls(const unsigned char id[BM_PQV5_ID_LEN], int null_bytes)
 {
-    unsigned char sig_seed[BM_PQV5_SEED_LEN];
-    unsigned char kem_seed[BM_PQV5_SEED_LEN];
-    int rc;
-
-    if (RAND_bytes(sig_seed, sizeof(sig_seed)) != 1 || RAND_bytes(kem_seed, sizeof(kem_seed)) != 1)
+    int i;
+    for (i = 0; i < null_bytes; i++)
     {
-        return -1;
+        if (id[i] != 0x00)
+        {
+            return 0;
+        }
     }
-    rc = bm_pqv5_identity_from_seeds(stream, sig_seed, kem_seed, out);
-    OPENSSL_cleanse(sig_seed, sizeof(sig_seed));
-    OPENSSL_cleanse(kem_seed, sizeof(kem_seed));
+    return 1;
+}
+
+/* 成分ごとのドメイン分離ラベル(address_v5.hのenum bm_pqv5_componentと同じ順) */
+static const char *const g_component_labels[BM_PQV5_COMP_COUNT] = {
+    "mldsa", "ed25519", "mlkem", "x25519"
+};
+
+/* sub_seed = SHAKE128(root || component_label || 0x00 || varint(counter), out_len) */
+static int derive_component_seed(const unsigned char root[BM_PQV5_ROOT_LEN], int component,
+                                  uint32_t counter, unsigned char *out, size_t out_len)
+{
+    unsigned char buf[BM_PQV5_ROOT_LEN + 16 + 9];
+    size_t label_len = strlen(g_component_labels[component]);
+    unsigned char *p = buf;
+
+    memcpy(p, root, BM_PQV5_ROOT_LEN);
+    p += BM_PQV5_ROOT_LEN;
+    memcpy(p, g_component_labels[component], label_len);
+    p += label_len;
+    *p++ = 0x00;
+    p = put_varint(p, counter);
+
+    return bm_pq_shake128(buf, (size_t)(p - buf), out, out_len);
+}
+
+/* 1成分だけを作り直して鍵ブロブへ書き込む。探索ループの1候補分のコストがこれ */
+static int apply_component(struct bm_pqv5_identity *id, const unsigned char root[BM_PQV5_ROOT_LEN],
+                            int component, uint32_t counter)
+{
+    unsigned char seed[64];
+    int rc = -1;
+
+    switch (component)
+    {
+    case BM_PQV5_COMP_MLDSA:
+        if (derive_component_seed(root, component, counter, seed, 32) == 0)
+        {
+            rc = bm_pqv5_sig_set_mldsa(seed, id->sig_pk, id->sig_sk);
+        }
+        break;
+    case BM_PQV5_COMP_ED25519:
+        if (derive_component_seed(root, component, counter, seed, 32) == 0)
+        {
+            rc = bm_pqv5_sig_set_ed25519(seed, id->sig_pk, id->sig_sk);
+        }
+        break;
+    case BM_PQV5_COMP_MLKEM:
+        if (derive_component_seed(root, component, counter, seed, 64) == 0)
+        {
+            rc = bm_pqv5_kem_set_mlkem(seed, id->kem_pk, id->kem_sk);
+        }
+        break;
+    case BM_PQV5_COMP_X25519:
+        if (derive_component_seed(root, component, counter, seed, 32) == 0)
+        {
+            rc = bm_pqv5_kem_set_x25519(seed, id->kem_pk, id->kem_sk);
+        }
+        break;
+    default:
+        break;
+    }
+    OPENSSL_cleanse(seed, sizeof(seed));
     return rc;
 }
 
-/* seed = SHA3-512(label || 0x00 || passphrase || varint(nonce))[0:32] */
-static int derive_seed(const char *passphrase, uint64_t nonce, unsigned char out_seed[BM_PQV5_SEED_LEN])
+int bm_pqv5_identity_from_root(uint64_t stream, const unsigned char root[BM_PQV5_ROOT_LEN],
+                                const uint32_t counters[BM_PQV5_COMP_COUNT],
+                                struct bm_pqv5_identity *out)
+{
+    int c;
+
+    memset(out, 0, sizeof(*out));
+    out->version = BM_PQV5_ADDRESS_VERSION;
+    out->stream = stream;
+    for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
+    {
+        out->counters[c] = counters[c];
+        if (apply_component(out, root, c, counters[c]) != 0)
+        {
+            return -1;
+        }
+    }
+    bm_pqv5_calc_id(out->version, out->stream, out->sig_pk, out->kem_pk, out->id);
+    return 0;
+}
+
+/*
+ * 探索本体。rootは固定で、modeで指定された成分のカウンタだけを1ずつ進めながら
+ * その成分の鍵を作り直す。ALLは4成分とも進める(v4のペア増加に相当)。
+ */
+static int search_from_root(uint64_t stream, const unsigned char root[BM_PQV5_ROOT_LEN],
+                             int null_bytes, enum bm_pqv5_search_mode mode,
+                             struct bm_pqv5_identity *out)
+{
+    uint32_t counters[BM_PQV5_COMP_COUNT] = { 0, 0, 0, 0 };
+    int c;
+
+    if (null_bytes < 0 || null_bytes > BM_PQV5_ID_LEN)
+    {
+        return -1;
+    }
+    if (bm_pqv5_identity_from_root(stream, root, counters, out) != 0)
+    {
+        return -1;
+    }
+    for (;;)
+    {
+        if (id_has_leading_nulls(out->id, null_bytes))
+        {
+            break;
+        }
+        for (c = 0; c < BM_PQV5_COMP_COUNT; c++)
+        {
+            if (mode != BM_PQV5_SEARCH_ALL && c != (int)mode)
+            {
+                continue;
+            }
+            counters[c]++;
+            out->counters[c] = counters[c];
+            if (apply_component(out, root, c, counters[c]) != 0)
+            {
+                return -1;
+            }
+        }
+        bm_pqv5_calc_id(out->version, out->stream, out->sig_pk, out->kem_pk, out->id);
+    }
+    return 0;
+}
+
+int bm_pqv5_identity_generate_random(uint64_t stream, int null_bytes,
+                                      enum bm_pqv5_search_mode mode,
+                                      struct bm_pqv5_identity *out)
+{
+    unsigned char root[BM_PQV5_ROOT_LEN];
+    int rc;
+
+    if (RAND_bytes(root, sizeof(root)) != 1)
+    {
+        return -1;
+    }
+    rc = search_from_root(stream, root, null_bytes, mode, out);
+    OPENSSL_cleanse(root, sizeof(root));
+    return rc;
+}
+
+/* root = SHA3-512(label || 0x00 || passphrase || varint(nonce)) */
+static int derive_root(const char *passphrase, uint64_t nonce, unsigned char out_root[BM_PQV5_ROOT_LEN])
 {
     size_t label_len = strlen(BM_PQV5_LABEL_DETERMINISTIC);
     size_t pass_len = strlen(passphrase);
     size_t total = label_len + 1 + pass_len + bm_varint_size(nonce);
     unsigned char *buf = malloc(total);
-    unsigned char digest[64];
     unsigned char *p;
 
     if (buf == NULL)
@@ -279,61 +421,29 @@ static int derive_seed(const char *passphrase, uint64_t nonce, unsigned char out
     p += pass_len;
     p = put_varint(p, nonce);
 
-    bm_pq_sha3_512(buf, (size_t)(p - buf), digest);
-    memcpy(out_seed, digest, BM_PQV5_SEED_LEN);
-    OPENSSL_cleanse(digest, sizeof(digest));
+    bm_pq_sha3_512(buf, (size_t)(p - buf), out_root);
     OPENSSL_cleanse(buf, total);
     free(buf);
     return 0;
 }
 
 int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t stream,
-                                             uint64_t start_nonce, int null_bytes,
+                                             uint64_t nonce, int null_bytes,
+                                             enum bm_pqv5_search_mode mode,
                                              struct bm_pqv5_identity *out)
 {
-    uint64_t nonce = start_nonce;
-    unsigned char sig_seed[BM_PQV5_SEED_LEN];
-    unsigned char kem_seed[BM_PQV5_SEED_LEN];
+    unsigned char root[BM_PQV5_ROOT_LEN];
+    int rc;
 
-    if (null_bytes < 0 || null_bytes > BM_PQV5_ID_LEN)
+    if (derive_root(passphrase, nonce, root) != 0)
     {
         return -1;
     }
-    for (;;)
+    rc = search_from_root(stream, root, null_bytes, mode, out);
+    if (rc == 0)
     {
-        int i;
-        int ok = 1;
-
-        if (derive_seed(passphrase, nonce, sig_seed) != 0 ||
-            derive_seed(passphrase, nonce + 1, kem_seed) != 0)
-        {
-            return -1;
-        }
-        if (bm_pqv5_identity_from_seeds(stream, sig_seed, kem_seed, out) != 0)
-        {
-            OPENSSL_cleanse(sig_seed, sizeof(sig_seed));
-            OPENSSL_cleanse(kem_seed, sizeof(kem_seed));
-            return -1;
-        }
-        for (i = 0; i < null_bytes; i++)
-        {
-            if (out->id[i] != 0x00)
-            {
-                ok = 0;
-                break;
-            }
-        }
-        if (ok)
-        {
-            out->sig_nonce = nonce;
-            out->kem_nonce = nonce + 1;
-            break;
-        }
-        /* v4(class_addressGenerator.py)と同じく署名鍵nonceと暗号化鍵nonceを
-         * ペアで2ずつ進める */
-        nonce += 2;
+        out->nonce = nonce;
     }
-    OPENSSL_cleanse(sig_seed, sizeof(sig_seed));
-    OPENSSL_cleanse(kem_seed, sizeof(kem_seed));
-    return 0;
+    OPENSSL_cleanse(root, sizeof(root));
+    return rc;
 }
