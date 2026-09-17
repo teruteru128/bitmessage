@@ -59,6 +59,9 @@ if(BM_SANITIZE_FLAGS)
     add_link_options("-fsanitize=${BM_SANITIZE_FLAGS_JOINED}")
 endif()
 
+# §PQ 2026-09-17 vendorしたML-DSA/ML-KEM参照実装(third_party/pqcrystals)。src側から
+# 参照するのでsrcより先に追加する。DESIGN-PQ.md §6。
+add_subdirectory(third_party)
 add_subdirectory(src)
 
 # §11 2026-08-24 backlog項目10の3/5: cmake --install用のinstall()定義。GNUInstallDirsで

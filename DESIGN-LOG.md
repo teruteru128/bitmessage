@@ -3071,3 +3071,161 @@ PoWした`nonce`を使っていた。`bm_pow_get_target`(`pow_engine.c`)の計�
 **検証**: 修正後の`test_object_sync`を`build-Debug`で60回連続実行し、全て成功
 (flakinessの再発なし)。`build-Debug`/`build-sanitize`(`ASAN_OPTIONS=detect_leaks=1
 UBSAN_OPTIONS=print_stacktrace=1`)とも`ctest --output-on-failure`45件全通過。
+
+
+---
+
+## 2026-09-17 ポスト量子(ML-DSA / ML-KEM)拡張の提案ドラフトとプロトタイプ
+
+**発端**: ユーザーから「ML-DSAとML-KEMを両方組み込んだプロトコルの提案の下書きを作りたい。
+wikiのProtocol specificationを見た限り、手を加えなくて良さそうなのはオブジェクト配送周りと
+ハンドシェイクの部分だけに見える。提案/設計の作成と、実際にv5アドレスやオブジェクトを
+作ってベンチマークするところまでやりたい」という依頼。
+
+設計提案そのものは [DESIGN-PQ.md](DESIGN-PQ.md) に独立した文書として書いた(DESIGN.mdの
+§0〜§10が現行v1実装の設計であるのに対し、こちらは「まだ実装されていない将来のプロトコル
+拡張の提案」で性格が違うため、混ぜずに分けた)。以下はこのセッションでの調査・判断の経緯。
+
+### 調査1: 「配送層は無改造で済む」という見立ての裏取り
+
+ユーザーの見立てが成立するかどうかは、**既存ノードが未知のobjectVersionを中継してくれるか**に
+かかっている。ここを推測で済ませると提案全体が崩れるので、3実装の実ソースを確認した
+(CLAUDE.mdの「本家との一致・不一致は必ず実ソースを確認してから判断する」)。
+
+結論は「中継される」。詳細はDESIGN-PQ.md §2。特に重要だったのはPyBitmessageの
+`src/network/bmproto.py` の `bm_command_object` で、`checkObjectByType()` が
+`BMObjectInvalidError` を投げても、その**後ろにある `state.Inventory[...] = ...` と
+`invQueue.put(...)` は例外に関係なく実行される**という構造になっていた。つまり
+「pubkeyオブジェクトが440byteを超えている」等の理由で無効判定されても、inventoryへは
+保存され他ピアへ再広告される。
+
+さらに `class_objectProcessor.py` を読むと、msg(`if msgVersion != 1: return`)と
+broadcast(`if broadcastVersion < 4 or > 5: return`)は**トライアル復号を試みる前に**
+versionで捨てられることが分かった。これは「新しいobjectTypeを定義する」案より
+「既存typeのobjectVersionを上げる」案の方が既存ノードに優しいという、当初予想して
+いなかった判断材料になった(DESIGN-PQ.md §3.4)。
+
+### 判断1: 外部ライブラリではなくvendor
+
+この環境(Ubuntu 24.04)ではOpenSSLが3.0.13でML-KEM/ML-DSAは未実装(3.5以降)、
+liboqs/PQCleanはディストロのアーカイブに存在しない(`apt-cache search`で0件)。
+ユーザーからも「外部ライブラリを使わない方針? オーバーエンジニアリングでは?」と
+指摘があったが、ここでの「外部ライブラリ」は実質「全員がliboqsをソースからビルドする」
+ことを意味するため、ビルドシステムを持たない参照実装をvendorする方が依存が軽いと判断した
+(DESIGN-PQ.md §6)。ラッパ(`src/pq/pq_crypto.c`)1ファイルだけが参照実装のシンボルを
+直接呼ぶ構造にしてあり、OpenSSL 3.5が使える環境になったらそこをEVPへ差し替えれば済む。
+
+### 判断2: Ed25519 / X25519を古典側に選んだ(未議論だった点)
+
+ハイブリッドの古典側をsecp256k1ではなくEd25519/X25519にした。最大の理由は、
+ハイブリッドKEMのcombinerとして仕様化・解析済みのX-Wing
+(draft-connolly-cfrg-xwing-kem)が「ML-KEM-768 + X25519」の組み合わせ専用であり、
+secp256k1に差し替えると自前combinerの設計になってしまうこと。ユーザーから
+「ec/ed側のアルゴリズムをed25519にするのって前に議論しましたっけ?」と確認があり、
+議論していない(このセッションでの独断)ことを明示した上で、secp256k1案の利点
+(既存bm_crypto資産の再利用)と切り替えコスト(pq_hybrid.cの中だけ)を提示した。
+
+### バグ: bm_varint_encodeの戻り値を取り違えた
+
+`address_v5.c` で `p = bm_varint_encode(p, version);` と書いていたが、
+`bm_varint_encode` は**書き込み先ポインタを進めずに引数の `out` をそのまま返す**仕様
+(varint.h)。結果としてversion/streamがハッシュ入力から丸ごと抜け落ち、
+決定性アドレス生成の探索ループ(null_bytes=1)が**同じseedを延々と作り直す無限ループ**に
+なっていた。ベンチマークが終わらないことで発覚。`put_varint()` ラッパを置いて修正し、
+`tests/test_pq_address.c` に「idがversion/streamに依存すること」を検査するテストを
+追加して再発を検知できるようにした。
+
+### 実測でひっくり返った想定
+
+当初「ML-DSA/ML-KEMの鍵生成はsecp256k1より重いので、v4のような先頭0x00探索
+(numberOfNullBytesDemandedOnFrontOfRipeHash)はコスト的に無理」と書いていたが、
+実測は逆だった。1候補あたりv4が約1.25ms、v5が約0.49msで**v5の方が2.5倍安い**
+(OpenSSLのsecp256k1が汎用EC実装で遅いため)。null_bytes=1を要求しても68msで、
+v4の458msより速い。したがって「v5で先頭ゼロを要求するか」はコストの問題ではなく
+アドレス長を1文字(54→53)縮める価値があるかどうかの選択になる、と結論を修正した
+(DESIGN-PQ.md §4.2、既定は0のまま)。
+
+同じ方向の驚きとして、**v5プロファイルは全ての暗号操作でv4より速い**
+(署名0.89倍・検証0.78倍・封緘0.25倍の時間)。PQ化のコストは計算時間ではなく
+サイズとPoWに全部乗る、というのがこの提案の全体像になった。
+
+### 調査2: v4が「ripe先頭1byteを0x00にする」設計にしていた理由
+
+上の実測を受けてユーザーから「そもそもアドレス生成でハッシュ冒頭1バイトをゼロにする設計に
+していたのはどういう設計思想だったか調べてほしい」との依頼。一次資料を当たった結果、
+**「アドレス文字列を短くするため」ただ一つ**で、スパム抑止・PoW的な意味は無いと確認できた。
+
+- PyBitmessage `f0666e65`(Jonathan Warren、2013-01-16、当時は`bitmessagemain.py`に直書き)
+  のコメントが決定的: "This next section is a little bit strange. We're going to generate
+  keys over and over until we find one that starts with either \x00 or \x00\x00. Then when
+  we pack them into a Bitmessage address, we won't store the \x00 or \x00\x00 bytes thus
+  making the address shorter."(実装者本人が "a little bit strange" と書いている)
+- GUI(`newaddressdialog.ui`のeighteenByteRipeチェックボックス)の文言も
+  "Spend several minutes of extra computing time to make the address(es) 1 or 2 characters
+  shorter" で、コスト対効果を「文字数」だけで説明している。なおこのチェックボックスは
+  2byte目の話で、1byte目はチェック無しでも常に要求される(chan生成も含めハードコード)。
+- wikiのProtocol specificationには先頭ゼロに関する要求が**存在しない**。仕様側にあるのは
+  encodeAddressの「先頭0x00を最大2byteまで削る」エンコード規則だけで、ゼロを作りに行くのは
+  クライアント側の生成方針にすぎない。つまり先頭ゼロの無いアドレスも仕様上正当
+  (DESIGN.md §3.3の「4byte分のゼロを持つ非正規v3アドレス」は逆方向の実例)。
+
+副次効果として「全アドレスの長さが揃う」という実利はある(v5で null_bytes=0 にすると
+255/256が54文字・1/256が53文字以下とばらつく)。v5の既定値は未確定のままユーザーの判断に
+委ねることにし、DESIGN-PQ.md §4.2と§9.3へ記録した。
+
+### ベンチマーク生出力(`bm-pq-bench --pow`、Ubuntu 24.04 / OpenSSL 3.0.13 / 16コア、Releaseビルド)
+
+```
+bm-pq-bench (DESIGN-PQ.md §8) — v5プロファイル: ML-DSA-65 + Ed25519 / X-Wing(ML-KEM-768 + X25519) / AES-256-GCM
+
+== 1. 暗号プリミティブ ==
+  alg            op               time    throughput
+  ML-DSA-44      keygen          139.1 us          7188 ops/s
+  ML-DSA-44      sign            615.7 us          1624 ops/s
+  ML-DSA-44      verify          156.5 us          6390 ops/s
+  ML-DSA-65      keygen          245.5 us          4073 ops/s
+  ML-DSA-65      sign           1073.8 us           931 ops/s
+  ML-DSA-65      verify          248.1 us          4030 ops/s
+  ML-DSA-87      keygen          390.8 us          2559 ops/s
+  ML-DSA-87      sign           1193.8 us           838 ops/s
+  ML-DSA-87      verify          411.1 us          2432 ops/s
+  ML-KEM-512     keygen           48.9 us         20463 ops/s
+  ML-KEM-512     encaps           61.3 us         16323 ops/s
+  ML-KEM-512     decaps           77.6 us         12883 ops/s
+  ML-KEM-768     keygen           82.9 us         12064 ops/s
+  ML-KEM-768     encaps           96.2 us         10390 ops/s
+  ML-KEM-768     decaps          119.2 us          8391 ops/s
+  ML-KEM-1024    keygen          129.2 us          7740 ops/s
+  ML-KEM-1024    encaps          142.7 us          7008 ops/s
+  ML-KEM-1024    decaps          171.1 us          5843 ops/s
+  v5 hybrid      sign           1090.6 us           917 ops/s
+  v5 hybrid      verify          439.6 us          2275 ops/s
+  v5 hybrid      seal            305.8 us          3271 ops/s
+  v5 hybrid      open            327.3 us          3055 ops/s
+  v4 secp256k1   sign           1278.0 us           782 ops/s
+  v4 secp256k1   verify          585.3 us          1709 ops/s
+  v4 ECIES       encrypt        1257.3 us           795 ops/s
+  v4 ECIES       decrypt         628.5 us          1591 ops/s
+
+== 2. アドレス生成 ==
+  v4 決定性生成(null_bytes=1, nonce=734):    458.1 ms  address=BM-2cVLBa9WeKtVtwMGuMRMVEfHZkNaUNDKDR (37文字)
+  v5 決定性生成(null_bytes=0, nonce=0):      0.6 ms  address=BM-jxw6mz2KpifZkgXrW58dtVvS3ErANmEi6om4A8BAvJTSsFxeEjX (54文字)
+  v5 決定性生成(null_bytes=1, nonce=276):     68.0 ms  (参考: v5では既定で要求しない)
+
+== 3. オブジェクトサイズ(PoW nonce込み、byte) ==
+  pubkey            v4=    396  v5=   7776  (x19.6)
+  --- msg(本文長別) ---
+  body=     0       v4=    396  v5=   7781  (x19.6, +7385)
+  body=   100       v4=    492  v5=   7881  (x16.0, +7389)
+  body=  1000       v4=   1404  v5=   8783  (x6.3, +7379)
+  body= 10000       v4=  10396  v5=  17783  (x1.7, +7387)
+  broadcast(本文5)  v4=    412  v5=   7785  (x18.9)
+  getpubkey         v4=     54  v5=     54
+  msgの固定オーバーヘッド: v5=7781 byte → 2^18制限下での本文上限 254363 byte
+
+== 4. PoWコスト(nonceTrialsPerByte=1000, extraBytes=1000) ==
+  実測ハッシュレート: 0.58 Mtrial/s/core × 16 core = 9.25 Mtrial/s
+  msg(本文1000, TTL 4日)  v4:   15081343 trials →    1.6 秒
+                          v5:   61373039 trials →    6.6 秒  (x4.07)
+  実測PoW(v5 msgサイズ): 4.3 秒 (nonce=9960769)
+```

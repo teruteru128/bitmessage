@@ -187,3 +187,17 @@ add_test(NAME burst_accept_real_epoll_thread COMMAND test_burst_accept_real_epol
 add_executable(test_network_stats test_network_stats.c)
 target_link_libraries(test_network_stats PRIVATE bm_core bm_infra)
 add_test(NAME network_stats COMMAND test_network_stats)
+
+# §PQ 2026-09-17 ポスト量子(ML-DSA/ML-KEM)プロトタイプのテスト。DESIGN-PQ.md。
+add_executable(test_pq_crypto test_pq_crypto.c)
+target_link_libraries(test_pq_crypto PRIVATE bm_pq)
+add_test(NAME pq_crypto COMMAND test_pq_crypto)
+
+# アドレスのテストはv4アドレス(bm_core)との対比も行うのでbm_coreもリンクする
+add_executable(test_pq_address test_pq_address.c)
+target_link_libraries(test_pq_address PRIVATE bm_pq bm_core)
+add_test(NAME pq_address COMMAND test_pq_address)
+
+add_executable(test_pq_object test_pq_object.c)
+target_link_libraries(test_pq_object PRIVATE bm_pq)
+add_test(NAME pq_object COMMAND test_pq_object)

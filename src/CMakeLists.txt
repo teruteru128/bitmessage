@@ -1,6 +1,7 @@
 add_subdirectory(common)
 add_subdirectory(pow)
 add_subdirectory(core)
+add_subdirectory(pq)
 add_subdirectory(infra)
 add_subdirectory(cli)
 

@@ -3071,3 +3071,14 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     無い(UA文字列の中身を見て挙動を分岐させる処理は無い)、純粋に見た目の一貫性のための変更。
     ビルド警告ゼロ、ctest 46件100%通過。daemon Aへのデプロイはbuild-RelWithDebInfoで別途行う
     (メモリfeedback_deploy_relwithdebinfo.md参照)。
+
+37. **ポスト量子(ML-DSA / ML-KEM)拡張の提案ドラフトとプロトタイプ**: 2026-09-17、ユーザー依頼。
+    設計提案は独立した文書 [DESIGN-PQ.md](DESIGN-PQ.md) に分離した(§0〜§10が現行v1実装の
+    設計であるのに対し、こちらは未実装の将来拡張の提案であり性格が違うため)。調査・判断の
+    経緯はDESIGN-LOG.mdの2026-09-17の節。
+    現時点の成果物は「アドレスv5 + v5オブジェクト(getpubkey/pubkey/msg/broadcast)の
+    プロトタイプ実装(`src/pq/`)、vendorしたML-DSA/ML-KEM参照実装(`third_party/pqcrystals/`)、
+    ベンチマークツール(`bm-pq-bench`)、テスト3件」で、**daemon本体(bm_core/bm_infra)からは
+    一切参照していない**。実運用へ組み込む段階のロードマップはDESIGN-PQ.md §9、
+    未解決事項(本文長上限の再設定・pubkey v5のPoWが重い問題・identity.dbスキーマ・
+    X-Wingテストベクタでの検証)は同§9.3。ビルド警告ゼロ、ctest 49件100%通過。
