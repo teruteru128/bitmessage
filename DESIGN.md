@@ -3213,3 +3213,143 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     **前提:** DESIGN-PQ.md §9のフェーズ2〜3(受信側・送信側の実装)まで進んでいること。
     それ以前に項目38(PoWのワーカースレッド化)が必要(v5 pubkeyのPoW 141秒で
     `network_epoll_thread`が止まると、そもそも実験中にピア接続が維持できない)。
+
+40. **web UIを付けるならどのインターフェイス経由にするか(思考実験、実装予定なし)**: 2026-09-19、
+    ユーザーとの議論。「webインターフェイスを付けるとしたらJSON-RPC経由は効率が悪いので、別の
+    インターフェイス経由で作ることになるのでは」という問いから始まった検討の記録。**現時点で
+    実装する予定は無い**が、いざ着手するときに同じ検討を一からやり直さずに済むよう、結論と
+    根拠を残しておく。
+
+    **(1) 「JSON-RPCが非効率」の中身は3つあり、どれもエンコーディング由来ではない**
+
+    - **一覧APIの形状**: `h_getInboxMessages`(`src/core/api_server.c`)は`folder`で絞る以外の
+      手段を持たず、`limit`/`offset`/`since`/フィールド射影がいずれも無い。一覧画面を描くだけで
+      全件の`body`が付いてくる。1通の上限は`BM_MAX_SUBJECT_PLUS_BODY_LEN` = 261,644バイト
+      (`src/common/message_limits.h`)なので、通数が増えるほど素朴なポーリングが重くなる。
+    - **応答生成で3重に持つ**: `bm_messages_store_list_inbox`が全行をstruct配列へmalloc →
+      cJSONツリーへコピー(エスケープ込み) → `cJSON_PrintUnformatted`で1本の文字列へ、と
+      inbox全体が同時に3つメモリに乗る。`queue_text_response`も単一バッファ前提でストリーミング
+      していないため、ピークメモリがinboxサイズに対して無制限。
+    - **pushが無い**: 新着を知る手段がポーリングしかない。本家の`apinotifypath`(§6の調査記録)も
+      内部イベント発生時に外部コマンドを起動する代用品で、本実装には移植していない。
+
+    **つまりJSONをprotobufに替えても3つのどれも解決しない。** 替えるべきなのはワイヤー
+    フォーマットではなく相互作用のモデルである、というのがこの議論全体の結論。
+
+    **(2) 分岐点: そのUIをどこから叩くか**
+
+    localhostのブラウザから叩くなら帯域は事実上無限でRTTはループバック、「効率」が指すのは
+    バイト数ではなくdaemon側のCPU・メモリとポーリングの無駄になる。onion越しに自分のノードを
+    見る形にするならRTTが500ms〜数秒になり、ここで初めて往復回数が支配的になる。どちらを
+    前提にするかで答えが変わるので、設計の最初に決めること。
+
+    **(3) 候補の評価**
+
+    - **gRPC**: 却下。ブラウザは生のgRPCを喋れずgrpc-web+プロキシが経路に要るので、*web*
+      インターフェイスの手段としては構造的に遠回り。grpc-coreも実質C++で、xmlrpc-c/CURLを
+      採らなかった依存方針(§10)と衝突する。
+    - **protobuf / MessagePack / FlatBuffersを既存HTTPに載せる**: 効く場所が違う。削れるのは
+      JSONエスケープとパースのCPUだけで、それを食っている本体は本文。本文を一覧に載せるのを
+      やめれば消える問題であり、代わりにブラウザ側デコーダが要り`curl`でのデバッグも失う。
+    - **WebSocket**: MHDの`MHD_USE_UPGRADE`は生ソケットを渡してくるだけなので、RFC 6455の
+      フレーミング・マスク解除・ping/pong・closeハンドシェイクを全て自前で書くか依存を増やす
+      ことになる。双方向が効くのはclient→serverが高頻度な場合で、読み中心のメールUIでは対価が
+      見合わない。
+    - **UDS + 別プロセスのフロント**: 分離としては正しい。daemonがブラウザとHTTPを喋らなく
+      なるので、XSS/CSRF/DNS rebindingの受け口がC実装から消える。増えるのはプロセスとIPC
+      プロトコル設計の分。
+    - **messages.dbを読み取り専用で直接開く(CQRS)**: 最安。既に`journal_mode=WAL`
+      (`src/common/db_common.c`)なので書き込みを止めずに並行読み取りでき、ページング・
+      ソート・FTS5全文検索がプロトコル設計ゼロで手に入る。代償はスキーマが公開APIになって
+      気軽に変えられなくなること、および`identity.db`を絶対に同じ経路へ乗せない規律。
+
+    **(4) 採るならこの形: トランスポートはHTTP+JSONのまま、相互作用モデルだけ変える**
+
+    既存のMHD daemonに`api_access_handler`でのパス分岐を足し、以下を追加する:
+
+    1. **一覧を射影付きRESTにする** — `GET /inbox?folder=inbox&limit=50&cursor=...`が返すのは
+       `{msgId, from, subject, receivedTime, read}`だけで、本文を含めない。
+    2. **本文を独立リソースにして不変キャッシュを効かせる** — inboxの`msg_id`はobjectの
+       inventory hash、すなわち**コンテンツアドレス**である(`src/core/messages_store.h`の
+       `bm_messages_store_insert_inbox`コメント)。`GET /messages/<hash>/body`に
+       `Cache-Control: max-age=31536000, immutable`を付ければ、各本文は生涯に一度しかワイヤを
+       渡らない。**JSON-RPC over POSTは仕様上キャッシュ不可なので、これは構造的に真似できない。**
+       (2)でonion越しを選んだ場合に効き方が桁違いになるのはここ。
+    3. **`GET /events`をSSEにする** — MHDは`MHD_create_response_from_callback`でチャンク応答を
+       作れるのでSSEは素直に載る。新着・接続数変化・送信ステータス遷移をpushしてポーリングを全廃。
+    4. **一覧応答をストリーム生成する** — `sqlite3_step`しながらコールバックでJSONを吐けば、
+       メモリがO(inbox)から定数になる((1)の2つ目の解決)。
+
+    JSON-RPCはそのまま残す(CLI・テスト・本家互換がぶら下がっている)。§6.1の「ハンドラ辞書と
+    トランスポートを分離した設計」のおかげで、`METHODS[]`は手付かずでパス分岐だけ足せる。
+
+    **(5) 実装時に必ず踏む罠(MHD固有)**
+
+    - `MHD_OPTION_CONNECTION_TIMEOUT`が30秒(`BM_API_CONNECTION_TIMEOUT_SECONDS`)なので、
+      **SSE接続が黙って切られる。** keep-aliveコメント行を定期送出するか、SSEのパスだけ
+      タイムアウトを免除する必要がある。
+    - `MHD_OPTION_CONNECTION_LIMIT`が64(`BM_API_CONNECTION_LIMIT`)。SSEは張りっぱなしなので、
+      タブを開くたびに枠を1つ占有し続ける。
+    - `MHD_USE_INTERNAL_POLLING_THREAD`下でレスポンスコールバックがブロックするとpollループごと
+      止まるため、イベント待ちは`MHD_suspend_connection`/`MHD_resume_connection`で行う。素直に
+      書くとビジーループになる。
+    - **イベント源が現状どこにも無い。** 新着の発生点は`trial_decrypt.c`・`broadcast_decrypt.c`・
+      `send_pipeline.c`の3箇所の`bm_messages_store_insert_inbox`呼び出しで、ここにフックを挿して
+      既存の`bm_queue_t`へ積む形になる。keep-alive送出は「周期処理のために専用スレッドを
+      新設しない」方針(CLAUDE.md)に従い`peer_connector_thread`の1秒ループへ相乗りさせる。
+      判定に使う時刻は他と同様`int64_t now`引数で受ける。
+
+    **(6) 効率より重いのはセキュリティ側**
+
+    - **DNS rebinding**: ブラウザUIを127.0.0.1に置くと任意のWebページが到達を試みられる。
+      Basic認証はオリジンが違えば送られないので一枚は守れるが、GETを無認証にした瞬間に穴になる。
+      `Host`ヘッダ検証 + CORS全拒否 + セッショントークンが要る。
+    - **本文のレンダリングがXSSになる**: `body`は完全に攻撃者制御の文字列で、同一オリジンから
+      スクリプトが走ればinbox全件とアドレス一覧が抜かれる。プレーンテキスト固定 + 厳格なCSP
+      (`default-src 'none'`)以外に安全な道は無い。
+    - **外部リソースを1つも読まない**: フォント1つCDNから引くだけでノードを見ている事実が漏れる。
+      UI資産は全てdaemonから配る。
+    - **onionで公開する場合**、UIを別のonionサービスにするか同じものへ相乗りさせるかで、
+      ノードのonionアドレスとUIのリンカビリティが変わる。公開経路にするなら最初に決めること。
+
+    **(7) 派生議論: libを拡張機能(dlopen)として読めるようにする案 — 不採用**
+
+    「トランスポートだけプラグインで差し替えられるようにすれば」という案も検討したが、
+    **効率は1ミリも動かず、攻撃断面とABI凍結の負債だけが増える**という結論になった。
+
+    - **ボトルネックが継ぎ目の向こう側にある。** (1)の3つは全てコア側の問題で、
+      `bm_messages_store_list_inbox`が全行をmallocして返す構造は呼び出し元がプラグインでも
+      本体でも変わらない。プラグインを効率面で意味あるものにするには、カーソル付き逐次読み出しや
+      射影を**プラグインABIとして公開**することになり、結局`messages_store`/`keyring`/
+      `peer_registry`の内部APIをほぼ全部エクスポートする羽目になる。それはもう継ぎ目ではない。
+    - **本家が何をプラグイン化しているかが示唆的。** PyBitmessageには実際にプラグイン機構が
+      あるが(`src/plugins/`、`setup.py`の`entry_points`)、拡張ポイントは
+      `bitmessage.gui.menu`(QRコードのメニュー項目)・`bitmessage.notification.message`/`.sound`
+      (notify2、canberra、gstreamer)・`bitmessage.indicator`(libmessaging)・
+      `bitmessage.desktop`(XDG)・`bitmessage.proxyconfig`(stem)の6群で、**全てが周辺・表示・
+      OS統合であり、データ経路上のものが1つも無い。** ネットワークプロトコル・ストレージ・暗号・
+      APIトランスポートはどれもプラグイン化されていない。ロード機構も
+      `pkg_resources.iter_entry_points`(`src/plugins/plugin.py`)で、ディレクトリに置いたファイルを
+      拾うのではなくインストール済みディストリビューションからの発見である。
+    - **アドレス空間を鍵と共有する。** `bm_keyring_t`はunlock済み秘密鍵をin-memoryで保持する
+      (§7.2、`struct bm_unlocked_identity`)。web UIプラグインの1つのバグがそのまま全identityの
+      秘密鍵読み出しになり、分離のつもりの仕組みが分離ゼロの場所に置かれることになる。
+    - **ABIが凍る。** `struct bm_api_server_config`や`struct bm_inbox_message`のレイアウトが
+      契約になる。このプロジェクトは`is_self`・`last_attempt`・`folder`を`ALTER TABLE`で足して
+      いく運用(CLAUDE.md)で構造体フィールドも同様に足してきたので、シンボルバージョニング
+      無しでそれを続けると古いプラグインが黙って壊れる。
+    - **規約が強制できない。** 「専用スレッドを新設しない」「sqlite3ハンドルは`SQLITE_OPEN_FULLMUTEX`
+      前提で共有可」「`last_gc`は単一スレッドからのみ触る」等は全てコメントで書かれた約束であり、
+      ABI越しには強制できない。長い読みトランザクションを握るプラグイン1つでWALの前提が崩れる。
+    - **コード読み込み経路が新設される。** 現状のdaemonには実行時に外部コードを取り込む経路が
+      1本も無い。プラグインディレクトリを作ることは、そこへ`.so`を書ける攻撃者に鍵入りプロセス
+      での任意コード実行を与える永続化ベクタを生やすことであり、匿名性ソフトとして割に合わない。
+
+    **継ぎ目が欲しいという直感自体は妥当だが、置き場所はプロセス境界である**((3)のUDS案)。
+    そちらならモジュール性は同じだけ得られて攻撃断面はむしろ減る。dlopenは同じ利益を
+    アドレス空間の共有と引き換えに得る版で、方向が逆。なお**コンパイル時のモジュール性は既にある**
+    — `src/CMakeLists.txt`は`add_subdirectory`で6ターゲットに割っており、`bm_pq`はビルドはされるが
+    `bitmessaged`の`target_link_libraries`には入っていない(DESIGN-PQ.mdの「daemon本体からは未参照」
+    という状態がランタイムローダー無しで実現できている)。差し替えたいものがあるなら`option()`と
+    リンク構成で足りるはずで、実行時の動的ロードが要る場面(第三者がforkせずに拡張したい)は
+    現時点では存在しない。
