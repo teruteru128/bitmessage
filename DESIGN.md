@@ -3440,11 +3440,43 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       あり、CLAUDE.mdの安全項目で「パーミッション・所有者・ACLを一切変更しない」と定めている
       (過去に`setfacl`で稼働中のTorをクラッシュさせた実績がある)。したがって**制御ポート経由の
       ADD_ONIONにclient auth引数を付ける経路を採る**。
-    - **ADD_ONIONでのclient auth指定の正確な構文(`ClientAuthV3=`および必要なFlags)は未検証。**
-      `man tor`はtorrc側のオプションしか記述しておらず、制御プロトコルの仕様(control-spec.txt)は
-      この環境に入っていない。実装前にtorspecの該当版を直接確認すること
-      (CLAUDE.md「推測だけで実装しない」)。使用中のtorのバージョンでサポートされているかの
-      確認も同時に行う。
+    - **ADD_ONIONでのclient auth指定の構文はtorspecで確認済み(2026-09-19、ユーザーからの指摘で
+      torspecが`.txt`から`.md`へ移行していることが分かり実物を取得)。** 現在の置き場所は
+      torspecリポジトリの`spec/control-spec/commands.md`(旧`control-spec.txt`は歴史的名称)。
+      ADD_ONIONの文法は:
+
+      ```text
+      "ADD_ONION" SP KeyType ":" KeyBlob
+              [SP "Flags=" Flag *("," Flag)]
+              [SP "MaxStreams=" NumStreams]
+              ...
+              1*(SP "Port=" VirtPort ["," Target])
+              *(SP "ClientAuth=" ClientName [":" ClientBlob]) CRLF
+              *(SP "ClientAuthV3=" V3Key) CRLF
+
+      V3Key = The client's base32-encoded x25519 public key, using only the key
+              part of rend-spec-v3.txt section G.1.2 (v3 only).
+      ```
+
+      要点: (a) `ClientAuthV3=`は**繰り返し指定可**なので、端末ごとに鍵を並べればよい。
+      (b) 鍵はx25519公開鍵のbase32で、`authorized_clients/*.auth`の`descriptor:x25519:<base32>`と
+      同じ値を使える。(c) 文法上`ClientAuthV3=`は`Port=`より**後ろ**に来るので、現行の
+      `ADD_ONION %s Port=%d,127.0.0.1:%d`に対しては末尾へ足すだけでよく、組み立ての作り直しは不要。
+    - **`Flags=V3Auth`を併記する必要があるかは仕様上あいまいで、実装時に実機で確認すること。**
+      Flagの一覧には`"V3Auth" / ; Version 3 client authorization is required (v3 only).`が
+      定義されている一方、**同じ文書の例では`Flags=`無しで`ClientAuthV3=`だけを渡している**
+      (`C: ADD_ONION NEW:ED25519-V3 ClientAuthV3=[Blob Redacted] Port=22`)。どちらが正しいかは
+      文面からは決まらないので、実際に投げて`250-ClientAuthV3=`が返るかで判断する。
+    - **必要なtorのバージョンは0.4.6.1-alpha以降**(`[ClientV3Auth support added 0.4.6.1-alpha]`)。
+      開発環境のtorは0.4.9.12で条件を満たしているが、古いtorも想定して、ADD_ONIONが
+      エラー応答を返した場合に**client auth無しへフォールバックしてはならない**。UI用サービスの
+      作成自体を失敗させること(認証が外れた状態で公開されるほうが遥かに悪い)。
+    - **2本目のADD_ONIONは既存の制御接続fdをそのまま使える。** `bm_tor_control_add_onion`は
+      意図的に`Flags=Detach`を指定せず、`main()`が`sigwait`でブロックしている間`tor_control_fd`を
+      開いたままにする設計になっている(Detachを付けると再起動時に永続化した鍵での再作成が
+      `550 Onion address collision`で失敗するため。tor_control.hのコメント参照)。仕様上も
+      「制御接続が閉じるとサービスも消える」のが既定の挙動なので、この既存の判断が2本目にも
+      そのまま効く。新しい接続を張る必要は無い。
     - 静的torrc設定でonionを建てている利用者(`bitmessage.conf`の`[tor] onion_address`経路、
       `main.c`参照)にはこの機能を自動適用できない。その場合はUI用サービスを自分でtorrcに
       書いてもらい、bind先のローカルポートだけ設定で受け取る形になる。
