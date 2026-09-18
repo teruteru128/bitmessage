@@ -3462,11 +3462,32 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       (b) 鍵はx25519公開鍵のbase32で、`authorized_clients/*.auth`の`descriptor:x25519:<base32>`と
       同じ値を使える。(c) 文法上`ClientAuthV3=`は`Port=`より**後ろ**に来るので、現行の
       `ADD_ONION %s Port=%d,127.0.0.1:%d`に対しては末尾へ足すだけでよく、組み立ての作り直しは不要。
-    - **`Flags=V3Auth`を併記する必要があるかは仕様上あいまいで、実装時に実機で確認すること。**
-      Flagの一覧には`"V3Auth" / ; Version 3 client authorization is required (v3 only).`が
-      定義されている一方、**同じ文書の例では`Flags=`無しで`ClientAuthV3=`だけを渡している**
-      (`C: ADD_ONION NEW:ED25519-V3 ClientAuthV3=[Blob Redacted] Port=22`)。どちらが正しいかは
-      文面からは決まらないので、実際に投げて`250-ClientAuthV3=`が返るかで判断する。
+    - **`Flags=V3Auth`は必須。`ClientAuthV3=`と両方を揃えて初めて通る(2026-09-19、tor 0.4.9.12の
+      制御ソケットへ実際に投げて確認)。** 仕様のFlag一覧には`"V3Auth" / ; Version 3 client
+      authorization is required (v3 only).`の定義がある一方、**同じ文書の例はFlags=無しで
+      `ClientAuthV3=`だけを渡しており**(`C: ADD_ONION NEW:ED25519-V3 ClientAuthV3=[Blob Redacted]
+      Port=22`)、文面からは決まらなかったので実測した。結果:
+
+      | 投げたコマンド | 応答 |
+      |---|---|
+      | `Flags=DiscardPK` + `ClientAuthV3=<key>` | `512 No auth type specified` |
+      | `Flags=DiscardPK,V3Auth` + `ClientAuthV3=<key>` | `250-ServiceID=...` / `250-ClientAuthV3=<key>` / `250 OK` |
+      | `Flags=DiscardPK,V3Auth` のみ(鍵なし) | `512 No auth clients specified` |
+      | `Flags=DiscardPK` のみ(対照、auth無し) | `250-ServiceID=...` / `250 OK` |
+
+      つまり**torspecの例のほうが誤解を招く**(少なくとも0.4.9.12に対しては動かない)。
+      upstreamへ報告する価値があるかもしれない。正しい形は:
+
+      ```text
+      ADD_ONION <KeyType>:<KeyBlob> Flags=V3Auth Port=<virt>,127.0.0.1:<local> ClientAuthV3=<base32>
+      ```
+
+      成功時は`250-ServiceID=`に続けて**渡した鍵をそのままエコーした`250-ClientAuthV3=`**が返るので、
+      これを実装の成否判定に使える。
+
+      検証は全てephemeral(`Flags=DiscardPK`、転送先は未使用ポート)で行い、各試行の直後に
+      `DEL_ONION`し、終了後に`GETINFO onions/current`が空であることを確認済み。`/var/lib/tor/`
+      以下には一切触れていない(制御ソケットとcookieは`debian-tor`グループ権限でそのまま読める)。
     - **必要なtorのバージョンは0.4.6.1-alpha以降**(`[ClientV3Auth support added 0.4.6.1-alpha]`)。
       開発環境のtorは0.4.9.12で条件を満たしているが、古いtorも想定して、ADD_ONIONが
       エラー応答を返した場合に**client auth無しへフォールバックしてはならない**。UI用サービスの
