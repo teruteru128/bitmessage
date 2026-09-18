@@ -3353,3 +3353,98 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     という状態がランタイムローダー無しで実現できている)。差し替えたいものがあるなら`option()`と
     リンク構成で足りるはずで、実行時の動的ロードが要る場面(第三者がforkせずに拡張したい)は
     現時点では存在しない。
+
+    **(8) onion公開にした場合のマルチユーザー問題(2026-09-19の追加議論)**
+
+    (2)でonion越しを選ぶと、「到達可能になった以上、他人にURLを渡せてしまう」という形で
+    マルチユーザーが視野に入る。結論から言うと**これは踏み込まないのが正しい**。
+
+    まず、**現状のコードには「ユーザー」という概念が1つも無い**:
+
+    - `bm_keyring_t`はプロセスに1個だけ(`src/main.c`)で、`api_config.keyring`と
+      `bm_object_sync_ctx_init`が同じ実体を共有している。unlockはプロセス全体の状態なので、
+      セッションAがunlockしたアドレスはセッションBからも見える。
+    - HTTP Basic認証の`username`/`password`は1組(`src/core/api_server.h`)。principalが1人しか
+      表現できない。
+    - §7.4のvault方式は**1つのパスフレーズで全identityが開く**設計で、「鍵の集合の所有者は1人」
+      が前提。
+    - 復号は`object_sync.c`の`handle_object`経路で`ctx->keyring`を使って行われる。「誰の鍵で
+      開くか」がネットワーク層に溶けていて、セッションの概念を差し込む隙間が無い。
+
+    仮にACLを付けるとして`inbox.to_address`で絞る発想になるが、**broadcastは
+    `to_address`に送信者のアドレスを入れて保存している**(`broadcast_decrypt.c`の
+    `bm_trial_decrypt_broadcast_and_store`は`insert_inbox`へ`decoded.from_address`を2回渡す)ため、
+    `to_address`を所有者キーにしたACLはbroadcastを誤って振り分ける。chanに至っては「鍵を
+    複数人が持っている」ことが定義なので、per-userのACLに最初から収まらない。
+
+    より本質的な問題として、**daemonが鍵を持って復号する以上、運営者は全ユーザーのメッセージを
+    必ず読める**。暗号で塞ぐ方法は無い(クライアント側で復号するなら、それはもうdaemonに鍵を
+    預けていない別アーキテクチャ)。つまりマルチユーザーのweb UIは、**Bitmessageが無くすために
+    存在している「信頼できる第三者」を、Bitmessageの上に再建する**ことになる。匿名性の面でも、
+    全ユーザーが同じTor回路・同じピア接続・同じDandelion stemを通るので、匿名集合としては得でも
+    区画化としては最悪で、運営者からは誰がいつどのアドレスをunlockしたかまで見える。
+
+    そもそも**Bitmessageプロトコル自身が「複数人で1つの受信箱」の答えを持っており、それがchan
+    (鍵の共有)である。サーバを共有するのではなく鍵を共有し、各自が自分のノードを走らせる。**
+    プロトコルの答えは「マルチユーザーにするな」だと読むべき。
+
+    したがって設計上は**「到達可能性」と「principalの数」を独立した軸として分けて扱う**。
+    onion公開のまま厳密にシングルprincipalを保つのが筋で、そのための具体策が項目41。
+
+    それでも本当にN人分必要になった場合の分割だけ書いておく。素朴な「1人1daemon」は、容量の
+    大半を占めるobject poolが**公開データで全員同じ**なため、N本立てるとネットワーク全体の
+    オブジェクトをN部持つことになり筋が悪い。取るなら:
+
+    - **共有側 = `infra/`**(network、object_sync、object pool、Tor)。秘密を一切持たない
+    - **ユーザーごと = `core/`**(keyring、trial_decrypt、messages.db、identity.db)。プロセスも分ける
+
+    §10のディレクトリ境界がそのままこの線に一致しているのは偶然ではないが、**ランタイムの境界は
+    まだ無い** — 復号が`object_sync.c`の中で走っているので、そこを「共有プールから読んで自分の
+    鍵で試す」形へ切り出す必要がある。(3)のUDS分離案と同じ継ぎ目。
+
+41. **web UI用のonionサービスをP2Pとは別に建て、v3 client authorizationを掛ける(未着手)**:
+    2026-09-19、項目40(8)の議論から分離してbacklogへ登録。項目40の他の部分と違い、これは
+    **web UIを作るかどうかと独立に価値がある実作業項目**(現状のJSON-RPC APIをonion経由で
+    叩きたくなった時点で同じ話になる)。
+
+    **なぜ分けるか(P2Pのonionサービスに別Portとして相乗りさせてはいけない理由):**
+
+    1. **P2Pのonionアドレスはネットワーク全体へ公開される。** `bm_object_sync_announce_onion_peer`
+       がonionpeer objectとして告知するので、全ノードが知る前提の値である。同一onionサービスの
+       別仮想Portに管理UIを置くと、**Bitmessageネットワークの全参加者が管理画面の所在を知る**
+       ことになる。これ単独で決定的。
+    2. **client authorizationはサービス単位であってポート単位ではない。** 同一サービスに掛けると
+       P2Pの到達性ごと壊れる(ピアはclient auth鍵を持っていない)。**サービスを分けることが
+       client authの前提条件**であり、この2つは技術的に不可分。
+    3. **ローテーションの独立性。** UI側のアドレスが漏れたと思ったとき、P2Pアドレスを変えずに
+       UIだけ捨てられる。P2P側を変えると再announceと到達性の作り直しが要る。
+    4. **信頼ゾーンが違う。** P2Pポートは設計上「不特定多数とワイヤープロトコルを喋る」もので、
+       UIポートは「自分だけとHTTPを喋る」もの。Torレイヤの識別子を共有する理由が無い。
+
+    コストはほぼ無い。`bm_tor_control_add_onion`は既に`(existing_private_key, virtual_port,
+    local_port)`を取って`PrivateKey`を返す形なので、2本目を呼んで鍵を別途永続化するだけで済む
+    (現状は`ADD_ONION %s Port=%d,127.0.0.1:%d`の1本のみ)。
+
+    **client authorizationの効果:** 鍵を持たないクライアントはサービス記述子を復号できず、
+    **接続すら張れない**。HTTPに到達する前のTor層で落ちるので、スキャナやDNS rebindingの類が
+    そもそも届かず、Basic認証と違ってブルートフォースの対象にもならない。「自分のスマホからも
+    見たい」は端末ごとにclient auth鍵を配る形になり、**マルチデバイスだがシングルprincipal**
+    という項目40(8)で欲しかった形にちょうど収まる。
+
+    **実装時の注意(要確認事項を含む):**
+
+    - 鍵形式は`man tor`で確認済み: `HiddenServiceDir`方式では`authorized_clients/*.auth`に
+      `descriptor:x25519:<base32-encoded-public-key>`を1行、x25519の生32バイトをbase32した値を
+      置く。少なくとも1つ読み込めた場合のみclient authが有効になる。
+    - **ただし`HiddenServiceDir`方式は採ってはいけない。** そのディレクトリは`/var/lib/tor/`以下に
+      あり、CLAUDE.mdの安全項目で「パーミッション・所有者・ACLを一切変更しない」と定めている
+      (過去に`setfacl`で稼働中のTorをクラッシュさせた実績がある)。したがって**制御ポート経由の
+      ADD_ONIONにclient auth引数を付ける経路を採る**。
+    - **ADD_ONIONでのclient auth指定の正確な構文(`ClientAuthV3=`および必要なFlags)は未検証。**
+      `man tor`はtorrc側のオプションしか記述しておらず、制御プロトコルの仕様(control-spec.txt)は
+      この環境に入っていない。実装前にtorspecの該当版を直接確認すること
+      (CLAUDE.md「推測だけで実装しない」)。使用中のtorのバージョンでサポートされているかの
+      確認も同時に行う。
+    - 静的torrc設定でonionを建てている利用者(`bitmessage.conf`の`[tor] onion_address`経路、
+      `main.c`参照)にはこの機能を自動適用できない。その場合はUI用サービスを自分でtorrcに
+      書いてもらい、bind先のローカルポートだけ設定で受け取る形になる。
