@@ -2319,6 +2319,30 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     Torの`info.log`と突き合わせられるよう、疑わしい兆候を検知した時点で監視間隔を
     5〜10分に短縮する運用とした。
 
+    **追記(2026-09-19、監視を縮小・保留)**: 2026-09-05の発覚から2週間、`/loop`による
+    daemon A本体の継続監視に加え、2026-09-15からは報告当時のコミット(`8b96ada`)を
+    別worktreeでビルドし直した専用検証インスタンス(`bitmessage-ghost-test`、独自の
+    onionアドレスを持ち実際に見知らぬpeerからのTor経由inbound接続を多数受けた)も
+    並行稼働させたが、目的の症状(`idle_sweep(handshake未完了)`のidle秒数が
+    `BM_HANDSHAKE_TIMEOUT_SECONDS`を大幅に超えてもなお切断されない実例)は
+    daemon A・検証インスタンスのいずれでも一度も再現しなかった。この過程で
+    副産物として以下が見つかり、既に対応済み: `BM_TOR_CONTROL`利用時の新規
+    インストールでseed_bootstrapが空振りするバグ(項目33)、`handle_object`が
+    新規object受信のたび同期的に`broadcast_inv`を呼ぶ経路の所要時間計測
+    (項目34、詰まったpeerによるnetwork_epoll_thread長時間占有を検証する目的で
+    追加、こちらも500ms以上のWARN発火は一度も無し)。一時「単一スレッドが
+    1接続の大量受信処理に占有される」という仮説を有力視しかけたが、これは
+    `idle_sweep_one`/`bm_network_epoll_thread`の調査用ログが両方とも
+    `!conn->handshake_complete`の時にしか出力されない条件付きログである
+    ことを見落とした誤読と判明し撤回した(ユーザー指摘)。
+
+    2週間ヒットゼロという実績と、専用検証インスタンスの維持コスト(masterが
+    動くたびの追従ビルド・再起動)を踏まえ、ユーザーと相談の上、専用検証
+    インスタンスは停止・worktreeも削除した。今後は`/loop`によるdaemon A本体の
+    通常監視(元々別目的でjournalctlを読んでいるため追加コストがほぼ無い)の中に
+    この症状の検知条件だけを残し、能動的な再現実験は打ち切る。根本原因は
+    依然として未解明のまま。再発したら都度対応する。
+
 24. **`received getdata`のnot_found大量発生・`sent getdata`に対する`received object`不足の
     調査(2026-09-07、進行中)**: ユーザーから「`received getdata: N item(s) requested,
     0 sent, N not found`が大量発生している、`sent getdata`に対する`received object`も
