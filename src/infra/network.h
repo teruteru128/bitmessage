@@ -10,6 +10,7 @@
  * bm_parse_result を使い分岐を明確化している(bm_network_handle_readable内)。
  */
 
+#include <pthread.h>
 #include <sqlite3.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,6 +19,7 @@
 #include "protocol.h"
 
 struct bm_peer_registry; /* peer_registry.h、循環includeを避けるため前方宣言のみ */
+struct bm_send_chunk;    /* 送信キューの1要素、network.cの内部構造 */
 
 /* §11 2026-08-23発覚のバグ修正: IPv4/IPv6文字列(INET6_ADDRSTRLEN=46で足りる)だけでなく、
  * v3 onionアドレス(56文字base32+".onion"=62文字)も切り捨てずに保持できるサイズ。
@@ -157,6 +159,23 @@ struct bm_fd_data
      * を記録するだけにし、実際の送信はbm_object_sync_flush_pending_verack_replies
      * (peer_connector_threadの既存1秒間隔ポーリングに相乗り)が行う。0なら保留無し。 */
     int64_t pending_verack_reply_at;
+    /* §11 2026-09-24 項目43: 接続ごとの送信キュー(bm_network_sendのdoc参照)。以下は全て
+     * send_lockで保護する。この接続へのwrite()は、どのスレッドからでも必ずsend_lockを
+     * 持った状態で、キュー先頭からノンブロッキングでのみ行う(複数スレッドの書き込みが
+     * ストリーム上で混ざらないようにするため)。bm_fd_data_newがmutexを初期化し、
+     * bm_fd_data_freeが残りのキューごと破棄する。calloc直後の全ゼロ状態(テストが
+     * bm_fd_data_newを使わず作るconn)もglibcのmutexとしては有効で、空キュー・epoll未登録を
+     * 表す。 */
+    pthread_mutex_t send_lock;
+    struct bm_send_chunk *send_head;
+    struct bm_send_chunk *send_tail;
+    size_t send_queued_bytes;
+    /* 最後に1バイト以上書けた時刻(キューが空の状態から積んだ時点も起点として更新する)。
+     * キューに残りがあるのにこれがBM_SEND_STALL_TIMEOUT_SECONDSより古ければ送信停滞とみなす */
+    int64_t last_write_progress;
+    int epfd;             /* bm_network_epoll_registerで登録したepoll fd */
+    int epoll_registered; /* 0なら未登録(EPOLLOUTの付け外しをしない) */
+    int send_out_armed;   /* EPOLLOUTを現在登録しているか */
 };
 
 /*
@@ -265,6 +284,44 @@ int bm_network_listen(const char *bind_address, int port);
 #define BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS 5
 int bm_network_write_all(int fd, const unsigned char *data, size_t len, int timeout_sec, char *reason_buf,
         size_t reason_buf_len);
+
+/*
+ * §11 2026-09-24 項目43: 送信キュー。
+ *
+ * 経緯: 以前は各所がbm_network_write_allで同期的に書いていた。そのため(1)受信側が
+ * 2秒読むのを止めるだけで「書き込み失敗」として切ってしまい、初期同期中の生きている
+ * 低速peerを誤って切っていた(handle_getdata、項目29)、(2)遅いpeerへの送信中は
+ * network_epoll_threadが全接続の処理を止めていた、(3)別スレッド(broadcast_inv等)が
+ * 同じソケットへ並行して書き、部分書き込みの途中に割り込むとメッセージが混ざりうる、
+ * という問題があった(DESIGN.md §11項目43)。PyBitmessage本家(network/advanceddispatcher.py、
+ * uploadthread.py)と同様に、接続ごとのキューへ積み、書けるだけノンブロッキングで書き、
+ * 残りはEPOLLOUTで送る方式にした。
+ *
+ * bm_network_send: dataをコピーしてconnの送信キュー末尾へ積み、その場でキュー先頭から
+ * 書けるだけ書く。どのスレッドから呼んでもよい(send_lockで直列化される)。ただし
+ * network_epoll_thread以外から呼ぶ場合は、connがclose_connectionでfreeされないよう
+ * reg->lockを持った状態で呼ぶこと(ロック順はreg->lock→send_lockの一方向)。書き切れな
+ * かった残りがあれば、epoll登録済みの接続ならEPOLLOUTを登録し、network_epoll_threadが
+ * 書けるようになり次第続きを送る。キューがBM_SEND_QUEUE_HARD_LIMIT_BYTESを超える場合と、
+ * 書き込みが致命的なエラー(EPIPE等)になった場合は-1を返し、pending_evictionを立てる
+ * (実際の切断はidle_sweep_oneが行う、項目27の方針)。それ以外は0。
+ *
+ * bm_network_flush: キュー先頭から書けるだけ書く(残りがあれば次のEPOLLOUTを待つ)。
+ * network_epoll_threadがEPOLLOUT受信時に呼ぶ。テストが送信の続きを進めるためにも使う。
+ * 致命的な書き込みエラーなら-1、それ以外は0。
+ *
+ * bm_network_epoll_register: connをEPOLLINで(キューに残りがあればEPOLLOUTも)epfdへ
+ * 登録し、以後キューの状態に応じてEPOLLOUTを付け外しできるようにする。epoll_ctlの
+ * 戻り値をそのまま返す。
+ *
+ * nowは「最後に書けた時刻」の記録に使う(送信停滞の判定、bm_network_idle_sweep参照)。
+ */
+#define BM_SEND_STALL_TIMEOUT_SECONDS 120
+#define BM_SEND_QUEUE_HARD_LIMIT_BYTES (16u * 1024u * 1024u)
+int bm_network_send(struct bm_fd_data *conn, const unsigned char *data, size_t len, int64_t now);
+int bm_network_flush(struct bm_fd_data *conn, int64_t now);
+size_t bm_network_queued_bytes(struct bm_fd_data *conn);
+int bm_network_epoll_register(int epfd, struct bm_fd_data *conn);
 
 /*
  * §11 2026-08-23 backlog項目5: プロセス起動時からの送受信バイト数の全体累積

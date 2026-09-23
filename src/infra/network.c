@@ -106,8 +106,19 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
         free(data);
         return NULL;
     }
+    pthread_mutex_init(&data->send_lock, NULL);
     return data;
 }
+
+/* §11 2026-09-24 項目43: 送信キューの1要素(network.hのbm_network_sendのdoc参照)。
+ * off=このchunkのうち既に送信済みのバイト数。 */
+struct bm_send_chunk
+{
+    struct bm_send_chunk *next;
+    size_t len;
+    size_t off;
+    unsigned char data[];
+};
 
 void bm_fd_data_free(struct bm_fd_data *data)
 {
@@ -115,6 +126,14 @@ void bm_fd_data_free(struct bm_fd_data *data)
     {
         return;
     }
+    struct bm_send_chunk *c = data->send_head;
+    while (c != NULL)
+    {
+        struct bm_send_chunk *next = c->next;
+        free(c);
+        c = next;
+    }
+    pthread_mutex_destroy(&data->send_lock);
     free(data->recv_buffer);
     free(data->user_agent);
     free(data->pending_inv_hashes);
@@ -224,6 +243,180 @@ int bm_network_write_all(int fd, const unsigned char *data, size_t len, int time
     }
     net_stats_add_sent((uint64_t)len);
     return 0;
+}
+
+/* §11 2026-09-24 項目43: キューの状態に合わせてEPOLLOUTを付け外しする。send_lockを持った
+ * 状態で呼ぶこと。付け外しを必ずsend_lock下で行うことで、「空になったので外した直後に
+ * 別スレッドが積み、EPOLLOUTが外れたまま残る」競合を防ぐ。 */
+static void update_out_interest_locked(struct bm_fd_data *conn)
+{
+    int want = conn->send_head != NULL;
+    if (!conn->epoll_registered || want == conn->send_out_armed)
+    {
+        return;
+    }
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | (want ? EPOLLOUT : 0);
+    ev.data.ptr = conn;
+    if (epoll_ctl(conn->epfd, EPOLL_CTL_MOD, conn->fd, &ev) == 0)
+    {
+        conn->send_out_armed = want;
+    }
+    else
+    {
+        bm_log_warn("[network] epoll_ctl MOD (fd=%d, EPOLLOUT=%d): %s\n", conn->fd, want, strerror(errno));
+    }
+}
+
+/* send_lockを持った状態で呼ぶ。キュー先頭から書けるだけ書く。MSG_DONTWAITでソケット自体の
+ * O_NONBLOCK設定に関係なくブロックしない。MSG_NOSIGNALは相手が切断済みの場合にSIGPIPEで
+ * プロセスが落ちないようにするため。 */
+static int flush_locked(struct bm_fd_data *conn, int64_t now, char *reason_buf, size_t reason_buf_len)
+{
+    while (conn->send_head != NULL)
+    {
+        struct bm_send_chunk *c = conn->send_head;
+        ssize_t n = send(conn->fd, c->data + c->off, c->len - c->off, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0)
+        {
+            c->off += (size_t)n;
+            conn->send_queued_bytes -= (size_t)n;
+            conn->bytes_sent += (uint64_t)n;
+            net_stats_add_sent((uint64_t)n);
+            conn->last_write_progress = now;
+            if (c->off == c->len)
+            {
+                conn->send_head = c->next;
+                if (conn->send_head == NULL)
+                {
+                    conn->send_tail = NULL;
+                }
+                free(c);
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            break;
+        }
+        if (reason_buf != NULL)
+        {
+            snprintf(reason_buf, reason_buf_len, "%s", n == 0 ? "wrote 0 bytes" : strerror(errno));
+        }
+        return -1;
+    }
+    update_out_interest_locked(conn);
+    return 0;
+}
+
+int bm_network_send(struct bm_fd_data *conn, const unsigned char *data, size_t len, int64_t now)
+{
+    if (len == 0)
+    {
+        return 0;
+    }
+    char reason[128] = {0};
+    int rc = 0;
+    pthread_mutex_lock(&conn->send_lock);
+    if (conn->send_queued_bytes + len > BM_SEND_QUEUE_HARD_LIMIT_BYTES)
+    {
+        size_t queued = conn->send_queued_bytes;
+        conn->pending_eviction = 1;
+        pthread_mutex_unlock(&conn->send_lock);
+        bm_log_warn("[network] send queue limit exceeded (fd=%d, %zu byte(s) queued + %zu), evicting\n", conn->fd,
+                queued, len);
+        return -1;
+    }
+    struct bm_send_chunk *c = malloc(sizeof(*c) + len);
+    if (c == NULL)
+    {
+        pthread_mutex_unlock(&conn->send_lock);
+        return -1;
+    }
+    c->next = NULL;
+    c->len = len;
+    c->off = 0;
+    memcpy(c->data, data, len);
+    if (conn->send_tail == NULL)
+    {
+        conn->send_head = c;
+        conn->last_write_progress = now; /* 空から積んだ時点を停滞判定の起点にする */
+    }
+    else
+    {
+        conn->send_tail->next = c;
+    }
+    conn->send_tail = c;
+    conn->send_queued_bytes += len;
+    if (flush_locked(conn, now, reason, sizeof(reason)) != 0)
+    {
+        conn->pending_eviction = 1;
+        rc = -1;
+    }
+    pthread_mutex_unlock(&conn->send_lock);
+    if (rc != 0)
+    {
+        bm_log_warn("[network] send failed (fd=%d): %s, evicting\n", conn->fd, reason);
+    }
+    return rc;
+}
+
+int bm_network_flush(struct bm_fd_data *conn, int64_t now)
+{
+    char reason[128] = {0};
+    pthread_mutex_lock(&conn->send_lock);
+    int rc = flush_locked(conn, now, reason, sizeof(reason));
+    pthread_mutex_unlock(&conn->send_lock);
+    if (rc != 0)
+    {
+        bm_log_warn("[network] send failed (fd=%d): %s\n", conn->fd, reason);
+    }
+    return rc;
+}
+
+size_t bm_network_queued_bytes(struct bm_fd_data *conn)
+{
+    pthread_mutex_lock(&conn->send_lock);
+    size_t n = conn->send_queued_bytes;
+    pthread_mutex_unlock(&conn->send_lock);
+    return n;
+}
+
+int bm_network_epoll_register(int epfd, struct bm_fd_data *conn)
+{
+    pthread_mutex_lock(&conn->send_lock);
+    int want_out = conn->send_head != NULL;
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | (want_out ? EPOLLOUT : 0);
+    ev.data.ptr = conn;
+    int rc = epoll_ctl(epfd, EPOLL_CTL_ADD, conn->fd, &ev);
+    if (rc == 0)
+    {
+        conn->epfd = epfd;
+        conn->epoll_registered = 1;
+        conn->send_out_armed = want_out;
+    }
+    pthread_mutex_unlock(&conn->send_lock);
+    return rc;
+}
+
+/* 送信停滞の判定(bm_network_idle_sweep用)。停滞していれば1を返し、ログ用にキュー量と
+ * 最終進捗からの経過秒数を返す */
+static int send_stalled(struct bm_fd_data *conn, int64_t now, size_t *out_queued, int64_t *out_since)
+{
+    pthread_mutex_lock(&conn->send_lock);
+    size_t queued = conn->send_queued_bytes;
+    int64_t since = now - conn->last_write_progress;
+    pthread_mutex_unlock(&conn->send_lock);
+    *out_queued = queued;
+    *out_since = since;
+    return queued > 0 && since > BM_SEND_STALL_TIMEOUT_SECONDS;
 }
 
 /* §11 2026-08-23 backlog項目5: connを取るようにした(以前はint fdのみ)。connの
@@ -519,10 +712,7 @@ void bm_network_handle_accept(struct bm_epoll_thread_args *args, struct bm_fd_da
             continue;
         }
 
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.ptr = conn;
-        if (epoll_ctl(args->epfd, EPOLL_CTL_ADD, client_fd, &ev) != 0)
+        if (bm_network_epoll_register(args->epfd, conn) != 0)
         {
             bm_log_warn("[network] epoll_ctl (inbound accept): %s\n", strerror(errno));
             bm_fd_data_free(conn);
@@ -698,6 +888,20 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
         close_connection(ctx->args, conn);
         return;
     }
+    /* §11 2026-09-24 項目43: 送るものがあるのにBM_SEND_STALL_TIMEOUT_SECONDSの間1バイトも
+     * 書けていない接続だけを切る。以前の「2秒書けなければ切る」(項目29等)は、初期同期中で
+     * 受信が追いつかないだけの生きている低速peerまで切っていた。沈黙死した相手は書き込みが
+     * 一切進まないので、この判定でも検出できる。 */
+    size_t stalled_queued = 0;
+    int64_t stalled_since = 0;
+    if (send_stalled(conn, ctx->now, &stalled_queued, &stalled_since))
+    {
+        bm_log_warn("[network] closing %s connection (fd=%d): send stalled, %zu byte(s) queued with no progress "
+                    "for %" PRId64 "s\n",
+                conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd, stalled_queued, stalled_since);
+        close_connection(ctx->args, conn);
+        return;
+    }
     /* §11 2026-08-26: big invの後続チャンク送信(bm_network_begin_big_inv参照)。
      * handshake_completeやidle timeoutの判定より先に行うことで、詰まったコネクションの
      * 判定と無関係に独立して動く(pending_inv_hashesはverack受信後にしか立たないため
@@ -801,6 +1005,22 @@ void *bm_network_epoll_thread(void *arg)
             {
                 bm_log_debug2("[network] epoll_wait event: fd=%d %s events=0x%x\n", conn->fd,
                         conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", events[i].events);
+            }
+            /* §11 2026-09-24 項目43: 送信キューの続き(bm_network_sendのdoc参照)。書き込みの
+             * 致命的エラーならこの場で切り、同じconnの読み取り処理には進まない(二重close防止)。 */
+            if (events[i].events & EPOLLOUT)
+            {
+                if (bm_network_flush(conn, now) != 0)
+                {
+                    bm_log_warn("[network] closing %s connection (fd=%d): write error\n",
+                            conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd);
+                    close_connection(args, conn);
+                    continue;
+                }
+            }
+            if (!(events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)))
+            {
+                continue;
             }
             int rc = bm_network_handle_readable(conn, args->handler, args->user_data);
             if (rc != 0)

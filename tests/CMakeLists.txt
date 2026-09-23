@@ -116,6 +116,10 @@ add_executable(test_peer_registry_proxy test_peer_registry_proxy.c)
 target_link_libraries(test_peer_registry_proxy PRIVATE bm_core bm_infra)
 add_test(NAME peer_registry_proxy COMMAND test_peer_registry_proxy)
 
+add_executable(test_network_send_queue test_network_send_queue.c)
+target_link_libraries(test_network_send_queue PRIVATE bm_core bm_infra bm_common Threads::Threads)
+add_test(NAME network_send_queue COMMAND test_network_send_queue)
+
 add_executable(test_peer_registry_evict test_peer_registry_evict.c)
 target_link_libraries(test_peer_registry_evict PRIVATE bm_core bm_infra)
 add_test(NAME peer_registry_evict COMMAND test_peer_registry_evict)
