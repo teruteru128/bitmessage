@@ -199,6 +199,19 @@ void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, 
 #define BM_VERACK_REPLY_DELAY_SECONDS 5
 
 /*
+ * §11 2026-09-24 項目43: getdataへの応答の送り方(PyBitmessage本家network/uploadthread.pyと同じ値)。
+ * handle_getdataは要求hashをconn->upload_pendingへ積むだけにし、この関数が、送信キューが
+ * BM_UPLOAD_REFILL_THRESHOLD_BYTES(本家のmaxBufSize=2MB)を下回っている間だけobjectを積む
+ * (1件ごとにしきい値を確かめるので、キューはしきい値+object1個分までに収まる。本家は1秒ごとの
+ * 巡回スレッドなので1巡あたりRandomTrackingDict.maxPending=10件ずつ積むが、こちらはEPOLLOUT
+ * のたびに呼ばれるのでまとめる必要がない)。
+ * network_epoll_threadから、handle_getdata直後・EPOLLOUT処理後・idle_sweep時に呼ばれる
+ * (bm_epoll_thread_args.refill、user_dataはstruct bm_object_sync_ctx *)。
+ */
+#define BM_UPLOAD_REFILL_THRESHOLD_BYTES (2u * 1024u * 1024u)
+void bm_object_sync_refill_uploads(struct bm_fd_data *conn, int64_t now, void *user_data);
+
+/*
  * §11 2026-08-26: bm_object_sync_dispatchのverackハンドラは、BM_VERACK_REPLY_DELAY_
  * SECONDS秒待ってから送るべく即座にはaddr/big invを送らず、conn->pending_verack_
  * reply_at(network.hのdoc参照)へ「いつ送るか」を記録するだけにする。この関数は

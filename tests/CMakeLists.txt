@@ -72,6 +72,10 @@ add_executable(test_object_sync test_object_sync.c)
 target_link_libraries(test_object_sync PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME object_sync COMMAND test_object_sync)
 
+add_executable(test_getdata_upload test_getdata_upload.c)
+target_link_libraries(test_getdata_upload PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME getdata_upload COMMAND test_getdata_upload)
+
 add_executable(test_pow_engine test_pow_engine.c)
 target_link_libraries(test_pow_engine PRIVATE bm_pow bm_common OpenSSL::Crypto)
 add_test(NAME pow_engine COMMAND test_pow_engine)

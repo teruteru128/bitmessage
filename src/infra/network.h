@@ -176,6 +176,18 @@ struct bm_fd_data
     int epfd;             /* bm_network_epoll_registerで登録したepoll fd */
     int epoll_registered; /* 0なら未登録(EPOLLOUTの付け外しをしない) */
     int send_out_armed;   /* EPOLLOUTを現在登録しているか */
+    /* §11 2026-09-24 項目43: getdataで要求されたがまだ送信キューへ積んでいないobject hashの
+     * FIFO(PyBitmessage本家のpendingUpload相当)。[upload_pending_head, +upload_pending_count)が
+     * 未処理。object_sync.cのhandle_getdataが積み、bm_object_sync_refill_uploadsが送信キューの
+     * 空きに合わせて少しずつobjectへ変えて積む。どちらもnetwork_epoll_threadからしか呼ばれない
+     * ため排他制御はしない。upload_sent/upload_not_foundは保留が空になった時点でログに出して
+     * 0へ戻す集計用。bm_fd_data_freeでfreeする。 */
+    unsigned char (*upload_pending)[32];
+    size_t upload_pending_head;
+    size_t upload_pending_count;
+    size_t upload_pending_cap;
+    size_t upload_sent;
+    size_t upload_not_found;
 };
 
 /*
@@ -372,6 +384,9 @@ struct bm_epoll_thread_args
      *   1秒ループから呼んでいたが、その結果pending_inv_hashes等をnetwork_epoll_threadと並行に
      *   触り、ソケットへも別スレッドから直接書いていた。 */
     void (*on_sweep)(struct bm_peer_registry *registry, int64_t now, void *user_data);
+    /* refill: 接続ごとに、EPOLLOUTで送信キューの続きを送った直後と、idle_sweepのたびに呼ぶ。
+     *   getdataの保留分を送信キューの空きに合わせて積む(bm_object_sync_refill_uploads)。 */
+    void (*refill)(struct bm_fd_data *conn, int64_t now, void *user_data);
 };
 
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。

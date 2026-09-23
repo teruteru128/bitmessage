@@ -140,6 +140,7 @@ void bm_fd_data_free(struct bm_fd_data *data)
     free(data->recv_buffer);
     free(data->user_agent);
     free(data->pending_inv_hashes);
+    free(data->upload_pending);
     free(data);
 }
 
@@ -918,6 +919,12 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
     {
         send_inv_chunk(conn, ctx->now);
     }
+    /* §11 2026-09-24 項目43: getdataの保留分の補充。通常はEPOLLOUT処理の直後に補充されるが、
+     * 何らかの理由でキューが空のまま保留が残った場合の取りこぼし防止として、ここでも呼ぶ。 */
+    if (ctx->args->refill != NULL && conn->upload_pending_count > 0)
+    {
+        ctx->args->refill(conn, ctx->now, ctx->args->user_data);
+    }
     int64_t idle_seconds = ctx->now - conn->last_activity;
 
     if (!conn->handshake_complete)
@@ -1024,6 +1031,11 @@ void *bm_network_epoll_thread(void *arg)
                             conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd);
                     close_connection(args, conn);
                     continue;
+                }
+                /* 送信キューに空きができたので、getdataの保留分を補充する */
+                if (args->refill != NULL && conn->upload_pending_count > 0)
+                {
+                    args->refill(conn, now, args->user_data);
                 }
             }
             if (!(events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)))

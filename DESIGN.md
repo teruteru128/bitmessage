@@ -3567,7 +3567,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     (`stopDownloadingObject(..., forwardAnyway=True)`の後、例外を再送出せず保存・invQueue投入へ
     進む)。MiNode-Refined 0.3.1は同じ閾値で早期returnし中継もしない。うちは型別検査を持たず
     保存・中継するので、中継挙動としては本家に近い。型別検査の追加は不要と判断した。
-43. **送信を接続ごとのキュー+EPOLLOUT駆動に作り替える(設計、未実装)**: 2026-09-24、ユーザー依頼。
+43. **送信を接続ごとのキュー+EPOLLOUT駆動に作り替える(実装済み・未デプロイ)**: 2026-09-24、ユーザー依頼。
     項目29のgetdata能動除去が、本来の目的(沈黙死した相手の検出)ではなく、初期同期中の
     **生きている低速peer**を切っていたことが運用ログから分かった(2026-09-21〜23の除去は
     すべて同じパターン: 新規inboundのPyBitmessage 0.6.3.2 → こちらが約13,600件のbig inv →
@@ -3690,3 +3690,33 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       全件届くこと
     - キュー上限を超えて積もうとした接続に`pending_eviction`が立つこと
     - 既存テスト全件の回帰
+
+    **実装メモ(2026-09-24)**: 4段階で実装した(コミット40b4e58・f44e31c・a600284と、getdata
+    補充方式のコミット)。定数はユーザーと合意した案どおり(停滞120秒、キュー上限16MiB、補充
+    しきい値2MiB)。設計から変えた・追加した点:
+    - **補充は1件ごとにしきい値を確かめる**: 当初は本家に合わせて10件ずつ積む案だったが、
+      10件単位でしか確かめないとしきい値を最大10件分はみ出す(テストで検出)。本家が10件ずつ
+      なのはUploadThreadが1秒ごとに巡回する別スレッドだからで、こちらはEPOLLOUTのたびに補充
+      するのでまとめる必要がない。そのため`BM_UPLOAD_BATCH_ITEMS`は作らず、キューの量が
+      しきい値+object1個分までに収まるようにした。
+    - **epoll_waitのタイムアウト(`BM_IDLE_SWEEP_INTERVAL_MS`)を5秒から1秒へ縮めた**:
+      verack応答の遅延送信をpeer_connector_threadの1秒ループからnetwork_epoll_threadへ
+      移したため、以前と同じ1秒刻みで回すため。
+    - **big invの後続chunkは送信キューが空のときだけ積む**: 読むのが遅い相手のキューへ、
+      1秒間隔だけを頼りにinvを溜め込まないため。
+    - `bm_reply_verack`/`bm_reply_pong`/`bm_post_version`/`bm_peer_registry_broadcast_inv`は
+      時刻を引数で受け取るようにした。`bm_post_version`はfdではなくconnを取る。
+    - **ログ文言の変化**(運用監視の目印が変わる): 「failed to send object for getdata ...
+      evicting」は出なくなる。代わりに、送信停滞での切断は「closing ... connection (fd=N):
+      send stalled, X byte(s) queued with no progress for Ns」、キュー上限超過は「send queue
+      limit exceeded (fd=N, ...), evicting」、致命的な書き込みエラーは「send failed (fd=N): ...,
+      evicting」。getdataは受信時に「received getdata: N item(s) requested, M queued for upload
+      (P pending)」、積み終えた時点で「getdata upload finished: S sent, F not found」を出す。
+    - **残した課題**: `bm_peer_registry_evict_if_current`は本体からは呼ばれなくなった
+      (broadcast_invの送信失敗はbm_network_sendがpending_evictionを立てるため)。専用テスト
+      (test_peer_registry_evict)があるので今回は残した。削除するかは別途判断する。
+
+    テスト: tests/test_network_send_queue.c(送信キュー自体、別スレッドのbroadcast_invとの
+    混在防止を含む)、tests/test_getdata_upload.c(約6MBのgetdataでもキューがしきい値+1個分に
+    収まり、読まない間も切らず、最終的に要求順で全件届き、持っていないhashは飛ばす)。
+    ctest 51件全通過。デプロイは運用中のノードで一通り動作を確かめてから。

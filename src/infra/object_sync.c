@@ -900,6 +900,115 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
     free(missing);
 }
 
+/* §11 2026-09-24 項目43: conn->upload_pending(network.hのdoc参照)の末尾へn件追加する。
+ * 先頭側に処理済みの空きがあれば詰めてから、足りなければ伸ばす。network_epoll_threadからのみ
+ * 呼ばれる。 */
+static int upload_pending_append(struct bm_fd_data *conn, unsigned char (*items)[32], size_t n)
+{
+    if (n == 0)
+    {
+        return 0;
+    }
+    if (conn->upload_pending_head > 0
+        && conn->upload_pending_head + conn->upload_pending_count + n > conn->upload_pending_cap)
+    {
+        memmove(conn->upload_pending, conn->upload_pending + conn->upload_pending_head,
+                conn->upload_pending_count * sizeof(*conn->upload_pending));
+        conn->upload_pending_head = 0;
+    }
+    size_t need = conn->upload_pending_head + conn->upload_pending_count + n;
+    if (need > conn->upload_pending_cap)
+    {
+        size_t cap = conn->upload_pending_cap > 0 ? conn->upload_pending_cap : 64;
+        while (cap < need)
+        {
+            cap *= 2;
+        }
+        unsigned char (*grown)[32] = realloc(conn->upload_pending, cap * sizeof(*grown));
+        if (grown == NULL)
+        {
+            return -1;
+        }
+        conn->upload_pending = grown;
+        conn->upload_pending_cap = cap;
+    }
+    memcpy(conn->upload_pending + conn->upload_pending_head + conn->upload_pending_count, items,
+           n * sizeof(*items));
+    conn->upload_pending_count += n;
+    return 0;
+}
+
+void bm_object_sync_refill_uploads(struct bm_fd_data *conn, int64_t now, void *user_data)
+{
+    struct bm_object_sync_ctx *ctx = user_data;
+    if (ctx == NULL || conn->upload_pending_count == 0)
+    {
+        return;
+    }
+    /* PyBitmessage本家のUploadThread(network/uploadthread.py)と同じく、送信キューが
+     * BM_UPLOAD_REFILL_THRESHOLD_BYTES(本家のmaxBufSize=2MB)を下回っている間だけobjectを積む。
+     * 相手の読む速さに合わせて少しずつ送るので、遅い相手でもキューが際限なく膨らまず、切る
+     * 必要もない。本家は1秒ごとに巡回する別スレッドなので1巡あたりmaxPending=10件ずつ積むが、
+     * こちらはEPOLLOUTのたびに呼ばれるため、1件ごとにしきい値を確かめる(キューの量が
+     * しきい値+object1個分までに収まる)。 */
+    while (conn->upload_pending_count > 0 && !conn->pending_eviction
+           && bm_network_queued_bytes(conn) < BM_UPLOAD_REFILL_THRESHOLD_BYTES)
+    {
+        unsigned char hash[32];
+        memcpy(hash, conn->upload_pending[conn->upload_pending_head], 32);
+        conn->upload_pending_head++;
+        conn->upload_pending_count--;
+
+        unsigned char *payload = NULL;
+        size_t payload_len = 0;
+        if (bm_object_store_get(ctx->object_pool_db, hash, &payload, &payload_len) != 0)
+        {
+            conn->upload_not_found++;
+            /* §11 2026-09-07: not_found率の原因調査用。hash+要求元をログに残し、
+             * handle_invのsent getdata item/handle_objectのreceived objectとhash文字列で
+             * 突き合わせられるようにする。§11 2026-09-12: 8段階化に伴いDEBUG3。 */
+            char hex[65];
+            hash_hex(hash, hex);
+            char requester_ip[BM_PEER_IP_STRLEN];
+            int requester_port = 0;
+            bm_network_resolve_peer_ip_port(conn, requester_ip, sizeof(requester_ip), &requester_port);
+            bm_log_debug3("[object_sync] getdata not found: hash=%s requester=%s:%d fd=%d\n", hex, requester_ip,
+                         requester_port, conn->fd);
+            continue; /* 持っていない要求は黙って無視(切断まではしない) */
+        }
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_packet("object", payload, payload_len, &packet_len);
+        free(payload);
+        if (packet == NULL)
+        {
+            continue;
+        }
+        /* 失敗するのはキュー上限超過か致命的な書き込みエラーのときだけで、どちらも
+         * bm_network_sendがpending_evictionを立て(実際の切断はidle_sweep_one)、理由も
+         * ログに出している。以後のitemも積めないので、残りの保留は捨てる。 */
+        int rc = bm_network_send(conn, packet, packet_len, now);
+        free(packet);
+        if (rc != 0)
+        {
+            conn->upload_pending_count = 0;
+            break;
+        }
+        conn->upload_sent++;
+    }
+    if (conn->upload_pending_count == 0)
+    {
+        if (!conn->pending_eviction && (conn->upload_sent > 0 || conn->upload_not_found > 0))
+        {
+            /* 要求された分を積み終えた時点で1行。受信件数はhandle_getdataのログにある */
+            bm_log_debug("[object_sync] getdata upload finished: %zu sent, %zu not found (fd=%d)\n", conn->upload_sent,
+                    conn->upload_not_found, conn->fd);
+        }
+        conn->upload_sent = 0;
+        conn->upload_not_found = 0;
+        conn->upload_pending_head = 0;
+    }
+}
+
 static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, const struct bm_message *msg)
 {
     struct bm_inventory_message inv_msg;
@@ -915,58 +1024,37 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         return;
     }
 
-    uint64_t requested_count = inv_msg.count;
-    size_t sent_count = 0;
-    size_t not_found_count = 0;
-    /* §11 2026-09-07: not_found率63.9%(journalctl実測)の原因調査用。hash+要求元をログに
-     * 残し、handle_invのsent getdata item/handle_objectのreceived objectとhash文字列で
-     * 突き合わせられるようにする(このブロック追加の経緯は上のsent getdata item参照)。 */
-    char requester_ip[BM_PEER_IP_STRLEN];
-    int requester_port = 0;
-    bm_network_resolve_peer_ip_port(conn, requester_ip, sizeof(requester_ip), &requester_port);
-    for (uint64_t i = 0; i < inv_msg.count; i++)
+    /* §11 2026-09-24 項目43: 以前は要求された全objectをこの場で送っていた(同期書き込みで、
+     * 受信側が2秒読まないだけで接続を切っていた。初期同期中の生きている低速peerを繰り返し
+     * 切っていたことが運用ログで判明、DESIGN.md §11項目43)。PyBitmessage本家
+     * (network/bmproto.pyのbm_command_getdata)と同じく、要求hashを保留へ積むだけにし、
+     * 実際の送信はbm_object_sync_refill_uploadsが送信キューの空きに合わせて行う。
+     * 保留は接続あたりBM_MAX_INVENTORY_ITEMS件まで(溢れた分は捨てる。相手は届かなかった
+     * objectを後で他のpeerへ要求し直す)。 */
+    size_t pending_before = conn->upload_pending_count;
+    size_t room = pending_before < BM_MAX_INVENTORY_ITEMS ? BM_MAX_INVENTORY_ITEMS - pending_before : 0;
+    size_t accepted = inv_msg.count < room ? (size_t)inv_msg.count : room;
+    if (upload_pending_append(conn, inv_msg.items, accepted) != 0)
     {
-        unsigned char *payload = NULL;
-        size_t payload_len = 0;
-        if (bm_object_store_get(ctx->object_pool_db, inv_msg.items[i], &payload, &payload_len) != 0)
-        {
-            not_found_count++;
-            char hex[65];
-            hash_hex(inv_msg.items[i], hex);
-            /* §11 2026-09-12: 8段階化に伴う移行。sent getdata itemと対になる調査用の
-             * hash単位ログなので同じくDEBUG3にした。 */
-            bm_log_debug3("[object_sync] getdata not found: hash=%s requester=%s:%d fd=%d\n", hex, requester_ip,
-                         requester_port, conn->fd);
-            continue; /* 持っていない要求は黙って無視(切断まではしない) */
-        }
-        size_t packet_len = 0;
-        unsigned char *packet = bm_create_packet("object", payload, payload_len, &packet_len);
-        free(payload);
-        if (packet != NULL)
-        {
-            /* §11 2026-09-24 項目43: 送信キュー経由にした。失敗するのはキュー上限超過か
-             * 致命的な書き込みエラーのときだけで、どちらもbm_network_sendがpending_eviction
-             * を立て(実際の切断はidle_sweep_one)、理由もログに出している。以後のitemも
-             * 積めないのでループを抜ける(2026-09-12 05:43に観測した失敗ログの連発を防ぐ
-             * 項目29の方針を維持)。 */
-            if (bm_network_send(conn, packet, packet_len, (int64_t)time(NULL)) != 0)
-            {
-                free(packet);
-                break;
-            }
-            sent_count++;
-            free(packet);
-        }
+        accepted = 0;
     }
+    uint64_t requested_count = inv_msg.count;
     bm_free_inventory_message(&inv_msg);
 
     /* §11 2026-08-23: inv受信の正常系ログ追加と同じ理由(ユーザーの指摘: 「外部から
-     * getdataを1回でも受信したか、ログから確認できない」)。受信件数・実際に送れた件数・
-     * 持っていなかった件数を可視化する。 */
-    /* §11 2026-09-12: 8段階化に伴う移行。getdata受信1回につき1行のサマリなので
-     * 無番号のDEBUGにした。 */
-    bm_log_debug("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu sent, %zu not found\n",
-            requested_count, sent_count, not_found_count);
+     * getdataを1回でも受信したか、ログから確認できない」)。§11 2026-09-12: 8段階化に伴い
+     * 無番号のDEBUG。§11 2026-09-24 項目43: 送信は後から少しずつ行うため、ここでは受けた件数と
+     * 保留の件数を出し、送れた件数・持っていなかった件数は積み終えた時点で
+     * bm_object_sync_refill_uploadsが出す。 */
+    bm_log_debug("[object_sync] received getdata: %" PRIu64 " item(s) requested, %zu queued for upload "
+                 "(%zu pending)\n",
+            requested_count, accepted, conn->upload_pending_count);
+    if (accepted < requested_count)
+    {
+        bm_log_warn("[object_sync] getdata: dropped %" PRIu64 " item(s), upload backlog limit (%d) reached (fd=%d)\n",
+                requested_count - accepted, BM_MAX_INVENTORY_ITEMS, conn->fd);
+    }
+    bm_object_sync_refill_uploads(conn, (int64_t)time(NULL), ctx);
 }
 
 /*
