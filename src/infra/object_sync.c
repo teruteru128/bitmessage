@@ -165,7 +165,7 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
                                             object, object_len, (int64_t)hdr.expires_time, now);
                     if (ctx->registry != NULL)
                     {
-                        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+                        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
                     }
                 }
             }
@@ -263,7 +263,7 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
                             msg->payload, msg->length, (int64_t)hdr.expires_time, now);
     if (!already_known && ctx->registry != NULL)
     {
-        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, except);
+        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, except, now);
     }
     bm_free_message(msg);
 }
@@ -330,7 +330,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     {
         if (ctx->registry != NULL)
         {
-            bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL);
+            bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL, now);
         }
         /* §11 2026-09-12: 8段階化に伴う移行。getpubkey応答1回につき1行のサマリなので
          * 無番号のDEBUG(常時見たい詳細情報)にした。 */
@@ -382,7 +382,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         bm_pubkey_cache_set_self_response(ctx->identity_db, ripe, hash, (int64_t)expires_time);
         if (ctx->registry != NULL)
         {
-            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
         }
         bm_log_info("[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
                 address_version);
@@ -540,7 +540,7 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
                                 (int64_t)expires_time, now);
         if (ctx->registry != NULL)
         {
-            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL);
+            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
         }
         bm_log_info("[object_sync] announced our onion peer: %s:%d\n", onion_address, port);
     }
@@ -685,7 +685,7 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
                             msg->payload, msg->length, (int64_t)hdr.expires_time, now0);
     if (ctx->registry != NULL)
     {
-        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, conn);
+        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, conn, now0);
     }
     /* §11 2026-08-25: これまでmsg(複合成功時)/pubkey(cache成功時)以外の型
      * (getpubkey/broadcast/onionpeer/ack、あるいは自分宛でなかったmsg/pubkey)は
@@ -1188,16 +1188,24 @@ void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx,
     {
         return;
     }
-    /* §11 2026-08-26: この関数はpeer_connector_thread(network_epoll_threadとは別スレッド)
-     * から呼ばれる。bm_peer_registry_for_eachは「ロックを早期解放し、callbackはロック
-     * 解放後に呼ぶ」設計で、これはnetwork_epoll_threadという単一スレッドの中でのみ
-     * 呼ばれる前提(peer_registry.hのdoc参照)。別スレッドから使うと、callback実行中に
-     * network_epoll_thread側でconnがclose_connection経由でfree()されるuse-after-freeを
-     * 起こしうるため、代わりにロックを保持したまま呼ぶbm_peer_registry_for_each_locked
-     * を使う(flush_verack_reply_oneはregistryの他の関数を一切呼ばないため安全、
-     * peer_registry.hのdoc参照)。 */
+    /* §11 2026-08-26: 以前はpeer_connector_threadから呼ばれていたため、callback実行中に
+     * network_epoll_thread側でconnがfree()されないよう、ロックを保持したまま呼ぶ
+     * bm_peer_registry_for_each_lockedを使っている(flush_verack_reply_oneはregistryの
+     * 他の関数を一切呼ばないため安全、peer_registry.hのdoc参照)。
+     * §11 2026-09-24 項目43: 呼び出し元はnetwork_epoll_threadに変わった(object_sync.hの
+     * doc参照)が、送信キューへ積む処理はreg->lock→send_lockの順でロックを取る前提
+     * (network.hのbm_network_sendのdoc参照)なので、ロックを保持したままの呼び出しを続ける。 */
     struct flush_verack_reply_ctx fctx = {ctx, now};
     bm_peer_registry_for_each_locked(registry, flush_verack_reply_one, &fctx);
+}
+
+void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t now, void *user_data)
+{
+    if (user_data == NULL)
+    {
+        return;
+    }
+    bm_object_sync_flush_pending_verack_replies(user_data, registry, now);
 }
 
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)
@@ -1505,7 +1513,7 @@ void *bm_object_sync_broadcast_thread(void *arg)
                                     item->object, item->object_len, (int64_t)hdr.expires_time, now);
             if (!already_known && args->ctx->registry != NULL)
             {
-                bm_peer_registry_broadcast_inv(args->ctx->registry, &hash, 1, NULL);
+                bm_peer_registry_broadcast_inv(args->ctx->registry, &hash, 1, NULL, now);
                 bm_log_info("[object_sync] broadcasted locally-originated object to peers\n");
             }
         }

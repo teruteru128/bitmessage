@@ -391,7 +391,7 @@ int bm_dandelion_expire_and_refluff(struct bm_peer_registry *registry, sqlite3 *
         {
             continue;
         }
-        bm_peer_registry_broadcast_inv(registry, &to_fluff[i], 1, NULL);
+        bm_peer_registry_broadcast_inv(registry, &to_fluff[i], 1, NULL, now);
     }
     return (int)to_fluff_count;
 }

@@ -120,7 +120,7 @@ int main(void)
     ev.data.ptr = client_conn;
     CHECK(epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) == 0, "epoll_ctl ADD should succeed");
 
-    struct bm_epoll_thread_args *args = malloc(sizeof(*args));
+    struct bm_epoll_thread_args *args = calloc(1, sizeof(*args)); /* 未使用のコールバック等をNULLにするため */
     args->epfd = epfd;
     args->handler = NULL; /* default_dispatchでよい。versionを送らないのでhandlerには到達しない */
     args->user_data = NULL;

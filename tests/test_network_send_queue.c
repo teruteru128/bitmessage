@@ -19,6 +19,7 @@
  *   (4) 相手がゆっくりでも読んでいれば切られず、全く進まなければ停滞判定で切られる
  *   (5) 残りがある間だけEPOLLOUTが登録され、送り切ると外れる
  *   (6) キューの上限を超えて積もうとすると-1になりpending_evictionが立つ
+ *   (7) 別スレッドのbroadcast_invと並行して大きなobjectを送っても、ストリームが壊れない
  * 時刻は全てnowを明示的に渡し、壁時計待ちはしない(プロジェクトの慣習)。
  */
 
@@ -392,6 +393,114 @@ static void test_hard_limit(void)
     close(sv[1]);
 }
 
+/* (7) 別スレッドのbm_peer_registry_broadcast_inv(object_sync_broadcast_thread・
+ * peer_connector_threadから呼ばれる経路)と、network_epoll_thread側の大きなobject送信が
+ * 同じ接続に並行して書いても、ストリームが壊れないこと。以前はbroadcast_invがdup()した
+ * fdへ直接書いており、部分書き込みの途中に割り込めた。 */
+struct broadcaster_args
+{
+    struct bm_peer_registry *reg;
+    int rounds;
+};
+
+static void *broadcaster_thread(void *arg)
+{
+    struct broadcaster_args *b = arg;
+    for (int i = 0; i < b->rounds; i++)
+    {
+        unsigned char hash[32];
+        memset(hash, 0, sizeof(hash));
+        hash[0] = (unsigned char)i;
+        hash[1] = (unsigned char)(i >> 8);
+        bm_peer_registry_broadcast_inv(b->reg, (const unsigned char (*)[32])&hash, 1, NULL, 1000);
+    }
+    return NULL;
+}
+
+static void test_broadcast_inv_from_other_thread_does_not_interleave(void)
+{
+    int sv[2];
+    make_pair(sv, 1);
+    struct bm_peer_registry reg;
+    bm_peer_registry_init(&reg);
+    struct bm_fd_data *conn = bm_fd_data_new(BM_FD_CLIENT_SOCKET, sv[0]);
+    conn->handshake_complete = 1;
+    bm_peer_registry_add(&reg, conn);
+
+    const int rounds = 300;
+    struct broadcaster_args ba = {&reg, rounds};
+    pthread_t th;
+    pthread_create(&th, NULL, broadcaster_thread, &ba);
+
+    const int objects = 60;
+    const size_t payload_len = 15000;
+    struct recv_buf rb = {0};
+    for (int i = 0; i < objects; i++)
+    {
+        size_t len = 0;
+        unsigned char *packet = make_packet(0, (uint32_t)i, payload_len, &len);
+        CHECK(bm_network_send(conn, packet, len, 1000) == 0, "(7) object send must succeed");
+        free(packet);
+        drain(sv[1], &rb, 0);
+        bm_network_flush(conn, 1000);
+    }
+    pthread_join(th, NULL);
+    for (int guard = 0; guard < 100000 && bm_network_queued_bytes(conn) > 0; guard++)
+    {
+        drain(sv[1], &rb, 0);
+        bm_network_flush(conn, 1001);
+    }
+    drain(sv[1], &rb, 0);
+
+    /* 全メッセージが正しくパースでき、objectは送った順に全部届いていること。
+     * inv/dinv(Dandelionの判定次第でどちらもありうる)は壊れていなければよい */
+    size_t off = 0;
+    int bad = 0;
+    int invs = 0;
+    uint32_t next_obj = 0;
+    while (off < rb.len)
+    {
+        struct bm_message *msg = NULL;
+        size_t consumed = 0;
+        if (bm_parse_message(rb.data + off, rb.len - off, &msg, &consumed) != BM_PARSE_OK)
+        {
+            bm_free_message(msg);
+            bad = 1;
+            break;
+        }
+        if (strncmp(msg->command, "object", 12) == 0)
+        {
+            uint32_t seq = ((uint32_t)msg->payload[4] << 24) | ((uint32_t)msg->payload[5] << 16)
+                           | ((uint32_t)msg->payload[6] << 8) | msg->payload[7];
+            if (msg->length != payload_len || seq != next_obj)
+            {
+                bad = 1;
+            }
+            next_obj++;
+        }
+        else if (strncmp(msg->command, "inv", 12) == 0 || strncmp(msg->command, "dinv", 12) == 0)
+        {
+            invs++;
+        }
+        else
+        {
+            bad = 1;
+        }
+        off += consumed;
+        bm_free_message(msg);
+    }
+    CHECK(!bad, "(7) no message may be corrupted when broadcast_inv writes concurrently from another thread");
+    CHECK(next_obj == (uint32_t)objects, "(7) every object must arrive, in order");
+    CHECK(invs > 0, "(7) the broadcast invs must actually have been sent on this connection");
+
+    free(rb.data);
+    bm_peer_registry_remove(&reg, conn);
+    bm_fd_data_free(conn);
+    bm_peer_registry_destroy(&reg);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void)
 {
     test_immediate_send();
@@ -400,6 +509,7 @@ int main(void)
     test_stall_eviction_and_epollout();
     test_epollout_disarmed_after_drain();
     test_hard_limit();
+    test_broadcast_inv_from_other_thread_does_not_interleave();
 
     if (failures == 0)
     {

@@ -97,9 +97,14 @@ void bm_peer_registry_for_each_locked(struct bm_peer_registry *reg,
  * が見つかった(DESIGN.md §11参照)。read側検知に依存しない独立した安全網として、
  * write失敗(EPIPE等、bm_network_write_allの2秒タイムアウトを含む)を検知した接続は
  * bm_peer_registry_evict_if_currentで能動的に除去するようにした。
+ *
+ * §11 2026-09-24 項目43: 書き込みはreg->lockを持ったまま各接続の送信キューへ積む形
+ * (bm_network_send)に変えた。ブロックしないので、どのスレッドから呼んでもよい。送信の
+ * 失敗(キュー上限超過・致命的な書き込みエラー)はbm_network_sendがpending_evictionを
+ * 立てるので、evict_if_currentはもう使わない。nowはbm_network_sendへそのまま渡す。
  */
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
-                                     size_t count, const struct bm_fd_data *except);
+                                     size_t count, const struct bm_fd_data *except, int64_t now);
 
 /*
  * §9 Dandelion++ Stage 2: registryに登録済みの接続のうち、outbound(BM_FD_CLIENT_SOCKET)

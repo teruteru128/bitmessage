@@ -102,7 +102,7 @@ int main(void)
      * (別スレッド)から参照し続けるため、mallocしてスレッドへ所有権を渡す
      * (test_peer_rating_on_disconnect.cと同じ方針、グレースフルシャットダウン機構が
      * 無いためjoinはせずプロセス終了時に道連れで終わらせる)。 */
-    struct bm_epoll_thread_args *args = malloc(sizeof(*args));
+    struct bm_epoll_thread_args *args = calloc(1, sizeof(*args)); /* 未使用のコールバック等をNULLにするため */
     args->epfd = epfd;
     args->handler = NULL;
     args->user_data = NULL;

@@ -232,7 +232,7 @@ int main(void)
         /* まずbroadcast_inv経由で新規object扱いにする(1回目はstem/skipに振り分けられ、
          * どちらの接続にも通常のinvは届かないはず)。この呼び出し(内部でtime(NULL)を使う)で
          * hash3のタイムアウトが実時刻基準で確定する */
-        bm_peer_registry_broadcast_inv(&reg, &hash3, 1, NULL);
+        bm_peer_registry_broadcast_inv(&reg, &hash3, 1, NULL, 1000);
 
         int real_stem_fd = (bm_dandelion_decide(hash3, stem_conn, t0) == BM_PROPAGATE_STEM) ? fds_stem[1]
                                                                                               : fds_other[1];
@@ -337,7 +337,7 @@ int main(void)
                                       (int64_t)time(NULL) + 86400, (int64_t)time(NULL))
                   == 0,
               "hash4 can be stored later once the object actually arrives");
-        bm_peer_registry_broadcast_inv(&reg, &hash4, 1, NULL);
+        bm_peer_registry_broadcast_inv(&reg, &hash4, 1, NULL, 1000);
         ssize_t n_stem_late = recv(fds_stem[1], stem_buf, sizeof(stem_buf), MSG_PEEK);
         ssize_t n_other_late = recv(fds_other[1], other_buf, sizeof(other_buf), MSG_PEEK);
         CHECK(n_stem_late > 0 || n_other_late > 0,

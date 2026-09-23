@@ -210,175 +210,124 @@ void bm_peer_registry_for_each_locked(struct bm_peer_registry *reg,
     pthread_mutex_unlock(&reg->lock);
 }
 
-/* §9 Dandelion++ Stage 2: dup()した接続1本ぶんの送信予定。bm_decide_propagationの
- * 判定結果ごとにfluff_hashes(通常inv)とstem_hashes(dinv)へ振り分けたもの。
- * ロック解放後にまとめて書き込むための一時データ(既存のfd dup()方式と同じ理由、下記参照)。 */
-struct pending_inv_send
+/* §11 2026-09-24 項目43: 1接続ぶんのinv/dinvを組み立てて送信キューへ積む。reg->lockを
+ * 持った状態で呼ぶ(connがこの間にfreeされないことをreg->lockで保証する、network.hの
+ * bm_network_sendのdoc参照)。hashesのうちこの接続へFLUFFで送るものをinvに、STEMで送る
+ * ものをdinvにまとめる。戻り値のビット0=invを積んだ、ビット1=dinvを積んだ、ビット2=積もうと
+ * して失敗した(bm_network_sendがpending_evictionを立て済み)。 */
+static int queue_inv_for_conn(struct bm_fd_data *conn, const unsigned char (*hashes)[32], size_t count,
+                              int64_t now)
 {
-    int fd;
-    unsigned char (*fluff_hashes)[32];
-    size_t fluff_count;
-    unsigned char (*stem_hashes)[32];
-    size_t stem_count;
-    /* §11 2026-09-05: write失敗時にbm_peer_registry_evict_if_currentへ渡す識別情報。
-     * connポインタ単体では、ロック解放後に元の接続がclose_connection済み+free()され、
-     * 同じアドレスへ別の新しいconnが割り当てられた場合に誤って別接続を除去しかねない
-     * (ABA問題、network.hのconn->generationのdoc参照)ため、この時点(ロック中)で読んだ
-     * generationも一緒に保持し、除去時に両方の一致を要求する。 */
-    struct bm_fd_data *conn;
-    uint64_t generation;
-};
+    /* §9 Dandelion++差し込み点(DESIGN.md §9.2「inv送信判断は必ずこの関数を経由させる」):
+     * 接続ごと・hashごとにfluff/stem/skipを判断する。FLUFFは通常のinv、STEMはdinvとして
+     * 別々のパケットで同じ接続へ送る(SKIPはその接続へは送らない)。 */
+    unsigned char (*fluff)[32] = malloc(sizeof(*fluff) * count);
+    unsigned char (*stem)[32] = malloc(sizeof(*stem) * count);
+    if (fluff == NULL || stem == NULL)
+    {
+        free(fluff);
+        free(stem);
+        return 0;
+    }
+    size_t fluff_count = 0;
+    size_t stem_count = 0;
+    for (size_t h = 0; h < count; h++)
+    {
+        enum bm_propagation_mode mode = bm_decide_propagation(hashes[h], conn);
+        if (mode == BM_PROPAGATE_FLUFF)
+        {
+            memcpy(fluff[fluff_count], hashes[h], 32);
+            fluff_count++;
+        }
+        else if (mode == BM_PROPAGATE_STEM)
+        {
+            memcpy(stem[stem_count], hashes[h], 32);
+            stem_count++;
+        }
+    }
+
+    int result = 0;
+    if (fluff_count > 0)
+    {
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_inventory_message("inv", fluff, fluff_count, &packet_len);
+        if (packet != NULL)
+        {
+            result |= bm_network_send(conn, packet, packet_len, now) == 0 ? 1 : 4;
+            free(packet);
+        }
+    }
+    if (stem_count > 0 && !(result & 4))
+    {
+        size_t packet_len = 0;
+        unsigned char *packet = bm_create_inventory_message("dinv", stem, stem_count, &packet_len);
+        if (packet != NULL)
+        {
+            result |= bm_network_send(conn, packet, packet_len, now) == 0 ? 2 : 4;
+            free(packet);
+        }
+    }
+    free(fluff);
+    free(stem);
+    return result;
+}
 
 void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned char (*hashes)[32],
-                                     size_t count, const struct bm_fd_data *except)
+                                     size_t count, const struct bm_fd_data *except, int64_t now)
 {
     if (count == 0)
     {
         return;
     }
 
-    /* §11 部分書き込み対策: bm_network_write_all は書き込み可能になるまで(最大
-     * BM_NETWORK_WRITE_TIMEOUT_SECONDS)select()で待つことがあるため、reg->lock を
-     * 持ったまま呼ぶと1本の詰まったpeerが他スレッドのregistry操作を長時間ブロック
-     * しかねない。かといってfd番号だけコピーしてロックを解放すると、書き込み前に
-     * 元の接続がepoll thread側でclose()されfd番号が別の用途に再利用された場合に
-     * 誤った相手へ書き込んでしまう恐れがある。dup()した複製fdはclose(conn->fd)されても
-     * 無効化されず同じsocketを指し続けるため、ロックを持っている間にdup()するだけで
-     * この競合を避けつつロックを早期に解放できる */
-    struct pending_inv_send *pending = reg->count > 0 ? malloc(sizeof(*pending) * reg->count) : NULL;
-    size_t pending_count = 0;
-
+    /* §11 2026-09-24 項目43: 以前は、ロックを早期に解放するため保持中にdup()した複製fdへ
+     * ロック解放後にbm_network_write_allで同期的に書いていた(書き込み可能になるまで最大
+     * BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS待つため、ロックを持ったままでは他スレッドの
+     * registry操作を長時間止めてしまうから)。しかしこれは他スレッド(network_epoll_thread等)の
+     * 書き込みと同じソケット上で混ざりうる構造だった。いまはbm_network_sendがブロックしない
+     * ので、reg->lockを持ったまま各接続の送信キューへ積む。送り切れない分は
+     * network_epoll_threadがEPOLLOUTで続きを送る。 */
+    size_t attempted_peers = 0;
+    size_t inv_sent_peers = 0;
+    size_t dinv_sent_peers = 0;
+    size_t evicted_peers = 0;
+    int64_t start_ms = monotonic_now_ms();
     pthread_mutex_lock(&reg->lock);
     for (size_t i = 0; i < reg->count; i++)
     {
         struct bm_fd_data *conn = reg->conns[i];
-        if (conn == except)
+        if (conn == except || conn->type == BM_FD_LISTEN_SOCKET)
         {
             continue;
         }
-
-        /* §9 Dandelion++差し込み点(DESIGN.md §9.2「inv送信判断は必ずこの関数を経由させる」):
-         * 接続ごと・hashごとにfluff/stem/skipを判断する。FLUFFは通常のinv、STEMはdinvとして
-         * 別々のパケットで同じ接続へ送る(SKIPはその接続へは送らない)。Stage 1時点は常に
-         * FLUFFを返すダミーだったが、Stage 2でdandelion.cの実ロジックに差し替えた。 */
-        unsigned char (*fluff)[32] = malloc(sizeof(*fluff) * count);
-        unsigned char (*stem)[32] = malloc(sizeof(*stem) * count);
-        size_t fluff_count = 0;
-        size_t stem_count = 0;
-        for (size_t h = 0; h < count; h++)
+        int r = queue_inv_for_conn(conn, hashes, count, now);
+        if (r != 0)
         {
-            enum bm_propagation_mode mode = bm_decide_propagation(hashes[h], conn);
-            if (mode == BM_PROPAGATE_FLUFF)
-            {
-                memcpy(fluff[fluff_count], hashes[h], 32);
-                fluff_count++;
-            }
-            else if (mode == BM_PROPAGATE_STEM)
-            {
-                memcpy(stem[stem_count], hashes[h], 32);
-                stem_count++;
-            }
+            attempted_peers++;
         }
-
-        if (fluff_count == 0 && stem_count == 0)
+        if (r & 1)
         {
-            free(fluff);
-            free(stem);
-            continue;
+            inv_sent_peers++;
         }
-
-        int dup_fd = dup(conn->fd);
-        if (dup_fd >= 0)
+        if (r & 2)
         {
-            pending[pending_count].fd = dup_fd;
-            pending[pending_count].fluff_hashes = fluff;
-            pending[pending_count].fluff_count = fluff_count;
-            pending[pending_count].stem_hashes = stem;
-            pending[pending_count].stem_count = stem_count;
-            pending[pending_count].conn = conn;
-            pending[pending_count].generation = conn->generation;
-            pending_count++;
+            dinv_sent_peers++;
         }
-        else
-        {
-            free(fluff);
-            free(stem);
-        }
-    }
-    pthread_mutex_unlock(&reg->lock);
-
-    size_t inv_sent_peers = 0;
-    size_t dinv_sent_peers = 0;
-    size_t evicted_peers = 0;
-    char reason[BUFSIZ];
-    int64_t write_loop_start_ms = monotonic_now_ms();
-    for (size_t i = 0; i < pending_count; i++)
-    {
-        /* §11 2026-09-05: fluff/stemいずれかのwriteが失敗したら、ループの最後でこの接続を
-         * evict_if_currentへ渡す(read側検知に頼らない能動的な除去、peer_registry.hのdoc参照)。
-         * 一方が失敗しもう一方が成功しても、同じdup済みfd=同じ接続である以上「現時点で
-         * 書き込み不能」という結論は変わらないため、evict対象とする。 */
-        int write_failed = 0;
-        if (pending[i].fluff_count > 0)
-        {
-            size_t packet_len = 0;
-            unsigned char *packet =
-                bm_create_inventory_message("inv", pending[i].fluff_hashes, pending[i].fluff_count, &packet_len);
-            if (packet != NULL)
-            {
-                if (bm_network_write_all(pending[i].fd, packet, packet_len,
-                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason, BUFSIZ)
-                    != 0)
-                {
-                    bm_log_warn("[peer_registry] failed to send inv to fd=%d(%s)\n", pending[i].fd, reason);
-                    write_failed = 1;
-                }
-                else
-                {
-                    inv_sent_peers++;
-                }
-                free(packet);
-            }
-        }
-        if (pending[i].stem_count > 0)
-        {
-            size_t packet_len = 0;
-            unsigned char *packet =
-                bm_create_inventory_message("dinv", pending[i].stem_hashes, pending[i].stem_count, &packet_len);
-            if (packet != NULL)
-            {
-                if (bm_network_write_all(pending[i].fd, packet, packet_len,
-                                          BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0)
-                    != 0)
-                {
-                    bm_log_warn("[peer_registry] failed to send dinv to fd=%d\n", pending[i].fd);
-                    write_failed = 1;
-                }
-                else
-                {
-                    dinv_sent_peers++;
-                }
-                free(packet);
-            }
-        }
-        close(pending[i].fd);
-        free(pending[i].fluff_hashes);
-        free(pending[i].stem_hashes);
-
-        if (write_failed
-            && bm_peer_registry_evict_if_current(reg, pending[i].conn, pending[i].generation))
+        if (r & 4)
         {
             evicted_peers++;
         }
     }
+    pthread_mutex_unlock(&reg->lock);
+
     /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(何件のhashを何peerへ
      * 配信できたか)が可視化されていなかった(handle_inv等の可視化と同種の穴、
      * ユーザー指摘)。宛先ごとの個別ログにはせず(peer数が多いと大量に出るため)
      * 1回のbroadcast呼び出しにつき1行のサマリにした。誰にも送るものが無かった
-     * (pending_count==0)場合は出さない。 */
-    if (pending_count > 0)
+     * 場合は出さない。 */
+    if (attempted_peers > 0)
     {
-        int64_t elapsed_ms = monotonic_now_ms() - write_loop_start_ms;
+        int64_t elapsed_ms = monotonic_now_ms() - start_ms;
         /* §11 2026-09-12: 8段階化に伴う移行。broadcast呼び出し1回につき1行のサマリなので
          * 無番号のDEBUGにした。 */
         bm_log_debug(
@@ -387,17 +336,14 @@ void bm_peer_registry_broadcast_inv(struct bm_peer_registry *reg, const unsigned
                 count, inv_sent_peers, dinv_sent_peers, evicted_peers, elapsed_ms);
         /* §11 2026-09-15: 項目23の「単一スレッドが詰まったpeerへのwriteで長時間ブロックする」
          * 仮説の検証用。DEBUGを有効にしなくても異常な遅さだけは見えるよう、閾値超過時は
-         * WARNでも重ねて出す(handshake_complete等の状態に一切依存しない無条件ログ、
-         * 2026-09-15に一度この条件付きログの罠で誤った結論を出した反省を踏まえた設計)。 */
+         * WARNでも重ねて出す。§11 2026-09-24 項目43: 送信キュー化でブロックしなくなったため
+         * 通常は0ms付近になるはず。それでも超えるなら、reg->lockの競合など別の原因を疑う。 */
         if (elapsed_ms >= BM_BROADCAST_INV_SLOW_WARN_MS)
         {
-            bm_log_warn(
-                    "[peer_registry] broadcast inv took %" PRId64 "ms (%zu peer(s) attempted, %zu evicted) - "
-                    "possible network_epoll_thread stall while a peer's write buffer was stuck\n",
-                    elapsed_ms, pending_count, evicted_peers);
+            bm_log_warn("[peer_registry] broadcast inv took %" PRId64 "ms (%zu peer(s) attempted, %zu evicted)\n",
+                    elapsed_ms, attempted_peers, evicted_peers);
         }
     }
-    free(pending);
 }
 
 int bm_peer_registry_pick_random_dandelion_peer(struct bm_peer_registry *reg, char *out_ip, size_t out_ip_len,

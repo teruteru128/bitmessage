@@ -584,12 +584,13 @@ int main(int argc, char **argv)
         }
     }
 
-    struct bm_epoll_thread_args *net_args = malloc(sizeof(*net_args));
+    struct bm_epoll_thread_args *net_args = calloc(1, sizeof(*net_args));
     net_args->epfd = epfd;
     net_args->handler = bm_object_sync_dispatch;
     net_args->user_data = &object_sync_ctx;
     net_args->registry = &peer_registry;
     net_args->peers_db = peers_db;
+    net_args->on_sweep = bm_object_sync_on_network_sweep; /* §11 2026-09-24 項目43、network.hのdoc参照 */
     bm_inbound_rate_limiter_init(&net_args->inbound_rate_limiter);
     pthread_create(&th_network, NULL, bm_network_epoll_thread, net_args);
     pthread_detach(th_network);

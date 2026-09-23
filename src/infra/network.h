@@ -364,6 +364,14 @@ struct bm_epoll_thread_args
      * bm_inbound_rate_limiter_initで初期化してから渡すこと(mallocでは自動でゼロ初期化
      * されない)。listenソケットを使わない(=inbound無効)構成のargsでは未使用のまま無害。 */
     struct bm_inbound_rate_limiter inbound_rate_limiter;
+    /* §11 2026-09-24 項目43: network層はobject_syncに依存しないため、object_sync側の処理を
+     * network_epoll_threadで回すためのコールバック。いずれもNULL可、user_dataには上の
+     * user_dataがそのまま渡る。
+     * on_sweep: ループ末尾(bm_network_idle_sweepの直後)で毎回呼ぶ。verack応答の遅延送信
+     *   (bm_object_sync_flush_pending_verack_replies)をここで行う。以前はpeer_connector_threadの
+     *   1秒ループから呼んでいたが、その結果pending_inv_hashes等をnetwork_epoll_threadと並行に
+     *   触り、ソケットへも別スレッドから直接書いていた。 */
+    void (*on_sweep)(struct bm_peer_registry *registry, int64_t now, void *user_data);
 };
 
 /* epoll_wait ループ本体。DESIGN.md §1.1 network_epoll_thread のスレッド関数として使う。

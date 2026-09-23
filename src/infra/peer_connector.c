@@ -531,10 +531,9 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
         strncpy(conn->logical_peer_ip, candidates[i].ip_address, sizeof(conn->logical_peer_ip) - 1);
         conn->logical_peer_port = candidates[i].port;
 
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.ptr = conn;
-        if (epoll_ctl(config->epfd, EPOLL_CTL_ADD, sock, &ev) != 0)
+        /* §11 2026-09-24 項目43: 送信キューがEPOLLOUTを付け外しできるよう、登録用の関数を通す
+         * (直後のversion送信が送り切れなかった場合、network_epoll_threadが続きを送る)。 */
+        if (bm_network_epoll_register(config->epfd, conn) != 0)
         {
             bm_log_warn("[peer_connector] epoll_ctl: %s\n", strerror(errno));
             bm_fd_data_free(conn);
@@ -634,17 +633,9 @@ void *bm_peer_connector_thread(void *arg)
                                                             args->config.self_onion_address,
                                                             args->config.self_onion_port, now);
             }
-            /* §11 2026-08-26診断実験: BM_VERACK_REPLY_DELAY_SECONDSで遅延させたaddr/big inv
-             * 応答(object_sync.cのverackハンドラがconn->pending_verack_reply_atへ記録する
-             * だけにしたもの)を、この既存の1秒間隔ループから吐き出す。registryが無ければ
-             * (テスト等)何もしない(bm_object_sync_flush_pending_verack_replies自身も
-             * registry==NULLガード済みだが、object_sync_ctxがNULLの構成もあるため二重に
-             * ガードする)。 */
-            if (args->config.object_sync_ctx != NULL && args->config.registry != NULL)
-            {
-                bm_object_sync_flush_pending_verack_replies(args->config.object_sync_ctx, args->config.registry,
-                                                             now);
-            }
+            /* §11 2026-09-24 項目43: verack応答の遅延送信(bm_object_sync_flush_pending_verack_
+             * replies)は、以前はここ(1秒ループ)から呼んでいたが、network_epoll_threadへ移した
+             * (network.hのbm_epoll_thread_args.on_sweep参照)。 */
             sleep(STOP_POLL_INTERVAL_SECONDS);
         }
     }

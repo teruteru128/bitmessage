@@ -203,11 +203,18 @@ void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, 
  * SECONDS秒待ってから送るべく即座にはaddr/big invを送らず、conn->pending_verack_
  * reply_at(network.hのdoc参照)へ「いつ送るか」を記録するだけにする。この関数は
  * registry内の全connを走査し、保留時刻に達したものだけ実際にaddr/big inv送信を
- * 実行する。peer_connector_threadの既存1秒間隔ポーリングループから、onionpeer
- * 再announceと同じ場所で毎回(間引き無しで)呼ばれる想定。registryがNULLなら何もしない。
+ * 実行する。registryがNULLなら何もしない。
+ * §11 2026-09-24 項目43: 以前はpeer_connector_threadの1秒ループから呼んでいたが、
+ * network_epoll_threadのループ末尾(bm_object_sync_on_network_sweep経由、network.hの
+ * bm_epoll_thread_args.on_sweep参照)から呼ぶように変えた。pending_inv_hashes等を触る
+ * スレッドを1つにするため。
  */
 void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx, struct bm_peer_registry *registry,
                                                   int64_t now);
+
+/* §11 2026-09-24 項目43: bm_epoll_thread_args.on_sweepに渡すためのアダプタ。user_dataは
+ * struct bm_object_sync_ctx *。bm_object_sync_flush_pending_verack_repliesを呼ぶ。 */
+void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t now, void *user_data);
 
 /*
  * §11 2026-08-25 join-chan後にchan宛の過去メッセージが読めない問題の対応。

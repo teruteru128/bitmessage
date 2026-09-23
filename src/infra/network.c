@@ -33,7 +33,10 @@
  * bm_network_idle_sweepへ戻ってくるための間隔)。BM_HANDSHAKE_TIMEOUT_SECONDS/
  * BM_IDLE_PING_TIMEOUT_SECONDSはnetwork.hで公開(テストが実際の値で境界を検証できるように
  * するため)。 */
-#define BM_IDLE_SWEEP_INTERVAL_MS 5000
+/* §11 2026-09-24 項目43: 5000msから1000msへ縮めた。verack応答の遅延送信(on_sweep)を
+ * peer_connector_threadの1秒ループからここへ移したため、以前と同じ1秒刻みで回すため。
+ * 1ループあたりの処理は登録済み接続の走査だけで軽い。 */
+#define BM_IDLE_SWEEP_INTERVAL_MS 1000
 
 /* §11 2026-08-23 backlog項目5: プロセス起動時からの送受信バイト数の全体累積
  * (network.hのbm_network_get_statsのdoc参照)。切断済み接続ぶんも失われず積み上がる、
@@ -1054,6 +1057,10 @@ void *bm_network_epoll_thread(void *arg)
         /* §11 2026-08-23: socket活動が無くても(nfds==0のタイムアウト時も含め)定期的に
          * アイドル/ハンドシェイクタイムアウトを走査する */
         bm_network_idle_sweep(args, now);
+        if (args->on_sweep != NULL)
+        {
+            args->on_sweep(args->registry, now, args->user_data);
+        }
     }
     free(args);
     return NULL;
