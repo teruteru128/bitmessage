@@ -3567,3 +3567,126 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     (`stopDownloadingObject(..., forwardAnyway=True)`の後、例外を再送出せず保存・invQueue投入へ
     進む)。MiNode-Refined 0.3.1は同じ閾値で早期returnし中継もしない。うちは型別検査を持たず
     保存・中継するので、中継挙動としては本家に近い。型別検査の追加は不要と判断した。
+43. **送信を接続ごとのキュー+EPOLLOUT駆動に作り替える(設計、未実装)**: 2026-09-24、ユーザー依頼。
+    項目29のgetdata能動除去が、本来の目的(沈黙死した相手の検出)ではなく、初期同期中の
+    **生きている低速peer**を切っていたことが運用ログから分かった(2026-09-21〜23の除去は
+    すべて同じパターン: 新規inboundのPyBitmessage 0.6.3.2 → こちらが約13,600件のbig inv →
+    相手が数百件単位でgetdata → handle_getdataが1件ずつ同期write → 途中の1件で2秒
+    書き込めず除去 → 相手が再接続して最初からやり直し。同一peerで80秒に4回繰り返した例もある)。
+
+    **問題は3つあり、根は同じ(送信を呼び出し元スレッドで同期的に行っている)**:
+    1. **誤検知**: `bm_network_write_all`の失敗条件は「送信バッファが空かないまま
+       `BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS`(2秒)経過」。受信側が数秒読むのを止めるだけで
+       成立するため、objectの処理で読み込みが止まりがちな初期同期中のpeerを切ってしまう。
+    2. **network_epoll_threadの停止**: handle_getdataは要求された全objectを送り終えるまで
+       戻らない。除去されない場合でも、遅いpeerへの数百件の送信中は全接続の処理が止まる
+       (1件あたり最大2秒の待ちが積み重なる)。項目34で仮説として計測を入れた現象の、
+       getdata版が実際に起きていた。
+    3. **複数スレッドからの書き込みの混在(コード読解による推測、未観測)**: 同じソケットへ、
+       network_epoll_thread以外からも直接書き込んでいる。接続単位の書き込みロックは無い。
+       - object_sync_broadcast_thread: `bm_peer_registry_broadcast_inv`(dup済みfdへ書く)
+       - peer_connector_thread: dandelionのexpire_and_refluff経由のbroadcast_inv、
+         `bm_object_sync_flush_pending_verack_replies`(reg->lockを持ったままaddrとbig invの
+         最初のchunkを同期write。`pending_inv_hashes`もnetwork_epoll_threadのidle_sweepと
+         並行して触っている)
+       `bm_network_write_all`は部分書き込みの続きを別のwrite()で送るため、その間に他スレッドの
+       inv等が割り込むとストリーム上でメッセージが混ざり、相手には壊れたメッセージが届く。
+       送信バッファが詰まっている時ほど部分書き込みが起きるので、1.と同じ状況で起きやすい。
+
+    **PyBitmessage本家の作り(実ソースで確認)**: getdataは要求hashを`pendingUpload`へ積むだけ
+    (network/bmproto.py:361)。UploadThreadが、接続ごとの`write_buf`が`maxBufSize`=2MB以下の
+    ときだけ`RandomTrackingDict.maxPending`=10件ずつobjectパケットを補充する
+    (network/uploadthread.py:18,36-40)。実際の送信はasyncoreのwritable時にノンブロッキングで行う
+    (advanceddispatcher.py handle_write)。書き込みが止まったことを理由に切る仕組みは無く、
+    確立済み接続は送受信が300秒止まるとpingを送るだけ、未確立接続は20秒でclose
+    (network/connectionpool.py:405-417)。
+
+    **設計**
+
+    - **書き込みの不変条件**: 登録済みの接続に対するwrite()は、どのスレッドからでも、必ず
+      接続ごとの送信mutexを持った状態で、送信キューの先頭からノンブロッキング
+      (`send(MSG_DONTWAIT|MSG_NOSIGNAL)`)でのみ行う。キューを介さない直接書き込みは無くす。
+      これで3.は構造的に起きなくなる(当初は「write()はnetwork_epoll_threadだけ」とする案
+      だったが、実装前の検討で改めた。mutexとFIFOで直列化すれば混在防止の保証は同じで、
+      加えて空いていれば積んだその場で送れるので遅延が増えず、handlerを直接呼んで応答を
+      読む既存テストもそのまま動く。どのスレッドもブロックしない点も変わらない)。
+    - **送信キュー**(`struct bm_fd_data`に追加): 送るバイト列のFIFO(積む側のデータを
+      コピーして保持)と、先頭の送信済みオフセット、キュー内の総バイト数、送信mutex、
+      EPOLLOUTを登録中かどうかのフラグ、登録先のepoll fd(未登録なら-1)、最後に1バイト以上
+      書けた時刻`last_write_progress`。
+    - **積む側**(`bm_network_send(conn, data, len, now)`、どのスレッドからでも可):
+      mutexを取ってキュー末尾へ追加し、その場でキュー先頭から書けるだけ書く。残りが
+      あり、EPOLLOUT未登録なら`epoll_ctl(EPOLL_CTL_MOD, EPOLLIN|EPOLLOUT)`する。キューが空の
+      状態から積んだ時点で`last_write_progress`=nowとする(無進捗判定の起点)。
+    - **EPOLLOUT受信時**(network_epoll_thread): mutexを取り、キュー先頭から書けるだけ書く。
+      空になったら`EPOLL_CTL_MOD, EPOLLIN`に戻してフラグを下ろす。1バイト以上書けたら
+      `last_write_progress`を更新する。`bytes_sent`は書けた時点で一元的に積む
+      (broadcast_inv分も計上されるようになる)。EPOLLOUTの登録・解除を必ずmutex下で行うことで、
+      「空と判断して解除した直後に別スレッドが積み、EPOLLOUTが外れたまま残る」競合を防ぐ。
+    - **ロック順**: `reg->lock` → 接続のキューmutex、の一方向のみ。他スレッドは、connが
+      registryに載っている間(=`reg->lock`保持中)にだけ積む。close_connectionはregistryから
+      外してからfreeするので、積む側がfree済みのconnに触ることはない。bm_fd_data_freeで
+      キューとmutexも破棄する(freeは従来どおりnetwork_epoll_threadだけ、項目27の方針を維持)。
+    - **getdataの補充**(本家と同じ方式): handle_getdataは要求hashを接続ごとの保留リストへ
+      積むだけにする(接続あたりの上限は`BM_MAX_INVENTORY_ITEMS`)。network_epoll_threadは、
+      キューの総バイト数が`BM_UPLOAD_REFILL_THRESHOLD_BYTES`を下回るたびに(EPOLLOUT処理後、
+      handle_getdata直後、idle_sweep時)、保留リストから`BM_UPLOAD_BATCH_ITEMS`件取り出し、
+      object_pool.dbから読んでパケット化して積む。持っていないhashは従来どおり黙って捨てる。
+    - **切断判定の置き換え**: 「送るものがキューにあるのに、`BM_SEND_STALL_TIMEOUT_SECONDS`の間
+      1バイトも書けていない」ときだけidle_sweepが切る(ログ文言も書き込み失敗ではなく
+      送信停滞と分かるものにする)。項目29の除去と、send_inv_chunk・broadcast_invでの書き込み
+      失敗除去はこれに統合する。沈黙死した相手は、書き込みが一切進まないのでこれで検出できる。
+      加えて、キューが`BM_SEND_QUEUE_HARD_LIMIT_BYTES`を超えて積まれようとした接続は、
+      その場で`pending_eviction`を立てる(読まない相手にメモリを食わせ続けないため)。
+    - **各書き込み箇所の移行先**
+      - network_epoll_thread上のハンドラ(verack/pong/versionの応答、inv受信時のgetdata送信、
+        getdata応答、keepalive ping、big invの後続chunk): すべてbm_network_sendへ。
+      - protocolバージョン不一致・時刻ずれ時のerror送信→切断: sendで積むだけにし、切断は
+        従来どおり即時。errorメッセージは小さく、積んだその場の送信でほぼ送り切れる。送り切れ
+        なかった分は切断時に捨てる(いまの2秒待ちも、送れなければ諦めるベストエフォートで同じ)。
+      - broadcast_inv(他スレッドから): dup()したfdへの直接書き込みをやめ、`reg->lock`保持中に
+        各connへbm_network_sendで積む。ブロッキングがなくなるので、ロックを早期に解放するための
+        dup()の工夫(peer_registry.cのコメント参照)も不要になる。
+      - `bm_object_sync_flush_pending_verack_replies`: peer_connector_threadからの呼び出しを
+        やめ、network_epoll_threadのidle_sweepで処理する。`pending_inv_hashes`を触るスレッドが
+        1つになり、並行アクセスも解消する(BM_VERACK_REPLY_DELAY_SECONDS=5秒の遅延に対し、
+        idle_sweepの周期も5秒なので、応答は最大で約5秒余計に遅れうる。許容範囲と判断)。
+      - outbound接続のversion送信(peer_connector_thread): sendで積む(その場で送れる)。
+        送り切れなかった場合に備え、epoll登録は登録用の関数を通し、その時点でキューに
+        残りがあれば最初から`EPOLLIN|EPOLLOUT`で登録する。
+      - flushとgetdata補充をnetwork層から呼ぶため、`struct bm_epoll_thread_args`に、
+        ループ末尾で呼ぶコールバック(verack応答のflush用)と、EPOLLOUT処理後・idle_sweep時に
+        接続ごとに呼ぶ補充コールバックを追加する(network層はobject_syncに依存しないため)。
+    - **既存の仕組みとの関係**: `pending_eviction`とgeneration照合(項目27)はそのまま残す
+      (キュー上限超過時の除去に使う)。broadcast_invの所要時間計測(項目34)は、
+      ブロッキングがなくなれば常に0ms付近になるので、役目を終えたら外してよい。
+
+    **定数の案**(カッコ内は根拠。値はユーザーと相談して確定する)
+    - `BM_UPLOAD_REFILL_THRESHOLD_BYTES` = 2MiB(本家uploadthread.pyの`maxBufSize`)
+    - `BM_UPLOAD_BATCH_ITEMS` = 10(本家`RandomTrackingDict.maxPending`)
+    - `BM_SEND_STALL_TIMEOUT_SECONDS` = 120(本家には送信停滞での切断が無い。沈黙死を
+      いつまでも放置しない一方で、Tor越しの低速peerが数十秒止まっても切らない値として提案)
+    - `BM_SEND_QUEUE_HARD_LIMIT_BYTES` = 16MiB(補充方式ではgetdata分は2MiB+object1個分
+      までしか積まれないので、これを超えるのはinvの滞留だけ。十分な余裕を持たせた値)
+
+    **デプロイ単位と実装の順番**: 送信キュー化だけを先に出すと、キュー経由で部分書き込みが
+    日常的に起きるようになる一方で、他スレッドの直接書き込みが残り、3.の混在がむしろ
+    起きやすくなる。そのため**単一writer化(全書き込み箇所の移行)までを1回のデプロイ単位**
+    とする。コミットは分けてよい:
+    (a) 送信キュー・EPOLLOUT処理・無進捗除去の基盤とそのテスト、
+    (b) network_epoll_thread上の書き込み箇所の移行、
+    (c) 他スレッドからの書き込み箇所の移行(broadcast_inv、verack応答のflush、version送信)、
+    (d) getdataの補充方式への置き換え。
+    (a)〜(d)がそろって全テストが通った時点で、初めて運用中のノードへデプロイする。
+
+    **テスト計画**(時刻は既存の慣習どおり`now`を明示的に渡し、壁時計待ちはしない)
+    - socketpairで送信バッファを小さくし、部分書き込みが起きても受信側で全メッセージが
+      順序どおり、checksumも正しく復元できること
+    - 別スレッドから積み続けながらEPOLLOUT側も回し、受信側で壊れたメッセージが1つも
+      出ないこと(3.の回帰防止)
+    - 相手が全く読まない場合は`BM_SEND_STALL_TIMEOUT_SECONDS`経過後に切られ、ゆっくりでも
+      読んでいる場合は切られないこと
+    - getdataで大量の要求を受けても、キューがしきい値+object1個分を超えず、最終的に
+      全件届くこと
+    - キュー上限を超えて積もうとした接続に`pending_eviction`が立つこと
+    - 既存テスト全件の回帰
