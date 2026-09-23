@@ -58,6 +58,8 @@ static void print_usage(const char *prog)
             "      identity.db全件に対し共通passphraseでunlockを試みる。行ごとのkdf_saltは\n"
             "      個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
             "      戻り値は[{address, unlocked}]の配列で、どの行が不一致だったか判別できる\n"
+            "      identity.dbが10,000件を超える場合は何もunlockせずエラーになる(受信msgの\n"
+            "      試行復号が件数に比例して重くなるため。必要なアドレスはunlockで個別に)\n"
             "  lock <address>\n"
             "  lock-all\n"
             "  delete <address>\n"

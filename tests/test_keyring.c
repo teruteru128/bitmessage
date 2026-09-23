@@ -172,6 +172,23 @@ int main(void)
         bm_keyring_t kr2;
         bm_keyring_init(&kr2);
 
+        /* §11 2026-09-24 項目44: 件数上限を超えるunlockAllは何もunlockせず-2で断ること。
+         * 数十万件規模の一括unlockでnetwork_epoll_threadが試行復号に数時間占有された事故の
+         * 再発防止(keyring.hのBM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES参照)。本物の上限(10,000件)
+         * を超える数のidentityをテストで作るのは重いため、上限を引数で渡す版で3件>2件を試す。 */
+        {
+            struct bm_unlock_all_entry *refused = NULL;
+            size_t refused_count = 0;
+            struct bm_unlocked_identity probe;
+            if (bm_keyring_unlock_all_with_limit(&kr2, db, common_passphrase, 2, &refused, &refused_count) != -2
+                || refused != NULL || refused_count != 3 || bm_keyring_find_by_address(&kr2, addrs[0], &probe))
+            {
+                fprintf(stderr, "FAIL: unlock_all over the limit must be refused without unlocking anything\n");
+                return EXIT_FAILURE;
+            }
+            printf("OK: 件数上限を超えるunlockAllは何もunlockせずに断られる\n");
+        }
+
         struct bm_unlock_all_entry *results = NULL;
         size_t count = 0;
         if (bm_keyring_unlock_all(&kr2, db, common_passphrase, &results, &count) != 0 || count != 3)

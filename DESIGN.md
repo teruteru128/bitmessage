@@ -3567,7 +3567,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     (`stopDownloadingObject(..., forwardAnyway=True)`の後、例外を再送出せず保存・invQueue投入へ
     進む)。MiNode-Refined 0.3.1は同じ閾値で早期returnし中継もしない。うちは型別検査を持たず
     保存・中継するので、中継挙動としては本家に近い。型別検査の追加は不要と判断した。
-43. **送信を接続ごとのキュー+EPOLLOUT駆動に作り替える(実装済み・未デプロイ)**: 2026-09-24、ユーザー依頼。
+43. **送信を接続ごとのキュー+EPOLLOUT駆動に作り替える(実装済み・デプロイ済み)**: 2026-09-24、ユーザー依頼。
     項目29のgetdata能動除去が、本来の目的(沈黙死した相手の検出)ではなく、初期同期中の
     **生きている低速peer**を切っていたことが運用ログから分かった(2026-09-21〜23の除去は
     すべて同じパターン: 新規inboundのPyBitmessage 0.6.3.2 → こちらが約13,600件のbig inv →
@@ -3720,3 +3720,47 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     混在防止を含む)、tests/test_getdata_upload.c(約6MBのgetdataでもキューがしきい値+1個分に
     収まり、読まない間も切らず、最終的に要求順で全件届き、持っていないhashは飛ばす)。
     ctest 51件全通過。デプロイは運用中のノードで一通り動作を確かめてから。
+
+44. **unlockAllに件数上限(10,000件)を設ける(実装済み・未デプロイ)**: 2026-09-24、ユーザー依頼。
+    数十万件規模のidentityを`unlockAllAddresses`で一括unlockしたところ、daemonが事実上
+    止まった。項目43のデプロイ直後だったため最初は項目43を疑ったが、原因は別だった。
+
+    **何が起きたか**: 受信したmsg objectは、unlock済みの全identityで順に復号を試して
+    自分宛てかどうかを判定する(`bm_trial_decrypt_msg`、keyringの連結リストを線形に走査)。
+    これがnetwork_epoll_thread上で動くため、unlock済みの件数に比例してネットワーク処理全体が
+    止まる。実測で1件あたり約0.36ms、24万件時点でmsg1件あたり約86秒かかり、その間は新規接続の
+    handshakeもgetdataへの応答も進まなかった。さらに:
+    - 試行復号はkeyringのrwlockを読み取りで握り続け、glibcのrwlockは既定で読み取り優先なので、
+      書き込みロックを取るunlockAll自体も進まなくなり、API呼び出しが戻らなかった。
+    - unlockAllは1件ごとに`bm_keyring_find_by_address`(線形探索)で既unlock判定をするため、
+      件数に対してO(n²)でもある。
+
+    **対処(今回)**: `BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES`(10,000)を`keyring.h`に置き、
+    identity.dbの件数がこれを超える場合、`bm_keyring_unlock_all`は何もunlockせず-2を返す
+    (`*out_count`には件数、`*out_results`はNULL)。
+    - APIの`unlockAllAddresses`は「unlockAllAddresses refused: N identities exceeds the limit of
+      10000 (...); unlock the addresses you need with unlockAddress」というエラーを返し、
+      daemon側にも`[keyring] unlock all refused`のwarnを出す。
+    - 上限値の根拠: 項目19で実地検証した約5,000件規模の運用はそのまま通し、msg1件あたりの
+      停止を約3.6秒(10,000件×0.36ms)に抑える。これでも軽くはないが、handshakeの20秒
+      タイムアウトや送信停滞の120秒(項目43)に届かない範囲に収まる。
+    - 件数を超えたら「上限までunlockする」のではなく丸ごと断る。どれがunlockされたか
+      分からない中途半端な状態を作らないため。個別に必要なアドレスは`unlockAddress`で
+      unlockできる(こちらには上限を設けていない)。
+    - PyBitmessage本家にはこの種の上限は無い(keys.datの全アドレスを起動時に常時ロードする
+      設計で、大量アドレスの運用自体を想定していない)。
+    - CLIの`unlock-all`のヘルプにも上限を追記した。
+
+    テスト: tests/test_keyring.cに、上限を引数で渡す`bm_keyring_unlock_all_with_limit`で
+    3件>上限2件を試し、-2が返ること・結果がNULLで件数が3であること・1件もunlockされない
+    ことを確かめるケースを追加した(本物の上限を超える10,001件をテストで作るのは重いため)。
+    ctest 51件全通過。
+
+    **残した課題(未着手)**: 上限は再発防止の柵であって、大量アドレスの運用そのものを
+    可能にするものではない。根本的には次のどれか(または組み合わせ)が要る。
+    - 試行復号をnetwork_epoll_threadから別スレッド(ワーカー)へ移し、ネットワーク処理を
+      止めないようにする(項目38のPoWと同じ考え方)。件数が多いならワーカー間で分割して
+      並列化もできる。
+    - unlockAllの既unlock判定をハッシュ等の索引にしてO(n²)をなくす。
+    - keyringのrwlockを書き込み優先にする(`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`)。
+      ただし試行復号が長く読み取りロックを握る構造自体は変わらない。

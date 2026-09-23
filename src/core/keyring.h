@@ -164,7 +164,20 @@ struct bm_unlock_all_entry
  * 既にkeyringにunlock済みのアドレスは再試行せずunlocked=1として扱う。
  * 成功時0、*out_countに全identity数(結果配列の要素数)を設定する。
  * *out_resultsはmalloc(呼び出し側でfreeすること)。
+ *
+ * §11 2026-09-24 項目44: identity.dbの件数がBM_KEYRING_UNLOCK_ALL_MAX_IDENTITIESを超える
+ * 場合は何もunlockせず-2を返す(*out_countには件数を入れ、*out_resultsはNULL)。
+ * 経緯: 数十万件規模の一括unlockを実行した結果、受信したmsg objectの試行復号(unlock済みの
+ * 全identityで順に復号を試す、bm_trial_decrypt_msg)がnetwork_epoll_thread上で1件約86秒
+ * (24万件時点、1件あたり約0.36ms)かかるようになり、新規接続の処理が数時間止まった。
+ * 上限の10,000件は、過去に実地検証した約5,000件規模の運用を通しつつ、msg1件あたりの
+ * 停止を数秒(約3.6秒)に抑える値。PyBitmessage本家にはこの種の上限は無い(全アドレスを
+ * 常時ロードする設計で、大量アドレスの運用自体を想定していない)。
+ * bm_keyring_unlock_all_with_limitは上限を引数で渡す版(テスト用)。
  */
+#define BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES 10000
+int bm_keyring_unlock_all_with_limit(bm_keyring_t *kr, sqlite3 *db, const char *passphrase, size_t max_identities,
+                                     struct bm_unlock_all_entry **out_results, size_t *out_count);
 int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
                            struct bm_unlock_all_entry **out_results, size_t *out_count);
 

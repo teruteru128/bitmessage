@@ -701,11 +701,27 @@ bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
 int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
                            struct bm_unlock_all_entry **out_results, size_t *out_count)
 {
+    return bm_keyring_unlock_all_with_limit(kr, db, passphrase, BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES, out_results,
+                                            out_count);
+}
+
+int bm_keyring_unlock_all_with_limit(bm_keyring_t *kr, sqlite3 *db, const char *passphrase, size_t max_identities,
+                                     struct bm_unlock_all_entry **out_results, size_t *out_count)
+{
     struct bm_identity_summary *list = NULL;
     size_t count = 0;
     if (bm_identity_store_list(db, &list, &count) != 0)
     {
         return -1;
+    }
+    /* §11 2026-09-24 項目44: 件数上限(keyring.hのdoc参照)。何もunlockしないうちに断る */
+    if (count > max_identities)
+    {
+        bm_log_warn("[keyring] unlock all refused: %zu identities exceeds the limit of %zu\n", count, max_identities);
+        free(list);
+        *out_results = NULL;
+        *out_count = count;
+        return -2;
     }
 
     /* §11 2026-09-12: 8段階化に伴う移行。一括unlockの開始・進捗・完了サマリは

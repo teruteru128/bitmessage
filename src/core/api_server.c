@@ -250,7 +250,19 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
 
     struct bm_unlock_all_entry *results = NULL;
     size_t count = 0;
-    if (bm_keyring_unlock_all(config->keyring, config->identity_db, passphrase, &results, &count) != 0)
+    int rc = bm_keyring_unlock_all(config->keyring, config->identity_db, passphrase, &results, &count);
+    if (rc == -2)
+    {
+        /* §11 2026-09-24 項目44: 件数上限超過(keyring.hのBM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES参照) */
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                "unlockAllAddresses refused: %zu identities exceeds the limit of %d (trial decryption of every "
+                "incoming msg would stall the network thread); unlock the addresses you need with unlockAddress",
+                count, BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES);
+        *out_error = dup_cstr(msg);
+        return NULL;
+    }
+    if (rc != 0)
     {
         *out_error = dup_cstr("failed to list identities");
         return NULL;
