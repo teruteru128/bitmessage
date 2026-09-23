@@ -548,7 +548,7 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
          * 「自分の到達可能アドレスは不明」を表す0.0.0.0を使う(protocol.hのdoc参照)。 */
         struct sockaddr_storage self_addr;
         bm_unspecified_ipv4_address(&self_addr);
-        if (bm_post_version(sock, config->user_agent, 3, &conn->peer_addr, &self_addr) != 0)
+        if (bm_post_version(conn, config->user_agent, 3, &conn->peer_addr, &self_addr, (int64_t)time(NULL)) != 0)
         {
             bm_log_warn("[peer_connector] failed to send version to %s\n", addr_buf);
             epoll_ctl(config->epfd, EPOLL_CTL_DEL, sock, NULL);
@@ -558,10 +558,6 @@ int bm_peer_connector_connect_initial(const struct bm_peer_connector_config *con
             candidates[i].rating = fmax(-1.0, candidates[i].rating - 0.1); /* §11 2026-08-28、上記コメント参照 */
             continue;
         }
-        /* §11 2026-08-23 backlog項目5: bm_post_versionはfdだけを取りconnを持たないため、
-         * ここで送信済みバイト数を積む(bm_version_message_sizeは実際に送った長さと
-         * 同じ計算をするだけの副作用の無い関数、network.hのdoc参照)。 */
-        conn->bytes_sent += (uint64_t)bm_version_message_size(config->user_agent);
 
         if (config->registry != NULL)
         {

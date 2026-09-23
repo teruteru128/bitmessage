@@ -168,8 +168,16 @@ int main(void)
     socklen_t client_peer_len = sizeof(client_peer);
     getsockname(client_fd, (struct sockaddr *)&client_local, &client_local_len);
     getpeername(client_fd, (struct sockaddr *)&client_peer, &client_peer_len);
-    CHECK(bm_post_version(client_fd, "/bitmessage-c-test-client:0.1.0/", 3, &client_peer, &client_local) == 0,
+    /* §11 2026-09-24 項目43: bm_post_versionは送信キューを持つconnを取るようになったため、
+     * クライアント役(fdだけ持つ)はversionを組み立てて直接書く */
+    size_t version_len = 0;
+    unsigned char *version_msg =
+            bm_new_version_message("/bitmessage-c-test-client:0.1.0/", 3, &client_peer, &client_local, &version_len);
+    CHECK(version_msg != NULL
+                  && bm_network_write_all(client_fd, version_msg, version_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS,
+                                          NULL, 0) == 0,
           "client sends version");
+    free(version_msg);
 
     /* --- 3. サーバー側: accept()し、BM_FD_SERVER_SOCKETとしてbm_fd_data_newできることを
      * 確認する(§11の「listenソケットはgetpeername()をスキップする」修正が、accept()された

@@ -419,39 +419,41 @@ static int send_stalled(struct bm_fd_data *conn, int64_t now, size_t *out_queued
     return queued > 0 && since > BM_SEND_STALL_TIMEOUT_SECONDS;
 }
 
-/* §11 2026-08-23 backlog項目5: connを取るようにした(以前はint fdのみ)。connの
- * bytes_sentへも積むため(network.hのdoc参照、broadcast_inv経由のdup()したfdのように
- * connを持たない書き込み経路は対象外だが、verack/pong/pingはいずれもconnを持っている)。 */
-static int send_header_only(struct bm_fd_data *conn, const char *command)
+/* §11 2026-09-24 項目43: 送信キュー経由(bm_network_send)にした。bytes_sentの計上も
+ * bm_network_send側で一元的に行う。 */
+static int send_header_only(struct bm_fd_data *conn, const char *command, int64_t now)
 {
     size_t len = 0;
     unsigned char *packet = bm_create_packet(command, NULL, 0, &len);
-    int rc = bm_network_write_all(conn->fd, packet, len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0);
-    if (rc == 0)
+    if (packet == NULL)
     {
-        conn->bytes_sent += (uint64_t)len;
+        return -1;
     }
+    int rc = bm_network_send(conn, packet, len, now);
     free(packet);
     return rc;
 }
 
-int bm_reply_verack(struct bm_fd_data *conn)
+int bm_reply_verack(struct bm_fd_data *conn, int64_t now)
 {
-    return send_header_only(conn, "verack");
+    return send_header_only(conn, "verack", now);
 }
 
-int bm_reply_pong(struct bm_fd_data *conn)
+int bm_reply_pong(struct bm_fd_data *conn, int64_t now)
 {
-    return send_header_only(conn, "pong");
+    return send_header_only(conn, "pong", now);
 }
 
-int bm_post_version(int sock, const char *user_agent_str, int version,
-                     const struct sockaddr_storage *peer_addr,
-                     const struct sockaddr_storage *local_addr)
+int bm_post_version(struct bm_fd_data *conn, const char *user_agent_str, int version,
+                     const struct sockaddr_storage *peer_addr, const struct sockaddr_storage *local_addr, int64_t now)
 {
     size_t len = 0;
     unsigned char *msg = bm_new_version_message(user_agent_str, version, peer_addr, local_addr, &len);
-    int rc = bm_network_write_all(sock, msg, len, BM_NETWORK_WRITE_TIMEOUT_LONG_SECONDS, NULL, 0);
+    if (msg == NULL)
+    {
+        return -1;
+    }
+    int rc = bm_network_send(conn, msg, len, now);
     free(msg);
     return rc;
 }
@@ -481,7 +483,7 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         bm_log_info("[network] version: v=%u services=%" PRIu64 " ua=%s\n",
                 ver.version, ver.services, ver.user_agent);
         bm_free_version_message(&ver);
-        if (bm_reply_verack(conn) != 0)
+        if (bm_reply_verack(conn, (int64_t)time(NULL)) != 0)
         {
             bm_log_warn("[network] failed to reply verack\n");
         }
@@ -495,7 +497,7 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {
-        if (bm_reply_pong(conn) != 0)
+        if (bm_reply_pong(conn, (int64_t)time(NULL)) != 0)
         {
             bm_log_warn("[network] failed to reply pong\n");
         }
@@ -830,21 +832,21 @@ static void send_inv_chunk(struct bm_fd_data *conn, int64_t now)
         conn->pending_inv_hashes = NULL;
         return;
     }
-    char reason[64] = {0};
-    if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason,
-                sizeof(reason)) != 0)
+    /* §11 2026-09-24 項目43: 送信キュー経由にした。失敗するのはキュー上限超過か致命的な
+     * 書き込みエラーのときだけで、どちらもbm_network_sendがpending_evictionを立てている
+     * (接続ごと切られる)ので、残りのhashは破棄する。 */
+    if (bm_network_send(conn, packet, packet_len, now) != 0)
     {
         char ip[BM_PEER_IP_STRLEN];
         int port = 0;
         bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
-        bm_log_warn("[network] failed to send big-inv chunk to %s:%d (fd=%d): %s, dropping remaining %zu hash(es)\n",
-                ip, port, conn->fd, reason, remaining);
+        bm_log_warn("[network] failed to queue big-inv chunk to %s:%d (fd=%d), dropping remaining %zu hash(es)\n", ip,
+                port, conn->fd, remaining);
         free(packet);
         free(conn->pending_inv_hashes);
         conn->pending_inv_hashes = NULL;
         return;
     }
-    conn->bytes_sent += (uint64_t)packet_len;
     free(packet);
 
     conn->pending_inv_sent += n;
@@ -905,8 +907,11 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
     /* §11 2026-08-26: big invの後続チャンク送信(bm_network_begin_big_inv参照)。
      * handshake_completeやidle timeoutの判定より先に行うことで、詰まったコネクションの
      * 判定と無関係に独立して動く(pending_inv_hashesはverack受信後にしか立たないため
-     * 通常はhandshake_complete==1のconnにしか発生しない)。 */
-    if (conn->pending_inv_hashes != NULL && ctx->now - conn->pending_inv_last_chunk_time >= BM_BIG_INV_CHUNK_INTERVAL_SECONDS)
+     * 通常はhandshake_complete==1のconnにしか発生しない)。
+     * §11 2026-09-24 項目43: 前のchunkを送り切ってから次を積む(送信キューが空のときだけ)。
+     * 読むのが遅い相手のキューへ、間隔だけを頼りにinvを溜め込まないため。 */
+    if (conn->pending_inv_hashes != NULL && ctx->now - conn->pending_inv_last_chunk_time >= BM_BIG_INV_CHUNK_INTERVAL_SECONDS
+        && bm_network_queued_bytes(conn) == 0)
     {
         send_inv_chunk(conn, ctx->now);
     }
@@ -945,7 +950,7 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * 送信直後にlast_activityをここで更新することで、無応答の相手へ毎回のsweepで
          * ping spamしてしまうのを防ぐ(次にpingを送るのはさらにBM_IDLE_PING_TIMEOUT_SECONDS
          * 経ってから)。 */
-        if (send_header_only(conn, "ping") == 0)
+        if (send_header_only(conn, "ping", ctx->now) == 0)
         {
             bm_log_debug("[network] sent idle keepalive ping (fd=%d, %s, idle %" PRId64 "s)\n", conn->fd,
                     conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds);

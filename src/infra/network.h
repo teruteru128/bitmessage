@@ -332,11 +332,12 @@ int bm_network_epoll_register(int epfd, struct bm_fd_data *conn);
  */
 void bm_network_get_stats(uint64_t *out_bytes_sent, uint64_t *out_bytes_received);
 
-int bm_reply_verack(struct bm_fd_data *conn);
-int bm_reply_pong(struct bm_fd_data *conn);
-int bm_post_version(int sock, const char *user_agent_str, int version,
-                     const struct sockaddr_storage *peer_addr,
-                     const struct sockaddr_storage *local_addr);
+/* §11 2026-09-24 項目43: いずれも送信キュー(bm_network_send)へ積む。bm_post_versionは以前は
+ * fdを取っていたが、キューを持つconnを取るようにした。nowはbm_network_sendへそのまま渡す。 */
+int bm_reply_verack(struct bm_fd_data *conn, int64_t now);
+int bm_reply_pong(struct bm_fd_data *conn, int64_t now);
+int bm_post_version(struct bm_fd_data *conn, const char *user_agent_str, int version,
+                     const struct sockaddr_storage *peer_addr, const struct sockaddr_storage *local_addr, int64_t now);
 
 /*
  * fdから読めるだけ読み、受信バッファに追記した上でパース可能なメッセージを

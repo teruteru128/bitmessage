@@ -85,11 +85,11 @@ int main(void)
         uint64_t sent_before = 0, received_before = 0;
         bm_network_get_stats(&sent_before, &received_before);
 
-        CHECK(bm_reply_verack(conn) == 0, "bm_reply_verack should succeed");
+        CHECK(bm_reply_verack(conn, 1000) == 0, "bm_reply_verack should succeed");
         CHECK(conn->bytes_sent == BM_MESSAGE_HEADER_SIZE,
               "conn->bytes_sent should equal the header-only verack packet size after one reply");
 
-        CHECK(bm_reply_pong(conn) == 0, "bm_reply_pong should succeed");
+        CHECK(bm_reply_pong(conn, 1000) == 0, "bm_reply_pong should succeed");
         CHECK(conn->bytes_sent == BM_MESSAGE_HEADER_SIZE * 2,
               "conn->bytes_sent should accumulate across multiple replies (verack + pong)");
 

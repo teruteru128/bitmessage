@@ -859,13 +859,12 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
         unsigned char *packet = bm_create_inventory_message("getdata", missing, missing_count, &packet_len);
         if (packet != NULL)
         {
-            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) != 0)
+            if (bm_network_send(conn, packet, packet_len, (int64_t)time(NULL)) != 0)
             {
                 bm_log_warn("[object_sync] failed to send getdata\n");
             }
             else
             {
-                conn->bytes_sent += (uint64_t)packet_len;
                 /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
                  * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
                  * 受信側の可視化と同種の穴、ユーザー指摘)。 */
@@ -945,28 +944,17 @@ static void handle_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *co
         free(payload);
         if (packet != NULL)
         {
-            char reason[BUFSIZ];
-            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, reason,
-                        BUFSIZ)
-                != 0)
+            /* §11 2026-09-24 項目43: 送信キュー経由にした。失敗するのはキュー上限超過か
+             * 致命的な書き込みエラーのときだけで、どちらもbm_network_sendがpending_eviction
+             * を立て(実際の切断はidle_sweep_one)、理由もログに出している。以後のitemも
+             * 積めないのでループを抜ける(2026-09-12 05:43に観測した失敗ログの連発を防ぐ
+             * 項目29の方針を維持)。 */
+            if (bm_network_send(conn, packet, packet_len, (int64_t)time(NULL)) != 0)
             {
-                /* §11 2026-09-13 項目29: このハンドラはnetwork_epoll_thread単一スレッド内
-                 * (bm_object_sync_dispatch経由)でのみ呼ばれるため、broadcast_inv
-                 * (network.hのconn->pending_evictionのdoc参照)のような別スレッドからの
-                 * evict_if_current(generation照合)は不要で、単にこのフラグを立てるだけで
-                 * 良い。実際のclose_connectionはこれまで通りidle_sweep_one(最大5秒後、
-                 * 通常は次の1秒間隔ポーリングで即座)が行う。書き込みに1回失敗した接続は
-                 * 以後のitemも送れない可能性が高いため、残りをnot_found扱いにせず
-                 * ループを抜けて無駄な失敗ログの連発(2026-09-12 05:43に観測した単一
-                 * peer切断で145件連続、DESIGN.md参照)を防ぐ。 */
-                bm_log_warn("[object_sync] failed to send object for getdata to fd=%d(%s), evicting\n", conn->fd,
-                        reason);
-                conn->pending_eviction = 1;
                 free(packet);
                 break;
             }
             sent_count++;
-            conn->bytes_sent += (uint64_t)packet_len;
             free(packet);
         }
     }
@@ -1066,7 +1054,7 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
         unsigned char *packet = bm_create_addr_message(addresses, (size_t)n, &packet_len);
         if (packet != NULL)
         {
-            if (bm_network_write_all(conn->fd, packet, packet_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) != 0)
+            if (bm_network_send(conn, packet, packet_len, (int64_t)time(NULL)) != 0)
             {
                 bm_log_warn("[object_sync] failed to send addr\n");
             }
@@ -1075,7 +1063,6 @@ static void send_addr_reply(struct bm_object_sync_ctx *ctx, struct bm_fd_data *c
                 /* §11 2026-09-12: 8段階化に伴う移行。verack受信時に1回だけ送るaddrの
                  * サマリなので無番号のDEBUGにした。 */
                 bm_log_debug("[object_sync] sent addr (%d entries)\n", n);
-                conn->bytes_sent += (uint64_t)packet_len;
             }
             free(packet);
         }
@@ -1237,10 +1224,9 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                     bm_create_error_message(2, 0, "Your is using an old protocol. Closing connection.", &err_len);
             if (err_packet != NULL)
             {
-                if (bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) == 0)
-                {
-                    conn->bytes_sent += (uint64_t)err_len;
-                }
+                /* §11 2026-09-24 項目43: 送信キューへ積むだけ(小さいのでその場でほぼ送り切れる)。
+                 * 送り切れなかった分は直後の切断で捨てる、以前の2秒待ちと同じベストエフォート */
+                bm_network_send(conn, err_packet, err_len, (int64_t)time(NULL));
                 free(err_packet);
             }
             conn->should_disconnect = 1;
@@ -1269,10 +1255,9 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             unsigned char *err_packet = bm_create_error_message(2, 0, err_text, &err_len);
             if (err_packet != NULL)
             {
-                if (bm_network_write_all(conn->fd, err_packet, err_len, BM_NETWORK_WRITE_TIMEOUT_SHORT_SECONDS, NULL, 0) == 0)
-                {
-                    conn->bytes_sent += (uint64_t)err_len;
-                }
+                /* §11 2026-09-24 項目43: 送信キューへ積むだけ(小さいのでその場でほぼ送り切れる)。
+                 * 送り切れなかった分は直後の切断で捨てる、以前の2秒待ちと同じベストエフォート */
+                bm_network_send(conn, err_packet, err_len, (int64_t)time(NULL));
                 free(err_packet);
             }
             conn->should_disconnect = 1;
@@ -1288,7 +1273,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         conn->user_agent = (ver.user_agent != NULL) ? strdup(ver.user_agent) : NULL;
         bm_free_version_message(&ver);
         record_outbound_success(ctx, conn);
-        if (bm_reply_verack(conn) != 0)
+        if (bm_reply_verack(conn, (int64_t)time(NULL)) != 0)
         {
             bm_log_warn("[object_sync] failed to reply verack\n");
         }
@@ -1303,13 +1288,9 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
              * 「自分の到達可能アドレスは不明」を表す0.0.0.0を使う(protocol.hのdoc参照)。 */
             struct sockaddr_storage self_addr;
             bm_unspecified_ipv4_address(&self_addr);
-            if (bm_post_version(conn->fd, ctx->user_agent, 3, &conn->peer_addr, &self_addr) != 0)
+            if (bm_post_version(conn, ctx->user_agent, 3, &conn->peer_addr, &self_addr, (int64_t)time(NULL)) != 0)
             {
                 bm_log_warn("[object_sync] failed to send version to inbound peer\n");
-            }
-            else
-            {
-                conn->bytes_sent += (uint64_t)bm_version_message_size(ctx->user_agent);
             }
         }
     }
@@ -1341,7 +1322,7 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
     }
     else if (strncmp(msg->command, "ping", 12) == 0)
     {
-        if (bm_reply_pong(conn) != 0)
+        if (bm_reply_pong(conn, (int64_t)time(NULL)) != 0)
         {
             bm_log_warn("[object_sync] failed to reply pong\n");
         }
