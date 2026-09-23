@@ -16,10 +16,13 @@
  * HandleSendMessage、および src/api.py:1258 の HandleSendBroadcast。いずれも
  *   if len(subject + message) > (2 ** 18 - 500):
  *       raise APIError(27, 'Message is too long.')
- * )。2^18はオブジェクトpayloadの上限そのもので、そこから引く500バイトのマージンは
- * 本家のコードにも根拠のコメントが無いが、msgフォーマットのヘッダ・署名・暗号化に伴う
- * 増分を吸収するためのものと読める。独自に広げると本家ノードが中継しないサイズの
- * オブジェクトを作りうるため、あえて本家と同じ値のままにしている。
+ * )。2^18はobject全体長の上限そのもの(object_sync.cのBM_MAX_OBJECT_PAYLOAD_SIZE参照)。
+ * 500バイトのマージンの根拠は、現行ソースには残っていないが、導入時のコミット(PyBitmessage
+ * c3060622、2014-08-27 "Bitmessage Protocol Version Three")のUI側コメントにある:
+ *   "The whole network message must fit in 2^18 bytes. Let's assume 500 bytes of overhead."
+ * つまり「object全体(ヘッダ・署名・暗号化・埋め込みack込み)を2^18に収めるための概算の
+ * 余裕」である。独自に広げると仕様上の上限を超えるオブジェクトを作りうるため、あえて本家と
+ * 同じ値のままにしている。
  *
  * なお「subjectとbodyの合計」で見るのは本家の判定式に合わせたもので、実際のmsg
  * payloadはこの2つ以外にも項目を含む(だからこそ上のマージンがある)。

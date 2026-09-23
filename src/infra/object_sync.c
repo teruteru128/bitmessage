@@ -30,6 +30,16 @@
 
 /* DoS対策の上限値(DESIGN.md §5.0、PyBitmessage protocol.py準拠) */
 #define BM_MAX_INVENTORY_ITEMS 50000
+/* §11 2026-09-23: この上限はnonce込みのobject全体長に適用する(handle_object参照)。
+ * 名前に"PAYLOAD"とあるが、ここで言うpayloadはP2P "object"メッセージのpayload(=object全体)
+ * であり、共通ヘッダの後ろの種別依存部分(objectPayload)ではない。根拠はプロトコル仕様
+ * (wiki.bitmessage.org Protocol_specification、PyBitmessage docs/protocol.rst)の
+ *   "The maximum allowable length of an object (not to be confused with the objectPayload)
+ *    is 2^18 bytes."
+ * 現行のPyBitmessage実装(network/bmproto.py bm_command_object)は共通ヘッダを除いた長さで
+ * 比べており、仕様よりヘッダ分(最小22バイト)緩い。一度は実装側に合わせたが、仕様の文言が
+ * 明確であること、MiNode-Refined 0.3.1も全体長基準であることから、仕様側を採った
+ * (経緯はDESIGN.md §11)。 */
 #define BM_MAX_OBJECT_PAYLOAD_SIZE (1u << 18)
 
 /* 期限切れobject GCの間引き間隔。dispatchが呼ばれるたびに毎回DELETEを試みるのは無駄なので、
@@ -608,6 +618,7 @@ void bm_object_sync_maybe_reannounce_onion_peer(struct bm_object_sync_ctx *ctx, 
 static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_data *conn,
                            const struct bm_message *msg)
 {
+    /* 仕様どおりobject全体長(nonce込み)で判定する。BM_MAX_OBJECT_PAYLOAD_SIZEのコメント参照 */
     if (msg->length > BM_MAX_OBJECT_PAYLOAD_SIZE)
     {
         bm_log_warn("[object_sync] object too large (%u bytes), ignoring\n", msg->length);

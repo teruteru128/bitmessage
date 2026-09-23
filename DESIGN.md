@@ -3039,7 +3039,8 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     として新設し、`check_subject_body_length`(api_server.c)を`h_sendMessage`/
     `h_sendBroadcast`の双方から呼ぶようにした。2^18はオブジェクトpayloadの上限そのもので、
     そこから引く500バイトのマージンは本家のコードにも根拠のコメントが無いが、msgフォーマットの
-    ヘッダ・署名・暗号化に伴う増分を吸収するためのものと読める。**独自に広げると本家ノードが
+    ヘッダ・署名・暗号化に伴う増分を吸収するためのものと読める(→項目42で、導入時のコミットに
+    根拠のコメントがあったことが判明。「object全体を2^18に収めるための概算」だった)。**独自に広げると本家ノードが
     中継しないサイズのオブジェクトを作りうるため、あえて本家と同じ値のままにしている。**
 
     `h_sendMessage`では、この検査をgetpubkey要求の自動送出**より前**に置いた。順序を逆にすると、
@@ -3525,3 +3526,44 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - 静的torrc設定でonionを建てている利用者(`bitmessage.conf`の`[tor] onion_address`経路、
       `main.c`参照)にはこの機能を自動適用できない。その場合はUI用サービスを自分でtorrcに
       書いてもらい、bind先のローカルポートだけ設定で受け取る形になる。
+42. **objectサイズ上限(2^18)の適用範囲を確認し、仕様どおり「object全体長」のまま維持**:
+    2026-09-23、ユーザー依頼。MiNode-Refined 0.3.1のchangelogが「objectサイズ検証を
+    PyBitmessageと完全一致にした」と主張していたのを機に、3実装を実ソースで突き合わせた。
+    - **うち(`object_sync.c`の`handle_object`)とMiNode-Refined 0.3.1**: nonce込みのobject
+      全体長を2^18と比べる。
+    - **PyBitmessageの現行実装(`network/bmproto.py`の`bm_command_object`)**: 共通ヘッダ
+      (nonce/expiresTime/objectType/varint version/varint stream、最小22バイト)を読み終えた
+      **後の残り**を2^18と比べる。うちより22バイト以上緩い。
+    - **プロトコル仕様**(wiki.bitmessage.orgのProtocol_specification、PyBitmessageの
+      `docs/protocol.rst`とreadthedocs版): "The maximum allowable length of an object (not to be
+      confused with the objectPayload) is 2^18 bytes." = **全体長**。ホワイトペーパー
+      (bitmessage.pdf)にはサイズ上限の記述自体が無い。
+
+    一度は本家実装に合わせる変更(ヘッダ除外後の長さで比較)を作ったが、ユーザーの「本家と
+    設計文書で食い違っている可能性もあるのでは」という指摘で仕様を確認したところ、仕様の
+    文言が明確に全体長を指していたため、**変更は取り下げて仕様準拠の現状を維持**し、根拠を
+    コメントに残した(`BM_MAX_OBJECT_PAYLOAD_SIZE`の定義箇所)。差はヘッダ分の数十バイトで、
+    実ネットワークでこの範囲のobjectに出会う見込みはほぼ無い(送信側の本家マージンは下記)。
+
+    本家実装がなぜ仕様とずれたかは、PyBitmessageのgit履歴で経緯が追える:
+    - 2014-08-27 `c3060622` "Bitmessage Protocol Version Three"(プロトコルv3導入): 受信
+      スレッドがP2Pメッセージの`payloadLength > 2 ** 18`を拒否していた。"object"メッセージの
+      payloadはobject全体なので、この時点の実装は**仕様どおり全体長**。同コミットのUI側に
+      "The whole network message must fit in 2^18 bytes. Let's assume 500 bytes of overhead."
+      というコメントがあり、これが送信側の本文上限`2**18 - 500`(項目35、`message_limits.h`)の
+      根拠。現行ソースからはこのコメントが消えている。
+    - 2017-05-24 `d635e515` "Big Asyncore update"(ネットワーク層の書き直し): 検査が
+      `bm_command_object`へ移り、ヘッダをデコードした後に`len(self.payload) - self.payloadOffset`
+      で比べる形になった。この時点で**ヘッダ除外後の長さ**に変わっている。意図的な変更であることを
+      示すコメントやコミットメッセージは見当たらず、書き直しに伴う副作用と考えるのが自然
+      (推測)。なお同コミットのログ出力は`'...(%s bytes)' % len(self.payload) - self.payloadOffset`
+      と演算子の優先順位を誤っており、この分岐が実行されればTypeErrorになる形だった
+      (2018-07-17の`996e71ae`でloggerの引数渡しに書き換えられ解消)。
+    - 2023-01-04 `0c07bb62`: 定数が`protocol.MAX_OBJECT_PAYLOAD_SIZE`へ移動(値・判定は不変)。
+
+    テストの追加は無し(挙動は変えていないため)。比較の過程で得た、中継挙動のもう一つの差分も
+    記録しておく: PyBitmessageは型別のサイズ検査(getpubkey≥42、pubkey 146〜440、broadcast≥180、
+    いずれも全体長)に落ちたobjectを、自分では処理しないが**inventoryへの保存と中継はする**
+    (`stopDownloadingObject(..., forwardAnyway=True)`の後、例外を再送出せず保存・invQueue投入へ
+    進む)。MiNode-Refined 0.3.1は同じ閾値で早期returnし中継もしない。うちは型別検査を持たず
+    保存・中継するので、中継挙動としては本家に近い。型別検査の追加は不要と判断した。
