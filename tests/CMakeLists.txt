@@ -88,6 +88,10 @@ add_executable(test_getpubkey_twin_versions test_getpubkey_twin_versions.c)
 target_link_libraries(test_getpubkey_twin_versions PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME getpubkey_twin_versions COMMAND test_getpubkey_twin_versions)
 
+add_executable(test_convert_v3_to_v4 test_convert_v3_to_v4.c)
+target_link_libraries(test_convert_v3_to_v4 PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME convert_v3_to_v4 COMMAND test_convert_v3_to_v4)
+
 add_executable(test_resend test_resend.c)
 target_link_libraries(test_resend PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME resend COMMAND test_resend)

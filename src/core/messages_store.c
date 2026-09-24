@@ -568,3 +568,29 @@ int bm_messages_store_trash_sent_message(sqlite3 *db, const unsigned char msg_id
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
+
+/* §11 2026-09-24 項目45(messages_store.h参照) */
+int bm_messages_store_rename_own_address(sqlite3 *db, const char *old_address, const char *new_address)
+{
+    static const char *SQLS[] = {
+        "UPDATE inbox SET to_address = ?2 WHERE to_address = ?1;",
+        "UPDATE sent SET from_address = ?2 WHERE from_address = ?1;",
+    };
+    for (size_t i = 0; i < sizeof(SQLS) / sizeof(SQLS[0]); i++)
+    {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, SQLS[i], -1, &stmt, NULL) != SQLITE_OK)
+        {
+            return -1;
+        }
+        sqlite3_bind_text(stmt, 1, old_address, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, new_address, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE)
+        {
+            return -1;
+        }
+    }
+    return 0;
+}

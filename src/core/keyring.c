@@ -130,6 +130,9 @@ static int aes256gcm_unwrap(const unsigned char kek[32], const unsigned char *aa
     return ret;
 }
 
+static int add_unlocked_entry(bm_keyring_t *kr, const struct bm_identity_row *row,
+                              const unsigned char priv_signing[32], const unsigned char priv_encryption[32]);
+
 /* KEKが分かった状態でGCM復号しkeyringへ追加する共通部分(§7.4でscrypt個別方式/vault-hkdf方式の
  * 双方から呼べるよう分離した)。成功時0、passphrase誤り・改竄検出(AEAD tag不一致)は非0 */
 static int unlock_with_kek(bm_keyring_t *kr, const struct bm_identity_row *row, const unsigned char kek[32])
@@ -149,11 +152,21 @@ static int unlock_with_kek(bm_keyring_t *kr, const struct bm_identity_row *row, 
         return -1;
     }
 
+    int rc = add_unlocked_entry(kr, row, priv_signing, priv_encryption);
+    OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
+    OPENSSL_cleanse(priv_encryption, sizeof(priv_encryption));
+    return rc;
+}
+
+/* 復号済みの秘密鍵でkeyringへ1件追加する(unlock_with_kekから分離。§11 2026-09-24 項目45の
+ * v3→v4変換で、v3行から取り出した鍵でv4をそのままunlock状態にするためにも使う)。
+ * priv_*のゼロ埋めは呼び出し側の責任。成功時0 */
+static int add_unlocked_entry(bm_keyring_t *kr, const struct bm_identity_row *row,
+                              const unsigned char priv_signing[32], const unsigned char priv_encryption[32])
+{
     struct bm_unlocked_identity *entry = malloc(sizeof(*entry));
     if (entry == NULL)
     {
-        OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
-        OPENSSL_cleanse(priv_encryption, sizeof(priv_encryption));
         return -1;
     }
     memset(entry, 0, sizeof(*entry));
@@ -168,9 +181,6 @@ static int unlock_with_kek(bm_keyring_t *kr, const struct bm_identity_row *row, 
     entry->nonce_trials_per_byte = row->nonce_trials_per_byte;
     entry->payload_length_extra_bytes = row->payload_length_extra_bytes;
     entry->unlocked_at = time(NULL);
-
-    OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
-    OPENSSL_cleanse(priv_encryption, sizeof(priv_encryption));
 
     pthread_rwlock_wrlock(&kr->lock);
     entry->next = kr->head;
@@ -582,6 +592,175 @@ int bm_keyring_export(sqlite3 *db, const char *address, const char *passphrase,
         return -1;
     }
     return 0;
+}
+
+/* §11 2026-09-24 項目45(keyring.h参照) */
+void bm_keyring_convert_session_init(struct bm_keyring_convert_session *session, const char *passphrase)
+{
+    memset(session, 0, sizeof(*session));
+    session->passphrase = passphrase;
+}
+
+void bm_keyring_convert_session_clear(struct bm_keyring_convert_session *session)
+{
+    OPENSSL_cleanse(session->master_kek, sizeof(session->master_kek));
+    session->master_kek_state = 0;
+}
+
+/* vaultのmaster KEKをセッション内で1回だけ導出する(一括変換で行ごとにscryptしないため)。
+ * vaultが無い・passphraseがvaultと一致しない場合は失敗を記録し、以後も失敗を返す。成功時0 */
+static int session_master_kek(sqlite3 *db, struct bm_keyring_convert_session *session)
+{
+    if (session->master_kek_state == 0)
+    {
+        unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+        char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+        unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+        if (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) == 0
+            && derive_master_kek(session->passphrase, vault_salt, vault_kdf_params, session->master_kek) == 0
+            && verify_vault_canary(session->master_kek, vault_canary) == 0)
+        {
+            session->master_kek_state = 1;
+        }
+        else
+        {
+            OPENSSL_cleanse(session->master_kek, sizeof(session->master_kek));
+            session->master_kek_state = -1;
+        }
+    }
+    return (session->master_kek_state == 1) ? 0 : -1;
+}
+
+int bm_keyring_ensure_v4_sibling(bm_keyring_t *kr, sqlite3 *db, const char *v3_address,
+                                  struct bm_keyring_convert_session *session,
+                                  char out_v4_address[BM_KEYRING_MAX_ADDRESS_LEN], int *out_created)
+{
+    *out_created = 0;
+    struct bm_identity_row v3;
+    if (bm_identity_store_load(db, v3_address, &v3) != 0)
+    {
+        return BM_KEYRING_CONVERT_ERR_NOT_FOUND;
+    }
+    if (v3.address_version != 3)
+    {
+        return BM_KEYRING_CONVERT_ERR_NOT_V3;
+    }
+
+    /* v3行の鍵を取り出す。鍵のラップはAAD(とvault方式ではHKDFのinfo)にアドレス文字列を
+     * 使っているので、wrapped鍵をv4行へそのままコピーすることはできず、必ず一度復号して
+     * v4のアドレスでラップし直す必要がある */
+    int is_vault = (strcmp(v3.kdf_algo, "vault-hkdf") == 0);
+    unsigned char kek[32];
+    int kek_rc;
+    if (is_vault)
+    {
+        kek_rc = (session_master_kek(db, session) == 0)
+                     ? hkdf_expand_wrap_key(session->master_kek, v3.kdf_salt, v3.address, kek)
+                     : -1;
+    }
+    else
+    {
+        kek_rc = resolve_kek_for_row(db, &v3, session->passphrase, kek);
+    }
+    if (kek_rc != 0)
+    {
+        OPENSSL_cleanse(kek, sizeof(kek));
+        return BM_KEYRING_CONVERT_ERR_PASSPHRASE;
+    }
+    unsigned char priv_signing[32];
+    unsigned char priv_encryption[32];
+    size_t addr_len = strlen(v3.address);
+    int rc1 = aes256gcm_unwrap(kek, (const unsigned char *)v3.address, addr_len, v3.wrapped_priv_signing_key,
+                                priv_signing);
+    int rc2 = aes256gcm_unwrap(kek, (const unsigned char *)v3.address, addr_len, v3.wrapped_priv_encryption_key,
+                                priv_encryption);
+    OPENSSL_cleanse(kek, sizeof(kek));
+    int ret = 0;
+    if (rc1 != 0 || rc2 != 0)
+    {
+        ret = BM_KEYRING_CONVERT_ERR_PASSPHRASE;
+        goto out;
+    }
+
+    unsigned char ripe[20];
+    bm_address_calc_ripe(v3.signing_pubkey, v3.encryption_pubkey, ripe);
+    char *v4_address = bm_address_encode(4, (uint64_t)v3.stream, ripe, 20);
+    if (v4_address == NULL)
+    {
+        ret = -1;
+        goto out;
+    }
+    snprintf(out_v4_address, BM_KEYRING_MAX_ADDRESS_LEN, "%s", v4_address);
+    free(v4_address);
+
+    struct bm_identity_row v4;
+    if (bm_identity_store_load(db, out_v4_address, &v4) == 0)
+    {
+        /* 兄弟のv4が既にある: v4側の設定を優先し、v4に無い情報(空のlabel、chanフラグ)だけ
+         * v3から補う。公開鍵はripeが一致する以上同じはずだが、念のため確かめる */
+        if (memcmp(v4.signing_pubkey, v3.signing_pubkey, 65) != 0
+            || memcmp(v4.encryption_pubkey, v3.encryption_pubkey, 65) != 0)
+        {
+            ret = -1;
+            goto out;
+        }
+        if (v4.label[0] == '\0' && v3.label[0] != '\0')
+        {
+            bm_identity_store_update_label(db, out_v4_address, v3.label);
+        }
+        if (v3.is_chan && !v4.is_chan)
+        {
+            bm_identity_store_set_is_chan(db, out_v4_address, 1);
+        }
+    }
+    else
+    {
+        /* 兄弟のv4を作る。ラップ方式はv3行に揃える(vault行ならセッションのmaster KEKで
+         * HKDF、scrypt行ならpassphraseで新しいsaltのscrypt)。label・難易度・chanフラグは
+         * v3から引き継ぐ(enabledは常に1で動作に影響しないので引き継がない) */
+        int store_rc;
+        if (is_vault)
+        {
+            store_rc = bm_keyring_import_identity_with_master_kek(
+                db, out_v4_address, v3.label, 4, v3.stream, v3.signing_pubkey, v3.encryption_pubkey, priv_signing,
+                priv_encryption, session->master_kek, v3.nonce_trials_per_byte, v3.payload_length_extra_bytes);
+        }
+        else
+        {
+            store_rc = bm_keyring_create_identity(db, out_v4_address, v3.label, 4, v3.stream, v3.signing_pubkey,
+                                                  v3.encryption_pubkey, priv_signing, priv_encryption,
+                                                  session->passphrase, v3.nonce_trials_per_byte,
+                                                  v3.payload_length_extra_bytes);
+        }
+        if (store_rc != 0 || bm_identity_store_load(db, out_v4_address, &v4) != 0)
+        {
+            ret = -1;
+            goto out;
+        }
+        if (v3.is_chan)
+        {
+            bm_identity_store_set_is_chan(db, out_v4_address, 1);
+        }
+        *out_created = 1;
+    }
+
+    /* v3がunlock済みなら、変換後もv4で受信し続けられるようv4もunlock状態にする
+     * (v3のkeyringエントリは呼び出し側がv3を削除するときにbm_keyring_delete_identityで外す) */
+    struct bm_unlocked_identity probe;
+    if (bm_keyring_find_by_address(kr, v3.address, &probe) && !bm_keyring_find_by_address(kr, out_v4_address, &probe))
+    {
+        if (add_unlocked_entry(kr, &v4, priv_signing, priv_encryption) != 0)
+        {
+            ret = -1;
+        }
+    }
+    OPENSSL_cleanse(&probe, sizeof(probe));
+
+out:
+    OPENSSL_cleanse(priv_signing, sizeof(priv_signing));
+    OPENSSL_cleanse(priv_encryption, sizeof(priv_encryption));
+    OPENSSL_cleanse(&v3, sizeof(v3));
+    return ret;
 }
 
 int bm_keyring_lock(bm_keyring_t *kr, const char *address)

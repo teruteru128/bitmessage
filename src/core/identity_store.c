@@ -251,15 +251,11 @@ int bm_identity_store_update_label(sqlite3 *db, const char *address, const char 
     return (rc == SQLITE_DONE && sqlite3_changes(db) > 0) ? 0 : -1;
 }
 
-int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count)
+/* bm_identity_store_list/_list_by_versionの共通部分: address, label, enabled, is_chanの順に
+ * SELECTするprepare済みstmtを読み切ってfinalizeする */
+static int collect_identity_summaries(sqlite3_stmt *stmt, struct bm_identity_summary **out_list,
+                                      size_t *out_count)
 {
-    static const char *SQL = "SELECT address, label, enabled, is_chan FROM identities ORDER BY created_time;";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
-    {
-        return -1;
-    }
-
     size_t cap = 8;
     size_t count = 0;
     struct bm_identity_summary *list = malloc(sizeof(*list) * cap);
@@ -288,6 +284,52 @@ int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, s
     *out_list = list;
     *out_count = count;
     return 0;
+}
+
+int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT address, label, enabled, is_chan FROM identities ORDER BY created_time;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    return collect_identity_summaries(stmt, out_list, out_count);
+}
+
+int bm_identity_store_list_by_version(sqlite3 *db, int address_version, size_t limit, size_t offset,
+                                      struct bm_identity_summary **out_list, size_t *out_count)
+{
+    static const char *SQL = "SELECT address, label, enabled, is_chan FROM identities WHERE address_version = ?1 "
+                             "ORDER BY created_time, address LIMIT ?2 OFFSET ?3;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, address_version);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)limit);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)offset);
+    return collect_identity_summaries(stmt, out_list, out_count);
+}
+
+int bm_identity_store_count_by_version(sqlite3 *db, int address_version, size_t *out_count)
+{
+    static const char *SQL = "SELECT COUNT(*) FROM identities WHERE address_version = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, address_version);
+    int rc = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        *out_count = (size_t)sqlite3_column_int64(stmt, 0);
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
 }
 
 int bm_identity_store_load_vault(sqlite3 *db, unsigned char out_vault_salt[BM_IDENTITY_VAULT_SALT_LEN],

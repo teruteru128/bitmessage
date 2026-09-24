@@ -136,6 +136,16 @@ void bm_sent_message_list_free(struct bm_sent_message *list, size_t count);
  * 一覧から消える。成功時0。 */
 int bm_messages_store_trash_sent_message(sqlite3 *db, const unsigned char msg_id[32]);
 
+/*
+ * §11 2026-09-24 項目45 convertV3AddressesToV4用。自分のアドレスがold_addressから
+ * new_addressへ変わったことを反映する: inboxのto_address(受信した宛先)とsentの
+ * from_address(差出人)を書き換える。sentを書き換えるのは、再送(send_pipeline)が
+ * from_addressでkeyringから鍵を引くため(旧アドレスのidentityを消すと再送できなくなる)。
+ * inboxのfrom_addressとsentのto_addressは相手のアドレスなので触らない。
+ * 該当行が無くても成功(何度呼んでも同じ結果になる)。成功時0。
+ */
+int bm_messages_store_rename_own_address(sqlite3 *db, const char *old_address, const char *new_address);
+
 /* --- §5.4 broadcast購読(subscriptions) --- */
 
 /* 既存行があればlabelのみ更新(UPSERT)。成功時0 */

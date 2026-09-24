@@ -63,6 +63,12 @@ static void print_usage(const char *prog)
             "  lock <address>\n"
             "  lock-all\n"
             "  delete <address>\n"
+            "  convert-to-v4 <v3Address> <passphrase>\n"
+            "      v3アドレスを同じ鍵のv4アドレスへ移す(v4が無ければ作り、inbox/sentのアドレスを\n"
+            "      書き換え、v3を削除する)。v3とv4はripeが共通で受信msgの宛先を区別できないため\n"
+            "  convert-all-v3-to-v4 <passphrase> [limit]\n"
+            "      identity.dbのv3を古い順に最大limit件(既定1000、上限10000)まとめてconvert-to-v4する。\n"
+            "      戻り値のremainingが0になるまで繰り返し実行する\n"
             "  cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n"
             "      相手の公開鍵(いずれも130桁hex)を手動でpubkey_cacheへ登録する。\n"
             "      通常はsend-messageが未登録ならgetpubkey要求を自動送出し応答を自動キャッシュ\n"
@@ -1050,6 +1056,35 @@ int main(int argc, char **argv)
         }
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         return call_rpc(&env, "deleteAddress", params);
+    }
+
+    if (strcmp(cmd, "convert-to-v4") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "使い方: %s convert-to-v4 <v3Address> <passphrase>\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        bm_json_array_append(params, bm_json_new_string(argv[3]));
+        return call_rpc(&env, "convertAddressToV4", params);
+    }
+
+    if (strcmp(cmd, "convert-all-v3-to-v4") == 0)
+    {
+        if (argc != 3 && argc != 4)
+        {
+            fprintf(stderr, "使い方: %s convert-all-v3-to-v4 <passphrase> [limit]\n", argv[0]);
+            bm_json_free(params);
+            return EXIT_FAILURE;
+        }
+        bm_json_array_append(params, bm_json_new_string(argv[2]));
+        if (argc == 4)
+        {
+            bm_json_array_append(params, bm_json_new_number(atof(argv[3])));
+        }
+        return call_rpc(&env, "convertV3AddressesToV4", params);
     }
 
     if (strcmp(cmd, "cache-pubkey") == 0)

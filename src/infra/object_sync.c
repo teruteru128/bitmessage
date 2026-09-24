@@ -306,6 +306,23 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
             return;
         }
         found = bm_keyring_find_by_ripe_version(ctx->keyring, body, hdr->version, hdr->stream, &id) ? 1 : 0;
+        /*
+         * §11 2026-09-24 項目45: v3の要求で該当するv3 identityが無ければ、同じripe・streamの
+         * v4 identity(兄弟)の鍵からv3形式のpubkeyを組み立てて応答する。v3の兄弟をv4へ寄せる
+         * 移行(convertV3AddressesToV4)の後も、v3アドレスしか知らない相手が送れるようにする
+         * ため。相手がv3アドレス宛に送ったmsgは、宛先のripeが同じなのでv4のidentityで復号できる
+         * (trial_decryptはripeしか照合しない)。
+         * 本家(processgetpubkey)は見つかったアドレスのversionが要求と違えば無視するので、ここは
+         * 意図的な逸脱。プライバシー面で増える露出は小さいと判断した: v3のgetpubkeyはripeを
+         * 平文で運ぶので、要求を見た第三者はその時点でv4アドレスも組み立てられる。応答で新たに
+         * 出るのは公開鍵と「そのアドレスが生きている」ことだが、アドレスを知っている者はv4の
+         * getpubkeyで同じものを得られる。PoWのコストは応答キャッシュ(キーは要求versionの3)で
+         * 抑えられる。
+         */
+        if (!found && hdr->version == 3)
+        {
+            found = bm_keyring_find_by_ripe_version(ctx->keyring, body, 4, hdr->stream, &id) ? 1 : 0;
+        }
     }
     else
     {
@@ -328,16 +345,18 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     unsigned char ripe[BM_RIPE_LEN];
     memcpy(ripe, id.ripe, sizeof(ripe));
 
+    /* 応答のversionは見つかったidentityのversionではなく要求version(上のv3→v4兄弟の
+     * フォールバックでは両者が異なる。それ以外では一致を確認済み) */
     struct bm_identity_info info;
     memset(&info, 0, sizeof(info));
-    info.address_version = id.address_version;
+    info.address_version = hdr->version;
     info.stream = id.stream;
     memcpy(info.pub_signing, id.pub_signing, 65);
     memcpy(info.pub_encryption, id.pub_encryption, 65);
     memcpy(info.priv_signing, id.priv_signing, 32);
     info.nonce_trials_per_byte = id.nonce_trials_per_byte;
     info.payload_length_extra_bytes = id.payload_length_extra_bytes;
-    uint64_t address_version = id.address_version;
+    uint64_t address_version = hdr->version;
     uint64_t stream = id.stream;
     OPENSSL_cleanse(&id, sizeof(id));
 

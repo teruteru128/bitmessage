@@ -3764,7 +3764,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - unlockAllの既unlock判定をハッシュ等の索引にしてO(n²)をなくす。
     - keyringのrwlockを書き込み優先にする(`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`)。
       ただし試行復号が長く読み取りロックを握る構造自体は変わらない。
-45. **v3/v4の兄弟アドレスが共存するときのgetpubkey応答の取り違えを修正(実装済み・未デプロイ)**:
+45. **v3/v4の兄弟アドレスが共存するときのgetpubkey応答の取り違えを修正し、v3をv4へ寄せる移行APIを追加(実装済み・未デプロイ)**:
     2026-09-24、ユーザーの質問(「v3とv4で宛先ripeが共通なので、受信は先にヒットした方の
     アドレスに入る。受信ボックスがv3宛ばかりになるのはどうしたらいいか」)を調べる中で発覚。
     以下、同じ鍵ペアから作ったv3とv4のアドレス(ripeが共通)を「兄弟」と呼ぶ。
@@ -3810,21 +3810,49 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     キャッシュテーブルが作り直されることを確認する。修正前のobject_sync.cに一時的に戻して
     実行し、10件失敗する(バグを検出できる)ことも確かめた。ctest 52件全通過。
 
-    **残した課題(未着手、ユーザーと検討中)**:
-    - **兄弟のv3をv4へ寄せる移行**: 「v3を1件ずつ取り出し、兄弟のv4がidentity.dbに無ければ作り、
-      v3を消す」ループ(ユーザー案)。注意点が2つある。
-      (1) 鍵のラップ(AES-256-GCM)はAADとHKDFのinfoに**アドレス文字列**を使っているので、
-      v3行のwrapped鍵をSQLでv4行へコピーしても復号できない。v3をunlockして平文の鍵を取り出し、
-      v4のアドレスでラップし直す必要がある(=daemon内のAPIとして実装し、keyringのメモリ上の
-      v3エントリも一緒に消す)。
-      (2) v3行だけが持つlabel/is_chan/enabled/難易度をv4へ引き継ぐこと、inbox/sentの
-      `to_address`/`from_address`をv4へ書き換えることも同じトランザクションで行う。
-      兄弟のいないv3も同じループでv4が作られるので鍵は失わないが、そのアドレスの利用者から
-      見て差出人が変わる点は変わらない。
-    - **v4 identityだけでもv3の要求にv3 pubkeyで応答する**: 上の移行と組み合わせれば、v3アドレスを
-      知っている相手からの新規送信を失わずに済む(v3宛msgは、ripeが同じなのでv4のidentityで
-      復号できる)。プライバシー面で増える露出は小さいと見ている。v3のgetpubkeyはripeを平文で
+    **続き(同日、ユーザーと合意して実装)**: v3の兄弟をv4へ寄せる移行と、v4だけでもv3の要求に
+    応答する仕組みを入れた。
+    - **v3→v4の変換API**: `convertAddressToV4 [v3Address, passphrase]`(1件)と
+      `convertV3AddressesToV4 [passphrase, limit]`(一括)。CLIは`convert-to-v4`と
+      `convert-all-v3-to-v4`。1件ごとに(1)兄弟のv4が無ければ作る(`bm_keyring_ensure_v4_sibling`)、
+      (2)inboxの`to_address`とsentの`from_address`をv4へ書き換える、(3)v3を削除してkeyringからも
+      外す、の順で行う。identity.dbとmessages.dbは別ファイルで1つのトランザクションにできない
+      ため、どこで中断しても同じv3をもう一度変換すれば完了する順序にした((1)はv4があれば
+      何もしない、(2)は何度実行しても同じ結果)。
+    - 鍵のラップ(AES-256-GCM)はAADに、vault方式ではHKDFのinfoにも**アドレス文字列**を使って
+      いるので、v3行のwrapped鍵をSQLでv4行へコピーしても復号できない。v3を復号して取り出した
+      鍵を、v4のアドレスでラップし直す。ラップ方式はv3行に揃える(vault行はmaster KEKで
+      HKDF、scrypt行は新しいsaltでscrypt)。label・難易度・chanフラグはv3から引き継ぐ
+      (`enabled`は常に1で動作に影響しないので引き継がない)。v4が既にある場合はv4の設定を
+      優先し、v4のlabelが空ならv3のlabelを、v3がchanならchanフラグを補う。v3がunlock済みなら
+      v4もunlock状態にする(変換の直後から受信を取りこぼさないため)。
+    - sentの`from_address`まで書き換えるのは、再送(send_pipeline.c)がfrom_addressで
+      keyringから鍵を引くため(v3を消すと再送できなくなる)。inboxの`from_address`とsentの
+      `to_address`は相手のアドレスなので触らない。
+    - 一括版: RPCのハンドラは直列実行で、scrypt行は1件あたりscryptが2回(v3の復号とv4のラップ)
+      かかる。そのため1回の呼び出しで変換する件数を`limit`(既定1,000、上限は項目44の
+      unlockAllと同じ10,000)で区切り、`remaining`が0になるまで繰り返し呼ぶ形にした。vault行の
+      master KEKは呼び出しごとに1回だけ導出して使い回す(`bm_keyring_convert_session`)。
+      passphraseが合わない行はv3のまま一覧の先頭に残り続けるので、失敗件数をOFFSETにして
+      読み進める(limitは成功件数に対して数える)。こうしないと、失敗行がlimit件以上たまった
+      時点で一括変換が一歩も進まなくなる。
+    - **v4だけでもv3の要求に応答する**: `handle_incoming_getpubkey`で、v3の要求に該当する
+      v3 identityが無ければ、同じripe・streamのv4 identityの鍵からv3形式のpubkeyを作って
+      応答する。応答キャッシュのキーは要求version(3)。変換後もv3アドレスしか知らない相手が
+      送れ、そのmsgは宛先ripeが同じなのでv4のidentityで復号できる。本家
+      (processgetpubkey)は見つかったアドレスのversionが要求と違えば無視するので、意図的な
+      逸脱になる。プライバシー面で増える露出は小さいと判断した。v3のgetpubkeyはripeを平文で
       運ぶので、要求を見た第三者はその時点でv4アドレスも組み立てられる。応答で新たに出るのは
-      公開鍵と「そのアドレスが生きている」ことの確認だが、アドレスを知っている者はv4の
-      getpubkeyで同じものを得られる。コストは要求ごとのPoWで、上記のキャッシュで抑えられる。
-      本家は兄弟という概念を持たないのでこの挙動は無い(逸脱になる)。
+      公開鍵と「そのアドレスが生きている」ことだが、アドレスを知っている者ならv4のgetpubkeyで
+      同じものを得られる。v2の要求にはフォールバックしない(v2アドレスの利用は想定しない)。
+    - 変換で失うもの: v3アドレスからのbroadcastは出せなくなる(v3とv4ではbroadcastの暗号鍵の
+      導出が違うので、v3を購読している相手にv4からのbroadcastは届かない)。v3アドレスとして
+      送った相手には、今後の差出人がv4に変わる。
+
+    テスト: tests/test_convert_v3_to_v4.c(新規、実HTTPリクエスト経由)。scrypt・unlock済み・
+    chan・label/難易度付きのv3で引き継ぎ・鍵の同一性・keyringの状態・inbox/sentの書き換えを確認し、
+    vault方式で兄弟のv4が既にある場合、エラー3種(v4アドレス、存在しないアドレス、passphrase違い)、
+    中断後の再実行、一括版のlimit・remaining・失敗行の読み飛ばしを確認する。
+    tests/test_getpubkey_twin_versions.cのケース3(v4だけの場合)は「v3の要求に応答しない」から
+    「v3形式で応答し、キャッシュが効き、v2や別streamの要求には応答しない」に書き換えた。
+    フォールバックを一時的に無効にすると、このケースが4件失敗することを確かめた。ctest 53件全通過。

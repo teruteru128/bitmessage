@@ -15,9 +15,10 @@
  * 2. 兄弟が両方unlockされている場合、unlock順(どちらがkeyringの先頭か)によらず、
  *    v3の要求にはv3のpubkeyを、v4の要求にはv4のpubkeyを返し、それぞれのキャッシュが
  *    独立して効くこと(2回目の要求では新しいobjectを作らない)
- * 3. v4だけがunlockされている場合、v3の要求には応答しないこと(本家processgetpubkeyと同じ。
- *    v4の鍵からv3のpubkeyを作って返すかどうかはDESIGN.md §11項目45で検討中で、採用したら
- *    このケースは書き換える)
+ * 3. v4だけがunlockされている場合(v3をconvertV3AddressesToV4でv4へ寄せた後の状態)、v3の要求には
+ *    v4の鍵から作ったv3形式のpubkeyで応答し、そのキャッシュも効くこと。v2の要求や、streamが
+ *    違うv3の要求には応答しないこと(本家processgetpubkeyからの意図的な逸脱、DESIGN.md §11
+ *    項目45参照)
  * 4. 要求のstreamがidentityのstreamと違えば応答しないこと
  * 5. self_pubkey_response_cacheの旧スキーマ(ripe単独がPRIMARY KEY)を持つDBに対して
  *    bm_identity_store_init_schemaを呼ぶと、新スキーマで作り直されること(再実行しても
@@ -273,7 +274,16 @@ static void test_v3_request_without_v3_identity(void)
     add_identity(&e, &gen, 4, 1);
 
     receive_getpubkey(&e, &gen, 3, 1);
-    CHECK(count_pubkeys(&e, &gen, -1) == 0, "v3 getpubkey is not answered when only the v4 identity exists");
+    CHECK(count_pubkeys(&e, &gen, 3) == 1,
+          "v3 getpubkey is answered with a v3 pubkey built from the v4 identity's keys");
+    CHECK(count_pubkeys(&e, &gen, -1) == 1, "exactly one pubkey object after the v3 request");
+
+    receive_getpubkey(&e, &gen, 3, 1);
+    CHECK(count_pubkeys(&e, &gen, -1) == 1, "a repeated v3 request reuses the cached v3 response");
+
+    receive_getpubkey(&e, &gen, 2, 1);
+    receive_getpubkey(&e, &gen, 3, 2);
+    CHECK(count_pubkeys(&e, &gen, -1) == 1, "v2 requests and v3 requests on another stream are not answered");
 
     receive_getpubkey(&e, &gen, 4, 1);
     CHECK(count_pubkeys(&e, &gen, 4) == 1, "v4 getpubkey is still answered");

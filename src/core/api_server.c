@@ -375,6 +375,178 @@ static cJSON *h_deleteAddress(const struct bm_api_server_config *config,
     return cJSON_CreateBool(rc == 0);
 }
 
+/*
+ * §11 2026-09-24 項目45 v3アドレスを兄弟のv4へ寄せる移行。同じ鍵ペアのv3とv4はripeが共通で、
+ * 受信したmsgの宛先がどちらだったかはワイヤー上で区別できない(DESIGN.md §11項目45)。v3を
+ * やめてv4に一本化するための操作で、1件ごとに次の順で行う:
+ *   1. 兄弟のv4 identityが無ければ作る(bm_keyring_ensure_v4_sibling)
+ *   2. inboxのto_address・sentのfrom_addressをv3からv4へ書き換える
+ *   3. v3 identityを削除する(keyringからも外す)
+ * identity.dbとmessages.dbは別ファイルで1つのトランザクションにできないので、この順序で
+ * 「どこで中断しても同じv3をもう一度変換すれば完了する」ようにしてある(1はv4が既にあれば
+ * 何もしない、2は何度実行しても同じ結果)。
+ * 変換後もv3アドレス宛のgetpubkeyにはv4の鍵からv3形式のpubkeyで応答し(object_sync.cの
+ * handle_incoming_getpubkey)、v3アドレス宛のmsgはripeが同じなのでv4のidentityで復号できる。
+ * 成功時0、失敗時はresult_entryにerrorを入れて非0。
+ */
+static int convert_one_v3_to_v4(const struct bm_api_server_config *config,
+                                struct bm_keyring_convert_session *session, const char *v3_address,
+                                cJSON *result_entry)
+{
+    char v4_address[BM_KEYRING_MAX_ADDRESS_LEN];
+    int created = 0;
+    int rc = bm_keyring_ensure_v4_sibling(config->keyring, config->identity_db, v3_address, session, v4_address,
+                                          &created);
+    const char *err = NULL;
+    if (rc == BM_KEYRING_CONVERT_ERR_NOT_FOUND)
+    {
+        err = "address not found";
+    }
+    else if (rc == BM_KEYRING_CONVERT_ERR_NOT_V3)
+    {
+        err = "not a v3 address";
+    }
+    else if (rc == BM_KEYRING_CONVERT_ERR_PASSPHRASE)
+    {
+        err = "wrong passphrase";
+    }
+    else if (rc != 0)
+    {
+        err = "failed to prepare the v4 sibling";
+    }
+    else if (config->messages_db != NULL
+             && bm_messages_store_rename_own_address(config->messages_db, v3_address, v4_address) != 0)
+    {
+        err = "failed to rewrite inbox/sent addresses (v4 is ready; retry to finish)";
+    }
+    else if (bm_keyring_delete_identity(config->keyring, config->identity_db, v3_address) != 0)
+    {
+        err = "failed to delete the v3 identity (v4 is ready; retry to finish)";
+    }
+
+    if (rc == 0)
+    {
+        cJSON_AddItemToObject(result_entry, "v4Address", json_str(v4_address));
+        cJSON_AddItemToObject(result_entry, "created", cJSON_CreateBool(created));
+    }
+    if (err != NULL)
+    {
+        cJSON_AddItemToObject(result_entry, "error", json_str(err));
+        return -1;
+    }
+    return 0;
+}
+
+/* §11 2026-09-24 項目45 convertAddressToV4: [v3Address, passphrase] → {v3Address, v4Address, created} */
+static cJSON *h_convertAddressToV4(const struct bm_api_server_config *config,
+                                   const cJSON *params, char **out_error)
+{
+    const char *address = param_str(params, 0);
+    const char *passphrase = param_str(params, 1);
+    if (address == NULL || passphrase == NULL)
+    {
+        *out_error = dup_cstr("convertAddressToV4 requires [v3Address, passphrase]");
+        return NULL;
+    }
+    struct bm_keyring_convert_session session;
+    bm_keyring_convert_session_init(&session, passphrase);
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "v3Address", json_str(address));
+    int rc = convert_one_v3_to_v4(config, &session, address, result);
+    bm_keyring_convert_session_clear(&session);
+    if (rc != 0)
+    {
+        *out_error = dup_cstr(json_cstr(json_obj_get(result, "error")));
+        cJSON_Delete(result);
+        return NULL;
+    }
+    return result;
+}
+
+/*
+ * §11 2026-09-24 項目45 convertV3AddressesToV4: [passphrase, limit(省略可)]
+ * → {converted: [{v3Address, v4Address, created}], failed: [{v3Address, error}], remaining}
+ * identity.dbのv3を古い順に最大limit件(既定BM_API_CONVERT_V3_DEFAULT_LIMIT)変換する。
+ * RPCのハンドラは直列実行で、scrypt方式の行は1件あたりscrypt 2回(v3の復号とv4のラップ)
+ * かかるため、1回の呼び出しで処理する件数に上限を設けて他のAPI呼び出しを長く待たせない
+ * ようにした。remainingが0になるまで繰り返し呼ぶ想定。vault方式の行はmaster KEKを呼び出し
+ * ごとに1回だけ導出するので速い。
+ * passphraseが合わない等で失敗した行はv3のまま残り一覧の先頭に居続けるので、失敗件数を
+ * OFFSETにして読み進める(limitは成功件数に対して数える。失敗行は呼び出しのたびに再試行
+ * される)。
+ */
+#define BM_API_CONVERT_V3_DEFAULT_LIMIT 1000
+#define BM_API_CONVERT_V3_MAX_LIMIT BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES
+static cJSON *h_convertV3AddressesToV4(const struct bm_api_server_config *config,
+                                       const cJSON *params, char **out_error)
+{
+    const char *passphrase = param_str(params, 0);
+    const cJSON *limit_v = param_at(params, 1);
+    if (passphrase == NULL)
+    {
+        *out_error = dup_cstr("convertV3AddressesToV4 requires [passphrase, limit(optional)]");
+        return NULL;
+    }
+    size_t limit = BM_API_CONVERT_V3_DEFAULT_LIMIT;
+    if (limit_v != NULL)
+    {
+        double v = json_num(limit_v);
+        if (!cJSON_IsNumber(limit_v) || v < 1 || v > BM_API_CONVERT_V3_MAX_LIMIT)
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "limit must be a number between 1 and %d", BM_API_CONVERT_V3_MAX_LIMIT);
+            *out_error = dup_cstr(msg);
+            return NULL;
+        }
+        limit = (size_t)v;
+    }
+
+    struct bm_keyring_convert_session session;
+    bm_keyring_convert_session_init(&session, passphrase);
+    cJSON *converted = cJSON_CreateArray();
+    cJSON *failed = cJSON_CreateArray();
+    size_t done = 0;
+    size_t offset = 0;
+    while (done < limit)
+    {
+        struct bm_identity_summary *list = NULL;
+        size_t count = 0;
+        if (bm_identity_store_list_by_version(config->identity_db, 3, limit - done, offset, &list, &count) != 0)
+        {
+            break;
+        }
+        for (size_t i = 0; i < count; i++)
+        {
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddItemToObject(entry, "v3Address", json_str(list[i].address));
+            if (convert_one_v3_to_v4(config, &session, list[i].address, entry) == 0)
+            {
+                cJSON_AddItemToArray(converted, entry);
+                done++;
+            }
+            else
+            {
+                cJSON_AddItemToArray(failed, entry);
+                offset++;
+            }
+        }
+        free(list);
+        if (count == 0)
+        {
+            break;
+        }
+    }
+    bm_keyring_convert_session_clear(&session);
+
+    size_t remaining = 0;
+    bm_identity_store_count_by_version(config->identity_db, 3, &remaining);
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(result, "converted", converted);
+    cJSON_AddItemToObject(result, "failed", failed);
+    cJSON_AddItemToObject(result, "remaining", cJSON_CreateNumber((double)remaining));
+    return result;
+}
+
 static cJSON *h_listAddresses(const struct bm_api_server_config *config,
                                          const cJSON *params, char **out_error)
 {
@@ -1530,6 +1702,8 @@ static const struct bm_api_method METHODS[] = {
     {"lockAddress", h_lockAddress},
     {"lockAllAddresses", h_lockAllAddresses},
     {"deleteAddress", h_deleteAddress},
+    {"convertAddressToV4", h_convertAddressToV4},
+    {"convertV3AddressesToV4", h_convertV3AddressesToV4},
     {"listAddresses", h_listAddresses},
     {"createDeterministicAddress", h_createDeterministicAddress},
     {"setAddressLabel", h_setAddressLabel},

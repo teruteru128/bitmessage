@@ -156,6 +156,46 @@ bool bm_keyring_find_by_ripe_version(bm_keyring_t *kr, const unsigned char ripe[
 bool bm_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32],
                              struct bm_unlocked_identity *out);
 
+/*
+ * §11 2026-09-24 項目45 v3アドレスを兄弟のv4へ寄せる移行(convertV3AddressesToV4)の中核。
+ * 同じ鍵ペアのv3とv4はripeが共通で、受信msgの宛先がどちらかはワイヤー上で区別できない
+ * (項目45参照)ため、v3をやめてv4に一本化できるようにする。
+ *
+ * 一括変換では多数の行を同じpassphraseで処理するので、vault方式(kdf_algo='vault-hkdf')の
+ * 行のためのmaster KEK(scrypt 1回)をセッションに保持して使い回す。passphraseは
+ * 呼び出し側が所有し、セッションより長く生存させること。使い終わったら
+ * bm_keyring_convert_session_clearでmaster KEKをゼロ埋めすること。
+ */
+struct bm_keyring_convert_session
+{
+    const char *passphrase;
+    int master_kek_state; /* 0=未導出, 1=導出済み, -1=vaultが無いかpassphraseが一致しない */
+    unsigned char master_kek[32];
+};
+
+void bm_keyring_convert_session_init(struct bm_keyring_convert_session *session, const char *passphrase);
+void bm_keyring_convert_session_clear(struct bm_keyring_convert_session *session);
+
+#define BM_KEYRING_CONVERT_ERR_NOT_FOUND (-2)
+#define BM_KEYRING_CONVERT_ERR_NOT_V3 (-3)
+#define BM_KEYRING_CONVERT_ERR_PASSPHRASE (-4)
+
+/*
+ * v3_addressの兄弟のv4 identityが無ければ作る(v3は消さない)。手順を「v4を用意する →
+ * 呼び出し側がinbox/sentのアドレスを書き換える → v3を消す」に分けているのは、identity.dbと
+ * messages.dbが別ファイルで1つのトランザクションにできないため。どこで中断しても、
+ * もう一度同じv3を変換すれば続きから完了する(v4が既にあれば作らずに先へ進む)。
+ * - v4が無ければ、v3の鍵をv4のアドレスでラップし直して保存する(ラップ方式・label・難易度・
+ *   chanフラグはv3から引き継ぐ)。*out_createdに1。
+ * - v4が既にあれば、v4の設定を優先し、v4のlabelが空ならv3のlabelを、v3がchanならchanフラグを
+ *   補う。*out_createdに0。
+ * - v3がunlock済みでv4が未unlockなら、v4もunlock状態にする。
+ * 成功時0、out_v4_addressに兄弟のv4アドレス。失敗時はBM_KEYRING_CONVERT_ERR_*か-1。
+ */
+int bm_keyring_ensure_v4_sibling(bm_keyring_t *kr, sqlite3 *db, const char *v3_address,
+                                  struct bm_keyring_convert_session *session,
+                                  char out_v4_address[BM_KEYRING_MAX_ADDRESS_LEN], int *out_created);
+
 /* address文字列で検索する(send_pipeline.cがfromアドレスの鍵を引く際に使う) */
 bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
                                  struct bm_unlocked_identity *out);

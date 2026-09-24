@@ -72,6 +72,17 @@ struct bm_identity_summary
 int bm_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count);
 
 /*
+ * §11 2026-09-24 項目45 convertV3AddressesToV4用。address_versionが一致するidentityを
+ * created_time(同値ならaddress)順に、先頭offset件を飛ばして最大limit件返す(malloc、
+ * 呼び出し側でfreeすること)。成功時0。
+ */
+int bm_identity_store_list_by_version(sqlite3 *db, int address_version, size_t limit, size_t offset,
+                                      struct bm_identity_summary **out_list, size_t *out_count);
+
+/* §11 2026-09-24 項目45 address_versionが一致するidentityの件数。成功時0 */
+int bm_identity_store_count_by_version(sqlite3 *db, int address_version, size_t *out_count);
+
+/*
  * §7.4 2026-08-29 数千件規模の一括unlock向け2段階KDF方式(DESIGN.md §11-19)。
  * kdf_vaultは単一行のみ(id=0固定)。全identityで共有するvault_saltを保持し、
  * ここからpassphrase→master KEKの重いKDF(scrypt)を1回だけ行う。各identity行の
