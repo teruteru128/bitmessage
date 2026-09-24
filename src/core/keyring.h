@@ -138,6 +138,17 @@ bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
                               struct bm_unlocked_identity *out);
 
 /*
+ * §11 2026-09-24 ripeに加えてaddress_version/streamも一致するものを検索する。同じ鍵ペアから
+ * 作ったv3とv4のアドレス(以下「兄弟」)はripeが共通なので、bm_keyring_find_by_ripeでは
+ * keyringの並び順(=unlock順)で先に当たった方が返り、v3のgetpubkey要求に対してv4の
+ * identityが見つかる、といった取り違えが起きる。versionごとに別物として扱う必要がある
+ * 呼び出し元(getpubkey応答)はこちらを使う。見つかればtrueを返しoutにコピーする。
+ */
+bool bm_keyring_find_by_ripe_version(bm_keyring_t *kr, const unsigned char ripe[20],
+                                      uint64_t address_version, uint64_t stream,
+                                      struct bm_unlocked_identity *out);
+
+/*
  * v4以降のgetpubkeyに含まれるtag(32byte)で検索する(§5.1)。address_version>=4の
  * unlocked identityそれぞれについてtagを導出し比較する(通常identity数は少数なので
  * 線形探索で十分)。見つかればtrueを返しoutにコピーする。

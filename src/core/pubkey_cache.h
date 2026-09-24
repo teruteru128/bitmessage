@@ -74,16 +74,23 @@ int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20]);
  * まだ有効期限内ならinv再broadcastのみで新規PoWは不要)。
  */
 
-/* ripe宛に直近組み立てた自己pubkey応答objectのhash/expires_timeを記録する(UPSERT)。成功時0 */
-int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
-                                       const unsigned char object_hash[32], int64_t expires_time);
+/*
+ * (ripe, address_version, stream)宛に直近組み立てた自己pubkey応答objectのhash/expires_timeを
+ * 記録する(UPSERT)。成功時0。
+ * §11 2026-09-24 以前はripeだけをキーにしていたが、同じ鍵から作ったv3とv4の兄弟アドレスは
+ * ripeが共通なため1行を共有してしまい、v4の要求にv3のpubkey objectを(またはその逆を)
+ * 再broadcastする取り違えが起きていた。pubkey objectはversionごとに形式が違う(v3は平文+署名、
+ * v4はtag付きで暗号化)ので、versionとstreamもキーに含める。
+ */
+int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, const unsigned char object_hash[32], int64_t expires_time);
 
 /*
  * まだ有効(expires_time > now)なキャッシュがあればout_hashへコピーして1を返す。
  * 無ければ0、DBエラー時は-1
  */
-int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], int64_t now,
-                                       unsigned char out_hash[32]);
+int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, int64_t now, unsigned char out_hash[32]);
 
 /* --- objectパース(§5.2の逆方向) --- */
 

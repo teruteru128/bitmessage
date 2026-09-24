@@ -3764,3 +3764,67 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - unlockAllの既unlock判定をハッシュ等の索引にしてO(n²)をなくす。
     - keyringのrwlockを書き込み優先にする(`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`)。
       ただし試行復号が長く読み取りロックを握る構造自体は変わらない。
+45. **v3/v4の兄弟アドレスが共存するときのgetpubkey応答の取り違えを修正(実装済み・未デプロイ)**:
+    2026-09-24、ユーザーの質問(「v3とv4で宛先ripeが共通なので、受信は先にヒットした方の
+    アドレスに入る。受信ボックスがv3宛ばかりになるのはどうしたらいいか」)を調べる中で発覚。
+    以下、同じ鍵ペアから作ったv3とv4のアドレス(ripeが共通)を「兄弟」と呼ぶ。
+
+    **受信側の前提(変更なし)**: 復号したmsgにあるのは宛先のripeだけで、宛先のaddress versionは
+    msgのどこにも含まれない(署名対象にも無い)。そのため、v3宛とv4宛はワイヤー上で区別できない。
+    唯一使えるのはobjectヘッダのstream(宛先のstream、署名対象)だけ。うちの
+    `bm_trial_decrypt_msg`はkeyringの連結リストを先頭から試し、`bm_keyring_unlock`は先頭に
+    挿入するので、「最後にunlockした兄弟」が宛先として記録される。本家(実ソースで確認)は
+    `shared.py`の`reloadMyAddressHashes`が`myECCryptorObjects`/`myAddressesByHash`をripeキーの
+    dictで作るため、**keys.datで後に書かれている方が上書きして勝つ**(復号ループ自体は
+    タイミング攻撃対策でランダム順だが、宛先はripeから引くので結果は決定的)。本家も兄弟の
+    共存は想定していない。
+
+    **修正したバグ(getpubkey応答)**: `handle_incoming_getpubkey`(object_sync.c)に2つの問題があった。
+    1. v2/v3の要求を`bm_keyring_find_by_ripe`(ripeだけ)で引いていたため、unlock順次第でv3の
+       要求にv4のidentityが当たり、v4形式のpubkey(tagで暗号化され、v3の要求者には使えない)を
+       PoWして返していた。
+    2. 応答objectのキャッシュ`self_pubkey_response_cache`がripeだけをキーにしていたため、兄弟で
+       1行を共有していた。v4の要求に対して、直前に作ったv3のpubkey objectのinvを再broadcastして
+       済ませる(その逆も)ことが起き、**v4アドレス宛に送ろうとしている相手がpubkeyを入手できない**
+       状態になりえた。受信ボックスの見た目より実害が大きい。
+
+    本家の`processgetpubkey`(class_objectProcessor.py)は、要求version(=getpubkey objectの
+    version)が2〜4以外なら無視し、見つかったアドレスのversion・streamが要求と一致しなければ
+    応答しない。ただしアドレスはripeキーのdict(後勝ち)から引くので、兄弟が共存すると片方の
+    versionの要求には応答しなくなる。
+
+    **対処**:
+    - `bm_keyring_find_by_ripe_version`(ripe+version+stream)を追加し、v2/v3の要求はこれで引く。
+      v4の要求はtag(version・stream・ripeから導出)で引くので元から取り違えないが、見つかった
+      identityのversion/streamを要求と照合する形は揃えた。要求versionが2〜4以外なら無視する
+      (本家と同じ)。
+    - キャッシュのキーを`(ripe, address_version, stream)`にした。PRIMARY KEYの変更は
+      `ALTER TABLE ADD COLUMN`ではできないが、中身はPoWを計算し直さないためのキャッシュでしか
+      ないので、`bm_identity_store_init_schema`で旧スキーマ(address_version列が無い)を検出したら
+      DROPして作り直す(失うのはPoW1回分だけ)。
+    - 本家と違い、兄弟が両方unlockされていれば、v3の要求にはv3、v4の要求にはv4で応答する。
+
+    テスト: tests/test_getpubkey_twin_versions.c(新規)。兄弟を両方の順序でunlockした状態で、
+    v4とv3の要求それぞれに正しいversionのpubkeyが返ること、キャッシュがversionごとに独立して
+    効くこと、v4だけの場合はv3の要求に応答しないこと、streamが違えば応答しないこと、旧スキーマの
+    キャッシュテーブルが作り直されることを確認する。修正前のobject_sync.cに一時的に戻して
+    実行し、10件失敗する(バグを検出できる)ことも確かめた。ctest 52件全通過。
+
+    **残した課題(未着手、ユーザーと検討中)**:
+    - **兄弟のv3をv4へ寄せる移行**: 「v3を1件ずつ取り出し、兄弟のv4がidentity.dbに無ければ作り、
+      v3を消す」ループ(ユーザー案)。注意点が2つある。
+      (1) 鍵のラップ(AES-256-GCM)はAADとHKDFのinfoに**アドレス文字列**を使っているので、
+      v3行のwrapped鍵をSQLでv4行へコピーしても復号できない。v3をunlockして平文の鍵を取り出し、
+      v4のアドレスでラップし直す必要がある(=daemon内のAPIとして実装し、keyringのメモリ上の
+      v3エントリも一緒に消す)。
+      (2) v3行だけが持つlabel/is_chan/enabled/難易度をv4へ引き継ぐこと、inbox/sentの
+      `to_address`/`from_address`をv4へ書き換えることも同じトランザクションで行う。
+      兄弟のいないv3も同じループでv4が作られるので鍵は失わないが、そのアドレスの利用者から
+      見て差出人が変わる点は変わらない。
+    - **v4 identityだけでもv3の要求にv3 pubkeyで応答する**: 上の移行と組み合わせれば、v3アドレスを
+      知っている相手からの新規送信を失わずに済む(v3宛msgは、ripeが同じなのでv4のidentityで
+      復号できる)。プライバシー面で増える露出は小さいと見ている。v3のgetpubkeyはripeを平文で
+      運ぶので、要求を見た第三者はその時点でv4アドレスも組み立てられる。応答で新たに出るのは
+      公開鍵と「そのアドレスが生きている」ことの確認だが、アドレスを知っている者はv4の
+      getpubkeyで同じものを得られる。コストは要求ごとのPoWで、上記のキャッシュで抑えられる。
+      本家は兄弟という概念を持たないのでこの挙動は無い(逸脱になる)。

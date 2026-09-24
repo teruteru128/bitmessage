@@ -651,6 +651,29 @@ bool bm_keyring_find_by_ripe(bm_keyring_t *kr, const unsigned char ripe[20],
     return false;
 }
 
+/* §11 2026-09-24 v3/v4兄弟の取り違え対策(keyring.h参照) */
+bool bm_keyring_find_by_ripe_version(bm_keyring_t *kr, const unsigned char ripe[20],
+                                      uint64_t address_version, uint64_t stream,
+                                      struct bm_unlocked_identity *out)
+{
+    pthread_rwlock_rdlock(&kr->lock);
+    struct bm_unlocked_identity *cur = kr->head;
+    while (cur != NULL)
+    {
+        if (cur->address_version == address_version && cur->stream == stream
+            && memcmp(cur->ripe, ripe, 20) == 0)
+        {
+            memcpy(out, cur, sizeof(*out));
+            out->next = NULL;
+            pthread_rwlock_unlock(&kr->lock);
+            return true;
+        }
+        cur = cur->next;
+    }
+    pthread_rwlock_unlock(&kr->lock);
+    return false;
+}
+
 bool bm_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32],
                              struct bm_unlocked_identity *out)
 {

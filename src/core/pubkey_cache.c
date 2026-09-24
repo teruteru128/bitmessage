@@ -240,12 +240,14 @@ int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20])
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
-                                       const unsigned char object_hash[32], int64_t expires_time)
+int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, const unsigned char object_hash[32], int64_t expires_time)
 {
     static const char *SQL =
-        "INSERT INTO self_pubkey_response_cache (ripe, object_hash, expires_time) VALUES (?1,?2,?3) "
-        "ON CONFLICT(ripe) DO UPDATE SET object_hash=excluded.object_hash, expires_time=excluded.expires_time;";
+        "INSERT INTO self_pubkey_response_cache (ripe, address_version, stream, object_hash, expires_time) "
+        "VALUES (?1,?2,?3,?4,?5) "
+        "ON CONFLICT(ripe, address_version, stream) DO UPDATE SET object_hash=excluded.object_hash, "
+        "expires_time=excluded.expires_time;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
@@ -253,24 +255,29 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
         return -1;
     }
     sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, object_hash, 32, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, expires_time);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)address_version);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)stream);
+    sqlite3_bind_blob(stmt, 4, object_hash, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, expires_time);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], int64_t now,
-                                       unsigned char out_hash[32])
+int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, int64_t now, unsigned char out_hash[32])
 {
-    static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache WHERE ripe = ?1;";
+    static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache "
+                             "WHERE ripe = ?1 AND address_version = ?2 AND stream = ?3;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
     {
         return -1;
     }
     sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)address_version);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)stream);
 
     int found = 0;
     int rc = sqlite3_step(stmt);

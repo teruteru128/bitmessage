@@ -44,10 +44,15 @@ static const char *SCHEMA_SQL =
     "stream INTEGER NOT NULL, "
     "requested_time INTEGER NOT NULL"
     ");"
+    /* §11 2026-09-24 キーを(ripe, address_version, stream)にした。旧スキーマ(ripe単独がPRIMARY
+     * KEY)からの移行はbm_identity_store_init_schema参照 */
     "CREATE TABLE IF NOT EXISTS self_pubkey_response_cache ("
-    "ripe BLOB PRIMARY KEY, "
+    "ripe BLOB NOT NULL, "
+    "address_version INTEGER NOT NULL, "
+    "stream INTEGER NOT NULL, "
     "object_hash BLOB NOT NULL, "
-    "expires_time INTEGER NOT NULL"
+    "expires_time INTEGER NOT NULL, "
+    "PRIMARY KEY (ripe, address_version, stream)"
     ");"
     /* §7.4 2026-08-29 単一行(id=0固定)。DESIGN.md §11-19の2段階KDF方式で全identityが
      * 共有するvault_saltを保持する。canaryはmaster KEKの正誤検証用(identity_store.h参照)。 */
@@ -61,6 +66,21 @@ static const char *SCHEMA_SQL =
 
 int bm_identity_store_init_schema(sqlite3 *db)
 {
+    /*
+     * §11 2026-09-24 self_pubkey_response_cacheの旧スキーマ(ripe単独がPRIMARY KEY)は、同じ鍵から
+     * 作ったv3とv4の兄弟アドレスで1行を共有してしまい、v4のgetpubkey要求に対してv3のpubkey
+     * objectを再broadcastして済ませる(その逆も)取り違えを起こしていた。PRIMARY KEYの変更は
+     * 他の列追加と違いALTER TABLE ADD COLUMNでは行えない。中身はPoWを計算し直さないための
+     * キャッシュでしかない(捨てても次の要求で1回PoWするだけ)ので、旧スキーマを検出したら
+     * DROPして新スキーマで作り直す。address_version列が無ければ旧スキーマと判定する
+     * (新規DBではまだテーブルが無いのでこのSELECTも失敗するが、DROP IF EXISTSが無害なので
+     * 区別しなくてよい)。
+     */
+    if (sqlite3_exec(db, "SELECT address_version FROM self_pubkey_response_cache LIMIT 0;", NULL, NULL, NULL)
+        != SQLITE_OK)
+    {
+        sqlite3_exec(db, "DROP TABLE IF EXISTS self_pubkey_response_cache;", NULL, NULL, NULL);
+    }
     return bm_db_init_schema(db, SCHEMA_SQL);
 }
 

@@ -281,6 +281,22 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     const unsigned char *body = msg->payload + hdr->header_len;
     size_t body_len = msg->length - hdr->header_len;
 
+    /*
+     * §11 2026-09-24 getpubkeyのobject versionは要求するアドレスのversionそのもの。本家
+     * (class_objectProcessor.pyのprocessgetpubkey)と同じく2〜4だけを受け付け、見つかった
+     * identityのversion・streamが要求と一致しなければ応答しない。
+     * 以前はv2/v3の要求をripeだけで引いていたため、同じ鍵から作ったv3とv4の兄弟アドレスが
+     * 両方unlockされていると、keyringの並び(unlock順)次第でv3の要求にv4のidentityが当たり、
+     * v4形式のpubkey(tagで暗号化されv3の要求者には使えない)を返していた。本家もripeを
+     * キーにしたdict(後勝ち)で引いてからversionを照合する作りのため、兄弟が共存すると
+     * 片方の要求には応答しなくなるが、うちでは要求versionのidentityを直接探すことで両方に
+     * 正しく応答する。v4の要求はtag(version・stream・ripeから導出)で引くので、最初から
+     * 取り違えは起きないが、照合は同じ形で行う。
+     */
+    if (hdr->version < 2 || hdr->version > 4)
+    {
+        return;
+    }
     struct bm_unlocked_identity id;
     int found = 0;
     if (hdr->version <= 3)
@@ -289,7 +305,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         {
             return;
         }
-        found = bm_keyring_find_by_ripe(ctx->keyring, body, &id) ? 1 : 0;
+        found = bm_keyring_find_by_ripe_version(ctx->keyring, body, hdr->version, hdr->stream, &id) ? 1 : 0;
     }
     else
     {
@@ -298,10 +314,15 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
             return;
         }
         found = bm_keyring_find_by_tag(ctx->keyring, body, &id) ? 1 : 0;
+        if (found && (id.address_version != hdr->version || id.stream != hdr->stream))
+        {
+            OPENSSL_cleanse(&id, sizeof(id));
+            found = 0;
+        }
     }
     if (!found)
     {
-        return; /* 自分宛てではない、またはロックされたままのアドレス宛 */
+        return; /* 自分宛てではない、ロックされたままのアドレス宛、またはversion/streamの不一致 */
     }
 
     unsigned char ripe[BM_RIPE_LEN];
@@ -325,7 +346,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
      * 対し、正規のPoWを払われた場合でも毎回計算し直させられないようにするため) */
     int64_t now = (int64_t)time(NULL);
     unsigned char cached_hash[32];
-    if (bm_pubkey_cache_get_self_response(ctx->identity_db, ripe, now, cached_hash) == 1
+    if (bm_pubkey_cache_get_self_response(ctx->identity_db, ripe, address_version, stream, now, cached_hash) == 1
         && bm_object_store_has(ctx->object_pool_db, cached_hash))
     {
         if (ctx->registry != NULL)
@@ -379,7 +400,8 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     {
         bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)stream,
                                 object, object_len, (int64_t)expires_time, now);
-        bm_pubkey_cache_set_self_response(ctx->identity_db, ripe, hash, (int64_t)expires_time);
+        bm_pubkey_cache_set_self_response(ctx->identity_db, ripe, address_version, stream, hash,
+                                          (int64_t)expires_time);
         if (ctx->registry != NULL)
         {
             bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
