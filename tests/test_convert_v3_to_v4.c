@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +186,25 @@ static int count_rows(sqlite3 *db, const char *sql, const char *address)
     int n = (sqlite3_step(stmt) == SQLITE_ROW) ? sqlite3_column_int(stmt, 0) : -1;
     sqlite3_finalize(stmt);
     return n;
+}
+
+/*
+ * §11 2026-09-25 項目45: 一括変換は`ORDER BY created_time, address`で行を読むが、created_timeは
+ * 秒単位なので、行を作った時刻が秒の境目をまたぐかどうかで並び順が変わる。CIのTSanビルド
+ * (実行が遅い)でpassphrase違いの行がbulkの行と同じ秒に入り、アドレス順で後ろへ回って
+ * 「失敗行が先頭に残る」前提が崩れ、failedが0件になって落ちた。並び順を決める列を
+ * テスト側で明示的に固定する。
+ */
+static void set_created_time(sqlite3 *db, const char *address, int64_t created_time)
+{
+    sqlite3_stmt *stmt = NULL;
+    CHECK(sqlite3_prepare_v2(db, "UPDATE identities SET created_time = ?1 WHERE address = ?2;", -1, &stmt, NULL) ==
+              SQLITE_OK,
+          "prepare created_time update");
+    sqlite3_bind_int64(stmt, 1, created_time);
+    sqlite3_bind_text(stmt, 2, address, -1, SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1, "update created_time");
+    sqlite3_finalize(stmt);
 }
 
 int main(void)
@@ -352,6 +372,9 @@ int main(void)
         make_twin(seed, &bulk[i]);
         store_vault(identity_db, &bulk[i], bulk[i].v3, 3, "");
     }
+    /* passphrase違いの行(w)を確実に一覧の先頭に置く(created_timeは秒単位で、放っておくと
+     * bulkの行と同じ秒に入ったときアドレス順で後ろへ回りうる) */
+    set_created_time(identity_db, w.v3, 1);
     snprintf(params, sizeof(params), "[\"%s\",2]", PASS);
     resp = rpc("convertV3AddressesToV4", params);
     result = resp != NULL ? bm_json_object_get(resp, "result") : NULL;
