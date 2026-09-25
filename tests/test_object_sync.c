@@ -1016,6 +1016,9 @@ int main(void)
         }
         CHECK(conn11a->should_disconnect == 1,
               "a peer announcing a protocol version below BM_MIN_PROTOCOL_VERSION should be marked for disconnect");
+        /* §11 2026-09-25 項目46: 切断ログが「read error」ではなく理由を出せるよう、理由も入ること */
+        CHECK(conn11a->disconnect_reason != NULL && strcmp(conn11a->disconnect_reason, "peer protocol version too old") == 0,
+              "the too-old protocol version disconnect should carry its reason for the close log");
 
         unsigned char reply_buf[512];
         size_t reply_total = 0;
@@ -1138,6 +1141,12 @@ int main(void)
         }
         CHECK(conn12a->should_disconnect == 1,
               "a peer whose version timestamp is too far in the future should be marked for disconnect");
+        /* §11 2026-09-25 項目46: 理由が入り、この理由での最初の切断なのでWARNは間引かれない
+         * (network.cの切断ログもWARNのまま) */
+        CHECK(conn12a->disconnect_reason != NULL && strcmp(conn12a->disconnect_reason, "peer clock offset exceeds limit") == 0,
+              "the clock-offset disconnect should carry its reason for the close log");
+        CHECK(conn12a->disconnect_log_quiet == 0,
+              "the first clock-offset rejection should be reported at WARN, not throttled");
 
         struct bm_message *future_reply = read_one_message(fds12a[1]);
         CHECK(future_reply != NULL, "an error message should have been sent back for the future timestamp");
@@ -1177,6 +1186,15 @@ int main(void)
         }
         CHECK(conn12b->should_disconnect == 1,
               "a peer whose version timestamp is too far in the past should be marked for disconnect");
+        /* §11 2026-09-25 項目46: 12aの直後(BM_TIME_OFFSET_LOG_INTERVAL_SECONDS内)の同じ理由の
+         * 切断なので、WARNは間引かれて切断ログもDEBUGへ落ちる。向き(未来/過去)が違っても
+         * 理由全体で1つの間引きにしている */
+        CHECK(conn12b->disconnect_reason != NULL && strcmp(conn12b->disconnect_reason, "peer clock offset exceeds limit") == 0,
+              "a throttled clock-offset disconnect should still carry its reason");
+        CHECK(conn12b->disconnect_log_quiet == 1,
+              "a second clock-offset rejection within the interval should be throttled");
+        CHECK(ctx.time_offset_log_throttle.suppressed == 1,
+              "the throttled rejection should be counted for the next report");
 
         struct bm_message *past_reply = read_one_message(fds12b[1]);
         CHECK(past_reply != NULL, "an error message should have been sent back for the past timestamp");
@@ -1216,6 +1234,8 @@ int main(void)
         }
         CHECK(conn12c->should_disconnect == 0,
               "a peer whose version timestamp offset is exactly BM_MAX_TIME_OFFSET_SECONDS should be accepted");
+        CHECK(conn12c->disconnect_reason == NULL && conn12c->disconnect_log_quiet == 0,
+              "an accepted peer should not get a disconnect reason");
 
         struct bm_message *boundary_reply = read_one_message(fds12c[1]);
         CHECK(boundary_reply != NULL, "a reply should have been sent back for an acceptable timestamp");

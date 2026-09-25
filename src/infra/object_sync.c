@@ -75,6 +75,12 @@
  * pubkey告知の目安(数週間)を参考にした固定値。 */
 #define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
 
+/* §11 2026-09-25 項目46: version timestampの時計ずれで切断したときのWARNを、この間隔に
+ * 1回へ間引く(間に黙った回数は次のWARNに含める)。時計のずれた相手が数秒おきに再接続
+ * してくると、切断のたびにWARNが出て1時間に約190行journalを埋めたため。10分あれば
+ * 「今も続いているか」「何回来たか」は十分追える。間引いた回の切断ログはDEBUGで残る。 */
+#define BM_TIME_OFFSET_LOG_INTERVAL_SECONDS 600
+
 /* §11 2026-09-07: 「sent getdataに対してreceived objectが少ない」「received getdataの
  * not_foundが大量発生している」というユーザー指摘の調査用。既存のログはhash・接続先を
  * 一切含まず、集計件数の突合せしかできなかった(journalctlで日次集計したところnot_found率
@@ -107,6 +113,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->last_gc = 0;
     ctx->last_resend_check = 0;
     ctx->last_onion_announce = 0;
+    memset(&ctx->time_offset_log_throttle, 0, sizeof(ctx->time_offset_log_throttle));
 }
 
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now)
@@ -1367,6 +1374,8 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
                 free(err_packet);
             }
             conn->should_disconnect = 1;
+            /* §11 2026-09-25 項目46: 切断ログの理由(以前は「read error」と出ていた) */
+            conn->disconnect_reason = "peer protocol version too old";
             return;
         }
         /* §11 2026-08-23 backlog項目4: version messageのtimestampの検証
@@ -1376,12 +1385,37 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
          * あるため切断する。PyBitmessage側にある「時計ズレpeerが一定数を超えたらGUIの
          * ステータスバーに警告を出す」機能(timeOffsetWrongCount)はGUI専用でこの
          * ヘッドレスdaemonには該当機能が無いため移植しない。 */
-        int64_t time_offset = (int64_t)ver.timestamp - (int64_t)time(NULL);
+        int64_t now = (int64_t)time(NULL);
+        int64_t time_offset = (int64_t)ver.timestamp - now;
         if (time_offset > BM_MAX_TIME_OFFSET_SECONDS || time_offset < -BM_MAX_TIME_OFFSET_SECONDS)
         {
-            bm_log_warn("[object_sync] closing connection: peer's version timestamp is %" PRId64
-                    "s off from our clock (limit %ds)\n",
-                    time_offset, BM_MAX_TIME_OFFSET_SECONDS);
+            /* §11 2026-09-25 項目46: 時計のずれた相手は相手の時計が直るまで再接続を繰り返して
+             * くるので、WARNはBM_TIME_OFFSET_LOG_INTERVAL_SECONDSに1回へ間引き、間に黙った
+             * 回数を添える。間引いた回はnetwork.cの切断ログ(理由付き)をDEBUGで出すだけにする。
+             * Tor経由のinboundは送信元が全て127.0.0.1に見え相手を区別できないので、間引きは
+             * 相手ごとではなくこの理由全体で1つ(別々の相手のずれも1つのWARNにまとまる)。 */
+            uint64_t suppressed = 0;
+            if (bm_log_throttle_check(&ctx->time_offset_log_throttle, now, BM_TIME_OFFSET_LOG_INTERVAL_SECONDS,
+                                      &suppressed))
+            {
+                if (suppressed > 0)
+                {
+                    bm_log_warn("[object_sync] closing connection: peer's version timestamp is %" PRId64
+                            "s off from our clock (limit %ds; %" PRIu64
+                            " more rejection(s) for the same reason since the last report)\n",
+                            time_offset, BM_MAX_TIME_OFFSET_SECONDS, suppressed);
+                }
+                else
+                {
+                    bm_log_warn("[object_sync] closing connection: peer's version timestamp is %" PRId64
+                            "s off from our clock (limit %ds)\n",
+                            time_offset, BM_MAX_TIME_OFFSET_SECONDS);
+                }
+            }
+            else
+            {
+                conn->disconnect_log_quiet = 1;
+            }
             bm_free_version_message(&ver);
             size_t err_len = 0;
             const char *err_text = (time_offset > 0)
@@ -1394,10 +1428,12 @@ void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *m
             {
                 /* §11 2026-09-24 項目43: 送信キューへ積むだけ(小さいのでその場でほぼ送り切れる)。
                  * 送り切れなかった分は直後の切断で捨てる、以前の2秒待ちと同じベストエフォート */
-                bm_network_send(conn, err_packet, err_len, (int64_t)time(NULL));
+                bm_network_send(conn, err_packet, err_len, now);
                 free(err_packet);
             }
             conn->should_disconnect = 1;
+            /* §11 2026-09-25 項目46: 切断ログの理由(以前は「read error」と出ていた) */
+            conn->disconnect_reason = "peer clock offset exceeds limit";
             return;
         }
         /* §9 Dandelion++: 相手のservicesビットフィールドを覚えておく(stem successor選定が

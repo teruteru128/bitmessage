@@ -54,6 +54,7 @@
 #include <time.h>
 
 #include "../common/broadcast_item.h"
+#include "../common/log_throttle.h"
 #include "../common/queue.h"
 #include "../core/keyring.h"
 #include "network.h"
@@ -79,6 +80,10 @@ struct bm_object_sync_ctx
      * 単一スレッドからのみ呼ばれる前提で排他制御はしない(last_gc/last_resend_checkと同じ理由。
      * ただしそれらとは別のスレッドから触られるフィールドである点に注意)。 */
     time_t last_onion_announce;
+    /* §11 2026-09-25 項目46: version timestampの時計ずれによる切断WARNの間引き用
+     * (BM_TIME_OFFSET_LOG_INTERVAL_SECONDSに1回)。versionを処理するnetwork_epoll_thread
+     * という単一スレッドからのみ触られる前提で排他制御はしない(last_gcと同じ理由)。 */
+    struct bm_log_throttle time_offset_log_throttle;
 };
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,

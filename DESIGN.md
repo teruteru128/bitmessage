@@ -3721,7 +3721,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     収まり、読まない間も切らず、最終的に要求順で全件届き、持っていないhashは飛ばす)。
     ctest 51件全通過。デプロイは運用中のノードで一通り動作を確かめてから。
 
-44. **unlockAllに件数上限(10,000件)を設ける(実装済み・未デプロイ)**: 2026-09-24、ユーザー依頼。
+44. **unlockAllに件数上限(10,000件)を設ける(実装済み・デプロイ済み)**: 2026-09-24、ユーザー依頼。
     数十万件規模のidentityを`unlockAllAddresses`で一括unlockしたところ、daemonが事実上
     止まった。項目43のデプロイ直後だったため最初は項目43を疑ったが、原因は別だった。
 
@@ -3856,3 +3856,45 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     tests/test_getpubkey_twin_versions.cのケース3(v4だけの場合)は「v3の要求に応答しない」から
     「v3形式で応答し、キャッシュが効き、v2や別streamの要求には応答しない」に書き換えた。
     フォールバックを一時的に無効にすると、このケースが4件失敗することを確かめた。ctest 53件全通過。
+
+46. **時計ずれによる切断WARNの間引きと、ハンドラが求めた切断の理由表示(実装済み・未デプロイ)**:
+    2026-09-25、ユーザー依頼。時計が数時間ずれたPyBitmessageノードがTor経由で数秒〜十数秒
+    おきにinbound接続してきて、そのたびにversion timestampの検証(項目4、±3600秒)で切断
+    され、1回の切断ごとに次の2行のWARNが並んだ。
+    - 「closing connection: peer's version timestamp is -Ns off from our clock (limit 3600s)」
+    - 「closing inbound connection (fd=N): read error」
+    1時間に約190回来て、journalのWARNがこれで埋まった。
+    - こちらの拒否はPyBitmessage本家(`network/bmproto.py`の`peerValidityChecks`、上限は
+      `protocol.MAX_TIME_OFFSET`=3600秒)と同じで正しい。相手の時計が直るまで止める手段は無い。
+      本家側もこちらを「時計が進みすぎ」として同じように拒否するので、どちらの実装で直しても
+      繋がる形にはならない。
+    - 本家はhandshake前に切れるたびに相手のratingを下げる(`network/tcp.py`の
+      `decreaseRating`)ので、他に選べるノードが多い相手ならいずれ来なくなるはずだが、
+      今回の相手は逆に頻度が上がっていった。
+    - Tor経由のinboundは送信元が全て127.0.0.1に見えるので、相手ごとに一定時間拒否する等の
+      対策はできない。ログの側で対処した。
+
+    **対処**:
+    - **WARNの間引き**: `common/log_throttle.c`(`bm_log_throttle_check`、時刻は引数で渡す)を
+      追加し、時計ずれの切断WARNを`BM_TIME_OFFSET_LOG_INTERVAL_SECONDS`(600秒)に1回へ間引く。
+      間に黙った回数は次のWARNに「(N more rejection(s) for the same reason since the last
+      report)」として添える。間引きは相手ごとではなくこの理由全体で1つ(相手を区別できない
+      ため)。状態は`bm_object_sync_ctx.time_offset_log_throttle`に持ち、versionを処理する
+      network_epoll_threadだけが触るので排他制御はしない。10分にしたのは、「今も続いているか」
+      「何回来たか」を追うには十分で、1時間あたりのWARNが最大6行に収まるため。
+    - **切断理由の表示**: ハンドラが`should_disconnect`を立てた切断は、network.cの切断ログで
+      一律「read error」と出ていた(読み取りエラーと同じ経路へ合流させているため)。
+      `bm_fd_data`に`disconnect_reason`(静的文字列)を足し、切断ログはハンドラが入れた理由を
+      出すようにした。時計ずれは「peer clock offset exceeds limit」、プロトコルバージョンが
+      古い場合は「peer protocol version too old」。
+    - **間引いた回の切断ログはDEBUG**: `bm_fd_data.disconnect_log_quiet`が立っている(=理由の
+      WARNが間引かれた)切断は、network.cの切断ログもWARNではなくDEBUGで出す。切断1回ごとの
+      記録はDEBUGとして残る。
+    - 間引かれた最後の分の回数は、次に同じ理由の切断が起きるまで報告されない(次のWARNで
+      まとめて出る)。止んだことを知らせる仕組みは作っていない。
+
+    テスト: tests/test_log_throttle.c(最初の1回は出る、間隔内は黙って数える、間隔が空いたら
+    黙った回数を添えて出してリセットする、時計が巻き戻っても黙り続けない)。
+    tests/test_object_sync.cのケース11/12に、切断理由が入ること、同じ理由の2回目が間引かれ
+    `disconnect_log_quiet`が立つこと、受け入れた相手には理由が入らないことを確かめるチェックを
+    足した。ctest 54件全通過。

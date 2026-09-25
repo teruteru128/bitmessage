@@ -98,6 +98,16 @@ struct bm_fd_data
      * 直後にこのフラグを見て、切断が必要な通常の読み取りエラーと同じ経路(戻り値-1)へ
      * 合流させる。0=切断不要(既定)。 */
     int should_disconnect;
+    /* §11 2026-09-25 項目46: should_disconnectを立てたハンドラが一緒に入れる切断理由
+     * (静的な文字列、NULL可)。以前はこの経路の切断ログが一律「read error」になっており、
+     * 時計ずれ等でこちらから意図的に切ったのに読み取り失敗のように見えていた。
+     * network.cの切断ログがこれを使う(NULLなら汎用の文言)。 */
+    const char *disconnect_reason;
+    /* §11 2026-09-25 項目46: 1なら、この切断の理由を報告するWARNはハンドラ側で間引かれた
+     * (同じ理由のWARNが直前に出ている)ので、network.cの切断ログもWARNではなくDEBUGで出す。
+     * 同じ相手が数秒おきに再接続してくるとき、切断1回ごとにWARNが2行並ぶのを防ぐ。
+     * 0=通常どおりWARN(既定)。 */
+    int disconnect_log_quiet;
     /* §11 2026-09-09発覚のバグ修正: 本番daemon(daemon A)がdouble free or corruption (out)で
      * SIGABRT死した事故の調査結果(DESIGN.md参照)。broadcast_inv経由のbm_peer_registry_
      * evict_if_current(peer_connector_thread等、network_epoll_thread以外のスレッドから

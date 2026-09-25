@@ -1060,9 +1060,28 @@ void *bm_network_epoll_thread(void *arg)
                  * (ログあり)と非対称だった。listConnections APIで接続の生死を追うように
                  * なって初めて、outbound接続がここを通って頻繁に(数秒〜十数秒単位で)切断
                  * されていることが分かったため、可視化のためログを追加した。 */
-                bm_log_warn("[network] closing %s connection (fd=%d): %s\n",
-                        conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
-                        rc == 1 ? "peer closed (EOF)" : "read error");
+                /* §11 2026-09-25 項目46: ハンドラが切断を求めた場合(should_disconnect)は
+                 * 「read error」ではなくハンドラの入れた理由を出す(以前はここが一律
+                 * read errorで、時計ずれで意図的に切った切断が読み取り失敗に見えていた)。
+                 * ハンドラ側で理由のWARNが間引かれた場合はDEBUGへ落とす(network.hの
+                 * disconnect_log_quiet参照)。 */
+                const char *close_reason = "read error";
+                enum bm_log_level close_level = BM_LOG_WARN;
+                if (rc == 1)
+                {
+                    close_reason = "peer closed (EOF)";
+                }
+                else if (conn->should_disconnect)
+                {
+                    close_reason = conn->disconnect_reason != NULL ? conn->disconnect_reason
+                                                                   : "disconnect requested by protocol handler";
+                    if (conn->disconnect_log_quiet)
+                    {
+                        close_level = BM_LOG_DEBUG;
+                    }
+                }
+                bm_log_leveled(close_level, "[network] closing %s connection (fd=%d): %s\n",
+                        conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd, close_reason);
                 close_connection(args, conn);
             }
         }

@@ -4,6 +4,10 @@ add_executable(test_varint test_varint.c)
 target_link_libraries(test_varint PRIVATE bm_common)
 add_test(NAME varint COMMAND test_varint)
 
+add_executable(test_log_throttle test_log_throttle.c)
+target_link_libraries(test_log_throttle PRIVATE bm_common)
+add_test(NAME log_throttle COMMAND test_log_throttle)
+
 add_executable(test_address_vectors test_address_vectors.c)
 target_link_libraries(test_address_vectors PRIVATE bm_core)
 add_test(NAME address_vectors COMMAND test_address_vectors)
