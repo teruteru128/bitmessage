@@ -780,6 +780,79 @@ int main(void)
         sqlite3_finalize(count_stmt);
     }
 
+    /* --- 8b. I2P object(BM_OBJECT_I2P = ASCII "I2P", §11 2026-09-28)受信 -> 中身は解釈せず、
+     * 他の種別と同じく保存だけされ、peers.dbには何も登録されないこと。PyBitmessage本家も
+     * 定義のみで処理しない種別。onionpeerと違ってワイヤーフォーマットの取り決めが無いので、
+     * payload本体は任意のバイト列にしている --- */
+    {
+        CHECK(BM_OBJECT_I2P == 0x493250 && ((BM_OBJECT_I2P >> 16) & 0xff) == 'I'
+                  && ((BM_OBJECT_I2P >> 8) & 0xff) == '2' && (BM_OBJECT_I2P & 0xff) == 'P',
+              "BM_OBJECT_I2P should be the big-endian ASCII \"I2P\" (PyBitmessage OBJECT_I2P)");
+
+        sqlite3_stmt *hosts_before_stmt = NULL;
+        sqlite3_prepare_v2(peers_db, "SELECT COUNT(*) FROM hosts;", -1, &hosts_before_stmt, NULL);
+        int hosts_before = (sqlite3_step(hosts_before_stmt) == SQLITE_ROW) ? sqlite3_column_int(hosts_before_stmt, 0)
+                                                                          : -1;
+        sqlite3_finalize(hosts_before_stmt);
+
+        uint64_t i2p_ttl = 3600;
+        uint64_t i2p_expires = (uint64_t)time(NULL) + i2p_ttl;
+        unsigned char i2p_payload[8 + 4 + 1 + 1 + 32];
+        unsigned char *ip = i2p_payload;
+        for (int i = 0; i < 8; i++)
+        {
+            ip[i] = (unsigned char)((i2p_expires >> (56 - 8 * i)) & 0xff);
+        }
+        ip += 8;
+        uint32_t i2p_type = BM_OBJECT_I2P;
+        for (int i = 0; i < 4; i++)
+        {
+            ip[i] = (unsigned char)((i2p_type >> (24 - 8 * i)) & 0xff);
+        }
+        ip += 4;
+        bm_varint_encode(ip, 1); /* object version */
+        ip += bm_varint_size(1);
+        bm_varint_encode(ip, 1); /* stream */
+        ip += bm_varint_size(1);
+        memset(ip, 0x5a, 32); /* 中身は解釈されないので任意 */
+        ip += 32;
+        size_t i2p_payload_len = (size_t)(ip - i2p_payload);
+
+        uint64_t i2p_target = bm_pow_get_target(i2p_payload_len, i2p_ttl, 1000, 1000);
+        uint64_t i2p_nonce = bm_pow_run(i2p_payload, i2p_payload_len, i2p_target);
+        size_t i2p_object_len = 8 + i2p_payload_len;
+        unsigned char *i2p_object = malloc(i2p_object_len);
+        for (int i = 0; i < 8; i++)
+        {
+            i2p_object[i] = (unsigned char)((i2p_nonce >> (56 - 8 * i)) & 0xff);
+        }
+        memcpy(i2p_object + 8, i2p_payload, i2p_payload_len);
+
+        struct bm_message i2p_msg;
+        memset(&i2p_msg, 0, sizeof(i2p_msg));
+        memcpy(i2p_msg.command, "object", 6);
+        i2p_msg.length = (uint32_t)i2p_object_len;
+        i2p_msg.payload = i2p_object;
+        bm_object_sync_dispatch(conn, &i2p_msg, &ctx);
+        free(i2p_object);
+
+        sqlite3_stmt *i2p_count_stmt = NULL;
+        sqlite3_prepare_v2(object_pool_db, "SELECT COUNT(*) FROM objects WHERE object_type = ?1;", -1,
+                            &i2p_count_stmt, NULL);
+        sqlite3_bind_int(i2p_count_stmt, 1, (int)BM_OBJECT_I2P);
+        CHECK(sqlite3_step(i2p_count_stmt) == SQLITE_ROW && sqlite3_column_int(i2p_count_stmt, 0) == 1,
+              "a received I2P object should be stored in object_pool.db like any other object");
+        sqlite3_finalize(i2p_count_stmt);
+
+        sqlite3_stmt *hosts_after_stmt = NULL;
+        sqlite3_prepare_v2(peers_db, "SELECT COUNT(*) FROM hosts;", -1, &hosts_after_stmt, NULL);
+        int hosts_after = (sqlite3_step(hosts_after_stmt) == SQLITE_ROW) ? sqlite3_column_int(hosts_after_stmt, 0)
+                                                                        : -2;
+        sqlite3_finalize(hosts_after_stmt);
+        CHECK(hosts_before >= 0 && hosts_after == hosts_before,
+              "an I2P object should not register anything into peers.db (its payload is not interpreted)");
+    }
+
     /* --- 9. errorメッセージの受信(§11 2026-08-22調査): fatal(varint) || banTime(varint) ||
      * vector(varstr) || errorText(varstr)をパースしてログに出す。これまで中身を一切見ずに
      * "unhandled command"として捨てていたため、rating調査中に頻発していたにも関わらず

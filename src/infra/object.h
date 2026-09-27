@@ -24,6 +24,14 @@ enum bm_object_type
      * objectペイロード末尾までを可変長のホストエンコードとして使うため、v3 onion(56文字
      * →35byte)も正しく往復できる */
     BM_OBJECT_ONIONPEER = 0x746f72,
+    /* §11 2026-09-28: ASCII "I2P"の16進表現。PyBitmessage本家もprotocol.pyで
+     * OBJECT_I2P = 0x493250を定義しているが、定義だけで送信側も受信側も参照していない
+     * (class_objectProcessor.pyでは「Don't know how to handle object type」とログを出して
+     * 何もしない)。それでも実ネットワーク上ではonionpeerと並んで少数ながら流通している
+     * ことをdaemon Aの運用ログで確認したため、ログや調査で種別を名前で扱えるよう定義だけ
+     * 置く。こちらもI2P経路を持たないので中身は解釈せず、他の種別と同じく共通の検証
+     * (有効期限・PoW)を通れば保存・中継するだけ(object_sync.cの型別分岐には入れない)。 */
+    BM_OBJECT_I2P = 0x493250,
 };
 
 /* §5.0: nonce(8)||expiresTime(8)||objectType(4)||varint(version)||varint(stream) */

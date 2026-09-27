@@ -3917,3 +3917,19 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     tests/test_object_sync.cのケース11/12に、切断理由が入ること、同じ理由の2回目が間引かれ
     `disconnect_log_quiet`が立つこと、受け入れた相手には理由が入らないことを確かめるチェックを
     足した。ctest 54件全通過。
+
+47. **I2P object type(0x493250)を定数として定義(実装済み・未デプロイ)**: 2026-09-28、ユーザー依頼。
+    運用ログでobject typeが4797008(0x493250)と7630706(0x746f72)のobjectを受信していた。
+    それぞれASCII "I2P"と"tor"で、後者は既に`BM_OBJECT_ONIONPEER`として扱っている。前者は
+    PyBitmessage本家の`protocol.py`に`OBJECT_I2P = 0x493250`として定義されているが、本家の
+    ソース中で参照しているのはその定義行だけで、送信も受信処理もしない
+    (`class_objectProcessor.py`は「Don't know how to handle object type」とログを出すだけ)。
+    流通量はonionpeerと比べてもごく少ない。
+    - `src/infra/object.h`の`enum bm_object_type`に`BM_OBJECT_I2P = 0x493250`を追加した。
+      ログや調査で種別を名前で扱うための定義で、`object_sync.c`の型別分岐には入れない。
+      こちらもI2P経路を持たないので中身は解釈せず、これまでどおり共通の検証(有効期限・PoW)を
+      通れば保存・中継するだけ。挙動は変わらない。
+
+    テスト: tests/test_object_sync.cにケース8bを足した。定数がASCII "I2P"と一致すること、
+    PoW付きのI2P objectを受信するとobject_pool.dbへ保存され、peers.dbには何も登録されない
+    ことを確かめる。ctest 54件全通過。
