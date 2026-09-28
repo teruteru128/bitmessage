@@ -3919,7 +3919,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     `disconnect_log_quiet`が立つこと、受け入れた相手には理由が入らないことを確かめるチェックを
     足した。ctest 54件全通過。
 
-47. **I2P object type(0x493250)を定数として定義(実装済み・未デプロイ)**: 2026-09-28、ユーザー依頼。
+47. **I2P object type(0x493250)を定数として定義(実装済み・デプロイ済み)**: 2026-09-28、ユーザー依頼。
     運用ログでobject typeが4797008(0x493250)と7630706(0x746f72)のobjectを受信していた。
     それぞれASCII "I2P"と"tor"で、後者は既に`BM_OBJECT_ONIONPEER`として扱っている。前者は
     PyBitmessage本家の`protocol.py`に`OBJECT_I2P = 0x493250`として定義されているが、本家の
@@ -3935,7 +3935,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     PoW付きのI2P objectを受信するとobject_pool.dbへ保存され、peers.dbには何も登録されない
     ことを確かめる。ctest 54件全通過。
 
-48. **指定アドレスの一括unlock(`unlockAddresses` / `unlock-addresses`)(実装済み・未デプロイ)**:
+48. **指定アドレスの一括unlock(`unlockAddresses` / `unlock-addresses`)(実装済み・デプロイ済み)**:
     2026-09-28、ユーザー依頼。identity.dbが項目44の上限(10,000件)を超えていると`unlock-all`は
     使えないので、必要なアドレスだけを`unlock`で1件ずつ(スクリプトで数千回)unlockすることになる。
     これが遅い。原因は2つあった。
