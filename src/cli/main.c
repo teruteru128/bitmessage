@@ -59,7 +59,15 @@ static void print_usage(const char *prog)
             "      個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
             "      戻り値は[{address, unlocked}]の配列で、どの行が不一致だったか判別できる\n"
             "      identity.dbが10,000件を超える場合は何もunlockせずエラーになる(受信msgの\n"
-            "      試行復号が件数に比例して重くなるため。必要なアドレスはunlockで個別に)\n"
+            "      試行復号が件数に比例して重くなるため。必要なアドレスはunlock-addressesで)\n"
+            "  unlock-addresses [--backfill] <アドレス一覧のパス|-> <passphrase>\n"
+            "      ファイル(\"-\"なら標準入力)に1行1アドレスで並べたアドレスを、共通passphraseで\n"
+            "      まとめてunlockする(空行と#で始まる行は無視)。unlockを1件ずつ繰り返すと毎回\n"
+            "      scryptが走るが、こちらは1,000件ごとに1回で済む。失敗したアドレスと理由\n"
+            "      (address not found / passphrase mismatch)をstderrへ出し、1件でも失敗すれば\n"
+            "      終了コードは非0。--backfillを付けると、unlockできたアドレス宛の過去msgを\n"
+            "      object_pool.dbから探してinboxへ入れる(unlockと違い既定では行わない。\n"
+            "      msg数×アドレス数に比例して時間がかかるため)\n"
             "  lock <address>\n"
             "  lock-all\n"
             "  delete <address>\n"
@@ -476,6 +484,165 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
     fclose(f);
 
     printf("インポート完了: 成功%d件, 失敗%d件, 鍵欠落でスキップ%d件\n", imported, failed, skipped_no_keys);
+    return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
+ * §11 2026-09-28 項目48 unlock-addresses: ファイル(1行1アドレス)に並べたアドレスを
+ * unlockAddressesでまとめてunlockする。identity.dbが項目44の上限を超えてunlock-allが使えない
+ * 運用で、unlockを1件ずつ数千回呼ぶと毎回vaultのmaster KEK導出(scrypt)とbackfillが走って
+ * 遅い、というユーザー要望への対応。
+ *
+ * UNLOCK_ADDRESSES_BATCH_SIZE件ずつ送る。master KEKの導出はバッチごとに1回だけなので、
+ * バッチを小さくしてもコストはほとんど増えない。一方でRPCのハンドラは直列実行なので、
+ * 旧方式(個別scrypt、1件約161ms)の行が混じっていても1回の呼び出しが他のAPI呼び出しを
+ * 数分単位で待たせない大きさにした(1,000件すべてが旧方式でも約3分)。
+ *
+ * 空行と'#'で始まる行は読み飛ばす(前後の空白・CRは除く)。backfillは既定では行わず、
+ * --backfillを付けたときだけ行う(API側のコメント参照)。
+ */
+#define UNLOCK_ADDRESSES_BATCH_SIZE 1000
+
+/* batch[0..batch_count)をunlockAddressesで送信し、成否をunlocked/failed/backfilledへ集計する */
+static void flush_unlock_addresses_batch(const struct bm_cli_env *env, char **batch, size_t batch_count,
+                                          const char *passphrase, int backfill, int *unlocked, int *failed,
+                                          int *backfilled)
+{
+    if (batch_count == 0)
+    {
+        return;
+    }
+
+    bm_json_value_t *addresses = bm_json_new_array();
+    for (size_t i = 0; i < batch_count; i++)
+    {
+        bm_json_array_append(addresses, bm_json_new_string(batch[i]));
+    }
+    bm_json_value_t *params = bm_json_new_array();
+    bm_json_array_append(params, addresses);
+    bm_json_array_append(params, bm_json_new_string(passphrase));
+    bm_json_array_append(params, bm_json_new_bool(backfill));
+
+    char *error_msg = NULL;
+    bm_json_value_t *response = NULL;
+    if (!call_rpc_raw(env, "unlockAddresses", params, &response, &error_msg))
+    {
+        fprintf(stderr, "バッチ全体が失敗しました(%zu件): %s\n", batch_count, error_msg);
+        free(error_msg);
+        *failed += (int)batch_count;
+        return;
+    }
+
+    bm_json_value_t *result = bm_json_object_get(response, "result");
+    bm_json_value_t *results = bm_json_object_get(result, "results");
+    if (results == NULL || results->type != BM_JSON_ARRAY)
+    {
+        fprintf(stderr, "バッチ応答の形式が不正です(%zu件を失敗扱いにします)\n", batch_count);
+        *failed += (int)batch_count;
+        bm_json_free(response);
+        return;
+    }
+
+    for (size_t i = 0; i < results->item_count; i++)
+    {
+        bm_json_value_t *item = bm_json_array_get(results, i);
+        bm_json_value_t *unlocked_v = bm_json_object_get(item, "unlocked");
+        if (unlocked_v != NULL && unlocked_v->type == BM_JSON_BOOL && unlocked_v->boolean)
+        {
+            (*unlocked)++;
+        }
+        else
+        {
+            const char *addr = bm_json_as_string(bm_json_object_get(item, "address"));
+            const char *err = bm_json_as_string(bm_json_object_get(item, "error"));
+            fprintf(stderr, "失敗: %s (%s)\n", addr != NULL ? addr : "?", err != NULL ? err : "不明なエラー");
+            (*failed)++;
+        }
+    }
+    bm_json_value_t *backfilled_v = bm_json_object_get(result, "backfilledMessages");
+    if (backfilled_v != NULL && backfilled_v->type == BM_JSON_NUMBER)
+    {
+        *backfilled += (int)bm_json_as_number(backfilled_v);
+    }
+    bm_json_free(response);
+}
+
+static int unlock_addresses_from_file(const struct bm_cli_env *env, const char *path, const char *passphrase,
+                                      int backfill)
+{
+    FILE *f = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
+    if (f == NULL)
+    {
+        fprintf(stderr, "エラー: %s を開けません\n", path);
+        return EXIT_FAILURE;
+    }
+
+    char **batch = malloc(sizeof(*batch) * UNLOCK_ADDRESSES_BATCH_SIZE);
+    if (batch == NULL)
+    {
+        if (f != stdin)
+        {
+            fclose(f);
+        }
+        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        return EXIT_FAILURE;
+    }
+    size_t batch_count = 0;
+    int unlocked = 0;
+    int failed = 0;
+    int backfilled = 0;
+    char line[KEYS_DAT_LINE_MAX];
+
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        char *nl = strchr(line, '\n');
+        if (nl != NULL)
+        {
+            *nl = '\0';
+        }
+        char *trimmed = trim_inplace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#')
+        {
+            continue;
+        }
+        batch[batch_count] = strdup(trimmed);
+        if (batch[batch_count] == NULL)
+        {
+            fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+            break;
+        }
+        batch_count++;
+        if (batch_count == UNLOCK_ADDRESSES_BATCH_SIZE)
+        {
+            flush_unlock_addresses_batch(env, batch, batch_count, passphrase, backfill, &unlocked, &failed,
+                                          &backfilled);
+            for (size_t i = 0; i < batch_count; i++)
+            {
+                free(batch[i]);
+            }
+            batch_count = 0;
+        }
+    }
+    flush_unlock_addresses_batch(env, batch, batch_count, passphrase, backfill, &unlocked, &failed, &backfilled);
+    for (size_t i = 0; i < batch_count; i++)
+    {
+        free(batch[i]);
+    }
+    free(batch);
+    if (f != stdin)
+    {
+        fclose(f);
+    }
+
+    if (backfill)
+    {
+        printf("unlock完了: 成功%d件, 失敗%d件, backfillで新たにinboxへ入ったmsg %d件\n", unlocked, failed,
+               backfilled);
+    }
+    else
+    {
+        printf("unlock完了: 成功%d件, 失敗%d件\n", unlocked, failed);
+    }
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1027,6 +1194,21 @@ int main(int argc, char **argv)
         }
         bm_json_array_append(params, bm_json_new_string(argv[2]));
         return call_rpc(&env, "unlockAllAddresses", params);
+    }
+
+    if (strcmp(cmd, "unlock-addresses") == 0)
+    {
+        /* --backfillは位置引数の前にだけ置ける(引数が少ないので並べ替えは受け付けない) */
+        int backfill = (argc >= 3 && strcmp(argv[2], "--backfill") == 0);
+        int first = backfill ? 3 : 2;
+        bm_json_free(params);
+        if (argc != first + 2)
+        {
+            fprintf(stderr, "使い方: %s unlock-addresses [--backfill] <アドレス一覧のパス|-> <passphrase>\n",
+                    argv[0]);
+            return EXIT_FAILURE;
+        }
+        return unlock_addresses_from_file(&env, argv[first], argv[first + 1], backfill);
     }
 
     if (strcmp(cmd, "lock") == 0)

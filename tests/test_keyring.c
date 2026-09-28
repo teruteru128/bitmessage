@@ -1,6 +1,8 @@
 /*
  * core/keyring.c + core/identity_store.c の統合テスト。
  * §7: create_identity(KEKラップして保存) -> unlock(復号してkeyringへ) -> lock -> delete の一連を検証する。
+ * 一括unlock(unlock_all、§11 2026-09-28 項目48のunlock_addresses)の結果・vaultへのre-wrap・
+ * canary保護も確認する。
  */
 
 #include <stdio.h>
@@ -332,6 +334,124 @@ int main(void)
 
     sqlite3_close(db);
     unlink(TEST_DB_PATH);
+
+    /* §11 2026-09-28 項目48: 指定アドレスの一括unlock(bm_keyring_unlock_addresses)の検証。
+     * vaultがまだ無いDBから始め、(1)リストに入れたアドレスだけがunlockされ、identity.dbに
+     * 無いアドレスはnot_found、passphrase違いはnot_foundでない失敗として区別されること、
+     * 重複は2件目が「既にunlock済み」になること、(2)旧方式の行は成功時にvaultへre-wrapされ
+     * (vaultもその場で作られ)、次回はvault経由で同じ鍵が取り出せること、(3)vaultと違う
+     * passphraseで旧方式の行をunlockしてもre-wrapされないこと(unlock_allと同じcanary保護)、
+     * (4)vault行をvaultと違うpassphraseで試すと失敗すること、を確認する。 */
+    {
+        sqlite3 *db3 = open_fresh_db();
+        const char *common_passphrase = "unlock addresses common passphrase";
+        const char *other_passphrase = "unlock addresses other passphrase";
+        const char *seeds[3] = {"unlock addresses seed 1", "unlock addresses seed 2", "unlock addresses seed 3"};
+        char *addrs[3];
+        struct bm_generated_address gens[3];
+        for (int i = 0; i < 3; i++)
+        {
+            if (bm_address_generate_deterministic(seeds[i], 1, &gens[i]) != 0
+                || (addrs[i] = bm_address_encode(4, 1, gens[i].ripe, BM_RIPE_LEN)) == NULL
+                || bm_keyring_create_identity(db3, addrs[i], "unlock addresses test", 4, 1, gens[i].pub_signing,
+                                              gens[i].pub_encryption, gens[i].priv_signing,
+                                              gens[i].priv_encryption,
+                                              (i == 2) ? other_passphrase : common_passphrase, 1000, 1000) != 0)
+            {
+                fprintf(stderr, "FAIL: unlock_addresses setup[%d]\n", i);
+                return EXIT_FAILURE;
+            }
+        }
+
+        bm_keyring_t kr3;
+        bm_keyring_init(&kr3);
+        struct bm_unlocked_identity probe;
+        struct bm_unlock_all_entry res[4];
+        const char *req1[4] = {addrs[0], "BM-2cNoSuchAddressInIdentityDb", addrs[2], addrs[0]};
+        if (bm_keyring_unlock_addresses(&kr3, db3, common_passphrase, req1, 4, res) != 0
+            || strcmp(res[0].address, addrs[0]) != 0 || res[0].unlocked != 1 || res[0].not_found != 0
+            || res[1].unlocked != 0 || res[1].not_found != 1
+            || res[2].unlocked != 0 || res[2].not_found != 0
+            || res[3].unlocked != 1 || res[3].not_found != 0)
+        {
+            fprintf(stderr, "FAIL: unlock_addresses (first call) results\n");
+            return EXIT_FAILURE;
+        }
+        if (!bm_keyring_find_by_address(&kr3, addrs[0], &probe) || bm_keyring_find_by_address(&kr3, addrs[1], &probe)
+            || bm_keyring_find_by_address(&kr3, addrs[2], &probe))
+        {
+            fprintf(stderr, "FAIL: unlock_addresses must unlock only the listed addresses that matched\n");
+            return EXIT_FAILURE;
+        }
+        printf("OK: unlockAddressesはリストのアドレスだけをunlockし、不在とpassphrase違いを区別する\n");
+
+        struct bm_identity_row row_check;
+        if (bm_identity_store_load(db3, addrs[0], &row_check) != 0 || strcmp(row_check.kdf_algo, "vault-hkdf") != 0
+            || bm_identity_store_load(db3, addrs[1], &row_check) != 0 || strcmp(row_check.kdf_algo, "scrypt") != 0)
+        {
+            fprintf(stderr, "FAIL: unlock_addresses must re-wrap only the unlocked scrypt row into the vault\n");
+            return EXIT_FAILURE;
+        }
+        printf("OK: unlockAddressesでも旧方式の行は成功時にvaultへre-wrapされる\n");
+
+        /* (2) 新しいkeyringで、vault行(addrs[0])と旧方式の行(addrs[1])をまとめてunlockする */
+        bm_keyring_destroy(&kr3);
+        bm_keyring_init(&kr3);
+        const char *req2[2] = {addrs[0], addrs[1]};
+        if (bm_keyring_unlock_addresses(&kr3, db3, common_passphrase, req2, 2, res) != 0 || res[0].unlocked != 1
+            || res[1].unlocked != 1)
+        {
+            fprintf(stderr, "FAIL: unlock_addresses (vault row + scrypt row)\n");
+            return EXIT_FAILURE;
+        }
+        for (int i = 0; i < 2; i++)
+        {
+            if (!bm_keyring_find_by_address(&kr3, addrs[i], &probe)
+                || memcmp(probe.priv_signing, gens[i].priv_signing, BM_PRIVATE_KEY_LEN) != 0
+                || memcmp(probe.priv_encryption, gens[i].priv_encryption, BM_PRIVATE_KEY_LEN) != 0)
+            {
+                fprintf(stderr, "FAIL: unlock_addresses keys do not match originals for addrs[%d]\n", i);
+                return EXIT_FAILURE;
+            }
+        }
+        if (bm_identity_store_load(db3, addrs[1], &row_check) != 0 || strcmp(row_check.kdf_algo, "vault-hkdf") != 0)
+        {
+            fprintf(stderr, "FAIL: addrs[1] not re-wrapped into the existing vault\n");
+            return EXIT_FAILURE;
+        }
+        printf("OK: vault行と旧方式の行を混ぜても正しい鍵が取り出せる\n");
+
+        /* (3) vaultと違うpassphraseの旧方式の行: unlockはできるがre-wrapはされない */
+        const char *req3[1] = {addrs[2]};
+        if (bm_keyring_unlock_addresses(&kr3, db3, other_passphrase, req3, 1, res) != 0 || res[0].unlocked != 1
+            || bm_identity_store_load(db3, addrs[2], &row_check) != 0 || strcmp(row_check.kdf_algo, "scrypt") != 0)
+        {
+            fprintf(stderr, "FAIL: unlock_addresses with a non-vault passphrase must not re-wrap "
+                            "(vault canary protection)\n");
+            return EXIT_FAILURE;
+        }
+        printf("OK: vaultと違うpassphraseでunlockした行はre-wrapされない\n");
+
+        /* (4) vault行をvaultと違うpassphraseで試すと失敗する(not_foundではない) */
+        bm_keyring_destroy(&kr3);
+        bm_keyring_init(&kr3);
+        const char *req4[1] = {addrs[0]};
+        if (bm_keyring_unlock_addresses(&kr3, db3, other_passphrase, req4, 1, res) != 0 || res[0].unlocked != 0
+            || res[0].not_found != 0 || bm_keyring_find_by_address(&kr3, addrs[0], &probe))
+        {
+            fprintf(stderr, "FAIL: unlock_addresses of a vault row with a wrong passphrase must fail\n");
+            return EXIT_FAILURE;
+        }
+        printf("OK: vault行をvaultと違うpassphraseで試すと失敗する\n");
+
+        bm_keyring_destroy(&kr3);
+        for (int i = 0; i < 3; i++)
+        {
+            free(addrs[i]);
+        }
+        sqlite3_close(db3);
+        unlink(TEST_DB_PATH);
+    }
 
     printf("ALL OK\n");
     return EXIT_SUCCESS;

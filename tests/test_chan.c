@@ -18,6 +18,8 @@
  *    「MSGオブジェクト数×既存unlockedアドレス数」の計算量になって実運用で9時間以上RPCサーバー
  *    をブロックした問題が発覚したための対応。address_filterに無関係なidentityのアドレスを
  *    渡した場合は復号されず、正しいアドレスを渡した場合のみ復号されることを確認する。
+ * 6. §11 2026-09-28 項目48: 複数アドレス版(bm_object_sync_backfill_trial_decrypt_addresses)も
+ *    リストに入れたアドレスだけを対象にし、MSG1件を1回だけ数えること。
  * を確認する。
  */
 
@@ -272,6 +274,27 @@ int main(void)
             CHECK(inbox_count_after == 2 && found_third == 1,
                   "the third chan post newly appears in member B's inbox after the correctly-scoped backfill");
             bm_inbox_message_list_free(inbox_list_after, inbox_count_after);
+
+            /* --- 7. §11 2026-09-28 項目48: 複数アドレス版(unlockAddressesのbackfill=true用)。
+             * 対象はリストに入れたアドレスだけで、keyringにunlock済みでもリストに無いidentityは
+             * 試さないこと、keyringに無いアドレスは黙って除かれること、MSG1件は1回だけ
+             * 数えられること(リストに複数のidentityがあっても、復号できた時点で打ち切る)。 --- */
+            const char *only_other[1] = {other_address};
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+                                                                  only_other, 1) == 0,
+                  "multi-address backfill with only the unrelated identity decrypts nothing");
+            const char *with_missing[2] = {"BM-2cNotUnlockedAnywhere", other_address};
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+                                                                  with_missing, 2) == 0,
+                  "multi-address backfill silently skips an address that is not in the keyring");
+            const char *both[3] = {other_address, "BM-2cNotUnlockedAnywhere", chan_address_b};
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+                                                                  both, 3) == 2,
+                  "multi-address backfill including the chan address decrypts each of the 2 backlog "
+                  "messages exactly once");
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+                                                                  NULL, 0) == 0,
+                  "multi-address backfill with an empty list does nothing");
         }
         free(object3);
         sqlite3_close(identity_db_other);

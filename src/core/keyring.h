@@ -204,6 +204,7 @@ struct bm_unlock_all_entry
 {
     char address[BM_KEYRING_MAX_ADDRESS_LEN];
     int unlocked; /* 成功(または既にunlock済みでスキップ)なら1、passphrase不一致等なら0 */
+    int not_found; /* §11 2026-09-28 項目48: identity.dbに行が無ければ1(unlock_allでは常に0) */
 };
 
 /*
@@ -231,5 +232,21 @@ int bm_keyring_unlock_all_with_limit(bm_keyring_t *kr, sqlite3 *db, const char *
                                      struct bm_unlock_all_entry **out_results, size_t *out_count);
 int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
                            struct bm_unlock_all_entry **out_results, size_t *out_count);
+
+/*
+ * §11 2026-09-28 項目48: 指定したアドレス群だけを共通passphraseで一括unlockする
+ * (unlockAddresses)。identity.dbが項目44の上限を超えてunlock_allが使えない運用で、必要な
+ * アドレスを個別のunlockAddressで数千回呼ぶと、vault方式の行でも呼び出しのたびにmaster KEKの
+ * 導出(scrypt、1回約161ms)が走って遅い。unlock_allと同じくmaster KEKを呼び出し全体で1回だけ
+ * 導出し、行ごとの処理(vault行はHKDF、旧方式の行は個別scrypt+vaultへのre-wrap、
+ * 既にunlock済みならスキップ)も共通にしてある。
+ * out_resultsは呼び出し側がcount要素分確保する。results[i]はaddresses[i]に対応し、
+ * identity.dbに無いアドレスはnot_found=1になる(処理は中断しない)。重複したアドレスは
+ * 2件目以降「既にunlock済み」として扱われる。件数の上限はここでは設けない(呼び出し側の責務)。
+ * 成功時0。
+ */
+int bm_keyring_unlock_addresses(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
+                                const char *const *addresses, size_t count,
+                                struct bm_unlock_all_entry *out_results);
 
 #endif /* BM_CORE_KEYRING_H */

@@ -257,7 +257,7 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
         char msg[256];
         snprintf(msg, sizeof(msg),
                 "unlockAllAddresses refused: %zu identities exceeds the limit of %d (trial decryption of every "
-                "incoming msg would stall the network thread); unlock the addresses you need with unlockAddress",
+                "incoming msg would stall the network thread); unlock the addresses you need with unlockAddresses",
                 count, BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES);
         *out_error = dup_cstr(msg);
         return NULL;
@@ -291,6 +291,120 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
     }
     free(results);
     return arr;
+}
+
+/*
+ * §11 2026-09-28 項目48 unlockAddresses: [[address, ...], passphrase, backfill(省略時false)]。
+ * 指定したアドレス群だけを共通passphraseで一括unlockする(bm_keyring_unlock_addresses参照)。
+ * identity.dbが項目44の上限を超えてunlockAllAddressesが使えない運用で、必要なアドレスを
+ * unlockAddressで数千回呼ぶと、1回ごとにvaultのmaster KEK導出(scrypt)と過去MSGのbackfillが
+ * 走って遅い、というユーザー要望への対応。
+ *
+ * 1回の呼び出しで受け付ける件数は項目44と同じ10,000件まで(RPCのハンドラは直列実行なので、
+ * 旧方式(個別scrypt)の行が多いと1件約161msで他のAPI呼び出しを長く待たせるため。
+ * 10,000件分のアドレス文字列はリクエストボディの1MiB上限にも収まる)。CLIはこれより
+ * 小さく分けて送る。keyring全体の件数には上限を設けない(unlockAddressの繰り返しと同じ扱い)。
+ *
+ * backfill(unlock直後にobject_pool.dbの過去MSGを試行復号する、h_unlockAddressのコメント参照)は
+ * ユーザーの希望で既定では行わず、backfill=trueのときだけ今回unlockできたアドレスを対象に行う。
+ * ECDHの回数が「MSGオブジェクト数×アドレス数」になり、数千件では長時間かかるため
+ * (h_unlockAllAddressesが省略しているのと同じ理由)。
+ *
+ * 戻り値は{results:[{address, unlocked, error?}], backfilledMessages?}。errorは失敗時のみで
+ * "address not found"(identity.dbに無い)か"passphrase mismatch"。backfilledMessagesは
+ * backfill=trueのときだけ付け、新たにinboxへ入った件数を入れる。
+ */
+#define BM_API_UNLOCK_ADDRESSES_MAX BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES
+
+static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
+                                const cJSON *params, char **out_error)
+{
+    const cJSON *addresses_v = param_at(params, 0);
+    const char *passphrase = param_str(params, 1);
+    const cJSON *backfill_v = param_at(params, 2);
+    if (!cJSON_IsArray(addresses_v) || passphrase == NULL)
+    {
+        *out_error = dup_cstr("unlockAddresses requires [addresses, passphrase, backfill(optional)]");
+        return NULL;
+    }
+    if (backfill_v != NULL && !cJSON_IsBool(backfill_v))
+    {
+        *out_error = dup_cstr("backfill must be a boolean");
+        return NULL;
+    }
+    int backfill = cJSON_IsTrue(backfill_v);
+
+    size_t count = (size_t)cJSON_GetArraySize(addresses_v);
+    if (count > BM_API_UNLOCK_ADDRESSES_MAX)
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "unlockAddresses accepts at most %d addresses per call",
+                 BM_API_UNLOCK_ADDRESSES_MAX);
+        *out_error = dup_cstr(msg);
+        return NULL;
+    }
+
+    const char **addresses = malloc(sizeof(*addresses) * (count > 0 ? count : 1));
+    struct bm_unlock_all_entry *results = malloc(sizeof(*results) * (count > 0 ? count : 1));
+    if (addresses == NULL || results == NULL)
+    {
+        free(addresses);
+        free(results);
+        *out_error = dup_cstr("out of memory");
+        return NULL;
+    }
+    /* param_at(cJSON_GetArrayItem)は先頭からたどるので、要素ごとに呼ぶと件数の2乗になる。
+     * addresses_vが配列であることは上で確認済みなのでcJSON_ArrayForEachで直接回す */
+    size_t idx = 0;
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, addresses_v)
+    {
+        addresses[idx] = json_cstr(item);
+        if (addresses[idx++] == NULL)
+        {
+            free(addresses);
+            free(results);
+            *out_error = dup_cstr("addresses must be an array of strings");
+            return NULL;
+        }
+    }
+
+    bm_keyring_unlock_addresses(config->keyring, config->identity_db, passphrase, addresses, count, results);
+
+    cJSON *arr = cJSON_CreateArray();
+    size_t unlocked_count = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(results[i].address));
+        cJSON_AddItemToObject(entry, "unlocked", cJSON_CreateBool(results[i].unlocked));
+        if (!results[i].unlocked)
+        {
+            cJSON_AddItemToObject(entry, "error",
+                                  json_str(results[i].not_found ? "address not found" : "passphrase mismatch"));
+        }
+        else
+        {
+            /* backfill対象は今回unlockできたものに詰めて渡す(addressesは以後使わないので上書きしてよい) */
+            addresses[unlocked_count++] = addresses[i];
+        }
+        cJSON_AddItemToArray(arr, entry);
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddItemToObject(out, "results", arr);
+    if (backfill)
+    {
+        /* object_pool_dbが無い構成(api_server.hのとおりNULL可)では探す対象が無いので0件 */
+        int n = (config->object_pool_db != NULL)
+                    ? bm_object_sync_backfill_trial_decrypt_addresses(config->object_pool_db, config->messages_db,
+                                                                      config->keyring, addresses, unlocked_count)
+                    : 0;
+        cJSON_AddItemToObject(out, "backfilledMessages", cJSON_CreateNumber(n > 0 ? n : 0));
+    }
+    free(addresses);
+    free(results);
+    return out;
 }
 
 /*
@@ -1698,6 +1812,7 @@ static cJSON *h_trashMessage(const struct bm_api_server_config *config,
 static const struct bm_api_method METHODS[] = {
     {"unlockAddress", h_unlockAddress},
     {"unlockAllAddresses", h_unlockAllAddresses},
+    {"unlockAddresses", h_unlockAddresses},
     {"exportAddress", h_exportAddress},
     {"lockAddress", h_lockAddress},
     {"lockAllAddresses", h_lockAllAddresses},

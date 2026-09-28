@@ -900,6 +900,106 @@ bool bm_keyring_find_by_address(bm_keyring_t *kr, const char *address,
     return false;
 }
 
+/*
+ * §11 2026-09-28 項目48: 一括unlock(unlock_all/unlock_addresses)の共通状態。vaultのmaster KEKを
+ * 呼び出し全体で1回だけ導出して使い回すためのもの(以前はbm_keyring_unlock_all_with_limitの
+ * ローカル変数だったが、指定アドレス版と共有するため切り出した)。
+ * vault_existsとhave_master_kekを分けているのは、「vaultはあるが渡されたpassphraseが
+ * vaultのものと異なる」場合に、誤って新規vault作成を試みない(=誤ったmaster KEKでre-wrapして
+ * vaultを壊す事故を防ぐ)ため。
+ */
+struct unlock_bulk_state
+{
+    const char *passphrase;
+    int vault_exists;
+    int have_master_kek;
+    unsigned char master_kek[32];
+};
+
+/* §7.4 vaultが既にあればmaster KEKをここで1回だけ導出する(無ければ、unlock_bulk_oneで初めて
+ * 旧方式のunlockに成功した時点で遅延生成する) */
+static void unlock_bulk_begin(sqlite3 *db, const char *passphrase, struct unlock_bulk_state *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->passphrase = passphrase;
+    unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+    char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
+    unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+    st->vault_exists = (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) == 0);
+    if (st->vault_exists && derive_master_kek(passphrase, vault_salt, vault_kdf_params, st->master_kek) == 0
+        && verify_vault_canary(st->master_kek, vault_canary) == 0)
+    {
+        st->have_master_kek = 1;
+    }
+}
+
+static void unlock_bulk_end(struct unlock_bulk_state *st)
+{
+    OPENSSL_cleanse(st->master_kek, sizeof(st->master_kek));
+    st->have_master_kek = 0;
+}
+
+/* 1件分の一括unlock処理。out->address/unlocked/not_foundを埋める */
+static void unlock_bulk_one(bm_keyring_t *kr, sqlite3 *db, struct unlock_bulk_state *st, const char *address,
+                            struct bm_unlock_all_entry *out)
+{
+    snprintf(out->address, BM_KEYRING_MAX_ADDRESS_LEN, "%s", address);
+    out->unlocked = 0;
+    out->not_found = 0;
+
+    struct bm_unlocked_identity dummy;
+    if (bm_keyring_find_by_address(kr, address, &dummy))
+    {
+        OPENSSL_cleanse(&dummy, sizeof(dummy));
+        out->unlocked = 1; /* 既にunlock済み、再試行しない */
+        return;
+    }
+
+    struct bm_identity_row row;
+    if (bm_identity_store_load(db, address, &row) != 0)
+    {
+        out->not_found = 1;
+        return;
+    }
+
+    if (strcmp(row.kdf_algo, "vault-hkdf") == 0)
+    {
+        /* master KEKが導出できていない(=vaultはあるがpassphrase不一致)場合は
+         * 個別に試す意味が無い(vault方式はmaster KEK前提)ので即失敗扱い */
+        out->unlocked = (st->have_master_kek && unlock_with_vault(kr, &row, st->master_kek) == 0) ? 1 : 0;
+        return;
+    }
+
+    /* 旧方式(個別scrypt)。成功したらvault方式へre-wrapする(lazy migration、rewrap_to_vault参照) */
+    if (bm_keyring_unlock(kr, db, address, st->passphrase) != 0)
+    {
+        return;
+    }
+    out->unlocked = 1;
+    if (!st->have_master_kek && !st->vault_exists)
+    {
+        unsigned char new_vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
+        char new_vault_params[BM_IDENTITY_KDF_PARAMS_MAX];
+        unsigned char new_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
+        snprintf(new_vault_params, sizeof(new_vault_params), "{\"N\":%llu,\"r\":%u,\"p\":%u}",
+                 (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
+        if (RAND_bytes(new_vault_salt, sizeof(new_vault_salt)) == 1
+            && derive_kek(st->passphrase, new_vault_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R,
+                           BM_KEYRING_SCRYPT_P, st->master_kek) == 0
+            && aes256gcm_wrap(st->master_kek, VAULT_CANARY_AAD, sizeof(VAULT_CANARY_AAD) - 1,
+                               VAULT_CANARY_PLAINTEXT, new_canary) == 0
+            && bm_identity_store_create_vault(db, new_vault_salt, new_vault_params, new_canary) == 0)
+        {
+            st->have_master_kek = 1;
+            st->vault_exists = 1;
+        }
+    }
+    if (st->have_master_kek)
+    {
+        rewrap_to_vault(db, kr, address, st->master_kek);
+    }
+}
+
 int bm_keyring_unlock_all(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
                            struct bm_unlock_all_entry **out_results, size_t *out_count)
 {
@@ -939,95 +1039,53 @@ int bm_keyring_unlock_all_with_limit(bm_keyring_t *kr, sqlite3 *db, const char *
         return -1;
     }
 
-    /* §7.4 vaultが既にあればmaster KEKをここで1回だけ導出してループ全体で使い回す
-     * (無ければ、下のループで初めて旧方式のunlockに成功した時点で遅延生成する)。
-     * vault_existsとhave_master_kekを分けているのは、「vaultはあるが渡されたpassphraseが
-     * vaultのものと異なる」場合に、下のループで誤って新規vault作成を試みない
-     * (=誤ったmaster KEKでre-wrapしてvaultを壊す事故を防ぐ)ため。 */
-    unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
-    char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
-    unsigned char vault_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
-    unsigned char master_kek[32] = {0};
-    int vault_exists = (bm_identity_store_load_vault(db, vault_salt, vault_kdf_params, vault_canary) == 0);
-    int have_master_kek = 0;
-    if (vault_exists && derive_master_kek(passphrase, vault_salt, vault_kdf_params, master_kek) == 0
-        && verify_vault_canary(master_kek, vault_canary) == 0)
-    {
-        have_master_kek = 1;
-    }
-
+    struct unlock_bulk_state st;
+    unlock_bulk_begin(db, passphrase, &st);
     for (size_t i = 0; i < count; i++)
     {
         if ((i + 1) % 10000 == 0)
         {
             bm_log_debug("[keyring] %zu identities processing...\n", i + 1);
         }
-        snprintf(results[i].address, BM_KEYRING_MAX_ADDRESS_LEN, "%s", list[i].address);
-
-        struct bm_unlocked_identity dummy;
-        if (bm_keyring_find_by_address(kr, list[i].address, &dummy))
+        unlock_bulk_one(kr, db, &st, list[i].address, &results[i]);
+        if (!results[i].unlocked)
         {
-            results[i].unlocked = 1; /* 既にunlock済み、再試行しない */
-            continue;
-        }
-
-        struct bm_identity_row row;
-        if (bm_identity_store_load(db, list[i].address, &row) != 0)
-        {
-            results[i].unlocked = 0;
-            continue;
-        }
-
-        if (strcmp(row.kdf_algo, "vault-hkdf") == 0)
-        {
-            /* master KEKが導出できていない(=vaultはあるがpassphrase不一致)場合は
-             * 個別に試す意味が無い(vault方式はmaster KEK前提)ので即失敗扱い */
-            results[i].unlocked = (have_master_kek && unlock_with_vault(kr, &row, master_kek) == 0) ? 1 : 0;
-            if (results[i].unlocked == 0)
-            {
-                /* §11 2026-09-12: 一括unlock中の個別失敗は、パスフレーズ不一致等で
-                 * 対象件数分(最大で全件)出うるため進捗ログ(無番号DEBUG)より一段詳細な
-                 * DEBUG1にした。 */
-                bm_log_debug1("[keyring] unlock failed (key number %zu)\n", i + 1);
-            }
-            continue;
-        }
-
-        /* 旧方式(個別scrypt)。成功したらvault方式へre-wrapする(lazy migration、上記コメント参照) */
-        int rc = bm_keyring_unlock(kr, db, list[i].address, passphrase);
-        results[i].unlocked = (rc == 0) ? 1 : 0;
-        if (rc != 0)
-        {
-            continue;
-        }
-        if (!have_master_kek && !vault_exists)
-        {
-            unsigned char new_vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
-            char new_vault_params[BM_IDENTITY_KDF_PARAMS_MAX];
-            unsigned char new_canary[BM_IDENTITY_WRAPPED_KEY_LEN];
-            snprintf(new_vault_params, sizeof(new_vault_params), "{\"N\":%llu,\"r\":%u,\"p\":%u}",
-                     (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
-            if (RAND_bytes(new_vault_salt, sizeof(new_vault_salt)) == 1
-                && derive_kek(passphrase, new_vault_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R,
-                               BM_KEYRING_SCRYPT_P, master_kek) == 0
-                && aes256gcm_wrap(master_kek, VAULT_CANARY_AAD, sizeof(VAULT_CANARY_AAD) - 1,
-                                   VAULT_CANARY_PLAINTEXT, new_canary) == 0
-                && bm_identity_store_create_vault(db, new_vault_salt, new_vault_params, new_canary) == 0)
-            {
-                have_master_kek = 1;
-                vault_exists = 1;
-            }
-        }
-        if (have_master_kek)
-        {
-            rewrap_to_vault(db, kr, list[i].address, master_kek);
+            /* §11 2026-09-12: 一括unlock中の個別失敗は、パスフレーズ不一致等で
+             * 対象件数分(最大で全件)出うるため進捗ログ(無番号DEBUG)より一段詳細な
+             * DEBUG1にした。 */
+            bm_log_debug1("[keyring] unlock failed (key number %zu)\n", i + 1);
         }
     }
+    unlock_bulk_end(&st);
     bm_log_debug("[keyring] all identities unlock done\n");
 
-    OPENSSL_cleanse(master_kek, sizeof(master_kek));
     free(list);
     *out_results = results;
     *out_count = count;
+    return 0;
+}
+
+/* §11 2026-09-28 項目48(keyring.h参照) */
+int bm_keyring_unlock_addresses(bm_keyring_t *kr, sqlite3 *db, const char *passphrase,
+                                const char *const *addresses, size_t count,
+                                struct bm_unlock_all_entry *out_results)
+{
+    bm_log_debug("[keyring] unlock addresses: %zu address(es)\n", count);
+    struct unlock_bulk_state st;
+    unlock_bulk_begin(db, passphrase, &st);
+    for (size_t i = 0; i < count; i++)
+    {
+        if ((i + 1) % 10000 == 0)
+        {
+            bm_log_debug("[keyring] %zu addresses processing...\n", i + 1);
+        }
+        unlock_bulk_one(kr, db, &st, addresses[i], &out_results[i]);
+        if (!out_results[i].unlocked)
+        {
+            bm_log_debug1("[keyring] unlock failed (key number %zu)\n", i + 1);
+        }
+    }
+    unlock_bulk_end(&st);
+    bm_log_debug("[keyring] unlock addresses done\n");
     return 0;
 }

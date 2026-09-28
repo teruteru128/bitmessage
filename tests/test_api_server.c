@@ -477,6 +477,132 @@ int main(void)
             }
         }
 
+        /* §11 2026-09-28 項目48 unlockAddresses: lockしてから、passphrase違い→正しいpassphrase
+         * (+identity.dbに無いアドレス)の順に一括unlockし、結果の形とerrorの区別、backfillの
+         * 既定がfalseであること(backfilledMessagesが付かない)を確認する。
+         * importAddressの確認より後に置いているのは、一括unlockが旧方式(scrypt)の行の成功時に
+         * vaultを作る(unlockAllと同じlazy migration)ため。前に置くと"store pass"のvaultが
+         * でき、"new store pass"でのimportAddressがvault不一致で失敗する。ここでは
+         * created_addressはimportAddressでvault方式("new store pass")になっている */
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"lockAddress\",\"params\":[\"%s\"],\"id\":481}",
+                 created_address);
+        free(do_request(req, "testuser", "testpass"));
+
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[[\"%s\"],\"wrong pass\"],"
+                 "\"id\":482}",
+                 created_address);
+        resp = do_request(req, "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *results = bm_json_object_get(bm_json_object_get(v, "result"), "results");
+            bm_json_value_t *e0 = bm_json_array_get(results, 0);
+            bm_json_value_t *unlocked0 = bm_json_object_get(e0, "unlocked");
+            const char *err0 = bm_json_as_string(bm_json_object_get(e0, "error"));
+            CHECK(results != NULL && results->item_count == 1 && unlocked0 != NULL && unlocked0->boolean == 0
+                      && err0 != NULL && strcmp(err0, "passphrase mismatch") == 0,
+                  "unlockAddresses with wrong passphrase reports unlocked=false / passphrase mismatch");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\","
+                 "\"params\":[[\"%s\",\"BM-2cNoSuchAddressInIdentityDb\"],\"new store pass\"],\"id\":483}",
+                 created_address);
+        resp = do_request(req, "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *result = bm_json_object_get(v, "result");
+            bm_json_value_t *results = bm_json_object_get(result, "results");
+            bm_json_value_t *e0 = bm_json_array_get(results, 0);
+            bm_json_value_t *e1 = bm_json_array_get(results, 1);
+            const char *addr0 = bm_json_as_string(bm_json_object_get(e0, "address"));
+            bm_json_value_t *unlocked0 = bm_json_object_get(e0, "unlocked");
+            bm_json_value_t *unlocked1 = bm_json_object_get(e1, "unlocked");
+            const char *err1 = bm_json_as_string(bm_json_object_get(e1, "error"));
+            CHECK(results != NULL && results->item_count == 2 && addr0 != NULL
+                      && strcmp(addr0, created_address) == 0 && unlocked0 != NULL && unlocked0->boolean == 1
+                      && bm_json_object_get(e0, "error") == NULL,
+                  "unlockAddresses unlocks the listed address with the correct passphrase");
+            CHECK(unlocked1 != NULL && unlocked1->boolean == 0 && err1 != NULL
+                      && strcmp(err1, "address not found") == 0,
+                  "unlockAddresses reports an unknown address as 'address not found' without aborting");
+            CHECK(bm_json_object_get(result, "backfilledMessages") == NULL,
+                  "unlockAddresses does not backfill unless backfill=true");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* backfill=true: 応答にbackfilledMessagesが付く(このテストはobject_pool_dbを持たないので0) */
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[[\"%s\"],\"new store pass\",true],"
+                 "\"id\":484}",
+                 created_address);
+        resp = do_request(req, "testuser", "testpass");
+        if (resp != NULL)
+        {
+            bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+            bm_json_value_t *backfilled = bm_json_object_get(bm_json_object_get(v, "result"), "backfilledMessages");
+            CHECK(backfilled != NULL && backfilled->type == BM_JSON_NUMBER && backfilled->number == 0,
+                  "unlockAddresses with backfill=true reports backfilledMessages");
+            bm_json_free(v);
+            free(resp);
+        }
+
+        /* 引数の誤り: backfillが真偽値でない、addressesが配列でない、要素が文字列でない */
+        const char *bad_unlock_addresses[] = {
+            "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[[\"BM-x\"],\"p\",\"yes\"],\"id\":485}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[\"BM-x\",\"p\"],\"id\":486}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[[\"BM-x\",1],\"p\"],\"id\":487}",
+        };
+        for (size_t i = 0; i < sizeof(bad_unlock_addresses) / sizeof(bad_unlock_addresses[0]); i++)
+        {
+            resp = do_request(bad_unlock_addresses[i], "testuser", "testpass");
+            if (resp != NULL)
+            {
+                bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                CHECK(v != NULL && bm_json_object_get(v, "error") != NULL
+                          && bm_json_object_get(v, "result") == NULL,
+                      "unlockAddresses rejects malformed params");
+                bm_json_free(v);
+                free(resp);
+            }
+        }
+
+        /* 1回の呼び出しの上限(10,000件)を超えると何もせずエラー */
+        {
+            const size_t over = 10001;
+            const char *head = "{\"jsonrpc\":\"2.0\",\"method\":\"unlockAddresses\",\"params\":[[";
+            const char *tail = "],\"p\"],\"id\":488}";
+            size_t cap = strlen(head) + over * 4 + strlen(tail) + 1;
+            char *big = malloc(cap);
+            if (big != NULL)
+            {
+                size_t pos = (size_t)snprintf(big, cap, "%s", head);
+                for (size_t i = 0; i < over; i++)
+                {
+                    pos += (size_t)snprintf(big + pos, cap - pos, "%s\"x\"", i == 0 ? "" : ",");
+                }
+                snprintf(big + pos, cap - pos, "%s", tail);
+                resp = do_request(big, "testuser", "testpass");
+                free(big);
+                if (resp != NULL)
+                {
+                    bm_json_value_t *v = bm_json_parse(resp, strlen(resp));
+                    const char *msg =
+                        bm_json_as_string(bm_json_object_get(bm_json_object_get(v, "error"), "message"));
+                    CHECK(msg != NULL && strstr(msg, "at most 10000") != NULL,
+                          "unlockAddresses refuses more than 10,000 addresses per call");
+                    bm_json_free(v);
+                    free(resp);
+                }
+            }
+        }
+
         free(created_address);
     }
 

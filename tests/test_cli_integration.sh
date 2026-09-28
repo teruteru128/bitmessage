@@ -310,4 +310,50 @@ echo "$BODY_FILE_DUP_OUTPUT" | grep -q "ttlSeconds には数値を指定して�
 
 "$CLI" delete "$ADDR6" >/dev/null
 
+# §11 2026-09-28 項目48 unlock-addresses: ファイル(1行1アドレス)/標準入力からの一括unlock。
+# コメント行・空行・前後の空白・CRLFを読み飛ばせること、identity.dbに無いアドレスと
+# passphrase違いが理由付きでstderrへ出て終了コードが非0になること、成功した分は実際に
+# unlockされていること、--backfillの配線(既定では行わない)を確認する。
+ADDR7A=$("$CLI" create-address "cli unlock-addresses test a" 4 1 1 "u7a" "storepass7" | tr -d '"')
+ADDR7B=$("$CLI" create-address "cli unlock-addresses test b" 4 1 1 "u7b" "storepass7" | tr -d '"')
+ADDR7C=$("$CLI" create-address "cli unlock-addresses test c" 4 1 1 "u7c" "otherpass7" | tr -d '"')
+"$CLI" lock-all >/dev/null
+printf '# unlock-addresses test\n\n  %s  \r\n%s\nBM-2cNoSuchAddressInIdentityDb\n%s\n' \
+    "$ADDR7A" "$ADDR7B" "$ADDR7C" > unlock_list.txt
+
+UNLOCK_ADDRS_RC=0
+UNLOCK_ADDRS_OUTPUT=$("$CLI" unlock-addresses unlock_list.txt "storepass7" 2>unlock_addrs_err.txt) \
+    || UNLOCK_ADDRS_RC=$?
+UNLOCK_ADDRS_ERR=$(cat unlock_addrs_err.txt)
+[ "$UNLOCK_ADDRS_RC" -ne 0 ] || fail "unlock-addresses with failures should exit non-zero"
+echo "$UNLOCK_ADDRS_OUTPUT" | grep -q "成功2件, 失敗2件" \
+    || fail "unlock-addresses should report 2 successes / 2 failures (got: $UNLOCK_ADDRS_OUTPUT)"
+echo "$UNLOCK_ADDRS_OUTPUT" | grep -q "backfill" \
+    && fail "unlock-addresses should not backfill by default (got: $UNLOCK_ADDRS_OUTPUT)"
+echo "$UNLOCK_ADDRS_ERR" | grep -q "BM-2cNoSuchAddressInIdentityDb (address not found)" \
+    || fail "unlock-addresses should report the unknown address (got: $UNLOCK_ADDRS_ERR)"
+echo "$UNLOCK_ADDRS_ERR" | grep -q "$ADDR7C (passphrase mismatch)" \
+    || fail "unlock-addresses should report the passphrase mismatch (got: $UNLOCK_ADDRS_ERR)"
+LIST_AFTER_UNLOCK_ADDRS=$("$CLI" list-addresses)
+for a in "$ADDR7A" "$ADDR7B"; do
+    echo "$LIST_AFTER_UNLOCK_ADDRS" | grep -qP "\"address\":\"$a\"[^}]*\"unlocked\":true" \
+        || fail "$a should be unlocked after unlock-addresses (got: $LIST_AFTER_UNLOCK_ADDRS)"
+done
+echo "$LIST_AFTER_UNLOCK_ADDRS" | grep -qP "\"address\":\"$ADDR7C\"[^}]*\"unlocked\":false" \
+    || fail "$ADDR7C should stay locked (got: $LIST_AFTER_UNLOCK_ADDRS)"
+
+# 標準入力 + --backfill(全件成功なので終了コード0)
+UNLOCK_STDIN_OUTPUT=$(printf '%s\n' "$ADDR7C" | "$CLI" unlock-addresses --backfill - "otherpass7") \
+    || fail "unlock-addresses from stdin should succeed (got: $UNLOCK_STDIN_OUTPUT)"
+echo "$UNLOCK_STDIN_OUTPUT" | grep -q "成功1件, 失敗0件, backfill" \
+    || fail "unlock-addresses --backfill should report the backfill count (got: $UNLOCK_STDIN_OUTPUT)"
+
+UNLOCK_ADDRS_USAGE_OUTPUT=$("$CLI" unlock-addresses onlyone 2>&1 || true)
+echo "$UNLOCK_ADDRS_USAGE_OUTPUT" | grep -q "使い方" \
+    || fail "unlock-addresses with wrong arg count should print usage (got: $UNLOCK_ADDRS_USAGE_OUTPUT)"
+
+for a in "$ADDR7A" "$ADDR7B" "$ADDR7C"; do
+    "$CLI" delete "$a" >/dev/null
+done
+
 echo "ALL OK"

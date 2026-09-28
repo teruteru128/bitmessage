@@ -853,6 +853,7 @@ api_handler_fn handler; }`の配列をコア層が持ち、HTTPレイヤーとJS
 | `listAddresses` | (なし) | identity.db一覧 + 各アドレスの`unlocked`状態(bool)を返す |
 | `createDeterministicAddress` | passphrase, addressVersion, stream, ripeNullBytes | §3.3のnonce探索でアドレス生成、KEK(新規passphrase)でラップして保存 |
 | `unlockAllAddresses` | passphrase | §7.4参照。数千件規模の一括unlock(vault方式) |
+| `unlockAddresses` | addresses(配列), passphrase, backfill? | 2026-09-28実装(§11項目48)。指定アドレス群だけを一括unlock。master KEK導出は1回の呼び出しにつき1回。backfillは既定false |
 | `importAddress` | address, signingWIF, encryptionWIF, label, storePassphrase, nonceTrialsPerByte?, payloadLengthExtraBytes? | 2026-08-29実装。当初案は`address`を含まなかったが、WIFは秘密鍵のみでaddressVersion/streamを含まないため確定時に追加した(§11参照)。addressから復元したripeとWIFの公開鍵ripeが一致するか検証してから保存する |
 | `exportAddress` | address, passphrase | 2026-08-29実装。importAddressと対称。その場でpassphrase復号しsigningWIF/encryptionWIFを返す一回性操作(keyringには触れない) |
 
@@ -3933,3 +3934,58 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     テスト: tests/test_object_sync.cにケース8bを足した。定数がASCII "I2P"と一致すること、
     PoW付きのI2P objectを受信するとobject_pool.dbへ保存され、peers.dbには何も登録されない
     ことを確かめる。ctest 54件全通過。
+
+48. **指定アドレスの一括unlock(`unlockAddresses` / `unlock-addresses`)(実装済み・未デプロイ)**:
+    2026-09-28、ユーザー依頼。identity.dbが項目44の上限(10,000件)を超えていると`unlock-all`は
+    使えないので、必要なアドレスだけを`unlock`で1件ずつ(スクリプトで数千回)unlockすることになる。
+    これが遅い。原因は2つあった。
+    - `unlockAddress`は呼び出しのたびにvaultのmaster KEK導出(scrypt、1回約161ms)を行う
+      (`resolve_kek_for_row`)。vault方式の行でもそうなので、§7.4/§7.5で解決した「1件ずつ
+      呼ぶとvault化の効果が出ない」問題がunlock側に残っていた。
+    - `unlockAddress`は成功のたびにbackfill(object_pool.dbの全MSGをそのアドレスで試行復号、
+      ECDHを伴う)を行う。
+    - 既存APIは1件版(`unlockAddress`)と全件版(`unlockAllAddresses`)だけで、指定アドレスの
+      一括版は無かった(`importAddressesBulk`は一括インポートでunlockはしない)。
+
+    **対処**:
+    - `bm_keyring_unlock_addresses`を追加。`bm_keyring_unlock_all_with_limit`のループ本体を
+      `unlock_bulk_begin`/`unlock_bulk_one`/`unlock_bulk_end`(master KEKを保持する
+      `struct unlock_bulk_state`)へ切り出し、全件版と共有した。行ごとの処理(vault行はHKDF、
+      旧方式の行は個別scrypt+成功時にvaultへre-wrap、vaultが無ければ作る、既にunlock済みなら
+      スキップ、vaultと違うpassphraseではcanary保護によりre-wrapしない)は全件版と同じ。
+      `bm_unlock_all_entry`に`not_found`を足し、identity.dbに無いアドレスとpassphrase違いを
+      区別できるようにした(全件版では常に0)。
+    - API `unlockAddresses [[address, ...], passphrase, backfill?]`。戻り値は
+      `{results:[{address, unlocked, error?}], backfilledMessages?}`。errorは
+      `"address not found"`か`"passphrase mismatch"`。1回の呼び出しは10,000件まで(項目44と同じ
+      値。RPCのハンドラは直列実行で、旧方式の行が多いと1件約161msかかるため。10,000件分の
+      アドレスはリクエストボディの1MiB上限にも収まる)。keyring全体の件数には上限を設けない
+      (`unlockAddress`を繰り返すのと同じ扱い。上限が必要なら別途検討)。
+    - **backfillは既定で行わない**(ユーザーの希望)。`backfill=true`のときだけ、今回unlockできた
+      アドレスを対象に行う。ECDHの回数は「MSG数×アドレス数」で、数千件では長時間かかる
+      (`unlockAllAddresses`が省略しているのと同じ理由)。このために
+      `bm_object_sync_backfill_trial_decrypt_addresses`(複数アドレス版)を追加した。
+      object_pool.dbの読み出しはMSG1件につき1回で済み、MSGが復号できた時点で残りのidentityは
+      試さない。keyringにある他のidentity(unlock-all済みの数千件等)は対象にしない。既存の
+      `bm_object_sync_backfill_trial_decrypt`のaddress_filter指定時はこれに1件のリストとして
+      委譲する。
+    - CLI `unlock-addresses [--backfill] <アドレス一覧のパス|-> <passphrase>`。1行1アドレス
+      (空行と`#`で始まる行は無視、前後の空白・CRは除く)、`-`なら標準入力。1,000件ずつ
+      `unlockAddresses`へ送る(master KEK導出はバッチごとに1回なので小さく分けてもほぼ損しない。
+      全件が旧方式でも1回の呼び出しが約3分に収まり、他のAPI呼び出しを長く待たせない)。
+      失敗したアドレスと理由をstderrへ出し、1件でも失敗すれば終了コードは非0。
+    - `unlockAllAddresses`の上限超過エラーの案内先を`unlockAddress`から`unlockAddresses`に変えた。
+
+    テスト: tests/test_keyring.c(リストのアドレスだけがunlockされる、not_foundとpassphrase違いの
+    区別、重複、旧方式の行のvaultへのre-wrapとvaultの新規作成、vault行と旧方式の行の混在で
+    正しい鍵が取り出せる、vaultと違うpassphraseではre-wrapしない、vault行を違うpassphraseで
+    試すと失敗する)。tests/test_chan.c(複数アドレス版backfillはリストのアドレスだけを対象にし、
+    keyringに無いアドレスは除き、MSG1件を1回だけ数える)。tests/test_api_server.c(結果の形と
+    errorの区別、backfillの既定がfalse、backfill=trueでbackfilledMessagesが付く、引数の誤り、
+    10,000件超の拒否)。tests/test_cli_integration.sh(ファイルのコメント行・空行・前後の空白・
+    CRLF、失敗理由のstderr出力と非0の終了コード、成功分が実際にunlockされていること、
+    標準入力と--backfill、引数の誤り)。backfillを常に有効にする改変でtest_api_serverが、
+    '#'行を読み飛ばさない改変でtest_cli_integrationが失敗することを確かめた。ctest 54件全通過。
+    APIテストの注意: 一括unlockは旧方式の行の成功時にvaultを作るので、importAddress
+    (vaultのpassphraseを確定させる)より前に置くと後続のimportAddressがvault不一致で落ちる。
+    そのためtest_api_serverではimportAddressの確認より後に置いた。

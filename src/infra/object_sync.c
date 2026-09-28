@@ -1698,30 +1698,24 @@ void *bm_object_sync_broadcast_thread(void *arg)
 int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
                                            const char *address_filter)
 {
-    unsigned char(*hashes)[32] = NULL;
-    size_t count = 0;
-    if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
-    {
-        return -1;
-    }
-
     /* §11 2026-08-31 address_filterが指定されていれば、そのidentity1件だけに絞って
      * bm_trial_decrypt_and_store_singleを使う(bm_trial_decrypt_and_store経由でkeyring全体を
      * 総当たりすると、unlock-all済みで既に大量のunlocked identityがkeyringに載っている環境で
      * 「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり実運用で9時間以上RPCサーバーを
      * ブロックする問題が発覚したため。詳細はtrial_decrypt.cのbm_trial_decrypt_msg_singleの
-     * コメント参照)。該当identityがkeyringに見つからなければ何もせず0を返す(unlock直後に
-     * 呼ぶ想定のため通常は見つかるが、防御的に扱う)。 */
-    struct bm_unlocked_identity identity;
-    int have_filter_identity = 0;
+     * コメント参照)。
+     * §11 2026-09-28 項目48: 絞り込みの処理は複数アドレス版(unlockAddressesのbackfill用)と
+     * 共通にした。1件だけのリストとして渡す。 */
     if (address_filter != NULL)
     {
-        have_filter_identity = bm_keyring_find_by_address(kr, address_filter, &identity) ? 1 : 0;
-        if (!have_filter_identity)
-        {
-            free(hashes);
-            return 0;
-        }
+        return bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db, messages_db, kr, &address_filter, 1);
+    }
+
+    unsigned char(*hashes)[32] = NULL;
+    size_t count = 0;
+    if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
+    {
+        return -1;
     }
 
     int decrypted_count = 0;
@@ -1733,10 +1727,7 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
         {
             continue;
         }
-        int rc = (address_filter != NULL)
-                     ? bm_trial_decrypt_and_store_single(&identity, messages_db, payload, payload_len, NULL, NULL)
-                     : bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL);
-        if (rc == 0)
+        if (bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL) == 0)
         {
             decrypted_count++;
         }
@@ -1744,10 +1735,81 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
     }
     free(hashes);
 
-    if (address_filter != NULL)
+    if (decrypted_count > 0)
     {
-        OPENSSL_cleanse(&identity, sizeof(identity));
+        bm_log_info("[object_sync] backfill trial_decrypt: %d message(s) newly decrypted from object_pool.db\n",
+                    decrypted_count);
     }
+    return decrypted_count;
+}
+
+/* §11 2026-09-28 項目48(object_sync.h参照) */
+int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *messages_db,
+                                                    bm_keyring_t *kr, const char *const *addresses,
+                                                    size_t address_count)
+{
+    unsigned char(*hashes)[32] = NULL;
+    size_t count = 0;
+    if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
+    {
+        return -1;
+    }
+
+    /* 対象identityをkeyringから先に取り出しておく。keyringに見つからないアドレス(unlockに
+     * 失敗した等)は黙って除く。1件も無ければ何もせず0を返す(unlock直後に呼ぶ想定のため
+     * 通常は見つかるが、防御的に扱う) */
+    struct bm_unlocked_identity *identities = NULL;
+    size_t identity_count = 0;
+    if (address_count > 0)
+    {
+        identities = malloc(sizeof(*identities) * address_count);
+        if (identities == NULL)
+        {
+            free(hashes);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < address_count; i++)
+    {
+        if (bm_keyring_find_by_address(kr, addresses[i], &identities[identity_count]))
+        {
+            identity_count++;
+        }
+    }
+    if (identity_count == 0)
+    {
+        free(identities);
+        free(hashes);
+        return 0;
+    }
+
+    /* object_pool.dbの読み出しはMSG1件につき1回だけにし、そのMSGを対象identityで順に試す
+     * (アドレスごとに全MSGを読み直すと、読み出しだけで「MSG数×アドレス数」回になる)。
+     * 1つのMSGの宛先は1つなので、復号できたらそのMSGについては打ち切る */
+    int decrypted_count = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        unsigned char *payload = NULL;
+        size_t payload_len = 0;
+        if (bm_object_store_get(object_pool_db, hashes[i], &payload, &payload_len) != 0)
+        {
+            continue;
+        }
+        for (size_t j = 0; j < identity_count; j++)
+        {
+            if (bm_trial_decrypt_and_store_single(&identities[j], messages_db, payload, payload_len, NULL, NULL)
+                == 0)
+            {
+                decrypted_count++;
+                break;
+            }
+        }
+        free(payload);
+    }
+    free(hashes);
+
+    OPENSSL_cleanse(identities, sizeof(*identities) * identity_count);
+    free(identities);
 
     if (decrypted_count > 0)
     {
