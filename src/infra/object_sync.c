@@ -478,7 +478,10 @@ static void handle_incoming_broadcast(struct bm_object_sync_ctx *ctx, const stru
  * 領域が必要(呼び出し側でlenを10または35に限定して呼ぶため常に割り切れる) */
 static size_t base32_encode_lower(const unsigned char *data, size_t len, char *out)
 {
-    static const char ALPHABET[32] = "abcdefghijklmnopqrstuvwxyz234567";
+    /* 2026-10-01 以前は[32]で終端NULを落としていたが、GCC 15の
+     * -Wunterminated-string-initialization(-Wextraに含まれる)が警告するため、
+     * 終端込みの33byteにした。添字は(...)&0x1fで0〜31に限られるので挙動は同じ */
+    static const char ALPHABET[] = "abcdefghijklmnopqrstuvwxyz234567";
     size_t out_len = 0;
     uint64_t buffer = 0;
     int bits = 0;
