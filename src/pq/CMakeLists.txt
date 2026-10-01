@@ -11,7 +11,7 @@ add_library(bm_pq STATIC
 
 target_include_directories(bm_pq PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # §PQ 2026-10-01 ML-DSA/ML-KEMのバックエンドはOpenSSL 3.5のEVP(pq_crypto.c)。
-# 以前はvendorした参照実装(bm_pq_backend)をPRIVATEリンクしていた。
+# 以前はvendorした参照実装(third_party/pqcrystals、同日削除)をPRIVATEリンクしていた。
 target_link_libraries(bm_pq PUBLIC bm_common OpenSSL::Crypto)
 
 # ベンチマークツール(DESIGN-PQ.md §8)。テストではなく手動実行用なのでctestには登録しない。

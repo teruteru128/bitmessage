@@ -225,10 +225,4 @@ if(BM_ENABLE_PQ)
     add_executable(test_pq_object test_pq_object.c)
     target_link_libraries(test_pq_object PRIVATE bm_pq)
     add_test(NAME pq_object COMMAND test_pq_object)
-
-    # §PQ 2026-10-01 OpenSSL版(bm_pq)とvendorした参照実装(bm_pq_backend)の突き合わせ。
-    # 参照実装の削除と同時に消す前提の一時的なテスト(DESIGN-PQ.md §6)。
-    add_executable(test_pq_crosscheck test_pq_crosscheck.c)
-    target_link_libraries(test_pq_crosscheck PRIVATE bm_pq bm_pq_backend OpenSSL::Crypto)
-    add_test(NAME pq_crosscheck COMMAND test_pq_crosscheck)
 endif()

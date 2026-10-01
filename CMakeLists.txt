@@ -23,6 +23,7 @@ else()
     set(BM_ENABLE_PQ OFF)
     message(STATUS "OpenSSL ${OPENSSL_VERSION} < 3.5: PQ prototype (src/pq) and its tests are disabled")
 endif()
+
 find_package(SQLite3 REQUIRED)
 
 # §11 2026-09-15 API層(core/api_server.c)のHTTPトランスポートとJSONを自前実装から
@@ -72,12 +73,6 @@ if(BM_SANITIZE_FLAGS)
     add_link_options("-fsanitize=${BM_SANITIZE_FLAGS_JOINED}")
 endif()
 
-# §PQ 2026-09-17 vendorしたML-DSA/ML-KEM参照実装(third_party/pqcrystals)。DESIGN-PQ.md §6。
-# §PQ 2026-10-01 バックエンドをOpenSSL 3.5へ差し替えた後は、実装間の突き合わせテスト
-# (tests/test_pq_crosscheck.c)からのみ参照している。
-if(BM_ENABLE_PQ)
-    add_subdirectory(third_party)
-endif()
 add_subdirectory(src)
 
 # §11 2026-08-24 backlog項目10の3/5: cmake --install用のinstall()定義。GNUInstallDirsで

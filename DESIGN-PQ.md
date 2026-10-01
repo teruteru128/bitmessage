@@ -420,13 +420,8 @@ PoW・inventory hash(プロトコル全体で共有される値なので変更�
 ## 6. 実装(プロトタイプ)
 
 ```
-third_party/pqcrystals/          vendorしたpq-crystals参照実装
-  kyber/      (ML-KEM, upstream 3edd5af5, 2026-08-02)
-  dilithium/  (ML-DSA, upstream d35ba3fe, 2026-06-03)
-  randombytes.{c,h}              両者のrandombytesを1本に差し替え(OpenSSL CSPRNGへ委譲)
-  dilithium/keypair_derand.{c,h} ML-DSA.KeyGen_internal(xi) を追加(上流に公開APIが無い)
-src/pq/
-  pq_crypto.{c,h}    ML-DSA/ML-KEM全パラメータセットの薄いラッパ
+src/pq/              (OpenSSL 3.5以降でのみビルドされる。§6.1)
+  pq_crypto.{c,h}    ML-DSA/ML-KEM全パラメータセットの薄いラッパ(OpenSSL EVP)
   pq_hybrid.{c,h}    ハイブリッド署名・X-Wing・AES-256-GCM封緘
   address_v5.{c,h}   v5アドレス
   pq_object.{c,h}    v5オブジェクトの組み立て/解析
@@ -435,7 +430,12 @@ tests/
   test_pq_crypto.c / test_pq_address.c / test_pq_object.c
 ```
 
-**なぜ外部ライブラリではなくvendorか。** この環境(Ubuntu 24.04)にはPQを提供する選択肢が無い:
+以下の4段落は、2026-09-17〜2026-10-01にpq-crystals参照実装をvendorしていた時期の記録。
+当時の構成は `third_party/pqcrystals/` に kyber(ML-KEM, upstream 3edd5af5)と
+dilithium(ML-DSA, upstream d35ba3fe)を置き、`randombytes` の差し替えと
+`keypair_derand` の追加を行っていた(§6.1で削除。git履歴に残っている)。
+
+**なぜ外部ライブラリではなくvendorか(当時)。** この環境(Ubuntu 24.04)にはPQを提供する選択肢が無い:
 OpenSSLは3.0.13でML-KEM/ML-DSAの実装は3.5以降、liboqs/PQCleanはディストリのアーカイブに
 パッケージが存在しない(`apt-cache search`で0件)、Botanも2.19系でML-KEM非対応。つまり
 「外部ライブラリを使う」は実質「全員がliboqsをソースからビルドする」を意味し、
@@ -446,7 +446,7 @@ OpenSSLは3.0.13でML-KEM/ML-DSAの実装は3.5以降、liboqs/PQCleanはディ�
 ライセンスは両リポジトリともCC0(パブリックドメイン)またはApache-2.0のデュアルで、
 MITの本体と衝突しない。
 
-**バックエンド差し替えの余地は残してある。** `src/pq/pq_crypto.c` だけが参照実装のシンボルを
+**バックエンド差し替えの余地は残してある(当時)。** `src/pq/pq_crypto.c` だけが参照実装のシンボルを
 直接呼ぶ(ヘッダも公開しない)ので、OpenSSL 3.5以降が使える環境になったらこの1ファイルを
 EVP呼び出しへ書き換えるだけで済む。DESIGN.md §3.5の「公開ヘッダに外部ライブラリの型を
 出さない」規律をPQ側でも踏襲した。
@@ -473,7 +473,8 @@ ML-DSAには無いため、`crypto_sign_keypair` の中身を複製して `rando
 OpenSSL 3.5はLTS(2030年4月までサポート)で、依存先として長く安定している。
 
 **差し替えの検証: 2つの実装を突き合わせた。** 参照実装を削除する前に、両者を同じ
-バイナリにリンクする一時的なテスト(`tests/test_pq_crosscheck.c`)を書き、
+バイナリにリンクする一時的なテスト(`tests/test_pq_crosscheck.c`。コミット7d97757に
+残っている)を書き、
 ML-DSA-44/65/87とML-KEM-512/768/1024の全6パラメータセットについて、固定パターン3種
 (全0・全0xff・連番)と乱数20個のseedで次を確認した。すべて一致した。
 
@@ -500,6 +501,10 @@ ML-DSA-44/65/87とML-KEM-512/768/1024の全6パラメータセットについて
 - **呼び出しごとに秘密鍵の取り込みコストがかかる。** 公開APIが生バイト列を受け取る形の
   ままなので、呼び出しのたびに `EVP_PKEY` を作り直している。そのため署名とdecapsが
   遅くなった(§8.1.1)
+
+vendorした参照実装(`third_party/`)と突き合わせテストは、この確認を記録した次の
+コミットで削除した。突き合わせをやり直したくなったら、7d97757をチェックアウトすれば
+両方が揃った状態でビルドできる。
 
 ---
 
