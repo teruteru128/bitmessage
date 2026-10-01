@@ -209,15 +209,26 @@ target_link_libraries(test_network_stats PRIVATE bm_core bm_infra)
 add_test(NAME network_stats COMMAND test_network_stats)
 
 # §PQ 2026-09-17 ポスト量子(ML-DSA/ML-KEM)プロトタイプのテスト。DESIGN-PQ.md。
-add_executable(test_pq_crypto test_pq_crypto.c)
-target_link_libraries(test_pq_crypto PRIVATE bm_pq)
-add_test(NAME pq_crypto COMMAND test_pq_crypto)
+# §PQ 2026-10-01 bm_pqはOpenSSL 3.5以降でのみビルドされる(ルートCMakeLists.txtの
+# BM_ENABLE_PQ)ので、テストも同じ条件で登録する。OpenSSL 3.0環境ではctestの件数が
+# この分だけ減る。
+if(BM_ENABLE_PQ)
+    add_executable(test_pq_crypto test_pq_crypto.c)
+    target_link_libraries(test_pq_crypto PRIVATE bm_pq)
+    add_test(NAME pq_crypto COMMAND test_pq_crypto)
 
-# アドレスのテストはv4アドレス(bm_core)との対比も行うのでbm_coreもリンクする
-add_executable(test_pq_address test_pq_address.c)
-target_link_libraries(test_pq_address PRIVATE bm_pq bm_core)
-add_test(NAME pq_address COMMAND test_pq_address)
+    # アドレスのテストはv4アドレス(bm_core)との対比も行うのでbm_coreもリンクする
+    add_executable(test_pq_address test_pq_address.c)
+    target_link_libraries(test_pq_address PRIVATE bm_pq bm_core)
+    add_test(NAME pq_address COMMAND test_pq_address)
 
-add_executable(test_pq_object test_pq_object.c)
-target_link_libraries(test_pq_object PRIVATE bm_pq)
-add_test(NAME pq_object COMMAND test_pq_object)
+    add_executable(test_pq_object test_pq_object.c)
+    target_link_libraries(test_pq_object PRIVATE bm_pq)
+    add_test(NAME pq_object COMMAND test_pq_object)
+
+    # §PQ 2026-10-01 OpenSSL版(bm_pq)とvendorした参照実装(bm_pq_backend)の突き合わせ。
+    # 参照実装の削除と同時に消す前提の一時的なテスト(DESIGN-PQ.md §6)。
+    add_executable(test_pq_crosscheck test_pq_crosscheck.c)
+    target_link_libraries(test_pq_crosscheck PRIVATE bm_pq bm_pq_backend OpenSSL::Crypto)
+    add_test(NAME pq_crosscheck COMMAND test_pq_crosscheck)
+endif()

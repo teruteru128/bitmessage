@@ -4057,3 +4057,25 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     5. **CLIの側**: `--backfill`付きで大量のアドレスを送るときは、所要時間の目安
        (MSG件数×アドレス数×1組あたりの時間)を表示して確認を促す。2の非同期化を入れた場合は、
        CLIは開始を知らせてすぐ戻り、進み具合はログか状態確認用のAPIで見る形にする。
+
+50. **PQプロトタイプのML-DSA/ML-KEMをOpenSSL 3.5のEVPへ差し替え(実装済み、daemon本体には無関係)**:
+    2026-10-01、ユーザー依頼。開発機のUbuntuを26.04(OpenSSL 3.5.5)へ上げたことで、
+    項目37でpq-crystals参照実装をvendorした理由(ディストロにPQを提供する選択肢が無い)が
+    無くなったため。`src/pq/pq_crypto.c` だけを書き換え、公開API(`pq_crypto.h`)と
+    `pq_hybrid.c` 以降は無変更。詳細・実測はDESIGN-PQ.md §6.1・§8.1.1。
+    - **参照実装を実行時フォールバックとして残す案は採らなかった**(ユーザーと相談して決定)。
+      暗号実装が2系統になると、CIで回っていない側が未検証のまま残るため。代わりに、
+      OpenSSL 3.5未満では`src/pq`・`third_party`・PQテストをまとめてビルドしない
+      (ルートCMakeLists.txtの`BM_ENABLE_PQ`)。daemon本体は`src/pq`に依存していないので
+      影響しない。GitHub Actionsの`ubuntu-latest`がOpenSSL 3.0の間は、CIでPQテストが
+      回らなくなる(ユーザーの選択。`runs-on`を26.04に固定する案と比べて決めた)。
+    - 参照実装は削除する前に、両方を同じバイナリにリンクする突き合わせテスト
+      (`test_pq_crosscheck`)で全6パラメータセットを比べた。鍵・署名(相互検証)・
+      共有秘密・implicit rejectionの出力まで、すべて一致した。
+    - 性能: 呼び出しのたびに秘密鍵を`EVP_PKEY`へ取り込み直すため、ML-DSA署名が約2.4倍、
+      ML-KEMのdecapsが約2倍遅くなった。v5の署名はv4より遅くなった(同じ実行内の比で
+      0.87 → 1.71)。PoW(秒〜分の単位)に比べれば小さいので、プロトタイプの段階では
+      受け入れ、`EVP_PKEY`のキャッシュをDESIGN-PQ.md §9.3の未解決事項に加えた。
+    - 同じ日に、GCC 15(Ubuntu 26.04の既定)で`-Wextra`に加わった
+      `-Wunterminated-string-initialization`の警告1件(`object_sync.c`のbase32表)も
+      直した(終端NULを含めた長さにしただけで、挙動は変わらない)。

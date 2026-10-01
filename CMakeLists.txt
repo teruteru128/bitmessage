@@ -10,6 +10,19 @@ endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# §PQ 2026-10-01 ポスト量子プロトタイプ(src/pq、DESIGN-PQ.md)はOpenSSL 3.5以降の
+# EVP_PKEY-ML-DSA/ML-KEMをバックエンドにしている。それ未満のOpenSSLでは参照実装へ
+# フォールバックするのではなく、PQモジュールとそのテスト自体をビルドしない
+# (暗号実装を2系統抱えると、CIで回っていない側が未検証のまま残るため)。
+# daemon本体(bitmessaged)はsrc/pqに依存していないので、OpenSSL 3.0環境でも
+# 本体のビルド・テストはそのまま通る。
+if(OPENSSL_VERSION VERSION_GREATER_EQUAL "3.5")
+    set(BM_ENABLE_PQ ON)
+else()
+    set(BM_ENABLE_PQ OFF)
+    message(STATUS "OpenSSL ${OPENSSL_VERSION} < 3.5: PQ prototype (src/pq) and its tests are disabled")
+endif()
 find_package(SQLite3 REQUIRED)
 
 # §11 2026-09-15 API層(core/api_server.c)のHTTPトランスポートとJSONを自前実装から
@@ -59,9 +72,12 @@ if(BM_SANITIZE_FLAGS)
     add_link_options("-fsanitize=${BM_SANITIZE_FLAGS_JOINED}")
 endif()
 
-# §PQ 2026-09-17 vendorしたML-DSA/ML-KEM参照実装(third_party/pqcrystals)。src側から
-# 参照するのでsrcより先に追加する。DESIGN-PQ.md §6。
-add_subdirectory(third_party)
+# §PQ 2026-09-17 vendorしたML-DSA/ML-KEM参照実装(third_party/pqcrystals)。DESIGN-PQ.md §6。
+# §PQ 2026-10-01 バックエンドをOpenSSL 3.5へ差し替えた後は、実装間の突き合わせテスト
+# (tests/test_pq_crosscheck.c)からのみ参照している。
+if(BM_ENABLE_PQ)
+    add_subdirectory(third_party)
+endif()
 add_subdirectory(src)
 
 # §11 2026-08-24 backlog項目10の3/5: cmake --install用のinstall()定義。GNUInstallDirsで

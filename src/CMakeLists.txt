@@ -1,7 +1,9 @@
 add_subdirectory(common)
 add_subdirectory(pow)
 add_subdirectory(core)
-add_subdirectory(pq)
+if(BM_ENABLE_PQ)
+    add_subdirectory(pq)
+endif()
 add_subdirectory(infra)
 add_subdirectory(cli)
 

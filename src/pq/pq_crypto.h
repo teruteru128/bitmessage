@@ -5,14 +5,13 @@
  * ML-DSA(FIPS 204)/ML-KEM(FIPS 203)の薄いラッパ。DESIGN-PQ.md §6。
  *
  * §3.5の規律(公開ヘッダに外部ライブラリの型を出さない)をPQ側でも守る。呼び出し側は
- * 生バイト列と長さだけを扱い、pq-crystals参照実装のヘッダ(api.h/params.h)には
- * 一切触れない。参照実装側のヘッダはkyber/dilithiumで同名(api.h・params.h・poly.h…)
- * のため、インクルードパスに両方を載せると衝突する。このラッパの.cの中だけで
- * namespace済みのシンボルを直接宣言して吸収している。
+ * 生バイト列と長さだけを扱い、OpenSSLの型(EVP_PKEY等)には一切触れない。
  *
- * このファイルは「どのバックエンドを使うか」を隠蔽する層でもある。OpenSSL 3.5以降
- * (EVP_PKEY-ML-DSA/ML-KEM)が使える環境になったら、pq_crypto.cの中身だけを
- * EVP呼び出しへ差し替えればプロトコル側のコードは無変更で済む。
+ * このファイルは「どのバックエンドを使うか」を隠蔽する層でもある。当初は
+ * vendorしたpq-crystals参照実装を使い、「OpenSSL 3.5以降が使える環境になったら
+ * pq_crypto.cの中身だけをEVP呼び出しへ差し替える」想定で設計していた。§PQ 2026-10-01
+ * にその差し替えを実施し、プロトコル側(pq_hybrid.c等)は実際に無変更で済んだ。
+ * OpenSSL 3.5未満ではこのモジュール自体がビルドされない(DESIGN-PQ.md §6)。
  */
 
 #include <stddef.h>
@@ -80,8 +79,9 @@ int bm_pq_kem_keypair_from_seed(enum bm_pq_kem_alg alg, const unsigned char *see
  * 署名。ML-DSAのcontext string(FIPS 204 §5.2)は空で呼ぶ。ドメイン分離は
  * 上位(pq_hybrid.c)がメッセージ先頭へラベルを連結する形で行う(Ed25519側に
  * context stringが無く、両者で同じ入力に署名させたいため)。
- * hedged signing(DILITHIUM_RANDOMIZED_SIGNING、FIPS 204の既定)なので、
- * 同じ入力でも毎回異なる署名になる。成功時0。
+ * hedged signing(FIPS 204の既定、OpenSSLでもdeterministic=0が既定)なので、
+ * 同じ入力でも毎回異なる署名になる。out_sigはsig_len byte以上を用意すること
+ * (*out_sig_lenは出力専用で、入力値は見ない)。成功時0。
  */
 int bm_pq_sig_sign(enum bm_pq_sig_alg alg, const unsigned char *msg, size_t msg_len,
                     const unsigned char *sk, unsigned char *out_sig, size_t *out_sig_len);

@@ -68,6 +68,8 @@ v1.1で実装済み)
 - CMake 3.25以降、Ninja(または他のCMake対応ビルドシステム)
 - Cコンパイラ(GCC/Clang、C11)
 - OpenSSL、SQLite3、pthread
+  (ポスト量子プロトタイプ`src/pq`はOpenSSL 3.5以降でのみビルドされる。それ未満では
+  自動的に除外され、daemon本体には影響しない。DESIGN-PQ.md §6.1)
 - libmicrohttpd、cJSON(JSON-RPC APIサーバーのHTTPトランスポートとJSON処理、
   `pkg-config`経由で検出する。DESIGN.md §6.3参照)
 
