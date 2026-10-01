@@ -11,6 +11,9 @@
  *     version/streamを混ぜる設計を取り下げた。v3/v4のripeと同じ意味論に戻した)。
  *     逆にtagはversion/streamに依存すること
  *   - アドレス由来のKEM鍵が「アドレスを知っていれば誰でも同じものを作れる」こと
+ *   - idの先頭0x00の個数とアドレス長の対応(固定のidで決定的に検証する)。
+ *     乱数で生成したidに対しては長さを決め打ちせず、上限と往復だけを見る
+ *     (§PQ 2026-10-01 決め打ちしていたため1/256の確率で落ちていた。test_null_byte_search参照)
  */
 
 #include <stdio.h>
@@ -360,14 +363,71 @@ static int test_null_byte_search(void)
         fprintf(stderr, "FAIL: random identity should not carry nonces\n");
         return 1;
     }
+    /* §PQ 2026-10-01 以前はここで長さ==53を決め打ちしていたが、null_bytes=1が保証するのは
+     * 「先頭1byteが0x00」までで、2byte目も偶然0x00なら(1/256)それも削られて52文字、
+     * 3byte目まで0x00なら(1/65536)50文字になる。CIのsanitizeジョブで実際に52文字を
+     * 引いて落ちた。「52も許す」と場合分けを足しても次の確率で同じ問題が起きるだけなので、
+     * 乱数のidに対しては「53文字以下」(先頭0x00が増えるほど短くなるだけで、長くはならない)と
+     * encode→decodeの往復だけを確認する。0x00の個数と長さの正確な対応は、固定のidで
+     * test_address_length_by_leading_zerosが決定的に検証する。 */
     address = bm_pqv5_address_encode(a.version, a.stream, a.id);
-    if (address == NULL || strlen(address) != 53)
+    if (address == NULL || strlen(address) > 53)
     {
-        fprintf(stderr, "FAIL: unexpected random address length %zu\n", address ? strlen(address) : 0);
+        fprintf(stderr, "FAIL: random address too long %zu\n", address ? strlen(address) : 0);
         free(address);
         return 1;
     }
+    {
+        uint64_t version = 0;
+        uint64_t stream = 0;
+        unsigned char id[BM_PQV5_ID_LEN];
+        if (bm_pqv5_address_decode(address, &version, &stream, id) != 0 || version != a.version ||
+            stream != a.stream || memcmp(id, a.id, BM_PQV5_ID_LEN) != 0)
+        {
+            fprintf(stderr, "FAIL: random address does not round-trip\n");
+            free(address);
+            return 1;
+        }
+    }
     free(address);
+    return 0;
+}
+
+/*
+ * §PQ 2026-10-01 idの先頭0x00の個数→アドレス長の対応を、手で組み立てたidで決定的に検証する。
+ * エンコード対象はversion(=5)||stream||先頭0x00を落としたid||checksumで、先頭バイトが
+ * 常に5なので値は[5,6)×256^kの狭い範囲に収まり、base58の桁数は0x00の個数だけで決まる
+ * (0x00が1個増えるごとに約1.37文字縮むので、52→50のように1文字飛ぶところがある)。
+ * 範囲の両端を確かめるため、残りのbyteを0x01で埋めたもの(下端寄り)と0xffで埋めたもの
+ * (上端寄り)の両方で見る。
+ */
+static int test_address_length_by_leading_zeros(void)
+{
+    static const size_t expected[] = { 54, 53, 52, 50, 49 };
+    static const unsigned char fills[] = { 0x01, 0xff };
+    size_t n;
+    size_t f;
+
+    for (n = 0; n < sizeof(expected) / sizeof(expected[0]); n++)
+    {
+        for (f = 0; f < sizeof(fills); f++)
+        {
+            unsigned char id[BM_PQV5_ID_LEN];
+            char *address;
+
+            memset(id, fills[f], sizeof(id));
+            memset(id, 0x00, n);
+            address = bm_pqv5_address_encode(5, 1, id);
+            if (address == NULL || strlen(address) != expected[n])
+            {
+                fprintf(stderr, "FAIL: %zu leading zero(s), fill 0x%02x: length %zu, expected %zu\n", n,
+                        fills[f], address ? strlen(address) : 0, expected[n]);
+                free(address);
+                return 1;
+            }
+            free(address);
+        }
+    }
     return 0;
 }
 
@@ -456,6 +516,10 @@ int main(void)
         return 1;
     }
     if (test_null_byte_search() != 0)
+    {
+        return 1;
+    }
+    if (test_address_length_by_leading_zeros() != 0)
     {
         return 1;
     }
