@@ -27,6 +27,11 @@
  *   idle_sweep呼び出しで確実にclose_connectionされる(registryから消え、fdがcloseされる)
  *   ことを検証する(tests/test_peer_registry_evict.cはフラグが立つことまでを検証、
  *   本テストはそのフラグが実際に消費されることを検証、住み分け)。
+ * - シナリオ5(§11 2026-10-15 項目53追加): ゴースト接続の見張り。handshake未完了の接続が
+ *   タイムアウトから大きく遅れて(BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS以上)切断されたときだけ、
+ *   通常の切断ログとは別に"handshake timeout overdue"のWARNが出ること、余裕の範囲内の
+ *   切断・handshake完了済みの接続では出ないこと、WARNに項目23で観測した症状(CLOSE_WAITのまま
+ *   未読データが残る)がそのまま記録されることを、stderrを取り込んで確かめる。
  */
 
 #include <errno.h>
@@ -35,6 +40,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -107,6 +114,92 @@ static struct bm_message *try_read_one_message(int fd)
             return msg;
         }
     }
+}
+
+/* §11 2026-10-15 項目53: stderrへ出るログ(bm_log_warn等)を、dup2で一時ファイルへ向けて取り込む。
+ * シナリオ5がWARNの有無と中身を確かめるために使う。 */
+static int g_saved_stderr = -1;
+static FILE *g_capture = NULL;
+
+static void capture_stderr_begin(void)
+{
+    fflush(stderr);
+    g_capture = tmpfile();
+    g_saved_stderr = dup(STDERR_FILENO);
+    dup2(fileno(g_capture), STDERR_FILENO);
+}
+
+/* 取り込んだ内容をbuf(NUL終端)へ入れ、stderrを元に戻す */
+static void capture_stderr_end(char *buf, size_t buf_len)
+{
+    fflush(stderr);
+    dup2(g_saved_stderr, STDERR_FILENO);
+    close(g_saved_stderr);
+    rewind(g_capture);
+    size_t n = fread(buf, 1, buf_len - 1, g_capture);
+    buf[n] = '\0';
+    fclose(g_capture);
+    g_capture = NULL;
+}
+
+/* 127.0.0.1上の本物のTCP接続を1組作る(server_fdはaccept側、client_fdは接続側)。
+ * AF_UNIXのsocketpairではTCP_INFOが取れないため、WARNのtcp_state/unreadの記録は本物のTCPで確かめる。 */
+static int make_tcp_pair(int *out_server_fd, int *out_client_fd)
+{
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t len = sizeof(addr);
+    if (listener < 0 || bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listener, 1) != 0
+        || getsockname(listener, (struct sockaddr *)&addr, &len) != 0)
+    {
+        if (listener >= 0)
+        {
+            close(listener);
+        }
+        return -1;
+    }
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    if (client < 0 || connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        close(listener);
+        if (client >= 0)
+        {
+            close(client);
+        }
+        return -1;
+    }
+    int server = accept(listener, NULL, NULL);
+    close(listener);
+    if (server < 0)
+    {
+        close(client);
+        return -1;
+    }
+    *out_server_fd = server;
+    *out_client_fd = client;
+    return 0;
+}
+
+/* fdのTCP状態がCLOSE_WAIT(8)になるまで最大約1秒待つ。ループバックでは相手のclose直後にほぼ即座に
+ * なるが、カーネルの処理順に依存しないよう短くポーリングする(壁時計の待ちはこの1箇所だけ) */
+static int wait_for_close_wait(int fd)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        struct tcp_info info;
+        socklen_t len = sizeof(info);
+        memset(&info, 0, sizeof(info));
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) == 0 && info.tcpi_state == 8)
+        {
+            return 1;
+        }
+        usleep(10 * 1000);
+    }
+    return 0;
 }
 
 int main(void)
@@ -370,6 +463,147 @@ int main(void)
         close(remote_fd);
         bm_peer_registry_destroy(&registry);
         close(epfd);
+    }
+
+    /* --- 5. §11 2026-10-15 項目53: ゴースト接続の見張り。handshake未完了の接続が、タイムアウトから
+     * BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS以上遅れて切られたときだけ"handshake timeout overdue"のWARNが出る --- */
+    {
+        int64_t t0 = (int64_t)1893456000;
+        char out[8192];
+
+        /* (a) 余裕の範囲内(しきい値+余裕-1秒)で切断されるのは通常の動作。WARNは出ない */
+        {
+            int epfd = epoll_create1(0);
+            struct bm_peer_registry registry;
+            bm_peer_registry_init(&registry);
+            int local_fd, remote_fd;
+            struct bm_fd_data *conn = make_test_conn(epfd, &local_fd, &remote_fd);
+            CHECK(conn != NULL, "make_test_conn should succeed");
+            bm_peer_registry_add(&registry, conn);
+            conn->last_activity = t0;
+            struct bm_epoll_thread_args args;
+            memset(&args, 0, sizeof(args));
+            args.epfd = epfd;
+            args.registry = &registry;
+
+            capture_stderr_begin();
+            bm_network_idle_sweep(&args, t0 + BM_HANDSHAKE_TIMEOUT_SECONDS + BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS - 1);
+            capture_stderr_end(out, sizeof(out));
+            CHECK(bm_peer_registry_count(&registry) == 0, "(a) the timed-out connection should be closed");
+            CHECK(strstr(out, "handshake not completed within") != NULL,
+                  "(a) the normal timeout WARN should still be logged");
+            CHECK(strstr(out, "handshake timeout overdue") == NULL,
+                  "(a) a close within the margin must NOT log the overdue WARN");
+
+            close(remote_fd);
+            bm_peer_registry_destroy(&registry);
+            close(epfd);
+        }
+
+        /* (b) 余裕ちょうど(しきい値+余裕秒)以上遅れた切断では、状態つきのWARNが出る(境界を含む) */
+        {
+            int epfd = epoll_create1(0);
+            struct bm_peer_registry registry;
+            bm_peer_registry_init(&registry);
+            int local_fd, remote_fd;
+            struct bm_fd_data *conn = make_test_conn(epfd, &local_fd, &remote_fd);
+            CHECK(conn != NULL, "make_test_conn should succeed");
+            bm_peer_registry_add(&registry, conn);
+            conn->last_activity = t0;
+            struct bm_epoll_thread_args args;
+            memset(&args, 0, sizeof(args));
+            args.epfd = epfd;
+            args.registry = &registry;
+
+            char fd_text[32];
+            snprintf(fd_text, sizeof(fd_text), "fd=%d,", local_fd);
+            capture_stderr_begin();
+            bm_network_idle_sweep(&args, t0 + BM_HANDSHAKE_TIMEOUT_SECONDS + BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS);
+            capture_stderr_end(out, sizeof(out));
+            CHECK(bm_peer_registry_count(&registry) == 0, "(b) the overdue connection should still be closed");
+            CHECK(strstr(out, "handshake timeout overdue") != NULL,
+                  "(b) a close at/after the margin must log the overdue WARN");
+            CHECK(strstr(out, fd_text) != NULL, "(b) the overdue WARN should name the fd");
+            CHECK(strstr(out, "5s past the 20s threshold") != NULL,
+                  "(b) the overdue WARN should say how far past the threshold the idle time was");
+            CHECK(strstr(out, "pending_eviction=0") != NULL, "(b) the overdue WARN should include pending_eviction");
+            CHECK(strstr(out, "tcp_state=n/a") != NULL,
+                  "(b) a non-TCP socket (socketpair) should be reported as tcp_state=n/a, not crash");
+            CHECK(strstr(out, "handshake not completed within") != NULL,
+                  "(b) the normal timeout WARN should still follow");
+
+            close(remote_fd);
+            bm_peer_registry_destroy(&registry);
+            close(epfd);
+        }
+
+        /* (c) 項目23で観測した症状(相手は切断済みでCLOSE_WAIT、受信バッファに130バイト未読)が、
+         * そのままWARNに記録される。本物のTCP接続で確かめる */
+        {
+            int epfd = epoll_create1(0);
+            struct bm_peer_registry registry;
+            bm_peer_registry_init(&registry);
+            int server_fd, client_fd;
+            CHECK(make_tcp_pair(&server_fd, &client_fd) == 0, "(c) a loopback TCP pair should be created");
+            struct bm_fd_data *conn = bm_fd_data_new(BM_FD_SERVER_SOCKET, server_fd);
+            CHECK(conn != NULL, "(c) bm_fd_data_new should succeed");
+            bm_peer_registry_add(&registry, conn);
+            conn->last_activity = t0;
+            struct bm_epoll_thread_args args;
+            memset(&args, 0, sizeof(args));
+            args.epfd = epfd;
+            args.registry = &registry;
+
+            unsigned char junk[130];
+            memset(junk, 0xab, sizeof(junk));
+            CHECK(write(client_fd, junk, sizeof(junk)) == (ssize_t)sizeof(junk), "(c) the peer sends 130 bytes");
+            close(client_fd);
+            CHECK(wait_for_close_wait(server_fd), "(c) the accepted socket should reach CLOSE_WAIT");
+
+            capture_stderr_begin();
+            bm_network_idle_sweep(&args, t0 + BM_HANDSHAKE_TIMEOUT_SECONDS + BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS + 10);
+            capture_stderr_end(out, sizeof(out));
+            CHECK(bm_peer_registry_count(&registry) == 0, "(c) the connection should be closed");
+            CHECK(strstr(out, "inbound connection (fd=") != NULL, "(c) the WARN should say inbound");
+            CHECK(strstr(out, "unread=130 byte(s) tcp_state=CLOSE_WAIT") != NULL,
+                  "(c) the overdue WARN should record the unread bytes and the CLOSE_WAIT state");
+            CHECK(strstr(out, "15s past the 20s threshold") != NULL, "(c) the overdue seconds should be reported");
+
+            bm_peer_registry_destroy(&registry);
+            close(epfd);
+        }
+
+        /* (d) handshake完了済みの接続は、どれだけ無活動でもこのWARNの対象ではない(pingが送られるだけ) */
+        {
+            int epfd = epoll_create1(0);
+            struct bm_peer_registry registry;
+            bm_peer_registry_init(&registry);
+            int local_fd, remote_fd;
+            struct bm_fd_data *conn = make_test_conn(epfd, &local_fd, &remote_fd);
+            CHECK(conn != NULL, "make_test_conn should succeed");
+            bm_peer_registry_add(&registry, conn);
+            conn->handshake_complete = 1;
+            conn->last_activity = t0;
+            struct bm_epoll_thread_args args;
+            memset(&args, 0, sizeof(args));
+            args.epfd = epfd;
+            args.registry = &registry;
+
+            capture_stderr_begin();
+            bm_network_idle_sweep(&args, t0 + 100000);
+            capture_stderr_end(out, sizeof(out));
+            CHECK(bm_peer_registry_count(&registry) == 1, "(d) a handshake-complete connection is not closed");
+            CHECK(strstr(out, "handshake timeout overdue") == NULL,
+                  "(d) a handshake-complete connection must NOT log the overdue WARN");
+
+            /* 切断されていないので、bm_fd_data自体はこのテストが片付ける(シナリオ2と同じ) */
+            bm_peer_registry_remove(&registry, conn);
+            bm_fd_data_free(conn);
+            close(local_fd);
+            close(remote_fd);
+            bm_peer_registry_destroy(&registry);
+            close(epfd);
+        }
     }
 
     if (failures == 0)

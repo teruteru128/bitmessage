@@ -8,11 +8,13 @@
 #include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -875,6 +877,64 @@ struct idle_sweep_ctx
     int64_t now;
 };
 
+/* getsockopt(TCP_INFO)のtcpi_state(Linuxの値、include/net/tcp_states.h)の名前。 */
+static const char *tcp_state_name(unsigned int state)
+{
+    static const char *const names[] = {"?",         "ESTABLISHED", "SYN_SENT",  "SYN_RECV",  "FIN_WAIT1", "FIN_WAIT2",
+                                        "TIME_WAIT", "CLOSE",       "CLOSE_WAIT", "LAST_ACK", "LISTEN",    "CLOSING"};
+    return state < sizeof(names) / sizeof(names[0]) ? names[state] : "?";
+}
+
+/*
+ * §11 2026-10-15 項目53: handshake未完了の接続が、タイムアウトを大幅に過ぎてから切られたときの
+ * WARN(ゴースト接続の見張り、DESIGN.md項目23・53参照)。
+ *
+ * 項目23(2026-09-04発覚)では、handshake未完了のinbound接続が20秒のタイムアウトを大きく超えて
+ * 何時間も刈り取られなかった。その後の約6週間は一度も再現せず、再現実験も計装ログ(DEBUG2の
+ * idle_sweep/epoll_waitログ)の観察でしか捉えられない状態だった。DEBUG2はログレベルを下げれば
+ * 消えるうえ、人が読まない限り気づけない。そこで、「タイムアウトの判定が働くのが遅れた」こと
+ * 自体を、既定のログレベルで必ず見えるWARNにして、その瞬間の状態を残す。
+ *
+ * ここへ来るのは「sweepが遅れた(network_epoll_threadがどこかで長く止まっていた)」か
+ * 「前のsweepで切るはずだった接続が残っていた」場合だけ(1秒間隔のsweepなら通常は21〜22秒で
+ * 切られる)。idleは直近の読み取り成功からの経過時間なので、1バイトずつ細々と送ってくる
+ * 相手(last_activityが更新され続ける)は対象外で、あくまで「タイムアウト判定そのものが
+ * 遅れた」ことの検知に絞っている。呼び出し直後にclose_connectionされるので、同じ接続について
+ * このWARNが出るのは通常1回きり(切断に失敗して残り続けた場合は毎回のsweepで出る=それ自体が
+ * 異常の合図)。
+ *
+ * 記録するもの: 接続の向き・fd・相手のアドレス、idleとしきい値からの超過秒数、未読の受信
+ * バイト数(FIONREAD、項目23では「CLOSE-WAITのままRecv-Q=130バイトが未読」だった)、TCPの状態
+ * (TCP_INFO。TCPでないソケットではn/a)、送信キューのバイト数、pending_evictionの有無。
+ * 呼び出し側(network_epoll_thread単一スレッド)からしか呼ばれない。
+ */
+static void warn_handshake_overdue(struct bm_fd_data *conn, int64_t idle_seconds)
+{
+    int unread = -1;
+    if (ioctl(conn->fd, FIONREAD, &unread) != 0)
+    {
+        unread = -1;
+    }
+    const char *tcp_state = "n/a";
+    struct tcp_info info;
+    socklen_t info_len = sizeof(info);
+    memset(&info, 0, sizeof(info));
+    if (getsockopt(conn->fd, IPPROTO_TCP, TCP_INFO, &info, &info_len) == 0)
+    {
+        tcp_state = tcp_state_name(info.tcpi_state);
+    }
+    char ip[BM_PEER_IP_STRLEN];
+    int port = 0;
+    bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+    bm_log_warn("[network] handshake timeout overdue: %s connection (fd=%d, %s:%d) idle %" PRId64
+                "s, %" PRId64 "s past the %ds threshold (expected to be closed at ~%ds): the idle sweep ran late or "
+                "this connection survived an earlier close attempt; unread=%d byte(s) tcp_state=%s queued=%zu "
+                "pending_eviction=%d\n",
+            conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd, ip, port, idle_seconds,
+            idle_seconds - BM_HANDSHAKE_TIMEOUT_SECONDS, BM_HANDSHAKE_TIMEOUT_SECONDS,
+            BM_HANDSHAKE_TIMEOUT_SECONDS + 1, unread, tcp_state, bm_network_queued_bytes(conn), conn->pending_eviction);
+}
+
 static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
 {
     struct idle_sweep_ctx *ctx = user_data;
@@ -946,6 +1006,11 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
                 BM_HANDSHAKE_TIMEOUT_SECONDS);
         if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)
         {
+            /* §11 2026-10-15 項目53: 切断が大幅に遅れた場合だけ、状態つきのWARNを先に出す */
+            if (idle_seconds >= BM_HANDSHAKE_TIMEOUT_SECONDS + BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS)
+            {
+                warn_handshake_overdue(conn, idle_seconds);
+            }
             bm_log_warn("[network] closing %s connection (fd=%d): handshake not completed within %ds\n",
                     conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", conn->fd,
                     BM_HANDSHAKE_TIMEOUT_SECONDS);

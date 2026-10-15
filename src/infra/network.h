@@ -408,6 +408,12 @@ void *bm_network_epoll_thread(void *arg);
  * できるようにするため(bm_network_idle_sweepのdocも参照)。 */
 #define BM_HANDSHAKE_TIMEOUT_SECONDS 20
 #define BM_IDLE_PING_TIMEOUT_SECONDS 300
+/* §11 2026-10-15 項目53: handshake未完了の接続が、タイムアウト(BM_HANDSHAKE_TIMEOUT_SECONDS)を
+ * これだけ超えてから初めて切断された場合に、通常の切断ログとは別にWARNを出す(番号の根拠は
+ * network.cのwarn_handshake_overdue参照)。1秒間隔のsweepなら通常は21〜22秒で切断される
+ * ので、5秒の余裕でも通常運用では出ない(journalの1,500回のinbound受付で、handshake未完了の
+ * idleの最大は21秒だった)。 */
+#define BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS 5
 /* §11 2026-08-26: big invのペーシング用(struct bm_fd_dataのdoc参照)。1chunkあたり
  * BM_BIG_INV_CHUNK_SIZE件(32byte/件、1000件で約32KB)、chunk間はBM_BIG_INV_CHUNK_
  * INTERVAL_SECONDS秒空ける。tcpdumpの実測(DESIGN-LOG.md)では260KB超を無間隔で送ると
@@ -424,6 +430,8 @@ void *bm_network_epoll_thread(void *arg);
  * BM_IDLE_PING_TIMEOUT_SECONDS以上無活動ならpingを送信する。nowを明示引数に取ることで
  * テストが実際の壁時計待ちをせずに呼べる(bm_peer_manager_cleanup等と同じ慣習)。
  * bm_network_epoll_threadが自身のepoll_waitタイムアウトのたびに呼ぶ。
+ * §11 2026-10-15 項目53: handshake未完了の接続を切るとき、idleがBM_HANDSHAKE_TIMEOUT_SECONDS+
+ * BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS以上なら「切断が遅れた」としてWARNを1回出す。
  */
 void bm_network_idle_sweep(struct bm_epoll_thread_args *args, int64_t now);
 

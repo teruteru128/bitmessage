@@ -2344,6 +2344,10 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     この症状の検知条件だけを残し、能動的な再現実験は打ち切る。根本原因は
     依然として未解明のまま。再発したら都度対応する。
 
+    **追記(2026-10-15)**: 発覚から約6週間、再発していない。再発したときに、DEBUG2の計装ログや
+    人の目視に頼らず、既定のログレベルでその場の状態が残るよう、タイムアウトの切断が大幅に
+    遅れたときのWARNを常設した(項目53)。
+
 24. **`received getdata`のnot_found大量発生・`sent getdata`に対する`received object`不足の
     調査(2026-09-07、進行中)**: ユーザーから「`received getdata: N item(s) requested,
     0 sent, N not found`が大量発生している、`sent getdata`に対する`received object`も
@@ -4269,3 +4273,48 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     **未確認**: ネットワーク側(PyBitmessage本家を含む)が受け付ける、未来側の有効期限の上限。
     本家が、自分のものではないgetpubkeyや、期限内のpubkeyをどう扱うか。着手するときは
     本家の実ソースで確かめる(CLAUDE.mdの方針)。
+
+53. **handshake未完了の接続の切断が大幅に遅れたときのWARN(ゴースト接続の見張り)(実装済み・未デプロイ)**:
+    2026-10-15、ユーザー依頼。項目23(2026-09-04発覚)のゴースト接続について、再発しないことから
+    原因を絞る検討をした際に、「再現しないこと自体は、コードが直った証拠にならない」ことが分かった。
+    発覚時の引き金(1秒間に8本のinboundが同時にacceptされ、同じ時刻にoutboundが1本切断・再接続)は
+    その後に一度も起きていない(daemon Aのjournalが残っている約1か月で、同じ秒の最大accept数は
+    2本)。一方、通常のケースは正しく処理されている(同じ期間のinbound約1,500回で、handshake未完了の
+    idleの最大は21秒、22秒以上は0件、20秒の閾値による切断が13件)。再発を待つしかないので、
+    再発したときに状態が残るようにした。
+
+    **従来の見張りの弱点**: `idle_sweep(handshake未完了)`のDEBUG2ログと、それを読む定期監視に
+    頼っていた。DEBUG2はログレベルを下げれば消え、人(や監視)が読まない限り気づけない。
+
+    **対処**: `idle_sweep_one`(`network.c`)で、handshake未完了の接続をタイムアウトで切るとき、
+    idleが`BM_HANDSHAKE_TIMEOUT_SECONDS`(20秒)+`BM_HANDSHAKE_OVERDUE_MARGIN_SECONDS`(5秒)
+    以上なら、通常の切断ログ(`handshake not completed within`)の前に`warn_handshake_overdue`で
+    **既定のログレベルのWARN**を1回出す。
+    - 出るのは「sweepが遅れた(`network_epoll_thread`がどこかで長く止まっていた)」か、「前のsweepで
+      切るはずだった接続が残っていた」場合だけ。sweepは1秒間隔なので、通常は21〜22秒で切断され、
+      余裕5秒なら通常運用では出ない(上の実績で偽陽性は0件)。
+    - WARNに残す状態: 接続の向き・fd・相手のアドレス、idleとしきい値からの超過秒数、**未読の受信
+      バイト数**(`ioctl(FIONREAD)`。項目23では「CLOSE-WAITのままRecv-Q=130バイトが未読」だった)、
+      **TCPの状態**(`getsockopt(TCP_INFO)`。TCPでないソケットではn/a)、送信キューのバイト数、
+      `pending_eviction`の有無。項目23で`ss`と`list-connections`を突き合わせて初めて分かった
+      情報を、WARNの1行に最初から残す。
+    - 呼び出し直後に`close_connection`されるので、同じ接続でこのWARNが出るのは通常1回だけ
+      (切断に失敗して残り続けた場合は毎回のsweepで出るが、それ自体が異常の合図)。
+
+    **見張れないもの**: idleは「直近の読み取り成功からの経過時間」なので、1バイトずつ細々と送ってきて
+    `last_activity`が更新され続ける相手は対象外(そもそも20秒のタイムアウトでも切れない)。
+    PyBitmessage本家も、`advanceddispatcher.py`の`handle_read`が読み取りのたびに`lastTx`を更新し、
+    `connectionpool.py`のメインループがその`lastTx`で未確立の接続を切るので、この点は同じ
+    (本家は`handle_write`・接続成立時にも更新する点だけが違う)。この見張りは「タイムアウトの判定が
+    遅れた」ことの検知に絞っている。
+    また、sweepの`now`はepoll_waitが返った直後に1回だけ取るため、1回のイベント処理が長引くと
+    idleがその分だけ小さく見積もられる(切断が遅れる方向で、偽陽性にはならない)。
+    registryに載っていない接続(accept後の登録漏れ等)はsweepの対象外なので、ここでは見えない。
+
+    テスト: `tests/test_idle_sweep.c`にシナリオ5を追加した(stderrを一時ファイルへ向けて取り込み、
+    WARNの有無と中身を確かめる)。(a)しきい値+余裕-1秒での切断では出ない、(b)しきい値+余裕秒
+    ちょうどで出る(fd・超過秒数・`pending_eviction`・非TCPで`tcp_state=n/a`)、(c)本物のTCP接続で、
+    相手が130バイト送って切断した状態(CLOSE_WAIT)が`unread=130 byte(s) tcp_state=CLOSE_WAIT`として
+    記録される(項目23の症状そのもの)、(d)handshake完了済みの接続では出ない。余裕を無視して常に
+    WARNを出す改変でテスト(a)が、WARNの呼び出しを消す改変でテスト(b)(c)が失敗することを確かめた。
+    ビルド警告ゼロ、ctest 54件全通過。daemon Aへは未デプロイ。
