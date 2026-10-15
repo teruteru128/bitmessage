@@ -4089,3 +4089,50 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       idに対しては「53文字以下」と往復だけを確認し、0x00の個数→長さの対応(0〜4個で
       54/53/52/50/49文字)は手で組み立てたidで決定的に検証する形に分けた
       (`test_address_length_by_leading_zeros`)。
+
+51. **CLIのpassphrase引数をプロセス一覧・シェル履歴に残さずに受け取る(未着手)**: 2026-10-15、
+    ユーザーとの議論。unlock状態はメモリ上にしか無いのでdaemonを再起動するたびにunlockし直しに
+    なり、手動運用では忘れやすい。GUIやweb UIがあれば起動時にpassphraseの入力画面を出して
+    そのままunlockできる(項目40・41。unlockはプロセス全体の状態で、web UIはP2Pとは別のonion
+    サービスに置く案を検討済み)が、今のCLIにはその代わりになる安全な入力手段が無い。
+
+    **現状の問題**: passphraseを取るコマンド(`create-address` / `join-chan` / `unlock` /
+    `export-address` / `unlock-all` / `unlock-addresses` / `convert-to-v4` /
+    `convert-all-v3-to-v4`、およびstorePassphraseを取る`create-address` / `import-address` /
+    `import-keys-dat` / `join-chan`)は、すべて**位置引数**で受け取る(`src/cli/main.c`)。
+    - 引数は`ps`や`/proc/<pid>/cmdline`から同じマシンの他のユーザーにも見える(`hidepid`を
+      付けていなければ誰でも読める)。シェルの履歴にも残る。
+    - 環境変数`BM_API_PASS`はAPIのパスワードで、passphraseとは別の秘密。環境変数は
+      `/proc/<pid>/environ`が所有者とrootにしか読めないので引数よりは漏れにくいが、passphrase
+      の入力手段としては用意していない。
+    - API自体の経路(127.0.0.1へのHTTP、JSON本文にpassphraseを含む)は今回の対象外。
+
+    **案**(CLIだけの変更で、daemonとAPIは変えない):
+    1. **`--passphrase-prompt`**: 端末のエコーを切って(`termios`)passphraseを読む。
+       `create-address`/`join-chan`/`import-*`のようにpassphraseを新しく決める操作では
+       確認のために2回入力させる。端末が無い(パイプ・cron等)ときはエラーにする。
+    2. **`--passphrase-fd <N>`**: 指定した番号のファイル記述子から1行読む。シェルの
+       `exec 3< <(...)`やプロセス置換で、引数に出さずに渡せる。テストでも端末を作らずに
+       決定的に検証できる。
+    3. **標準入力との衝突**: `unlock-addresses`はアドレス一覧を`-`(標準入力)でも受けるので、
+       そのときpassphraseを標準入力から読むことはできない。この組み合わせでは
+       `--passphrase-prompt`(`/dev/tty`から読む)か`--passphrase-fd`を要求する。
+    4. 環境変数(例: `BM_PASSPHRASE`)での受け渡しは、子プロセスへ引き継がれる・クラッシュ
+       ダンプに残りうる点から、まず入れない。必要なら別途判断する。
+    5. **後方互換**: 既存の位置引数はそのまま使えるようにする(`tests/test_cli_integration.sh`
+       等が位置引数に依存している)。位置引数で渡したときにstderrへ注意を出すかは、
+       スクリプトの出力を汚すので、導入後に決める。
+
+    **テスト**: `--passphrase-fd`は`tests/test_cli_integration.sh`で、正しいpassphraseで
+    unlockできる・誤ったpassphraseでは失敗する・位置引数と併用するとエラー、を確かめる。
+    `--passphrase-prompt`は端末が要るので、`script`コマンド等で擬似端末を用意するか、読み出し
+    部分(エコー制御)だけを関数に切り出して単体で確認する。
+
+    **見送った案**:
+    - **daemon起動時の自動unlock**: passphraseをディスク(`ExecStartPost`のスクリプトや環境
+      変数)に置く必要があり、unlockを手動操作にしている目的(保管時の鍵の保護)を損なう。
+      やるなら、読み取り専用の専用ファイルにして所有者はroot・パーミッション600が最低限。
+      運用上の割り切りであって、実装側で勧めるものではない。
+    - **unlock済みアドレスが0件のまま、起動後しばらくたったらdaemonがWARNを1回出す**:
+      小さな変更で済むが、まずは外から監視して気づく運用で足りるとして、今は入れない。
+      必要になったら別項目で起こす。
