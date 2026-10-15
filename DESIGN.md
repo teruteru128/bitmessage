@@ -4230,6 +4230,22 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
 
     軸は「どこで動くか」より「鍵を誰が持つか」。
 
+    **既存の実装の位置づけ**(手元のクローンのソースで確認):
+    - **PyBitmessage**: ノードと財布とUIを1つのコードベースに持つ。受信処理は
+      `class_objectProcessor.py`、送信と署名は`class_singleWorker.py`、アドレス生成は
+      `class_addressGenerator.py`。UIはQt・curses・Kivy・CLI・SMTPサーバーまである。`api.py`で
+      UIを別プロセスにできるが、`createRandomAddress`・`sendMessage`・`sendBroadcast`・
+      `getAllInboxMessages`のハンドラはデーモン側にあり、鍵(`keys.dat`)もデーモンが持つ。
+      つまり分かれるのはUIだけで、ノードと財布は分かれない。
+    - **MiNode-Refined**(0.3.1): ノードだけ。READMEに「Designed only as a relay node – no
+      messaging client functionality」とあり、受信箱・復号の処理は無い。鍵はTor隠しサービスの
+      ものが中心(`utils.py`にECDSA署名の関数があるが用途は未確認)。
+    - **本実装**: ノードと財布の両方。GUIは無く、JSON-RPCとCLIを付けている。構造はPyBitmessage
+      のデーモンに近い。
+    - **どれにも無いもの**: 財布だけを切り出した(鍵を持つクライアントだけの)実装。(2)の2台型は
+      これにあたる。鍵無しノードのサーバー側はMiNode-Refinedが近いが、ノードから財布へobject
+      を渡すAPIがあるかは未確認。
+
     **PCで動かすときの注意**: 起動していない間のmsgは、起動してノードへ接続した時に、相手が
     inventoryの一覧をまとめて送ってくる(big inv)ので、objectの有効期限が切れる前に起動すれば
     取りこぼさない。弱点は、pubkeyを期限前に出し直せないこと(PCが止まっている間に期限が
