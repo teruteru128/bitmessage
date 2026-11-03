@@ -91,6 +91,10 @@ struct bm_object_sync_ctx
      * (テスト用。bm_object_sync_ctx_initはNULLで初期化し、main.cがスレッド起動前にセットする)。
      * セットした後は書き換えないので排他制御はしない。 */
     struct bm_pow_queue *pow_queue;
+    /* §11 2026-11-04 項目55: ポスト量子拡張(v5のobjectVersion)を受信処理で扱うか。
+     * bm_object_sync_ctx_initは0で初期化し、main.cがスレッド起動前にセットする(以後は
+     * 読むだけなので排他制御はしない)。0なら従来通り、v5のobjectは中身を見ずに中継だけする */
+    int pq_enabled;
     /* §11 2026-11-03 項目38: pow_queueが溢れてgetpubkey自応答を捨てたときのWARNの間引き用
      * (BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDSに1回)。getpubkeyを処理するnetwork_epoll_thread
      * という単一スレッドからのみ触られる前提で排他制御はしない(last_gcと同じ理由)。 */

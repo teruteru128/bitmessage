@@ -58,6 +58,10 @@ struct bm_api_server_config
      * PoWを投げる先(src/pow/pow_queue.h)。NULL可(その場合は従来通りapi_server_threadで
      * 同期実行する。testやCLI単体動作用)。 */
     struct bm_pow_queue *pow_queue;
+    /* §11 2026-11-04 項目55: ポスト量子拡張(v5)を扱うか。main.cが[pq] enabled/BM_PQ_ENABLEDと
+     * ビルド時のBM_HAVE_PQから決めて、スレッド起動前にセットする(以後は読むだけなので
+     * 排他制御はしない)。0ならv5のアドレス作成等は従来通り拒否する(テストの既定、memsetの0) */
+    int pq_enabled;
 };
 
 /*

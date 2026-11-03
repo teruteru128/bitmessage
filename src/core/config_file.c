@@ -25,6 +25,7 @@ static void set_defaults(struct bm_config_file *out)
     out->onion_address[0] = '\0';
     out->default_nonce_trials_per_byte = 1000;
     out->default_payload_length_extra_bytes = 1000;
+    out->pq_enabled = 0;
 }
 
 /* 先頭・末尾の空白を取り除く(inを直接書き換えてポインタを返す、strdup等はしない) */
@@ -154,6 +155,15 @@ static void apply_kv(struct bm_config_file *out, const char *section, const char
         if (strcmp(key, "onion_address") == 0)
         {
             strncpy(out->onion_address, value, sizeof(out->onion_address) - 1);
+            return;
+        }
+    }
+    else if (strcmp(section, "pq") == 0)
+    {
+        /* §11 2026-11-04 項目55(config_file.hのpq_enabled参照) */
+        if (strcmp(key, "enabled") == 0)
+        {
+            out->pq_enabled = atoi(value);
             return;
         }
     }

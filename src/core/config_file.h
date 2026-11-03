@@ -53,6 +53,11 @@ struct bm_config_file
      * 既定値1000を維持し警告するガードを持つ)。 */
     uint64_t default_nonce_trials_per_byte;
     uint64_t default_payload_length_extra_bytes;
+    /* §11 2026-11-04 項目55: ポスト量子拡張(v5アドレス、DESIGN-PQ.md)を有効にするか
+     * ([pq] enabled、BM_PQ_ENABLED、既定0)。PQの有無はブランチではなくこのフラグで分ける
+     * (DESIGN-PQ.md §9.1)。OpenSSL 3.5未満でビルドしたdaemon(BM_HAVE_PQが無い)では1にしても
+     * 起動時に警告して無効のまま動く。 */
+    int pq_enabled;
 };
 
 /*

@@ -1,9 +1,11 @@
 add_subdirectory(common)
 add_subdirectory(pow)
-add_subdirectory(core)
+# §11 2026-11-04 項目55: bm_coreがbm_pqへ依存するようになったので、coreより前に置く
+# (bm_pqはbm_commonにしか依存しないので循環しない)
 if(BM_ENABLE_PQ)
     add_subdirectory(pq)
 endif()
+add_subdirectory(core)
 add_subdirectory(infra)
 add_subdirectory(cli)
 

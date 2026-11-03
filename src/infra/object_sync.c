@@ -115,6 +115,7 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->last_resend_check = 0;
     ctx->last_onion_announce = 0;
     ctx->pow_queue = NULL;
+    ctx->pq_enabled = 0;
     memset(&ctx->time_offset_log_throttle, 0, sizeof(ctx->time_offset_log_throttle));
     memset(&ctx->pow_queue_full_log_throttle, 0, sizeof(ctx->pow_queue_full_log_throttle));
 }

@@ -4541,7 +4541,21 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
        SQLiteのTEXT列には長さの制約が無いのでスキーマの変更は無く、v4以前の動作は変わらない。
        `tests/test_address_width.c`で、54文字のアドレスがidentity行・inbox・sent・再送候補・
        購読の各経路を往復しても切れないことを確かめた(値を40に戻すと8件落ちることも確認)。
-    2. 実行時フラグ(既定は無効)と、`BM_ENABLE_PQ`のときだけ`bm_pq`をdaemonへリンクする配線
+    2. **実行時フラグと`bm_pq`の配線(実装済み、2026-11-04)。** `bitmessage.conf`の`[pq] enabled`、
+       または`BM_PQ_ENABLED=1`(既定は無効、優先順位は他の設定と同じく環境変数>ファイル>既定値)。
+       OpenSSL 3.5以降でビルドしたときだけ`bm_core`が`bm_pq`へPUBLICに依存し、`BM_HAVE_PQ`を
+       定義する(`src/core/CMakeLists.txt`。PUBLICなのでbm_infra・bitmessaged・テストも同じ条件で
+       `#ifdef`できる)。`src/CMakeLists.txt`では`pq`を`core`より前に置いた(`bm_pq`は`bm_common`
+       にしか依存しないので循環しない。v5の処理は`bm_pq`の中で閉じ、`bm_pq`から`bm_core`へは
+       依存させない)。`BM_HAVE_PQ`の無いビルドでフラグが要求されたら、WARNを出して無効のまま
+       起動する(起動自体は止めない。設定の書き間違い1つで起動全体を止めない、という
+       設定ファイルの既存の方針に合わせた)。main.cが決めた値を`api_config.pq_enabled`と
+       `object_sync_ctx.pq_enabled`へスレッド起動前にセットする(この段ではまだ誰も読まない)。
+       起動時に`[pq] post-quantum (v5) support: enabled/disabled`を1行出す。
+       `tests/test_config_file.c`に既定値0と`[pq] enabled = 1`の読み込みを足した。実daemonを
+       短時間起動し、フラグの有無で起動ログが切り替わることも確認した。
+       READMEの環境変数表と`bitmessage.conf.example`への記載は、v5が実際に動く段まで保留する
+       (有効にしても何も起きない段階で利用者向けの文書に載せると、動くと誤解されるため)。
     3. v5 identityの保存(identity.dbの新しい表、成分seedを既存と同じKEKでラップ)とkeyring
     4. API: `createDeterministicAddress`のversion 5、listAddresses・unlock・lockのv5対応。
        アドレス生成でバージョンを指定できるのは現状`createDeterministicAddress`

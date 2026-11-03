@@ -15,7 +15,8 @@ find_package(OpenSSL REQUIRED)
 # EVP_PKEY-ML-DSA/ML-KEMをバックエンドにしている。それ未満のOpenSSLでは参照実装へ
 # フォールバックするのではなく、PQモジュールとそのテスト自体をビルドしない
 # (暗号実装を2系統抱えると、CIで回っていない側が未検証のまま残るため)。
-# daemon本体(bitmessaged)はsrc/pqに依存していないので、OpenSSL 3.0環境でも
+# daemon本体(bitmessaged)は、§11 2026-11-04 項目55からBM_ENABLE_PQのときだけsrc/pqへ
+# 依存する(BM_HAVE_PQ、src/core/CMakeLists.txt)。OpenSSL 3.0環境ではv5の分岐ごとビルドされず、
 # 本体のビルド・テストはそのまま通る。
 if(OPENSSL_VERSION VERSION_GREATER_EQUAL "3.5")
     set(BM_ENABLE_PQ ON)

@@ -1,7 +1,8 @@
 # §PQ 2026-09-17 ポスト量子(ML-DSA/ML-KEM)プロトタイプ。DESIGN-PQ.md。
-# 現時点ではdaemon本体(bm_core/bm_infra)からは一切参照されておらず、テストと
-# ベンチマークツールからのみ使われる独立したモジュール。v5を実運用へ組み込む
-# 段階になったらbm_coreから依存させる(DESIGN-PQ.md §9のロードマップ)。
+# 当初はdaemon本体から一切参照されず、テストとベンチマークツールからのみ使われる
+# 独立したモジュールだった。§11 2026-11-04 項目55(フェーズ2)からbm_coreが依存する
+# (src/core/CMakeLists.txt)。bm_pq自身はbm_commonにしか依存しない(bm_coreへ逆向きに
+# 依存させると循環するので、v5のアドレス・オブジェクトの処理はbm_pqの中で閉じる)。
 add_library(bm_pq STATIC
     pq_crypto.c
     pq_hybrid.c

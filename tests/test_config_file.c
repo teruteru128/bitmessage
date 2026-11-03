@@ -54,6 +54,7 @@ int main(void)
         CHECK(strcmp(cfg.tor_control_host, "127.0.0.1") == 0, "default tor_control_host");
         CHECK(cfg.tor_control_port == 9051, "default tor_control_port should be 9051");
         CHECK(cfg.tor_virtual_port == 8444, "default tor_virtual_port should be 8444");
+        CHECK(cfg.pq_enabled == 0, "default pq_enabled should be 0 (post-quantum extension off)");
         CHECK(cfg.onion_address[0] == '\0', "default onion_address should be empty");
         CHECK(cfg.max_outbound_connections == 3, "default max_outbound_connections should be 3");
         CHECK(cfg.default_nonce_trials_per_byte == 1000, "default default_nonce_trials_per_byte should be 1000");
@@ -82,6 +83,9 @@ int main(void)
                "[inbound]\n"
                "port = 18444\n"
                "\n"
+               "[pq]\n"
+               "enabled = 1\n"
+               "\n"
                "[tor]\n"
                "control = 1\n"
                "control_socket = /custom/control\n"
@@ -98,6 +102,7 @@ int main(void)
         CHECK(cfg.api_port == 9442, "[api] port should be parsed (surrounding whitespace trimmed)");
         CHECK(cfg.inbound_port == 18444, "[inbound] port should be parsed");
         CHECK(cfg.tor_control == 1, "[tor] control should be parsed");
+        CHECK(cfg.pq_enabled == 1, "[pq] enabled should be parsed");
         CHECK(strcmp(cfg.tor_control_socket, "/custom/control") == 0, "[tor] control_socket should be parsed");
         CHECK(strcmp(cfg.tor_control_host, "10.0.0.1") == 0, "[tor] control_host should be parsed");
         CHECK(cfg.tor_control_port == 19051, "[tor] control_port should be parsed");

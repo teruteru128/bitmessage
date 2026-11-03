@@ -367,6 +367,28 @@ int main(int argc, char **argv)
     bm_protocol_set_testnet(testnet);
     bm_log_info("[network] mode=%s\n", testnet ? "testnet" : "mainnet");
 
+    /* §11 2026-11-04 項目55: ポスト量子拡張(v5アドレス、DESIGN-PQ.md)。bitmessage.confの
+     * [pq] enabled、またはBM_PQ_ENABLED=1で有効にする(既定は無効)。PQの有無はブランチでは
+     * なくこのフラグで分ける(DESIGN-PQ.md §9.1)。OpenSSL 3.5未満でビルドしたdaemonには
+     * v5のコード自体が入っていない(BM_HAVE_PQ、src/core/CMakeLists.txt)ので、要求されても
+     * 警告して無効のまま動く(起動自体は止めない: 設定の書き間違い1つで起動全体を止めない、
+     * という設定ファイルの既存の方針に合わせた)。api_server・object_syncのスレッドを
+     * 起動する前に決め、以後は書き換えない。 */
+    int pq_requested = env_flag_or("BM_PQ_ENABLED", cfg.pq_enabled);
+#ifdef BM_HAVE_PQ
+    int pq_enabled = pq_requested;
+    bm_log_info("[pq] post-quantum (v5) support: %s\n", pq_enabled ? "enabled" : "disabled");
+#else
+    int pq_enabled = 0;
+    if (pq_requested)
+    {
+        /* 特殊モードの要求が通らなかったことを見落とさないようNOTICEより上のWARNにする */
+        bm_log_warn("[pq] post-quantum (v5) support was requested, but this build has no PQ support "
+                    "(OpenSSL >= 3.5 is required); continuing with it disabled\n");
+    }
+#endif
+    api_config.pq_enabled = pq_enabled;
+
     /* §9 Dandelion++ Stage 2: プロセス内シングルトンの初期化(DESIGN.md §9.2)。
      * peer_connector_threadの再接続ループから定期的に呼ばれるbm_dandelion_maybe_reshuffle/
      * bm_dandelion_expire_and_refluffより前に済ませておく。 */
@@ -405,6 +427,7 @@ int main(int argc, char **argv)
     bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, peers_db, &keyring,
                              &peer_registry, BM_USER_AGENT);
     object_sync_ctx.pow_queue = &pow_queue; /* §11 2026-11-03 項目38、network/peer_connectorの起動前に */
+    object_sync_ctx.pq_enabled = pq_enabled; /* §11 2026-11-04 項目55 */
 
     /* §11 inbound接続(Tor hidden service)対応。BM_INBOUND_PORTが設定されていれば
      * 127.0.0.1:<port>でTCP listenし、Tor hidden serviceからの転送を受け付ける準備をする
