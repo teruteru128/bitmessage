@@ -951,7 +951,17 @@ static char *load_body_file(const char *path, size_t *out_len)
  * 確保したargv配列と本文バッファはfreeしない。このCLIは1コマンド実行して即exitするので、
  * プロセス終了時のOSによる回収に任せている(引数として使う以上、コマンドの処理が終わるまで
  * 生かしておく必要があり、途中でfreeできる箇所も無い)。
+ *
+ * §11 2026-11-03 項目54: ただし組み立てたargv配列はg_body_file_argvにも保持する。保持して
+ * いないと、main()が返った後のLeakSanitizer(CIのsanitizeジョブ)から見たときに到達可能か
+ * どうかが、ポインタがたまたまスタックやレジスタに残っているかどうかで決まってしまう。実際、
+ * main()の先頭にbm_cli_i18n_init()を足しただけでコードの配置が変わってリーク扱いになり、
+ * --body-fileでの送信が(成功したのに)終了コード非0になってcli_integrationが落ちた。
+ * ファイルスコープの変数はLSanの探索の起点になるので、配列とそこから指す本文バッファが
+ * 常に到達可能になる。
  */
+static char **g_body_file_argv;
+
 static int apply_body_file_option(int argc, char **argv, int subject_index, int body_index,
                                    int *out_argc, char ***out_argv)
 {
@@ -1058,6 +1068,7 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
     free(rest);
 
     *out_argc = rest_argc + 1;
+    g_body_file_argv = result;
     *out_argv = result;
     return 1;
 }
