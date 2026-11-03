@@ -824,7 +824,8 @@ v4とv5は別アドレスとして共存する。同一ユーザーが両方を�
   **2026-11-03 前提条件を解消(DESIGN.md §11項目38 Tier 1)**: getpubkey自応答のPoWは
   `pow_queue`のワーカースレッドで行うようになり、network_epoll_threadは止まらない。
   走行中のPoWはshutdown時にcancelで打ち切られるので、141秒のPoWでも終了が待たされない。
-  send_pipeline(msg・broadcast・ack)のPoWは引き続きAPIスレッドで同期実行する(Tier 2)。
+  同日のTier 2でsend_pipeline(msg・broadcast・ack、再送を含む)のPoWもpow_queueへ移し、
+  v5 msgのPoW(期待26秒)の間もAPIの他の呼び出しは止まらない(DESIGN.md §11項目38)。
 - **getpubkey応答のスロットリング。** 既存の既知ギャップ(DESIGN.md §5.1)がv5では
   より深刻になる(1回の応答コストが上がるため)。
 - **ack payloadのv5対応**(§7.5)。

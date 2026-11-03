@@ -7,6 +7,8 @@
 #include <netinet/in.h>
 #include <openssl/crypto.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1159,6 +1161,219 @@ static void getpubkey_request_done(void *user_data, unsigned char *object, size_
     bm_queue_push(broadcast_queue, item);
 }
 
+/*
+ * §11 2026-11-03 項目38 Tier 2: sendMessage/sendBroadcastのPoWをAPIスレッドから追い出す。
+ *
+ * 背景: API serverはMHD_USE_INTERNAL_POLLING_THREAD単独(下の「HTTPトランスポート」の
+ * コメント参照)で、ハンドラは常にMHDの内部スレッド1本から直列に呼ばれる。以前は
+ * ハンドラの中で送信のPoW(v4 msgで期待6秒、v5で26秒)を同期実行していたので、その間は
+ * 他のAPI呼び出しが全て待たされていた。
+ *
+ * 返り値({objectLength, inventoryHash})の契約は変えない(ユーザーとの相談で決定。
+ * 本家PyBitmessageのようにmsgIdを即返す形にすると、CLI・テスト・利用者のスクリプトが
+ * 全て影響を受けるため)。代わりにMHDのsuspend/resumeを使う:
+ *   1. ハンドラは送信をpow_queueへ投げ、空のJSONオブジェクト(器)を結果として返し、
+ *      完了待ちの「slot」をリクエストの状態(api_async_state)へ登録する
+ *   2. ボディを処理し終えた時点で完了待ちが残っていれば、その接続だけをsuspendする
+ *      (MHDは他の接続の処理を続ける)
+ *   3. 最後の完了コールバック(ワーカースレッド上)がMHD_resume_connectionを呼ぶ
+ *   4. MHDがアクセスハンドラを再び呼ぶので、そこで器を埋めて応答を返す
+ * 呼び出し元から見れば、従来通りPoWが終わってから同じ形の応答が返る。バッチ
+ * (§6)の中に複数の送信があっても、全部が終わってから1つの応答配列を返す。
+ * PoWの後で失敗した場合(shutdownでの打ち切り等)は、その要素だけをerrorの応答に差し替える。
+ */
+struct api_async_state;
+
+struct api_send_slot
+{
+    struct api_async_state *state; /* NULL=同期実行(リクエストの文脈の外から呼ばれた場合) */
+    bm_queue_t *broadcast_queue;
+    /* 以下3つは完了コールバックが書き、state->mutex下で読み書きする */
+    int done;
+    int rc;
+    size_t object_len;
+    unsigned char inv_hash[32];
+    /* 以下2つはMHDスレッドだけが触る */
+    cJSON *placeholder; /* ハンドラが返した結果の器(通知なら応答ごと捨てられるのでNULL) */
+    cJSON *resp;        /* placeholderを"result"に持つ応答オブジェクト(失敗時にerrorへ差し替える) */
+};
+
+struct api_async_state
+{
+    pthread_mutex_t mutex;
+    int outstanding; /* 完了待ちの送信数(mutex下) */
+    int suspended;   /* MHD_suspend_connection済みか(mutex下) */
+    struct MHD_Connection *connection;
+    /* 以下はMHDスレッドだけが触る(slotの追加もMHDスレッド上のハンドラだけが行う) */
+    struct api_send_slot **slots;
+    size_t slot_count;
+    size_t slot_cap;
+};
+
+/*
+ * 今処理しているHTTPリクエストの状態。MHDの内部スレッド(ハンドラを呼ぶ唯一のスレッド)
+ * だけが読み書きするので排他制御はしない。api_access_handlerがJSON-RPCの処理の前後で
+ * セット・クリアする。
+ */
+static struct api_async_state *current_async_state;
+
+/* suspend中の接続数。api_server_threadの停止時に、MHD_stop_daemonの前にこれが0になるのを
+ * 待つ(MHDはsuspend中の接続を残したままのstopを許さない)。main.cはpow_queueを先に
+ * shutdownするので、完了待ちはcancelで速やかに片付く */
+static atomic_int api_suspended_connections;
+
+static void api_async_state_free(struct api_async_state *state)
+{
+    if (state == NULL)
+    {
+        return;
+    }
+    for (size_t i = 0; i < state->slot_count; i++)
+    {
+        free(state->slots[i]);
+    }
+    free(state->slots);
+    pthread_mutex_destroy(&state->mutex);
+    free(state);
+}
+
+/* 送信の完了コールバック。pow_queueのワーカースレッド上(pow_queue==NULLならMHDスレッド上で
+ * 同期的に)呼ばれる。objectはgetpubkey_request_doneと同じくbroadcast_queueへ積む */
+static void api_send_done(void *user_data, int rc, unsigned char *object, size_t object_len, int64_t now)
+{
+    (void)now;
+    struct api_send_slot *slot = user_data;
+    unsigned char inv_hash[32];
+    if (rc == 0)
+    {
+        bm_inventory_hash(object, object_len, inv_hash);
+        getpubkey_request_done(slot->broadcast_queue, object, object_len, now); /* 所有権はqueueへ */
+    }
+
+    struct api_async_state *state = slot->state;
+    if (state == NULL)
+    {
+        slot->done = 1;
+        slot->rc = rc;
+        slot->object_len = object_len;
+        memcpy(slot->inv_hash, inv_hash, sizeof(inv_hash));
+        return;
+    }
+    pthread_mutex_lock(&state->mutex);
+    slot->done = 1;
+    slot->rc = rc;
+    slot->object_len = object_len;
+    if (rc == 0)
+    {
+        memcpy(slot->inv_hash, inv_hash, sizeof(inv_hash));
+    }
+    state->outstanding--;
+    int resume = (state->outstanding == 0 && state->suspended);
+    struct MHD_Connection *connection = state->connection;
+    pthread_mutex_unlock(&state->mutex);
+    /* unlockの後はstateに触らない(resumeするとMHDスレッドが応答を返してstateを解放しうる)。
+     * resumeを呼ぶまではMHDスレッドがこの接続を処理しないので、それまでは生きている */
+    if (resume)
+    {
+        MHD_resume_connection(connection);
+    }
+}
+
+static void fill_send_result(cJSON *result, size_t object_len, const unsigned char inv_hash[32])
+{
+    char inv_hex[65];
+    hex_encode(inv_hash, 32, inv_hex);
+    cJSON_AddItemToObject(result, "objectLength", cJSON_CreateNumber((double)object_len));
+    cJSON_AddItemToObject(result, "inventoryHash", json_str(inv_hex));
+}
+
+#define BM_API_SEND_FAILED_AFTER_QUEUED "send failed after its PoW was queued (is the daemon shutting down?)"
+
+static struct api_send_slot *send_slot_begin(const struct bm_api_server_config *config)
+{
+    struct api_send_slot *slot = calloc(1, sizeof(*slot));
+    if (slot == NULL)
+    {
+        return NULL;
+    }
+    slot->state = current_async_state;
+    slot->broadcast_queue = config->broadcast_queue;
+    if (slot->state != NULL && slot->state->slot_count == slot->state->slot_cap)
+    {
+        /* 登録先は投入より前に確保しておく(投入した後はslotがワーカーから参照されうるので、
+         * 確保に失敗しても捨てられない) */
+        struct api_async_state *state = slot->state;
+        size_t new_cap = state->slot_cap == 0 ? 4 : state->slot_cap * 2;
+        struct api_send_slot **grown = realloc(state->slots, new_cap * sizeof(*grown));
+        if (grown == NULL)
+        {
+            free(slot);
+            return NULL;
+        }
+        state->slots = grown;
+        state->slot_cap = new_cap;
+    }
+    if (slot->state != NULL)
+    {
+        /* 投入より前に数えておく(完了コールバックは投入の直後にワーカーで走りうる) */
+        pthread_mutex_lock(&slot->state->mutex);
+        slot->state->outstanding++;
+        pthread_mutex_unlock(&slot->state->mutex);
+    }
+    return slot;
+}
+
+/* slotに使うpow_queue。リクエストの文脈の外ではsuspendできないので同期実行にする */
+static struct bm_pow_queue *send_slot_queue(const struct bm_api_server_config *config,
+                                            const struct api_send_slot *slot)
+{
+    return slot->state != NULL ? config->pow_queue : NULL;
+}
+
+/*
+ * 投入の結果を受けてハンドラの戻り値を作る。submit_rc!=0ならdoneは呼ばれていないので、
+ * 数えた分を戻してslotを捨てる。成功なら、同期実行ならその場で結果を作り、そうでなければ
+ * 器を返してslotをリクエストの状態へ登録する(器はfinish_async_responseで埋める)。
+ */
+static cJSON *send_slot_end(struct api_send_slot *slot, int submit_rc, const char *fail_msg, char **out_error)
+{
+    struct api_async_state *state = slot->state;
+    if (submit_rc != 0)
+    {
+        if (state != NULL)
+        {
+            pthread_mutex_lock(&state->mutex);
+            state->outstanding--;
+            pthread_mutex_unlock(&state->mutex);
+        }
+        free(slot);
+        *out_error = dup_cstr(fail_msg);
+        return NULL;
+    }
+
+    if (state == NULL)
+    {
+        cJSON *result = NULL;
+        if (slot->rc == 0)
+        {
+            result = cJSON_CreateObject();
+            fill_send_result(result, slot->object_len, slot->inv_hash);
+        }
+        else
+        {
+            *out_error = dup_cstr(BM_API_SEND_FAILED_AFTER_QUEUED);
+        }
+        free(slot);
+        return result;
+    }
+
+    /* 容量はsend_slot_beginで確保済み。器の確保に失敗した場合でもslotは登録する(完了待ちの
+     * 数と解放の責任をstateに持たせるため)。器がNULLなら応答のresultはnullになる */
+    slot->placeholder = cJSON_CreateObject();
+    state->slots[state->slot_count++] = slot;
+    return slot->placeholder;
+}
+
 static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                                        const cJSON *params, char **out_error)
 {
@@ -1227,49 +1442,29 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
     uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)json_num(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
     int ack_stealth_level = stealth_v != NULL ? (int)json_num(stealth_v) : 1;
 
-    unsigned char *object = NULL;
-    size_t object_len = 0;
-    int64_t next_resend_time = (int64_t)time(NULL) + BM_RESEND_INITIAL_INTERVAL_SECONDS;
-    int rc = bm_send_pipeline_send_message(config->keyring, config->identity_db, config->messages_db,
-                                            from_address, to_address,
-                                            subject, body, ttl_seconds, ack_stealth_level,
-                                            NULL, next_resend_time,
-                                            &object, &object_len);
-    if (rc != 0)
+    /* §1.2 完成したobjectはapi_send_doneがbroadcast_queueへ投入する(infra/object_sync.cの
+     * bm_object_sync_broadcast_threadがobject_pool.dbへの挿入とpeer_registry経由のネットワークへの
+     * inv broadcastを行う)。queueが未設定(NULL)ならネットワークへは流さず捨てる(test/CLI単体動作用)。
+     * §11 2026-11-03 項目38 Tier 2: PoWはpow_queueで行い、応答はPoWの完了後に返す
+     * (send_slot_beginの上のコメント参照) */
+    struct api_send_slot *slot = send_slot_begin(config);
+    if (slot == NULL)
     {
-        *out_error = dup_cstr("send failed (is fromAddress unlocked? is toAddress valid? if "
-                              "the recipient's key was not yet cached, a getpubkey request was "
-                              "broadcast automatically; retry sendMessage once it has been "
-                              "received, or supply it directly via cachePubkey)");
+        *out_error = dup_cstr("out of memory");
         return NULL;
     }
-
-    unsigned char inv_hash[32];
-    bm_inventory_hash(object, object_len, inv_hash);
-
-    /* §1.2 broadcast_queueへ投入(infra/object_sync.cのbm_object_sync_broadcast_threadが
-     * object_pool.dbへの挿入とpeer_registry経由のネットワークへのinv broadcastを行う)。
-     * 所有権(object)はここでqueueへ渡す(popした側がfreeする)。queueが未設定(NULL)なら
-     * ネットワークへは流さずここでfreeする(test/CLI単体動作用)。 */
-    if (config->broadcast_queue != NULL)
-    {
-        struct bm_broadcast_item *item = malloc(sizeof(*item));
-        item->object = object;
-        item->object_len = object_len;
-        bm_queue_push(config->broadcast_queue, item);
-    }
-    else
-    {
-        free(object);
-    }
-
-    char inv_hex[65];
-    hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
-
-    cJSON *result = cJSON_CreateObject();
-    cJSON_AddItemToObject(result, "objectLength", cJSON_CreateNumber((double)object_len));
-    cJSON_AddItemToObject(result, "inventoryHash", json_str(inv_hex));
-    return result;
+    int64_t now = (int64_t)time(NULL);
+    int64_t next_resend_time = now + BM_RESEND_INITIAL_INTERVAL_SECONDS;
+    int rc = bm_send_pipeline_send_message_async(send_slot_queue(config, slot), config->keyring, config->identity_db,
+                                                 config->messages_db, from_address, to_address, subject, body,
+                                                 ttl_seconds, ack_stealth_level, NULL, next_resend_time, now,
+                                                 api_send_done, slot);
+    return send_slot_end(slot, rc,
+                         "send failed (is fromAddress unlocked? is toAddress valid? if "
+                         "the recipient's key was not yet cached, a getpubkey request was "
+                         "broadcast automatically; retry sendMessage once it has been "
+                         "received, or supply it directly via cachePubkey. Otherwise the PoW queue may be full)",
+                         out_error);
 }
 
 /* sendBroadcast: [fromAddress, subject, body, ttlSeconds?]。§5.4/§11 */
@@ -1292,38 +1487,18 @@ static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
     }
     uint64_t ttl_seconds = ttl_v != NULL ? (uint64_t)json_num(ttl_v) : (uint64_t)(2 * 24 * 60 * 60);
 
-    unsigned char *object = NULL;
-    size_t object_len = 0;
-    int rc = bm_send_pipeline_send_broadcast(config->keyring, from_address, subject, body, ttl_seconds,
-                                              &object, &object_len);
-    if (rc != 0)
+    /* §11 2026-11-03 項目38 Tier 2: sendMessageと同じくpow_queueで行い、応答はPoWの完了後 */
+    struct api_send_slot *slot = send_slot_begin(config);
+    if (slot == NULL)
     {
-        *out_error = dup_cstr("broadcast failed (is fromAddress unlocked?)");
+        *out_error = dup_cstr("out of memory");
         return NULL;
     }
-
-    unsigned char inv_hash[32];
-    bm_inventory_hash(object, object_len, inv_hash);
-
-    if (config->broadcast_queue != NULL)
-    {
-        struct bm_broadcast_item *item = malloc(sizeof(*item));
-        item->object = object;
-        item->object_len = object_len;
-        bm_queue_push(config->broadcast_queue, item);
-    }
-    else
-    {
-        free(object);
-    }
-
-    char inv_hex[65];
-    hex_encode(inv_hash, sizeof(inv_hash), inv_hex);
-
-    cJSON *result = cJSON_CreateObject();
-    cJSON_AddItemToObject(result, "objectLength", cJSON_CreateNumber((double)object_len));
-    cJSON_AddItemToObject(result, "inventoryHash", json_str(inv_hex));
-    return result;
+    int rc = bm_send_pipeline_send_broadcast_async(send_slot_queue(config, slot), config->keyring, from_address,
+                                                   subject, body, ttl_seconds, (int64_t)time(NULL), api_send_done,
+                                                   slot);
+    return send_slot_end(slot, rc, "broadcast failed (is fromAddress unlocked? or the PoW queue may be full)",
+                         out_error);
 }
 
 /* getInboxMessages: [folder?](省略時は全件、'inbox'/'trash'等で絞り込み可) */
@@ -1960,16 +2135,31 @@ static cJSON *process_one_request(const struct bm_api_server_config *config, con
         if (strcmp(METHODS[i].name, method) == 0)
         {
             char *error_msg = NULL;
+            struct api_async_state *state = current_async_state;
+            size_t first_slot = state != NULL ? state->slot_count : 0;
             cJSON *result = METHODS[i].handler(config, params, &error_msg);
+            cJSON *resp = NULL;
             if (is_notification)
             {
                 /* 通知でも副作用(ハンドラの実行)は起こした上で、応答だけを捨てる */
                 cJSON_Delete(result);
-                free(error_msg);
-                return NULL;
             }
-            cJSON *resp = build_response(id, result, BM_JSONRPC_ERR_SERVER, error_msg);
+            else
+            {
+                resp = build_response(id, result, BM_JSONRPC_ERR_SERVER, error_msg);
+            }
             free(error_msg);
+            /* §11 2026-11-03 項目38 Tier 2: このハンドラが登録した完了待ちのslotへ、器を持つ
+             * 応答オブジェクトを教える(PoWの後で失敗したらerrorへ差し替えるため)。通知なら器は
+             * 上で捨てたのでNULLにする(PoWそのものは続き、完了を待ってから204を返す) */
+            for (size_t s = first_slot; state != NULL && s < state->slot_count; s++)
+            {
+                state->slots[s]->resp = resp;
+                if (resp == NULL)
+                {
+                    state->slots[s]->placeholder = NULL;
+                }
+            }
             return resp;
         }
     }
@@ -1982,9 +2172,10 @@ static cJSON *process_one_request(const struct bm_api_server_config *config, con
 }
 
 /*
- * リクエストボディ全体を処理し、応答本文(cJSONのアロケータで確保されたNUL終端文字列、
- * 呼び出し側がcJSON_freeで解放)を返す。応答を返してはならない場合(全て通知だった
- * バッチ、および単一の通知)はNULLを返す。
+ * リクエストボディ全体を処理し、応答のJSONの木(呼び出し側がcJSON_Deleteで解放)を返す。
+ * 応答を返してはならない場合(全て通知だったバッチ、および単一の通知)はNULLを返す。
+ * §11 2026-11-03 項目38 Tier 2: 以前は文字列にして返していたが、送信の結果の器をPoWの
+ * 完了後に埋めてから文字列にする必要があるので、木のまま返すようにした。
  *
  * §11 2026-09-15 バッチリクエスト対応(JSON-RPC 2.0 Specification §6)。以前はボディが
  * JSONオブジェクトであることを要求しており、仕様で定められたバッチ(リクエストオブジェクトの
@@ -1993,7 +2184,7 @@ static cJSON *process_one_request(const struct bm_api_server_config *config, con
  * 各リクエストの応答オブジェクトを要素とする配列で返す(順序はリクエスト順。仕様上
  * 順不同でよいがクライアント側の突き合わせが楽なので揃えておく)。
  */
-static char *process_jsonrpc_request(const struct bm_api_server_config *config,
+static cJSON *process_jsonrpc_request(const struct bm_api_server_config *config,
                                       const char *body, size_t body_len)
 {
     cJSON *root = cJSON_ParseWithLength(body, body_len);
@@ -2003,9 +2194,7 @@ static char *process_jsonrpc_request(const struct bm_api_server_config *config,
          * NULLを返す。自前パーサ時代はここに深さ制限が無く、深いネストを送りつけると
          * 再帰でスタックオーバーフローしdaemonごと落とせた(§11参照) */
         cJSON *resp = build_response(NULL, NULL, BM_JSONRPC_ERR_PARSE, "Parse error: invalid JSON");
-        char *text = cJSON_PrintUnformatted(resp);
-        cJSON_Delete(resp);
-        return text;
+        return resp;
     }
 
     if (!cJSON_IsArray(root))
@@ -2016,9 +2205,7 @@ static char *process_jsonrpc_request(const struct bm_api_server_config *config,
         {
             return NULL; /* 単一の通知: 応答なし */
         }
-        char *text = cJSON_PrintUnformatted(resp);
-        cJSON_Delete(resp);
-        return text;
+        return resp;
     }
 
     int count = cJSON_GetArraySize(root);
@@ -2039,9 +2226,7 @@ static char *process_jsonrpc_request(const struct bm_api_server_config *config,
         }
         cJSON *resp = build_response(NULL, NULL, BM_JSONRPC_ERR_INVALID_REQUEST, msg);
         cJSON_Delete(root);
-        char *text = cJSON_PrintUnformatted(resp);
-        cJSON_Delete(resp);
-        return text;
+        return resp;
     }
 
     cJSON *responses = cJSON_CreateArray();
@@ -2061,9 +2246,7 @@ static char *process_jsonrpc_request(const struct bm_api_server_config *config,
         cJSON_Delete(responses);
         return NULL;
     }
-    char *text = cJSON_PrintUnformatted(responses);
-    cJSON_Delete(responses);
-    return text;
+    return responses;
 }
 
 /* --- HTTPトランスポート(libmicrohttpd) --- */
@@ -2115,6 +2298,11 @@ struct api_request_ctx
     size_t body_len;
     size_t body_cap;
     int too_large; /* MAX_REQUEST_SIZE超過を検出したら1(以後のボディは捨てて413を返す) */
+    /* §11 2026-11-03 項目38 Tier 2: ボディを処理した後の状態。asyncが非NULLなら処理済みで、
+     * 送信のPoW完了待ちでsuspendしているか、resumeされて応答を返すところ。treeは応答の木
+     * (NULL可=応答なし) */
+    struct api_async_state *async;
+    cJSON *tree;
 };
 
 static enum MHD_Result queue_text_response(struct MHD_Connection *connection, unsigned int status,
@@ -2148,6 +2336,49 @@ static enum MHD_Result queue_auth_required(struct MHD_Connection *connection)
     enum MHD_Result rc = MHD_queue_basic_auth_required_response3(connection, "bitmessage", MHD_YES, response);
     MHD_destroy_response(response);
     return rc;
+}
+
+static enum MHD_Result queue_jsonrpc_response(struct MHD_Connection *connection, cJSON *tree);
+
+/*
+ * §11 2026-11-03 項目38 Tier 2: 送信の完了待ちが全て片付いた後(suspendしなかった場合は
+ * ボディの処理の直後、した場合はresumeの後)に、MHDスレッド上で器を埋めて応答を返す。
+ * 完了待ちは0なので、ここではもうワーカーからslotへの書き込みは起きない。
+ */
+static enum MHD_Result finish_async_response(struct MHD_Connection *connection, struct api_request_ctx *ctx)
+{
+    struct api_async_state *state = ctx->async;
+    if (state->suspended)
+    {
+        state->suspended = 0;
+        atomic_fetch_sub(&api_suspended_connections, 1);
+    }
+    for (size_t i = 0; i < state->slot_count; i++)
+    {
+        struct api_send_slot *slot = state->slots[i];
+        if (slot->resp == NULL)
+        {
+            continue; /* 通知: 応答を返さない */
+        }
+        if (slot->rc == 0)
+        {
+            if (slot->placeholder != NULL)
+            {
+                fill_send_result(slot->placeholder, slot->object_len, slot->inv_hash);
+            }
+            continue;
+        }
+        /* PoWの後で失敗した: その要素の応答だけをerrorへ差し替える(器はresultごと消える) */
+        cJSON_DeleteItemFromObject(slot->resp, "result");
+        slot->placeholder = NULL;
+        cJSON *err = cJSON_CreateObject();
+        cJSON_AddItemToObject(err, "code", cJSON_CreateNumber(BM_JSONRPC_ERR_SERVER));
+        cJSON_AddItemToObject(err, "message", json_str(BM_API_SEND_FAILED_AFTER_QUEUED));
+        cJSON_AddItemToObject(slot->resp, "error", err);
+    }
+    cJSON *tree = ctx->tree;
+    ctx->tree = NULL;
+    return queue_jsonrpc_response(connection, tree);
 }
 
 static enum MHD_Result api_access_handler(void *cls, struct MHD_Connection *connection,
@@ -2214,13 +2445,58 @@ static enum MHD_Result api_access_handler(void *cls, struct MHD_Connection *conn
         return MHD_YES;
     }
 
+    /* §11 2026-11-03 項目38 Tier 2: 送信のPoW完了待ちからresumeされた(=処理済み) */
+    if (ctx->async != NULL)
+    {
+        return finish_async_response(connection, ctx);
+    }
+
     /* upload_data_size == 0 かつ2回目以降の呼び出し = ボディ受信完了 */
     if (ctx->too_large)
     {
         return queue_text_response(connection, MHD_HTTP_CONTENT_TOO_LARGE, "request body too large\n");
     }
 
-    char *response_json = process_jsonrpc_request(config, ctx->body != NULL ? ctx->body : "", ctx->body_len);
+    struct api_async_state *state = calloc(1, sizeof(*state));
+    if (state == NULL)
+    {
+        return MHD_NO;
+    }
+    pthread_mutex_init(&state->mutex, NULL);
+    current_async_state = state;
+    ctx->tree = process_jsonrpc_request(config, ctx->body != NULL ? ctx->body : "", ctx->body_len);
+    current_async_state = NULL;
+    ctx->async = state;
+
+    /* 完了待ちが残っていればこの接続だけを保留する。suspendedを立てるのとsuspendは同じ
+     * ロックの中で行う(完了コールバックがsuspendより先にresumeを呼ばないように) */
+    pthread_mutex_lock(&state->mutex);
+    if (state->outstanding > 0)
+    {
+        state->suspended = 1;
+        state->connection = connection;
+        atomic_fetch_add(&api_suspended_connections, 1);
+        MHD_suspend_connection(connection);
+        pthread_mutex_unlock(&state->mutex);
+        return MHD_YES;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return finish_async_response(connection, ctx);
+}
+
+/* 応答の木をJSON-RPCの応答として返す(treeの所有権を受け取る。NULLなら204) */
+static enum MHD_Result queue_jsonrpc_response(struct MHD_Connection *connection, cJSON *tree)
+{
+    char *response_json = NULL;
+    if (tree != NULL)
+    {
+        response_json = cJSON_PrintUnformatted(tree);
+        cJSON_Delete(tree);
+        if (response_json == NULL)
+        {
+            return MHD_NO;
+        }
+    }
     if (response_json == NULL)
     {
         /* JSON-RPCの通知のみだった場合、仕様上ボディを返してはならない(§6) */
@@ -2273,6 +2549,8 @@ static void api_request_completed(void *cls, struct MHD_Connection *connection, 
     if (ctx != NULL)
     {
         free(ctx->body);
+        cJSON_Delete(ctx->tree); /* 通常はfinish_async_responseで渡し済み(NULL) */
+        api_async_state_free(ctx->async);
         free(ctx);
         *req_cls = NULL;
     }
@@ -2301,8 +2579,11 @@ void *bm_api_server_thread(void *arg)
     }
 
     struct MHD_Daemon *daemon =
-        MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG, (uint16_t)config->port,
-                          NULL, NULL, &api_access_handler, (void *)(uintptr_t)config,
+        /* §11 2026-11-03 項目38 Tier 2: 送信のPoW完了待ちで接続をsuspendするため
+         * MHD_ALLOW_SUSPEND_RESUMEを足した(内部でITCを使い、別スレッドからのresumeで
+         * MHDのpollループを起こす) */
+        MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG | MHD_ALLOW_SUSPEND_RESUME,
+                          (uint16_t)config->port, NULL, NULL, &api_access_handler, (void *)(uintptr_t)config,
                           /* EXTERNAL_LOGGERは必ず先頭に置く。後ろに置くと
                            * 「MHD_OPTION_EXTERNAL_LOGGER is not the first option specified
                            * for the daemon. Some messages may be printed by the standard
@@ -2330,6 +2611,31 @@ void *bm_api_server_thread(void *arg)
     while (*args->stop_flag == 0)
     {
         poll(NULL, 0, BM_API_STOP_POLL_INTERVAL_MS);
+    }
+
+    /* §11 2026-11-03 項目38 Tier 2: suspend中の接続が残ったままMHD_stop_daemonを呼んではいけない
+     * (MHDの仕様)。main.cはpow_queueを先にshutdownするので、完了待ちはcancelで片付いて
+     * resumeされ、MHDスレッドが応答を返すとここが0になる。万一片付かない(pow_queueを
+     * shutdownせずに止めた)場合に永久に待たないよう上限を設ける。上限を過ぎても残っていれば
+     * MHD_stop_daemonは呼ばない(呼ぶとMHDが"called while we have suspended connections"で
+     * プロセスごとabortする。test_send_asyncの開発中に実際に踏んだ)。daemonはこの後
+     * プロセス終了で片付く */
+    int still_suspended = 0;
+    for (int waited_ms = 0; atomic_load(&api_suspended_connections) > 0; waited_ms += 50)
+    {
+        if (waited_ms >= 10000)
+        {
+            still_suspended = atomic_load(&api_suspended_connections);
+            break;
+        }
+        poll(NULL, 0, 50);
+    }
+    if (still_suspended > 0)
+    {
+        bm_log_warn("[api_server] %d connection(s) still waiting for PoW at shutdown, not stopping the HTTP daemon\n",
+                    still_suspended);
+        free(args);
+        return NULL;
     }
 
     MHD_stop_daemon(daemon);

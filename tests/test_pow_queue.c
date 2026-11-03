@@ -14,9 +14,10 @@
  * 1. q==NULLなら呼び出し元スレッドで同期実行され、submitが戻る前にdoneが正しいobject
  *    (nonce(8byte BE) || payload、nonceはtargetを満たす)で呼ばれること
  * 2. キューを使うと、ワーカーでPoWされてdoneが呼ばれること
- * 3. 同じdedupキーのジョブが走行中・待ち中なら1を返して破棄し(doneはobject==NULL)、
- *    別キー・キー無しは投入されること
+ * 3. 同じdedupキーのジョブが走行中・待ち中なら1を返して破棄し(投入時の拒否ではdoneは
+ *    呼ばない。§11 Tier 2で契約を変更)、別キー・キー無しは投入されること
  * 4. 待ちジョブ数がmax_pendingに達したら-1で拒否すること(走行中の1本は数えない)
+ *    BM_POW_QUEUE_KEY_MAXを超えるキーも-1で拒否すること(黙って「キー無し」にしない)
  * 5. shutdownが走行中のPoWをcancelで打ち切り、走行中・待ちのジョブのdoneをobject==NULLで
  *    呼んで速やかに戻ること。shutdown後のsubmitは-1
  * 6. object_sync経由: ワーカーが塞がっていてもgetpubkeyの受信処理(network_epoll_threadの
@@ -221,7 +222,7 @@ static void test_dedup_limit_and_cancel(void)
 
     CHECK(bm_pow_queue_submit(&q, random_payload(32), 32, 0, key_a, sizeof(key_a), record_done, &dup, 0) == 1,
           "same key as the running job is deduplicated");
-    CHECK(dup.calls == 1 && dup.null_calls == 1, "deduplicated job's done is called with NULL synchronously");
+    CHECK(dup.calls == 0, "deduplicated job's done is not called (the caller keeps user_data)");
 
     CHECK(bm_pow_queue_submit(&q, random_payload(32), 32, 0, key_b, sizeof(key_b), record_done, &other, 0) == 0,
           "different key is queued");
@@ -232,7 +233,12 @@ static void test_dedup_limit_and_cancel(void)
     CHECK(pending_count(&q) == 2, "two jobs are pending (the running one is not counted)");
     CHECK(bm_pow_queue_submit(&q, random_payload(32), 32, 0, NULL, 0, record_done, &over, 0) == -1,
           "submit beyond max_pending is rejected");
-    CHECK(over.calls == 1 && over.null_calls == 1, "rejected job's done is called with NULL");
+    CHECK(over.calls == 0, "rejected job's done is not called");
+    unsigned char long_key[BM_POW_QUEUE_KEY_MAX + 1];
+    memset(long_key, 'L', sizeof(long_key));
+    CHECK(bm_pow_queue_submit(&q, random_payload(32), 32, 0, long_key, sizeof(long_key), record_done, &over, 0)
+              == -1,
+          "a key longer than BM_POW_QUEUE_KEY_MAX is rejected instead of silently ignored");
 
     int64_t start = monotonic_ms();
     bm_pow_queue_shutdown(&q);
@@ -244,7 +250,7 @@ static void test_dedup_limit_and_cancel(void)
 
     CHECK(bm_pow_queue_submit(&q, random_payload(32), 32, 0, NULL, 0, record_done, &late, 0) == -1,
           "submit after shutdown is rejected");
-    CHECK(late.calls == 1 && late.null_calls == 1, "late job's done is called with NULL");
+    CHECK(late.calls == 0, "late job's done is not called");
 
     bm_pow_queue_shutdown(&q); /* 2回呼んでも安全 */
     bm_pow_queue_destroy(&q);

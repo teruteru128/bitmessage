@@ -108,6 +108,11 @@ add_executable(test_pow_queue test_pow_queue.c)
 target_link_libraries(test_pow_queue PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME pow_queue COMMAND test_pow_queue)
 
+# §11 2026-11-03 項目38 Tier 2 送信(send_pipeline・API)のPoWの非同期化
+add_executable(test_send_async test_send_async.c)
+target_link_libraries(test_send_async PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME send_async COMMAND test_send_async)
+
 add_executable(test_getpubkey_automation test_getpubkey_automation.c)
 target_link_libraries(test_getpubkey_automation PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)

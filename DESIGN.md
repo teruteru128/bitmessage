@@ -136,7 +136,8 @@ dispatchに流す→sent.statusがackreceivedへ遷移」までのack往復をen
 方がシンプルで、v1では並列度より実装の見通しを優先した)。`pow_worker_thread`の非同期化は
 §11項目38のTODO。**2026-11-03**: 項目38のTier 1として`pow_worker_thread`(1本)を
 `src/pow/pow_queue.c`で実装した。getpubkey自応答・onionpeer announce・getpubkey自動要求の
-PoWはここで行う。send_pipelineのPoWはまだ直接呼び出しのまま(Tier 2)。
+PoWはここで行う。同日のTier 2でsend_pipeline(sendMessage・sendBroadcast・再送)のPoWも
+ここへ移し、PoWの呼び出し箇所は全てpow_queue経由になった。
 
 **上記の`pow_worker_thread × NumCPU`という記述は誤りなので、実装時に踏襲しないこと
 (2026-09-18追記)**。`bm_pow_run`が既に内部で`sysconf(_SC_NPROCESSORS_ONLN)`本へ探索空間を
@@ -607,7 +608,7 @@ broadcast_queueへ投入すること・pubkey_requestsへ登録すること・co
 がブロックされる点は既存のsend_pipeline PoW(APIスレッドをブロック)と同じ性質のトレードオフ。
 **2026-11-03 解消(§11項目38 Tier 1)**: 自応答のPoWは`pow_queue`のワーカースレッドで
 行うようになり、network_epoll_threadは止まらない(getpubkey自動要求のPoWも同じ。
-send_pipelineのPoWは引き続きAPIスレッドで同期実行)。
+同日のTier 2でsend_pipelineのPoWもpow_queueへ移した)。
 (b) 同一宛先への短時間repeated getpubkeyに対する応答側スロットリングは無い。受信object全般の
 PoW検証(§1、2026-08-23実装)により無償のPoW無しobjectでの負荷はかけられなくなったが、
 相手が正規のPoWを払ってgetpubkeyを連投した場合の応答側スロットリングは依然として無い
@@ -3261,6 +3262,62 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       api_server_threadで同期実行する。ピア接続は止めないのでv5のブロッカーではないが、
       v5 msgのPoW(期待26秒)の間APIが応答しなくなる。フェーズ3(送信側)の前に
       片付けるのが望ましい。
+
+    **Tier 2 実装済み(2026-11-03)。** Tier 1をpushした後、同日に続けて着手した。
+
+    - **見落としていた経路: 再送。** `bm_object_sync_check_resends`はdispatch経由で
+      network_epoll_threadから呼ばれており、再送のたびにack+msgの2段のPoWの間、全ピア接続が
+      止まっていた(Tier 1の調査では「send_pipelineはAPIスレッド」とだけ見ていた)。
+      上の表の分類Bは「ピア接続は落ちない」としていたが、再送の経路ではこれは誤り。
+    - **send_pipelineの非同期版**(`bm_send_pipeline_send_message_async`/
+      `bm_send_pipeline_send_broadcast_async`)。処理を「準備(呼び出し元)→ackのPoW→msgの
+      組み立てとPoW→sentへの記録・doneの呼び出し」に分け、pow_queueの完了コールバックから
+      次の段を投入する2段チェーンにした。ackのパケットは暗号化されるmsg本文に埋め込まれる
+      ので、msgはackのPoWの後でしか組み立てられない。そのため署名するまで送信元の秘密
+      署名鍵をjobが持つ(組み立てた直後にcleanse)。同期版の2関数は「pow_queue==NULLで
+      非同期版を呼ぶ薄いラッパー」として残し、既存テストは無改修で通る。
+    - **dedupキーの段またぎ。** 同じsent行(msg_id)の送信を2本同時に走らせないよう、
+      キーは`'S'+msg_id`にした(効くのは再送。next_resend_timeはPoW完了時のsent行の更新で
+      進むので、それまでは再送チェックが同じ行を拾いうる)。2段目は1段目と同じキーで
+      投入する必要があるので、pow_queueに「doneの中(ワーカー上)からの投入では、走行中の
+      ジョブとのキー一致を見ない」という例外を足した。
+    - **APIの返り値は変えない(ユーザーとの相談で決定)。** 本家のように`msgId`を即返す形に
+      すると、CLI・テスト・利用者のスクリプトが全て影響を受ける。代わりにMHDの
+      suspend/resume(`MHD_ALLOW_SUSPEND_RESUME`)を使った: ハンドラは送信をpow_queueへ
+      投げて空の結果の器を返し、ボディの処理後に完了待ちが残っていればその接続だけを
+      suspendする。最後の完了コールバックが`MHD_resume_connection`を呼び、MHDスレッドが
+      器を埋めて従来通りの`{objectLength, inventoryHash}`を返す。バッチの中の複数の送信も
+      全部の完了を待って1つの応答配列で返し、PoWの後で失敗した要素だけをerrorに差し替える。
+      `process_jsonrpc_request`は文字列ではなくJSONの木を返すようにした(器を埋めてから
+      文字列にするため)。
+    - **pow_queueの契約を変更: 投入時の拒否ではdoneを呼ばない。** Tier 1では拒否のときも
+      `done(NULL)`を同期的に呼んでいた。send_pipelineでは「投入時の拒否」(呼び出し元が
+      戻り値を見て片付ける)と「受け付けた後の破棄」(doneが片付ける)を区別する必要があり、
+      最初は「ワーカー以外のスレッドでのdone(NULL)は投入時の拒否」と見分けていた。ところが
+      shutdownでの待ちジョブの破棄もshutdownを呼んだスレッドで起きるので誤認し、破棄された
+      送信の完了通知が失われてHTTPの接続がsuspendされたまま残った。さらにその状態で
+      `MHD_stop_daemon`を呼んだため、MHDが"called while we have suspended connections"で
+      プロセスごとabortした(新しいテストで発覚)。スレッドで推測するのをやめ、
+      「0以外を返したらdoneは呼ばない(user_dataは呼び出し側に残る)」に契約を変えた。
+      Tier 1の呼び出し側(自応答・onionpeer)は、拒否のときに自分でjobを解放する形に直した。
+    - **dedupキーの長さ。** `'S'+msg_id`は33byteで、当初の`BM_POW_QUEUE_KEY_MAX`(32)を
+      超えていた。超過したキーは黙って「キー無し」扱いになっていたので、再送のdedupが
+      効いていなかった(これもテストで発覚)。上限を40に上げ、超過したキーは-1で拒否するようにした。
+    - **停止処理。** suspend中の接続を残したまま`MHD_stop_daemon`を呼ぶとabortするので、
+      api_server_threadはsuspend中の接続数が0になるのを最大10秒待つ。main.cはpow_queueを
+      先にshutdownするので、完了待ちはcancelで片付いて普通は即座に0になる。それでも残って
+      いた場合は警告を出し、`MHD_stop_daemon`を呼ばずに抜ける(プロセス終了で片付く)。
+    - **テスト**: `tests/test_send_async.c`。ack→msgの2段が同じキーで通ること、自分宛
+      (1段)のinboxへのコピー、再送のdedup、shutdownでの打ち切り(rc=-1でsent行は書かない)、
+      HTTPでの従来通りの返り値と、broadcast_queueに積まれたobjectのhashとの一致、
+      バッチ(通知の送信を含む)、そして「ワーカーを塞いでsendMessageを保留させたまま、
+      別の接続のlistAddressesが応答される」こと(受信タイムアウト付きで、塞がっていれば
+      失敗になる)と、その後のshutdownで保留中の要求にerrorが返り、API serverが正常に
+      止まること。ASan/UBSan・TSanのビルドでも通過。
+    - これで項目38の呼び出し箇所6つは全てpow_queue経由になった。DESIGN.md §1.1の
+      `send_pipeline_thread`(send_request_queueをpopする専用スレッド)は不要になった
+      (準備段は呼び出し元、PoW以降はpow_queueの完了コールバックのチェーン)。スタブの
+      スレッド起動はmain.cの骨格に残してある。
 
 39. **v5オブジェクトが「v5を理解しないノードを経由して」届くことの実地検証**: 2026-09-18、
     ユーザーとの議論で構成が決まったのでbacklogへ登録。項目37・[DESIGN-PQ.md](DESIGN-PQ.md) §2の

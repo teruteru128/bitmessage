@@ -59,6 +59,40 @@ int bm_send_pipeline_send_broadcast(bm_keyring_t *kr, const char *from_address,
                                      const char *subject, const char *body, uint64_t ttl_seconds,
                                      unsigned char **out_object, size_t *out_object_len);
 
+/*
+ * §11 2026-11-03 項目38 Tier 2: 上の2つの非同期版。PoWをpow_queue(src/pow/pow_queue.h)の
+ * ワーカーで行い、呼び出し元スレッドを止めない。上の同期版は、これをpow_queue==NULLで呼んで
+ * その場で結果を受け取る薄いラッパーになった(テスト・単体動作用。挙動は以前と同じ)。
+ *
+ * 鍵・宛先の解決など、失敗の大半はこの関数の中(呼び出し元スレッド)で同期的に判定する。
+ *
+ * 戻り値:
+ *   0  受け付けた。doneはちょうど1回呼ばれる(pow_queue==NULLなら、この関数が戻る前に)。
+ *      PoW以降の失敗(sentへの記録の失敗・shutdownでの打ち切り等)はdoneのrc=-1で知らせる
+ *   -1 準備段での失敗、またはpow_queueの上限超過・shutdown後。doneは呼ばれない
+ *   1  (send_messageのみ)同じmsg_id(=reuse_msg_idを渡した再送)のPoWが既に走っている。
+ *      doneは呼ばれない
+ *
+ * doneはワーカースレッド上で呼ばれうる。rc==0ならobject(nonce込みの完成object)の所有権は
+ * doneへ移る(doneがfreeする)。nowはPoW完了時点の時刻。sent行の記録(send_message)は
+ * doneより前に済んでいる。ネットワークへ流すのは従来通りdone(呼び出し側)の責務。
+ * nowは準備段の時刻で、expires_timeはnow+ttl_secondsになる(CLAUDE.mdの方針で、
+ * 関数内部でtime(NULL)を呼ばない)。
+ */
+struct bm_pow_queue;
+typedef void (*bm_send_done_fn)(void *user_data, int rc, unsigned char *object, size_t object_len, int64_t now);
+
+int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr, sqlite3 *identity_db,
+                                        sqlite3 *messages_db, const char *from_address, const char *to_address,
+                                        const char *subject, const char *body, uint64_t ttl_seconds,
+                                        int ack_stealth_level, const unsigned char reuse_msg_id[32],
+                                        int64_t next_resend_time, int64_t now, bm_send_done_fn done,
+                                        void *user_data);
+
+int bm_send_pipeline_send_broadcast_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr,
+                                          const char *from_address, const char *subject, const char *body,
+                                          uint64_t ttl_seconds, int64_t now, bm_send_done_fn done, void *user_data);
+
 void *bm_send_pipeline_thread(void *arg);
 
 #endif /* BM_CORE_SEND_PIPELINE_H */

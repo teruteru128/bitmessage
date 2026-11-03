@@ -28,8 +28,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* dedupキーの最大長。getpubkey自応答ではversion+stream+ripe(20byte)が収まればよい */
-#define BM_POW_QUEUE_KEY_MAX 32
+/* dedupキーの最大長。getpubkey自応答のversion+stream+ripe(30byte)と、send_pipelineの
+ * 'S'+msg_id(33byte、§11項目38 Tier 2)が収まる長さ。これを超えるキーを渡すと
+ * submitは-1で拒否する(2026-11-03 Tier 2の実装中に、33byteのキーが黙って「キー無し」
+ * 扱いになり再送のdedupが効いていなかったのをテストで見つけたため、黙って無視しない形にした) */
+#define BM_POW_QUEUE_KEY_MAX 40
 
 /*
  * 完了コールバック。PoWが終わるとワーカースレッド上で
@@ -38,9 +41,10 @@
  * (コールバックがfreeする)。nowはワーカーがPoW完了時点で取った時刻(呼び出し側の関数の
  * 中でtime(NULL)を呼ばない、というCLAUDE.mdの方針に合わせてキュー側で取って渡す)。
  *
- * ジョブがPoWされずに捨てられた場合(dedup・上限超過・shutdown後の投入・shutdownによる
- * 打ち切り)は object==NULL, object_len==0 で呼ばれる。user_dataの解放はいずれの場合も
- * コールバックの責任。
+ * 受け付けたジョブがPoWされずに捨てられた場合(shutdownによる打ち切り・待ちジョブの破棄)は
+ * object==NULL, object_len==0 で呼ばれる(ワーカー上とは限らず、shutdownを呼んだスレッドで
+ * 呼ばれることもある)。user_dataの解放はいずれの場合もコールバックの責任。
+ * 投入の時点で拒否した場合(bm_pow_queue_submitが0以外を返す)はdoneを呼ばない。
  */
 typedef void (*bm_pow_done_fn)(void *user_data, unsigned char *object, size_t object_len, int64_t now);
 
@@ -81,9 +85,18 @@ void bm_pow_queue_destroy(struct bm_pow_queue *q);
  * PoW完了前に重ねて届く」経路で、同じPoWを何本も積まないための仕組み(同期実装では
  * network_epoll_threadがPoW中に止まっていたので、後続の要求は応答キャッシュができてから
  * 処理されて自然に再利用されていた。非同期化でその暗黙の直列化が無くなるため明示的に要る)。
+ * 例外として、doneの中(ワーカースレッド上)から投入した場合は走行中のジョブ(=今doneを
+ * 呼ばれているジョブ自身)とのキー一致は見ない。多段のPoWで同じキーを次の段へ引き継げる
+ * ようにするため(§11項目38 Tier 2、send_pipelineのack→msg)。待ち中のジョブとは比べる。
  *
- * 戻り値: 0=投入した(またはq==NULLで同期実行した)、1=dedupで破棄、-1=上限超過または
- * shutdown後で破棄。0以外でもpayloadは解放され、doneはobject==NULLで同期的に呼ばれる。
+ * 戻り値: 0=投入した(またはq==NULLで同期実行した)、1=dedupで破棄、-1=上限超過・
+ * shutdown後・キーが長すぎるので破棄。0以外でもpayloadは解放されるが、doneは呼ばない
+ * (user_dataは呼び出し側に残るので、呼び出し側が片付ける)。
+ * §11 2026-11-03 Tier 2で変更: 以前は拒否のときもdoneをobject==NULLで同期的に呼んでいたが、
+ * そうするとdoneの側では「投入時の拒否」(呼び出し元が戻り値を見て片付けたい)と
+ * 「受け付けた後の破棄」(doneが片付けるべき)を見分けられない。スレッドで見分けようと
+ * したら、shutdownの破棄もshutdownを呼んだスレッドで起きるため誤認し、破棄された送信の
+ * 完了通知が失われてAPIの接続がsuspendされたまま残った(test_send_asyncで発覚)。
  *
  * q==NULLなら、その場(呼び出し元スレッド)でbm_pow_runを実行してdoneを呼ぶ
  * (テスト・CLI単体動作用。broadcast_queue==NULLならネットワークへ流さない、という

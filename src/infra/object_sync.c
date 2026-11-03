@@ -138,6 +138,51 @@ static void maybe_run_gc(struct bm_object_sync_ctx *ctx)
     }
 }
 
+/* §11 2026-11-03 項目38 Tier 2: 再送のPoW完了コールバック用の文脈 */
+struct resend_job
+{
+    struct bm_object_sync_ctx *ctx;
+    char to_address[BM_MESSAGES_ADDRESS_MAX];
+    int attempt;
+};
+
+/* pow_queueのワーカースレッド上で呼ばれる(ctx->pow_queue==NULLならnetwork_epoll_thread上)。
+ * スレッド安全性の前提はpubkey_response_doneと同じ。sent行の更新はsend_pipeline側で
+ * 済んでいる */
+static void resend_done(void *user_data, int rc, unsigned char *object, size_t object_len, int64_t now)
+{
+    struct resend_job *job = user_data;
+    struct bm_object_sync_ctx *ctx = job->ctx;
+    if (rc == 0)
+    {
+        struct bm_object_header hdr;
+        if (bm_object_parse_header(object, object_len, &hdr) == 0)
+        {
+            unsigned char hash[32];
+            bm_inventory_hash(object, object_len, hash);
+            if (!bm_object_store_has(ctx->object_pool_db, hash))
+            {
+                bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream, object,
+                                       object_len, (int64_t)hdr.expires_time, now);
+                if (ctx->registry != NULL)
+                {
+                    bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
+                }
+            }
+        }
+        /* §11 2026-09-12: 8段階化に伴う移行。ackが返ってこず再送(リトライ)している
+         * という、INFOの大量出力に紛れさせたくない事象なのでNOTICEにした
+         * (DESIGN.md §11 backlog項目28のNOTICE設計方針「再接続成功など」と同種)。 */
+        bm_log_notice("[object_sync] resent message to %s (attempt %d)\n", job->to_address, job->attempt);
+        free(object);
+    }
+    else
+    {
+        bm_log_warn("[object_sync] resend to %s failed after it was queued (shutting down?)\n", job->to_address);
+    }
+    free(job);
+}
+
 int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
 {
     ctx->last_resend_check = (time_t)now;
@@ -156,37 +201,32 @@ int bm_object_sync_check_resends(struct bm_object_sync_ctx *ctx, int64_t now)
         int new_resend_count = c->resend_count + 1;
         int64_t next_resend_time = now + (int64_t)BM_RESEND_INITIAL_INTERVAL_SECONDS * (1LL << new_resend_count);
 
-        unsigned char *object = NULL;
-        size_t object_len = 0;
-        int rc = bm_send_pipeline_send_message(ctx->keyring, ctx->identity_db, ctx->messages_db,
-                                                c->from_address, c->to_address,
-                                                c->subject, c->body, (uint64_t)c->ttl, c->ack_stealth_level,
-                                                c->msg_id, next_resend_time, &object, &object_len);
-        if (rc == 0)
+        /* §11 2026-11-03 項目38 Tier 2: 以前はbm_send_pipeline_send_message(同期)を呼んでおり、
+         * この関数はdispatch経由でnetwork_epoll_threadから呼ばれるので、再送のたびに
+         * ackとmsgの2段のPoW(v4で数秒、v5ではmsgだけで期待26秒)の間、全ピア接続が止まって
+         * いた(Tier 1の調査では見落としていた経路)。非同期版でpow_queueへ投げ、object_pool.dbへの
+         * 登録とbroadcastは完了コールバック(resend_done)で行う。PoWの完了前に次の再送チェックが
+         * 同じ行を拾っても、msg_idのdedupキーで2本目は積まれない(rc==1)。 */
+        struct resend_job *job = malloc(sizeof(*job));
+        if (job == NULL)
         {
-            struct bm_object_header hdr;
-            if (bm_object_parse_header(object, object_len, &hdr) == 0)
-            {
-                unsigned char hash[32];
-                bm_inventory_hash(object, object_len, hash);
-                if (!bm_object_store_has(ctx->object_pool_db, hash))
-                {
-                    bm_object_store_insert(ctx->object_pool_db, hash, (int)hdr.object_type, (int)hdr.stream,
-                                            object, object_len, (int64_t)hdr.expires_time, now);
-                    if (ctx->registry != NULL)
-                    {
-                        bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
-                    }
-                }
-            }
-            /* §11 2026-09-12: 8段階化に伴う移行。ackが返ってこず再送(リトライ)している
-             * という、INFOの大量出力に紛れさせたくない事象なのでNOTICEにした
-             * (DESIGN.md §11 backlog項目28のNOTICE設計方針「再接続成功など」と同種)。 */
-            bm_log_notice("[object_sync] resent message to %s (attempt %d)\n", c->to_address, new_resend_count);
-            free(object);
+            continue;
         }
-        else
+        job->ctx = ctx;
+        snprintf(job->to_address, sizeof(job->to_address), "%s", c->to_address);
+        job->attempt = new_resend_count;
+        int rc = bm_send_pipeline_send_message_async(ctx->pow_queue, ctx->keyring, ctx->identity_db,
+                                                     ctx->messages_db, c->from_address, c->to_address, c->subject,
+                                                     c->body, (uint64_t)c->ttl, c->ack_stealth_level, c->msg_id,
+                                                     next_resend_time, now, resend_done, job);
+        if (rc == 1)
         {
+            free(job);
+            bm_log_debug("[object_sync] resend to %s is already in progress\n", c->to_address);
+        }
+        else if (rc != 0)
+        {
+            free(job);
             bm_log_warn(
                     "[object_sync] resend attempt skipped for %s (fromAddress not unlocked or "
                     "recipient pubkey not cached?)\n",
@@ -489,6 +529,10 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     memcpy(key + 10, ripe, BM_RIPE_LEN);
     int rc = bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key),
                                  pubkey_response_done, job, now);
+    if (rc != 0)
+    {
+        free(job); /* 拒否ではdoneが呼ばれないので、ここで片付ける(pow_queue.h参照) */
+    }
     if (rc == 1)
     {
         bm_log_debug("[object_sync] getpubkey response PoW (v%" PRIu64 ") is already queued, not queuing again\n",
@@ -696,9 +740,13 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
     job->stream = stream;
     job->expires_time = expires_time;
     static const unsigned char key[] = {'O'};
-    if (bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key), onionpeer_done, job,
-                            now)
-        < 0)
+    int rc = bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key), onionpeer_done,
+                                 job, now);
+    if (rc != 0)
+    {
+        free(job); /* 拒否ではdoneが呼ばれないので、ここで片付ける(pow_queue.h参照) */
+    }
+    if (rc < 0)
     {
         bm_log_warn("[object_sync] PoW queue is full or shutting down, dropping onionpeer announce\n");
     }

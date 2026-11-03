@@ -129,7 +129,7 @@ void bm_pow_queue_shutdown(struct bm_pow_queue *q)
     pthread_join(q->thread, NULL);
 
     /* 待ちジョブはmutexの外で破棄する(doneの中で別のロックを取る実装があっても
-     * キューのmutexと入れ子にならないように。submitの拒否経路も同じ) */
+     * キューのmutexと入れ子にならないように) */
     while (list != NULL)
     {
         struct bm_pow_job *next = list->next;
@@ -147,7 +147,12 @@ void bm_pow_queue_destroy(struct bm_pow_queue *q)
 
 static int key_in_flight(const struct bm_pow_queue *q, const unsigned char *key, size_t key_len)
 {
-    if (q->running != NULL && q->running->key_len == key_len && memcmp(q->running->key, key, key_len) == 0)
+    /* §11 2026-11-03 項目38 Tier 2: ワーカースレッド自身(=走行中ジョブのdoneの中)からの投入では、
+     * 走行中のジョブとのキー一致を見ない。send_pipelineのack→msgのように、1段目のdoneが
+     * 同じキーで2段目を投入して「キーを途切れさせずに引き継ぐ」ため(runningはdoneの後で
+     * 下ろすので、ここで見てしまうと2段目が自分自身の1段目に弾かれる) */
+    if (q->running != NULL && !pthread_equal(pthread_self(), q->thread) && q->running->key_len == key_len
+        && memcmp(q->running->key, key, key_len) == 0)
     {
         return 1;
     }
@@ -174,9 +179,14 @@ int bm_pow_queue_submit(struct bm_pow_queue *q, unsigned char *payload, size_t p
         return 0;
     }
 
-    if (key == NULL || key_len > BM_POW_QUEUE_KEY_MAX)
+    if (key == NULL)
     {
         key_len = 0;
+    }
+    if (key_len > BM_POW_QUEUE_KEY_MAX)
+    {
+        free(payload); /* 黙って「キー無し」にはしない(BM_POW_QUEUE_KEY_MAXのコメント参照) */
+        return -1;
     }
 
     pthread_mutex_lock(&q->mutex);
@@ -200,8 +210,9 @@ int bm_pow_queue_submit(struct bm_pow_queue *q, unsigned char *payload, size_t p
     }
     if (reject != 0)
     {
+        /* 拒否ではdoneを呼ばない(user_dataは呼び出し側に残る。pow_queue.h参照) */
         pthread_mutex_unlock(&q->mutex);
-        discard(payload, done, user_data);
+        free(payload);
         return reject;
     }
 
