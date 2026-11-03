@@ -4556,7 +4556,48 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
        短時間起動し、フラグの有無で起動ログが切り替わることも確認した。
        READMEの環境変数表と`bitmessage.conf.example`への記載は、v5が実際に動く段まで保留する
        (有効にしても何も起きない段階で利用者向けの文書に載せると、動くと誤解されるため)。
-    3. v5 identityの保存(identity.dbの新しい表、成分seedを既存と同じKEKでラップ)とkeyring
+    3. **v5 identityの保存とkeyring(実装済み、2026-11-04)。** いずれも`BM_HAVE_PQ`のビルドのみ。
+       - **成分seed。** `src/pq/address_v5`の生成の3経路(seed 2本から・ランダム・決定性)が、
+         `struct bm_pqv5_identity`に成分seed(ξ 32 + Ed25519 seed 32 + ML-KEM (d,z) 64 +
+         X25519 sk 32 = 160byte、`struct bm_pqv5_component_seeds`)を記録するようにし、
+         成分seedから組み立て直す`bm_pqv5_identity_from_component_seeds`を足した。
+         ML-DSAのξとML-KEMの(d,z)は展開済みの鍵ブロブから復元できないので、生成の時点で
+         記録する必要がある。決定性生成の鍵の作り方は「seed→keypair_from_seed」から
+         「seed→成分へ展開→成分から鍵」へ変えたが、展開は同じなので鍵は変わらない
+         (パスフレーズから既存のアドレスを作り直せなくなると困るので、書き換えていない
+         旧経路との一致を`test_pq_address`に足した。このテストスイートには固定の期待値が
+         無かったため。展開を1byteずらすと落ちることも確認)。
+       - **保存(`src/core/pq_identity_store.c`)。** v4以前の`identities`表とは別の
+         `pq_identities`表。鍵の形が全く違い、identities表の固定長の列へ押し込むと既存の
+         全ての読み手がv5の行を誤読しうるため。公開鍵(3200byte)は平文、成分seedはラップして
+         188byte。スキーマは`bm_identity_store_init_schema`から`BM_HAVE_PQ`のときだけ作る
+         (PQ有りのビルドで作ったDBをPQ無しのビルドで開いても、この表が無視されるだけ)。
+       - **ラップはv4以前と同じ規則。** `keyring.c`の32byte固定だったAES-256-GCMのラップを
+         任意長に一般化し、KEKの解決(行ごとのscrypt/vaultのHKDF)を行の構造体に依存しない
+         形で切り出して、`keyring_internal.h`(keyring.cとpq_keyring.cだけが使う)で公開した。
+         別の規則を作ると片方だけ脆弱な実装が残りうるため。新規のv5 identityはv4の
+         `bm_keyring_create_identity`と同じく行ごとのscrypt(AAD=アドレス)。既存の行の形式は
+         変わらない(32byteの鍵は従来通り60byteにラップされる)。
+       - **改竄の検出。** unlock時に、平文の公開鍵のSHA3-256がアドレスに埋め込まれたidと
+         一致するか、アドレスのversion/streamが行と一致するかを確かめる(公開鍵のすり替え)。
+         seedはAAD=アドレスのGCMで縛られる(seedのすり替え・別の行への付け替え)。さらに、
+         展開した公開鍵が保存済みのものと一致するかを展開時に照合する。「seedも公開鍵も
+         それぞれ正当だが別のidentityのもの」という行は、前の2つの検査を通ってしまうため。
+       - **keyring(`src/core/pq_keyring.c`)。** `bm_keyring_t`に`pq_head`(v5の別リスト)を
+         足し、ロックはv4以前と共通の`kr->lock`。unlockはseedを復号するだけで、展開済みの
+         秘密鍵(sig_sk・kem_sk)は`bm_pq_keyring_get_secret_keys`で初めて要るときに作って
+         キャッシュする(展開はロックの外で行い、keyring全体の書き込みロックで鍵生成を
+         しない)。`bm_keyring_lock`/`bm_keyring_lock_all`/`bm_keyring_destroy`はv5も外す。
+         同じアドレスを2回unlockしても1件のまま(v4の`add_unlocked_entry`は先頭へ足すだけで
+         重複しうるが、v5では最初から重複させない)。
+       - **テスト**: `tests/test_pq_keyring.c`(作成・一覧・誤ったpassphrase・tagでの検索・
+         2回のunlock・遅延展開した秘密鍵の一致・lock・3通りの改竄)。2つの照合をそれぞれ
+         無効にすると対応する検査が落ちることを確認した。ASan/UBSanでkeyring・identity・
+         PQ関連の10件も通過。`keyring.c`・`identity_store.c`は`BM_HAVE_PQ`無しで`-Werror`の
+         コンパイルが通ることも確かめた(CIのOpenSSL 3.0)。
+       - **まだやっていないこと(段4以降)。** v5の行のvault方式への移行(v4のunlock時の
+         lazy migration)、`unlockAllAddresses`・`deleteAddress`・`listAddresses`でのv5の扱い、
+         APIからの作成。
     4. API: `createDeterministicAddress`のversion 5、listAddresses・unlock・lockのv5対応。
        アドレス生成でバージョンを指定できるのは現状`createDeterministicAddress`
        (CLI: `create-address`)だけで、3と4以外は拒否している。ランダム生成のAPI(本家の

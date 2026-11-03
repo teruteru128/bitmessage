@@ -68,6 +68,30 @@
  */
 #define BM_PQV5_LABEL_DETERMINISTIC "BitmessagePQ-v5-deterministic"
 
+/*
+ * §11 2026-11-04 項目55の段3: v5の秘密鍵を「展開済みの鍵ブロブ」ではなく「成分seed」として
+ * 保存するための表現(DESIGN-PQ.md §9.3)。4成分それぞれのKeyGenの入力そのもの:
+ *   mldsa_xi     ML-DSA-65のξ(FIPS 204 KeyGen_internalの入力)
+ *   ed25519_seed Ed25519の32byte seed(sig_skの末尾32byteと同じ値)
+ *   mlkem_coins  ML-KEM-768の(d,z)(FIPS 203 KeyGen_internalの入力)
+ *   x25519_sk    X25519の秘密鍵(kem_skの末尾32byteと同じ値)
+ * 決定性生成の鍵は32byteのseed 2本から再現できるが、ランダム生成はML-KEMとX25519を独立な
+ * 乱数から作る(上の説明)のでKEM側を1本に畳めない。両方の経路を1つの形式で扱うため、
+ * 1本のseedへ畳む前の成分で持つ。ML-DSAのξとML-KEMの(d,z)は展開済みの鍵ブロブから
+ * 復元できないので、生成の時点で記録しておく必要がある。
+ * 全てunsigned charの配列なので、構造体のままmemcpyしても詰め物は入らない
+ * (BM_PQV5_COMPONENT_SEEDS_LENと一致することをaddress_v5.cでstatic_assertしている)。
+ */
+#define BM_PQV5_COMPONENT_SEEDS_LEN 160
+
+struct bm_pqv5_component_seeds
+{
+    unsigned char mldsa_xi[32];
+    unsigned char ed25519_seed[32];
+    unsigned char mlkem_coins[64];
+    unsigned char x25519_sk[32];
+};
+
 struct bm_pqv5_identity
 {
     uint64_t version;
@@ -81,6 +105,9 @@ struct bm_pqv5_identity
      * アドレスを完全に再現できる(v4のstruct bm_generated_addressと同じ役割) */
     uint64_t sig_nonce;
     uint64_t kem_nonce;
+    /* §11 2026-11-04 項目55の段3: 上の4本の鍵を作った成分seed(生成の全経路で埋まる)。
+     * 秘密情報なので、使い終わったら構造体ごとOPENSSL_cleanseすること */
+    struct bm_pqv5_component_seeds seeds;
 };
 
 /* id = SHA3-256(sig_pk || kem_pk)。v3/v4のripeと同じく公開鍵だけのハッシュ */
@@ -119,6 +146,13 @@ int bm_pqv5_identity_from_seeds(uint64_t stream,
                                  const unsigned char sig_seed[BM_PQV5_SEED_LEN],
                                  const unsigned char kem_seed[BM_PQV5_SEED_LEN],
                                  struct bm_pqv5_identity *out);
+
+/*
+ * §11 2026-11-04 項目55の段3: 成分seed(identity.dbに保存したもの)からidentityを組み立て直す。
+ * 4本の鍵とidを計算し、seedsもそのまま写す(sig_nonce/kem_nonceは0)。成功時0。
+ */
+int bm_pqv5_identity_from_component_seeds(uint64_t stream, const struct bm_pqv5_component_seeds *seeds,
+                                          struct bm_pqv5_identity *out);
 
 /*
  * CSPRNGから新規identityを作る。X25519鍵だけを引き直して探索する(上記の説明参照)。

@@ -12,7 +12,11 @@
 
 #include "address.h"
 #include "identity_store.h"
+#include "keyring_internal.h"
 #include "logging.h"
+#ifdef BM_HAVE_PQ
+#include "pq_keyring.h"
+#endif
 
 /* §7.1のKDFパラメータ既定値。N=2^15はインタラクティブ用途として妥当な強度
  * (概算メモリ使用量 128*N*r = 128*32768*8 ≈ 32MiB) */
@@ -24,6 +28,9 @@
 void bm_keyring_init(bm_keyring_t *kr)
 {
     kr->head = NULL;
+#ifdef BM_HAVE_PQ
+    kr->pq_head = NULL;
+#endif
     pthread_rwlock_init(&kr->lock, NULL);
 }
 
@@ -39,6 +46,9 @@ void bm_keyring_destroy(bm_keyring_t *kr)
         cur = next;
     }
     kr->head = NULL;
+#ifdef BM_HAVE_PQ
+    bm_pq_keyring_clear_locked(kr); /* §11 2026-11-04 項目55の段3 */
+#endif
     pthread_rwlock_unlock(&kr->lock);
     pthread_rwlock_destroy(&kr->lock);
 }
@@ -68,13 +78,16 @@ static int derive_kek(const char *passphrase, const unsigned char salt[BM_IDENTI
         ? 0 : -1;
 }
 
-/* out = nonce(12) || ciphertext(32) || tag(16)。§7.1 */
-static int aes256gcm_wrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
-                           const unsigned char plaintext[32], unsigned char out[BM_IDENTITY_WRAPPED_KEY_LEN])
+/* out = nonce(12) || ciphertext(pt_len) || tag(16)。§7.1。
+ * §11 2026-11-04 項目55の段3: 以前は平文32byte固定のaes256gcm_wrapだったが、v5の成分seed
+ * (160byte)も同じKEKでラップするため任意長にした(keyring_internal.h)。32byteの鍵は
+ * 下のaes256gcm_wrapが従来通りこれを呼ぶので、既存の行の形式は変わらない。 */
+int bm_keyring_internal_wrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
+                             const unsigned char *plaintext, size_t pt_len, unsigned char *out)
 {
     unsigned char *nonce = out;
     unsigned char *ciphertext = out + 12;
-    unsigned char *tag = out + 12 + 32;
+    unsigned char *tag = out + 12 + pt_len;
 
     if (RAND_bytes(nonce, 12) != 1)
     {
@@ -92,7 +105,7 @@ static int aes256gcm_wrap(const unsigned char kek[32], const unsigned char *aad,
         && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1
         && EVP_EncryptInit_ex(ctx, NULL, NULL, kek, nonce) == 1
         && (aad_len == 0 || EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) == 1)
-        && EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, 32) == 1
+        && EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, (int)pt_len) == 1
         && EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) == 1
         && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1)
     {
@@ -102,12 +115,23 @@ static int aes256gcm_wrap(const unsigned char kek[32], const unsigned char *aad,
     return ret;
 }
 
-static int aes256gcm_unwrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
-                             const unsigned char in[BM_IDENTITY_WRAPPED_KEY_LEN], unsigned char out_plaintext[32])
+static int aes256gcm_wrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
+                           const unsigned char plaintext[32], unsigned char out[BM_IDENTITY_WRAPPED_KEY_LEN])
 {
+    return bm_keyring_internal_wrap(kek, aad, aad_len, plaintext, 32, out);
+}
+
+int bm_keyring_internal_unwrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
+                               const unsigned char *in, size_t in_len, unsigned char *out_plaintext)
+{
+    if (in_len < BM_KEYRING_WRAP_OVERHEAD)
+    {
+        return -1;
+    }
+    size_t pt_len = in_len - BM_KEYRING_WRAP_OVERHEAD;
     const unsigned char *nonce = in;
     const unsigned char *ciphertext = in + 12;
-    const unsigned char *tag = in + 12 + 32;
+    const unsigned char *tag = in + 12 + pt_len;
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL)
@@ -120,7 +144,7 @@ static int aes256gcm_unwrap(const unsigned char kek[32], const unsigned char *aa
         && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1
         && EVP_DecryptInit_ex(ctx, NULL, NULL, kek, nonce) == 1
         && (aad_len == 0 || EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) == 1)
-        && EVP_DecryptUpdate(ctx, out_plaintext, &len, ciphertext, 32) == 1
+        && EVP_DecryptUpdate(ctx, out_plaintext, &len, ciphertext, (int)pt_len) == 1
         && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) == 1
         && EVP_DecryptFinal_ex(ctx, out_plaintext + len, &len) == 1)
     {
@@ -128,6 +152,12 @@ static int aes256gcm_unwrap(const unsigned char kek[32], const unsigned char *aa
     }
     EVP_CIPHER_CTX_free(ctx);
     return ret;
+}
+
+static int aes256gcm_unwrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
+                             const unsigned char in[BM_IDENTITY_WRAPPED_KEY_LEN], unsigned char out_plaintext[32])
+{
+    return bm_keyring_internal_unwrap(kek, aad, aad_len, in, BM_IDENTITY_WRAPPED_KEY_LEN, out_plaintext);
 }
 
 static int add_unlocked_entry(bm_keyring_t *kr, const struct bm_identity_row *row,
@@ -375,6 +405,21 @@ static int store_new_identity_with_kek(sqlite3 *db, const char *address, const c
     return bm_identity_store_insert(db, &row);
 }
 
+/* §11 2026-11-04 項目55の段3: bm_keyring_create_identityから、v5の新規identity
+ * (pq_keyring.c)でも同じ規則(行ごとの新しいsalt・既定のscryptパラメータ)でKEKを作れるよう
+ * 切り出した */
+int bm_keyring_internal_new_scrypt_kek(const char *passphrase, unsigned char out_salt[BM_IDENTITY_KDF_SALT_LEN],
+                                       char out_params[BM_IDENTITY_KDF_PARAMS_MAX], unsigned char out_kek[32])
+{
+    if (RAND_bytes(out_salt, BM_IDENTITY_KDF_SALT_LEN) != 1)
+    {
+        return -1;
+    }
+    snprintf(out_params, BM_IDENTITY_KDF_PARAMS_MAX, "{\"N\":%llu,\"r\":%u,\"p\":%u}",
+             (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
+    return derive_kek(passphrase, out_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P, out_kek);
+}
+
 int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *label,
                                 int address_version, int stream,
                                 const unsigned char pub_signing[65],
@@ -386,16 +431,9 @@ int bm_keyring_create_identity(sqlite3 *db, const char *address, const char *lab
                                 uint64_t payload_length_extra_bytes)
 {
     unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN];
-    if (RAND_bytes(kdf_salt, sizeof(kdf_salt)) != 1)
-    {
-        return -1;
-    }
     char kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
-    snprintf(kdf_params, sizeof(kdf_params), "{\"N\":%llu,\"r\":%u,\"p\":%u}",
-             (unsigned long long)BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P);
-
     unsigned char kek[32];
-    if (derive_kek(passphrase, kdf_salt, BM_KEYRING_SCRYPT_N, BM_KEYRING_SCRYPT_R, BM_KEYRING_SCRYPT_P, kek) != 0)
+    if (bm_keyring_internal_new_scrypt_kek(passphrase, kdf_salt, kdf_params, kek) != 0)
     {
         return -1;
     }
@@ -516,10 +554,11 @@ int bm_keyring_import_identity(sqlite3 *db, const char *address, const char *lab
  * 'vault-hkdf'ならvaultをロード・canary検証してからHKDF-Expand、それ以外('scrypt')は
  * 従来通り行固有のsalt+kdf_paramsで直接scrypt。成功時0。
  */
-static int resolve_kek_for_row(sqlite3 *db, const struct bm_identity_row *row, const char *passphrase,
-                                unsigned char out_kek[32])
+int bm_keyring_internal_resolve_kek(sqlite3 *db, const char *kdf_algo,
+                                    const unsigned char kdf_salt[BM_IDENTITY_KDF_SALT_LEN], const char *kdf_params,
+                                    const char *address, const char *passphrase, unsigned char out_kek[32])
 {
-    if (strcmp(row->kdf_algo, "vault-hkdf") == 0)
+    if (strcmp(kdf_algo, "vault-hkdf") == 0)
     {
         unsigned char vault_salt[BM_IDENTITY_VAULT_SALT_LEN];
         char vault_kdf_params[BM_IDENTITY_KDF_PARAMS_MAX];
@@ -531,7 +570,7 @@ static int resolve_kek_for_row(sqlite3 *db, const struct bm_identity_row *row, c
         {
             return -1;
         }
-        int rc = hkdf_expand_wrap_key(master_kek, row->kdf_salt, row->address, out_kek);
+        int rc = hkdf_expand_wrap_key(master_kek, kdf_salt, address, out_kek);
         OPENSSL_cleanse(master_kek, sizeof(master_kek));
         return rc;
     }
@@ -539,11 +578,20 @@ static int resolve_kek_for_row(sqlite3 *db, const struct bm_identity_row *row, c
     uint64_t n = 0;
     unsigned int r = 0;
     unsigned int p = 0;
-    if (parse_kdf_params(row->kdf_params, &n, &r, &p) != 0)
+    if (parse_kdf_params(kdf_params, &n, &r, &p) != 0)
     {
         return -1;
     }
-    return derive_kek(passphrase, row->kdf_salt, n, r, p, out_kek);
+    return derive_kek(passphrase, kdf_salt, n, r, p, out_kek);
+}
+
+/* §11 2026-11-04 項目55の段3: 中身をv5の行(pq_identity_store)でも使えるよう、行の構造体に
+ * 依存しないbm_keyring_internal_resolve_kekへ切り出した */
+static int resolve_kek_for_row(sqlite3 *db, const struct bm_identity_row *row, const char *passphrase,
+                                unsigned char out_kek[32])
+{
+    return bm_keyring_internal_resolve_kek(db, row->kdf_algo, row->kdf_salt, row->kdf_params, row->address,
+                                           passphrase, out_kek);
 }
 
 int bm_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const char *passphrase)
@@ -780,6 +828,14 @@ int bm_keyring_lock(bm_keyring_t *kr, const char *address)
         }
         cur = &(*cur)->next;
     }
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段3: v4以前に無ければv5(別リスト)も探す */
+    if (bm_pq_keyring_remove_locked(kr, address) == 0)
+    {
+        pthread_rwlock_unlock(&kr->lock);
+        return 0;
+    }
+#endif
     pthread_rwlock_unlock(&kr->lock);
     return -1;
 }
@@ -796,6 +852,9 @@ void bm_keyring_lock_all(bm_keyring_t *kr)
         cur = next;
     }
     kr->head = NULL;
+#ifdef BM_HAVE_PQ
+    bm_pq_keyring_clear_locked(kr); /* §11 2026-11-04 項目55の段3 */
+#endif
     pthread_rwlock_unlock(&kr->lock);
 }
 

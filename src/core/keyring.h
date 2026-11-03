@@ -35,9 +35,18 @@ struct bm_unlocked_identity
     struct bm_unlocked_identity *next;
 };
 
+#ifdef BM_HAVE_PQ
+struct bm_unlocked_pq_identity; /* pq_keyring.h */
+#endif
+
 typedef struct
 {
     struct bm_unlocked_identity *head;
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段3: unlock済みのv5(ポスト量子)identity。鍵の形がv4以前と
+     * 全く違う(公開鍵だけで3.2KB)ので別リストにした。lockはheadと共通(pq_keyring.c) */
+    struct bm_unlocked_pq_identity *pq_head;
+#endif
     pthread_rwlock_t lock;
 } bm_keyring_t;
 

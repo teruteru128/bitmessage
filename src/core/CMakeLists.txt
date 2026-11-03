@@ -25,6 +25,8 @@ target_link_libraries(bm_core PUBLIC bm_common bm_pow SQLite::SQLite3 OpenSSL::C
 if(BM_ENABLE_PQ)
     target_link_libraries(bm_core PUBLIC bm_pq)
     target_compile_definitions(bm_core PUBLIC BM_HAVE_PQ=1)
+    # §11 2026-11-04 項目55の段3: v5 identityの保存とkeyring
+    target_sources(bm_core PRIVATE pq_identity_store.c pq_keyring.c)
 endif()
 # §11 2026-09-15 api_server.cのみが使う。api_server.hにはstruct MHD_Daemon*もcJSON*も
 # 露出させていない(§3.5と同じ「公開ヘッダに外部ライブラリの型を出さない」規律)ので

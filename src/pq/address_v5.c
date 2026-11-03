@@ -218,21 +218,81 @@ static int id_has_leading_nulls(const unsigned char id[BM_PQV5_ID_LEN], int null
     return 1;
 }
 
-int bm_pqv5_identity_from_seeds(uint64_t stream,
-                                 const unsigned char sig_seed[BM_PQV5_SEED_LEN],
-                                 const unsigned char kem_seed[BM_PQV5_SEED_LEN],
-                                 struct bm_pqv5_identity *out)
+_Static_assert(sizeof(struct bm_pqv5_component_seeds) == BM_PQV5_COMPONENT_SEEDS_LEN,
+               "struct bm_pqv5_component_seeds must have no padding");
+
+/*
+ * §11 2026-11-04 項目55の段3: 32byteのseed 1本を、bm_pqv5_sig_keypair_from_seed/
+ * bm_pqv5_kem_keypair_from_seedと同じ展開(SHAKE128)で成分seedへ分ける。
+ * 鍵ブロブはこの成分から作るので、両者は必ず同じ鍵になる。
+ */
+static int expand_sig_seed(const unsigned char seed[BM_PQV5_SEED_LEN], struct bm_pqv5_component_seeds *out)
 {
-    memset(out, 0, sizeof(*out));
-    out->version = BM_PQV5_ADDRESS_VERSION;
-    out->stream = stream;
-    if (bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0 ||
-        bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
+    unsigned char expanded[64];
+    if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
+    {
+        return -1;
+    }
+    memcpy(out->mldsa_xi, expanded, 32);
+    memcpy(out->ed25519_seed, expanded + 32, 32);
+    OPENSSL_cleanse(expanded, sizeof(expanded));
+    return 0;
+}
+
+static int expand_kem_seed(const unsigned char seed[BM_PQV5_SEED_LEN], struct bm_pqv5_component_seeds *out)
+{
+    unsigned char expanded[96];
+    if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
+    {
+        return -1;
+    }
+    memcpy(out->mlkem_coins, expanded, 64);
+    memcpy(out->x25519_sk, expanded + 64, 32);
+    OPENSSL_cleanse(expanded, sizeof(expanded));
+    return 0;
+}
+
+/* 成分seedから4本の鍵とidを作る(stream/versionは呼び出し側で設定済みであること) */
+static int keys_from_component_seeds(struct bm_pqv5_identity *out)
+{
+    if (bm_pqv5_sig_set_mldsa(out->seeds.mldsa_xi, out->sig_pk, out->sig_sk) != 0 ||
+        bm_pqv5_sig_set_ed25519(out->seeds.ed25519_seed, out->sig_pk, out->sig_sk) != 0 ||
+        bm_pqv5_kem_set_mlkem(out->seeds.mlkem_coins, out->kem_pk, out->kem_sk) != 0 ||
+        bm_pqv5_kem_set_x25519(out->seeds.x25519_sk, out->kem_pk, out->kem_sk) != 0)
     {
         return -1;
     }
     bm_pqv5_calc_id(out->sig_pk, out->kem_pk, out->id);
     return 0;
+}
+
+int bm_pqv5_identity_from_component_seeds(uint64_t stream, const struct bm_pqv5_component_seeds *seeds,
+                                          struct bm_pqv5_identity *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->version = BM_PQV5_ADDRESS_VERSION;
+    out->stream = stream;
+    out->seeds = *seeds;
+    return keys_from_component_seeds(out);
+}
+
+int bm_pqv5_identity_from_seeds(uint64_t stream,
+                                 const unsigned char sig_seed[BM_PQV5_SEED_LEN],
+                                 const unsigned char kem_seed[BM_PQV5_SEED_LEN],
+                                 struct bm_pqv5_identity *out)
+{
+    /* §11 2026-11-04 項目55の段3: 以前はbm_pqv5_*_keypair_from_seedで直接鍵を作っていたが、
+     * 成分seedを記録するために「展開→成分から鍵」の順にした(同じ展開なので鍵は変わらない。
+     * 書き換えていないbm_pqv5_*_keypair_from_seedと同じ鍵になることを
+     * test_pq_addressのtest_component_seeds_match_old_pathで確認) */
+    memset(out, 0, sizeof(*out));
+    out->version = BM_PQV5_ADDRESS_VERSION;
+    out->stream = stream;
+    if (expand_sig_seed(sig_seed, &out->seeds) != 0 || expand_kem_seed(kem_seed, &out->seeds) != 0)
+    {
+        return -1;
+    }
+    return keys_from_component_seeds(out);
 }
 
 /*
@@ -255,18 +315,22 @@ int bm_pqv5_identity_generate_random(uint64_t stream, int null_bytes,
     out->version = BM_PQV5_ADDRESS_VERSION;
     out->stream = stream;
 
-    if (RAND_bytes(seed, 32) != 1 ||
-        bm_pqv5_sig_keypair_from_seed(seed, out->sig_pk, out->sig_sk) != 0)
+    /* §11 2026-11-04 項目55の段3: 引いた乱数を成分seedとして記録する(保存用) */
+    if (RAND_bytes(seed, 32) != 1 || expand_sig_seed(seed, &out->seeds) != 0 ||
+        bm_pqv5_sig_set_mldsa(out->seeds.mldsa_xi, out->sig_pk, out->sig_sk) != 0 ||
+        bm_pqv5_sig_set_ed25519(out->seeds.ed25519_seed, out->sig_pk, out->sig_sk) != 0)
     {
         goto out;
     }
-    if (RAND_bytes(seed, 64) != 1 || bm_pqv5_kem_set_mlkem(seed, out->kem_pk, out->kem_sk) != 0)
+    if (RAND_bytes(out->seeds.mlkem_coins, 64) != 1 ||
+        bm_pqv5_kem_set_mlkem(out->seeds.mlkem_coins, out->kem_pk, out->kem_sk) != 0)
     {
         goto out;
     }
     for (;;)
     {
-        if (RAND_bytes(seed, 32) != 1 || bm_pqv5_kem_set_x25519(seed, out->kem_pk, out->kem_sk) != 0)
+        if (RAND_bytes(out->seeds.x25519_sk, 32) != 1 ||
+            bm_pqv5_kem_set_x25519(out->seeds.x25519_sk, out->kem_pk, out->kem_sk) != 0)
         {
             goto out;
         }
@@ -352,14 +416,15 @@ int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t str
 
     for (;;)
     {
+        /* §11 2026-11-04 項目55の段3: 成分seedを記録するため、展開→成分から鍵の順にした */
         if (derive_seed(passphrase, sig_nonce, sig_seed) != 0 ||
             derive_seed(passphrase, kem_nonce, kem_seed) != 0 ||
-            bm_pqv5_sig_keypair_from_seed(sig_seed, out->sig_pk, out->sig_sk) != 0 ||
-            bm_pqv5_kem_keypair_from_seed(kem_seed, out->kem_pk, out->kem_sk) != 0)
+            expand_sig_seed(sig_seed, &out->seeds) != 0 ||
+            expand_kem_seed(kem_seed, &out->seeds) != 0 ||
+            keys_from_component_seeds(out) != 0)
         {
             goto out;
         }
-        bm_pqv5_calc_id(out->sig_pk, out->kem_pk, out->id);
         if (id_has_leading_nulls(out->id, null_bytes))
         {
             break;
