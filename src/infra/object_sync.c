@@ -24,6 +24,7 @@
 #include "../core/send_pipeline.h"
 #include "../core/trial_decrypt.h"
 #include "../pow/pow_engine.h"
+#include "../pow/pow_queue.h"
 #include "dandelion.h"
 #include "object.h"
 #include "object_store.h"
@@ -113,7 +114,9 @@ void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_poo
     ctx->last_gc = 0;
     ctx->last_resend_check = 0;
     ctx->last_onion_announce = 0;
+    ctx->pow_queue = NULL;
     memset(&ctx->time_offset_log_throttle, 0, sizeof(ctx->time_offset_log_throttle));
+    memset(&ctx->pow_queue_full_log_throttle, 0, sizeof(ctx->pow_queue_full_log_throttle));
 }
 
 int bm_object_sync_gc(struct bm_object_sync_ctx *ctx, int64_t now)
@@ -275,10 +278,52 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
     bm_free_message(msg);
 }
 
+/* §11 2026-11-03 項目38: getpubkey自応答のPoWをpow_queueへ投げるときの完了コールバック用の文脈。
+ * 秘密鍵は含まない(署名はpayloadの組み立て時に済んでいる) */
+struct pubkey_response_job
+{
+    struct bm_object_sync_ctx *ctx;
+    unsigned char ripe[BM_RIPE_LEN];
+    uint64_t address_version;
+    uint64_t stream;
+    uint64_t expires_time;
+};
+
+/* pow_queueのワーカースレッド上で呼ばれる。ctxのうち触るのはobject_pool_db/identity_db/
+ * registryだけで、いずれも初期化後は書き換えられない(sqlite3ハンドルはFULLMUTEX、
+ * registryは内部でロックする。broadcast_threadも同じものを別スレッドから使っている) */
+static void pubkey_response_done(void *user_data, unsigned char *object, size_t object_len, int64_t now)
+{
+    struct pubkey_response_job *job = user_data;
+    struct bm_object_sync_ctx *ctx = job->ctx;
+    if (object != NULL)
+    {
+        unsigned char hash[32];
+        bm_inventory_hash(object, object_len, hash);
+        if (!bm_object_store_has(ctx->object_pool_db, hash))
+        {
+            bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)job->stream, object, object_len,
+                                   (int64_t)job->expires_time, now);
+            bm_pubkey_cache_set_self_response(ctx->identity_db, job->ripe, job->address_version, job->stream, hash,
+                                              (int64_t)job->expires_time);
+            if (ctx->registry != NULL)
+            {
+                bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
+            }
+            bm_log_info("[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
+                        job->address_version);
+        }
+        free(object);
+    }
+    free(job);
+}
+
 /*
  * §5.1/§11: 受信したgetpubkeyが自分の(keyringでunlock済みの)アドレス宛かどうかを判定し、
  * 該当すれば自分のpubkeyオブジェクトを組み立ててPoWし、object_pool.dbへ登録した上で
  * 全peer(除外無し、自分が新たに作った物なので§1の他object同様except=NULL)へbroadcastする。
+ * §11 2026-11-03 項目38: PoW以降はpow_queueのワーカースレッドで行う(この関数はPoWを
+ * 投入した時点で戻る)。
  * unlockされていないアドレス宛の要求には応答できない(秘密鍵が必要な署名を作れないため、
  * keyringにロードされているアドレスのみ対応する設計)。
  */
@@ -409,33 +454,59 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
 
     uint64_t target = bm_pow_get_target(payload_len, BM_PUBKEY_RESPONSE_TTL_SECONDS,
                                          info.nonce_trials_per_byte, info.payload_length_extra_bytes);
-    uint64_t nonce = bm_pow_run(payload, payload_len, target);
 
-    size_t object_len = 8 + payload_len;
-    unsigned char *object = malloc(object_len);
+    /* §11 2026-11-03 項目38: 以前はここでbm_pow_runを同期実行しており、PoWの間
+     * network_epoll_thread(このハンドラを呼んでいるスレッド)が止まって全ピア接続が停止していた
+     * (v4で実測20秒超、ポスト量子v5では期待141秒、DESIGN-PQ.md §8.4)。pow_queueへ投げて
+     * すぐ戻り、object_pool.dbへの登録・応答キャッシュの更新・inv broadcastは完了コールバック
+     * (pubkey_response_done、ワーカースレッド上)で行う。ctx->pow_queue==NULL(テスト)なら
+     * 従来通りこの場で同期実行される。 */
+    struct pubkey_response_job *job = malloc(sizeof(*job));
+    if (job == NULL)
+    {
+        free(payload);
+        return;
+    }
+    job->ctx = ctx;
+    memcpy(job->ripe, ripe, sizeof(job->ripe));
+    job->address_version = address_version;
+    job->stream = stream;
+    job->expires_time = expires_time;
+
+    /* dedupキーは応答キャッシュ(self_pubkey_response_cache)と同じ(ripe, version, stream)。
+     * 同じ要求が応答のPoW完了前に重ねて届いても、PoWを2本積まない。同期実装では
+     * network_epoll_threadがPoW中に止まっていたので、後続の要求はキャッシュができてから
+     * 処理されて自然に再利用されていたが、非同期化でその暗黙の直列化が無くなる
+     * (放置すると、正規のPoWを払ったgetpubkeyを連打されるだけで同じ応答PoWを何本も
+     * 積まされる。pow_queue.h参照) */
+    unsigned char key[1 + 1 + 8 + BM_RIPE_LEN];
+    key[0] = 'P';
+    key[1] = (unsigned char)address_version;
     for (int i = 0; i < 8; i++)
     {
-        object[i] = (unsigned char)((nonce >> (56 - 8 * i)) & 0xff);
+        key[2 + i] = (unsigned char)((stream >> (56 - 8 * i)) & 0xff);
     }
-    memcpy(object + 8, payload, payload_len);
-    free(payload);
-
-    unsigned char hash[32];
-    bm_inventory_hash(object, object_len, hash);
-    if (!bm_object_store_has(ctx->object_pool_db, hash))
+    memcpy(key + 10, ripe, BM_RIPE_LEN);
+    int rc = bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key),
+                                 pubkey_response_done, job, now);
+    if (rc == 1)
     {
-        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)stream,
-                                object, object_len, (int64_t)expires_time, now);
-        bm_pubkey_cache_set_self_response(ctx->identity_db, ripe, address_version, stream, hash,
-                                          (int64_t)expires_time);
-        if (ctx->registry != NULL)
-        {
-            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
-        }
-        bm_log_info("[object_sync] responded to getpubkey with our own pubkey (v%" PRIu64 ")\n",
-                address_version);
+        bm_log_debug("[object_sync] getpubkey response PoW (v%" PRIu64 ") is already queued, not queuing again\n",
+                     address_version);
     }
-    free(object);
+    else if (rc < 0)
+    {
+        /* TTLを短くすれば要求側のPoWは安いので、溢れる状況ではこの行も大量に出うる。
+         * 時計ずれのWARN(項目46)と同じく一定間隔に1回へ間引く */
+        uint64_t suppressed = 0;
+        if (bm_log_throttle_check(&ctx->pow_queue_full_log_throttle, now, BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDS,
+                                  &suppressed))
+        {
+            bm_log_warn("[object_sync] PoW queue is full or shutting down, dropping getpubkey response (v%" PRIu64
+                        ", %" PRIu64 " more dropped since the last report)\n",
+                        address_version, suppressed);
+        }
+    }
 }
 
 /*
@@ -553,6 +624,41 @@ static void handle_incoming_onionpeer(struct bm_object_sync_ctx *ctx, const stru
  * ttl引数)も軽くなり、daemon起動時にmain()を長時間ブロックしにくくなる副次効果もある */
 #define BM_ONIONPEER_ANNOUNCE_TTL_SECONDS (2 * 24 * 60 * 60)
 
+/* §11 2026-11-03 項目38: onionpeer announceのPoW完了コールバック用の文脈。onion_addressは
+ * bm_build_onionpeerの検証を通った62文字のv3アドレスなので64byteで足りる */
+struct onionpeer_job
+{
+    struct bm_object_sync_ctx *ctx;
+    char onion_address[64];
+    int port;
+    uint64_t stream;
+    uint64_t expires_time;
+};
+
+/* pow_queueのワーカースレッド上で呼ばれる(スレッド安全性の前提はpubkey_response_doneと同じ) */
+static void onionpeer_done(void *user_data, unsigned char *object, size_t object_len, int64_t now)
+{
+    struct onionpeer_job *job = user_data;
+    struct bm_object_sync_ctx *ctx = job->ctx;
+    if (object != NULL)
+    {
+        unsigned char hash[32];
+        bm_inventory_hash(object, object_len, hash);
+        if (!bm_object_store_has(ctx->object_pool_db, hash))
+        {
+            bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_ONIONPEER, (int)job->stream, object,
+                                   object_len, (int64_t)job->expires_time, now);
+            if (ctx->registry != NULL)
+            {
+                bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
+            }
+            bm_log_info("[object_sync] announced our onion peer: %s:%d\n", job->onion_address, job->port);
+        }
+        free(object);
+    }
+    free(job);
+}
+
 int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const char *onion_address, int port,
                                         int64_t now)
 {
@@ -572,30 +678,30 @@ int bm_object_sync_announce_onion_peer(struct bm_object_sync_ctx *ctx, const cha
     uint64_t target = bm_pow_get_target(payload_len, BM_ONIONPEER_ANNOUNCE_TTL_SECONDS,
                                          BM_NETWORK_MIN_NONCE_TRIALS_PER_BYTE,
                                          BM_NETWORK_MIN_PAYLOAD_LENGTH_EXTRA_BYTES);
-    uint64_t nonce = bm_pow_run(payload, payload_len, target);
 
-    size_t object_len = 8 + payload_len;
-    unsigned char *object = malloc(object_len);
-    for (int i = 0; i < 8; i++)
+    /* §11 2026-11-03 項目38: 以前はbm_pow_runを同期実行しており、PoWの間
+     * peer_connector_thread(bm_object_sync_maybe_reannounce_onion_peerの呼び出し元)が
+     * 止まっていた。getpubkey自応答と同じくpow_queueへ投げる。dedupキーは定数('O')にした:
+     * 告知するのは自分のonionアドレス1本だけで、再告知の間隔(7380秒)の間に前回のPoWが
+     * 終わっていないことは通常無いが、もし重なっても同じ告知を2本積む意味は無いため */
+    struct onionpeer_job *job = malloc(sizeof(*job));
+    if (job == NULL)
     {
-        object[i] = (unsigned char)((nonce >> (56 - 8 * i)) & 0xff);
+        free(payload);
+        return 0;
     }
-    memcpy(object + 8, payload, payload_len);
-    free(payload);
-
-    unsigned char hash[32];
-    bm_inventory_hash(object, object_len, hash);
-    if (!bm_object_store_has(ctx->object_pool_db, hash))
+    job->ctx = ctx;
+    snprintf(job->onion_address, sizeof(job->onion_address), "%s", onion_address);
+    job->port = port;
+    job->stream = stream;
+    job->expires_time = expires_time;
+    static const unsigned char key[] = {'O'};
+    if (bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key), onionpeer_done, job,
+                            now)
+        < 0)
     {
-        bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_ONIONPEER, (int)stream, object, object_len,
-                                (int64_t)expires_time, now);
-        if (ctx->registry != NULL)
-        {
-            bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
-        }
-        bm_log_info("[object_sync] announced our onion peer: %s:%d\n", onion_address, port);
+        bm_log_warn("[object_sync] PoW queue is full or shutting down, dropping onionpeer announce\n");
     }
-    free(object);
     return 0;
 }
 

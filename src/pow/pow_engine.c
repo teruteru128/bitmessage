@@ -46,7 +46,13 @@ struct pow_worker_arg
     uint64_t stride;      /* num_threads */
     atomic_bool *found;
     atomic_uint_fast64_t *result_nonce;
+    const atomic_bool *cancel; /* NULL可。§11項目38: pow_queueのshutdownで走行中のPoWを打ち切るため */
 };
+
+static int cancel_requested(const atomic_bool *cancel)
+{
+    return cancel != NULL && atomic_load_explicit(cancel, memory_order_relaxed);
+}
 
 static void *pow_worker(void *arg_)
 {
@@ -57,7 +63,8 @@ static void *pow_worker(void *arg_)
      * 適度に間引く(64回に1回)。取りこぼしても他ワーカーの結果を待つだけで正しさには影響しない */
     for (uint64_t i = 0;; i++, nonce += arg->stride)
     {
-        if ((i & 0x3f) == 0 && atomic_load_explicit(arg->found, memory_order_relaxed))
+        if ((i & 0x3f) == 0
+            && (atomic_load_explicit(arg->found, memory_order_relaxed) || cancel_requested(arg->cancel)))
         {
             return NULL;
         }
@@ -75,6 +82,14 @@ static void *pow_worker(void *arg_)
 
 uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t target)
 {
+    uint64_t nonce = 0;
+    bm_pow_run_cancellable(payload, payload_len, target, NULL, &nonce); /* cancel==NULLなら必ず0を返す */
+    return nonce;
+}
+
+int bm_pow_run_cancellable(const unsigned char *payload, size_t payload_len, uint64_t target,
+                           const atomic_bool *cancel, uint64_t *out_nonce)
+{
     unsigned char initial_hash[64];
     bm_sha512(payload, payload_len, initial_hash);
 
@@ -87,8 +102,13 @@ uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t t
         while (bm_pow_trial_value(nonce, initial_hash) > target)
         {
             nonce++;
+            if ((nonce & 0x3f) == 0 && cancel_requested(cancel))
+            {
+                return -1;
+            }
         }
-        return nonce;
+        *out_nonce = nonce;
+        return 0;
     }
 
     atomic_bool found = false;
@@ -104,6 +124,7 @@ uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t t
         args[i].stride = (uint64_t)num_threads;
         args[i].found = &found;
         args[i].result_nonce = &result_nonce;
+        args[i].cancel = cancel;
         pthread_create(&threads[i], NULL, pow_worker, &args[i]);
     }
     for (size_t i = 0; i < num_threads; i++)
@@ -113,5 +134,12 @@ uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t t
     free(threads);
     free(args);
 
-    return atomic_load_explicit(&result_nonce, memory_order_relaxed);
+    /* cancelで全ワーカーが抜けた場合はfoundが立っていない。cancelと発見が同時に起きた場合は
+     * 見つかったnonceを優先する(正しいnonceを捨てる理由は無い) */
+    if (!atomic_load(&found))
+    {
+        return -1;
+    }
+    *out_nonce = atomic_load_explicit(&result_nonce, memory_order_relaxed);
+    return 0;
 }

@@ -36,6 +36,7 @@
 #include "infra/peer_registry.h"
 #include "infra/protocol.h"
 #include "infra/tor_control.h"
+#include "pow/pow_queue.h"
 
 /* BM_PROJECT_VERSIONはCMakeLists.txt(ルート)のproject(bitmessage VERSION ...)から
  * target_compile_definitionsで注入される(src/CMakeLists.txt参照)。バージョン文字列を
@@ -57,15 +58,15 @@
  * 処理は無い)、単なる一貫性のための変更。 */
 #define BM_USER_AGENT "/CBitmessage:" BM_PROJECT_VERSION "/"
 
-/* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO) */
+/* DESIGN.md §1.2: 層間キュー一覧。中身のstructはまだ各モジュール実装時に確定させる(TODO)。
+ * §11 2026-11-03 項目38: 使われないまま定義されていたpow_request_queue/pow_result_queueは
+ * 削除し、完了コールバック方式のpow_queue(src/pow/pow_queue.h、下のmain()で起動)に置き換えた */
 struct bm_queues
 {
     bm_queue_t command_queue;
     bm_queue_t object_inbox_queue;
     bm_queue_t decrypt_request_queue;
     bm_queue_t send_request_queue;
-    bm_queue_t pow_request_queue;
-    bm_queue_t pow_result_queue;
     bm_queue_t broadcast_queue;
 };
 
@@ -75,8 +76,6 @@ static void queues_init(struct bm_queues *q)
     bm_queue_init(&q->object_inbox_queue);
     bm_queue_init(&q->decrypt_request_queue);
     bm_queue_init(&q->send_request_queue);
-    bm_queue_init(&q->pow_request_queue);
-    bm_queue_init(&q->pow_result_queue);
     bm_queue_init(&q->broadcast_queue);
 }
 
@@ -86,8 +85,6 @@ static void queues_shutdown(struct bm_queues *q)
     bm_queue_shutdown(&q->object_inbox_queue);
     bm_queue_shutdown(&q->decrypt_request_queue);
     bm_queue_shutdown(&q->send_request_queue);
-    bm_queue_shutdown(&q->pow_request_queue);
-    bm_queue_shutdown(&q->pow_result_queue);
     bm_queue_shutdown(&q->broadcast_queue);
 }
 
@@ -97,8 +94,6 @@ static void queues_destroy(struct bm_queues *q)
     bm_queue_destroy(&q->object_inbox_queue);
     bm_queue_destroy(&q->decrypt_request_queue);
     bm_queue_destroy(&q->send_request_queue);
-    bm_queue_destroy(&q->pow_request_queue);
-    bm_queue_destroy(&q->pow_result_queue);
     bm_queue_destroy(&q->broadcast_queue);
 }
 
@@ -299,6 +294,19 @@ int main(int argc, char **argv)
     struct bm_queues queues;
     queues_init(&queues);
 
+    /* §11 2026-11-03 項目38: 自分が作るobject(getpubkey自応答・onionpeer announce・getpubkey
+     * 自動要求)のPoWを、呼び出し元スレッドの外で実行するワーカー(1本、pow_queue.h参照)。
+     * 待ちジョブの上限は、v5 pubkey(約7.8KB)が上限まで積まれても2MB程度に収まる256にした。
+     * 溢れた要求には応答しないが、要求側は応答が来なければ自分で再送する(同期実装の頃も、
+     * PoW中にnetwork_epoll_threadが読めなかった要求はソケットバッファで待たされていた)。
+     * main()がsigwaitで待つ間ずっと生存するスタック変数(他のctx類と同じ扱い)。 */
+    struct bm_pow_queue pow_queue;
+    if (bm_pow_queue_init(&pow_queue, 256) != 0)
+    {
+        bm_log_error("failed to start the PoW worker thread\n");
+        return EXIT_FAILURE;
+    }
+
     bm_keyring_t keyring;
     bm_keyring_init(&keyring);
 
@@ -349,6 +357,7 @@ int main(int argc, char **argv)
     api_config.default_payload_length_extra_bytes =
         env_or_u64("BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES", cfg.default_payload_length_extra_bytes);
     api_config.registry = &peer_registry;
+    api_config.pow_queue = &pow_queue; /* §11 2026-11-03 項目38 */
     bm_log_info("[api] apiusername=bitmessage apipassword=%s port=%d (valid for this run only; credentials are intentionally not persisted)\n",
             api_password, api_port);
 
@@ -395,6 +404,7 @@ int main(int argc, char **argv)
     struct bm_object_sync_ctx object_sync_ctx;
     bm_object_sync_ctx_init(&object_sync_ctx, object_pool_db, identity_db, messages_db, peers_db, &keyring,
                              &peer_registry, BM_USER_AGENT);
+    object_sync_ctx.pow_queue = &pow_queue; /* §11 2026-11-03 項目38、network/peer_connectorの起動前に */
 
     /* §11 inbound接続(Tor hidden service)対応。BM_INBOUND_PORTが設定されていれば
      * 127.0.0.1:<port>でTCP listenし、Tor hidden serviceからの転送を受け付ける準備をする
@@ -659,6 +669,14 @@ int main(int argc, char **argv)
      * 節目であり、意図した終了(シグナル)かクラッシュかを見分ける手掛かりとして他のINFOより
      * 目立たせたいのでNOTICEにした。 */
     bm_log_notice("received signal %d, shutting down\n", sig);
+
+    /* §11 2026-11-03 項目38: PoWワーカーを最初に止める。完了コールバックがbroadcast_queue・
+     * peer_registry・各DBを使うので、それらより先にjoinしておく必要がある。走行中のPoWは
+     * cancelで打ち切られる(v5 pubkeyの141秒PoWでもjoinが待たされない)。
+     * bm_pow_queue_destroyは呼ばない: detachしたnetwork_epoll_threadがプロセス終了まで
+     * 動き続けてsubmitしうるため、mutexを生かしておく(shutdown後のsubmitは-1で即座に
+     * 拒否されるだけで、PoWもコールバックの副作用も起きない) */
+    bm_pow_queue_shutdown(&pow_queue);
 
     queues_shutdown(&queues);
     peer_connector_stop = 1;

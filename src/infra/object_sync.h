@@ -60,6 +60,8 @@
 #include "network.h"
 #include "peer_registry.h"
 
+struct bm_pow_queue; /* pow/pow_queue.h。api_server.hと同じく前方宣言のみ */
+
 struct bm_object_sync_ctx
 {
     sqlite3 *object_pool_db;
@@ -84,7 +86,18 @@ struct bm_object_sync_ctx
      * (BM_TIME_OFFSET_LOG_INTERVAL_SECONDSに1回)。versionを処理するnetwork_epoll_thread
      * という単一スレッドからのみ触られる前提で排他制御はしない(last_gcと同じ理由)。 */
     struct bm_log_throttle time_offset_log_throttle;
+    /* §11 2026-11-03 項目38: getpubkey自応答とonionpeer announceのPoWを投げる先
+     * (src/pow/pow_queue.h)。NULLなら従来通り呼び出し元スレッドで同期実行する
+     * (テスト用。bm_object_sync_ctx_initはNULLで初期化し、main.cがスレッド起動前にセットする)。
+     * セットした後は書き換えないので排他制御はしない。 */
+    struct bm_pow_queue *pow_queue;
+    /* §11 2026-11-03 項目38: pow_queueが溢れてgetpubkey自応答を捨てたときのWARNの間引き用
+     * (BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDSに1回)。getpubkeyを処理するnetwork_epoll_thread
+     * という単一スレッドからのみ触られる前提で排他制御はしない(last_gcと同じ理由)。 */
+    struct bm_log_throttle pow_queue_full_log_throttle;
 };
+
+#define BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDS 600
 
 void bm_object_sync_ctx_init(struct bm_object_sync_ctx *ctx, sqlite3 *object_pool_db,
                               sqlite3 *identity_db, sqlite3 *messages_db, sqlite3 *peers_db,

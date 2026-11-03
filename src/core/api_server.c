@@ -23,6 +23,7 @@
 #include "../infra/object_sync.h"
 #include "../infra/peer_registry.h"
 #include "../pow/pow_engine.h"
+#include "../pow/pow_queue.h"
 #include "address.h"
 #include "config_store.h"
 #include "identity_store.h"
@@ -1131,6 +1132,33 @@ static int check_subject_body_length(const char *subject, const char *body, char
     return -1;
 }
 
+/* §11 2026-11-03 項目38: getpubkey自動要求のPoW完了コールバック(pow_queueのワーカースレッド上、
+ * pow_queue==NULLならapi_server_thread上で呼ばれる)。user_dataはbroadcast_queue(NULL可、
+ * NULLならネットワークへ流さず捨てる)。bm_queue_pushはスレッドセーフ */
+static void getpubkey_request_done(void *user_data, unsigned char *object, size_t object_len, int64_t now)
+{
+    (void)now;
+    bm_queue_t *broadcast_queue = user_data;
+    if (object == NULL)
+    {
+        return;
+    }
+    if (broadcast_queue == NULL)
+    {
+        free(object);
+        return;
+    }
+    struct bm_broadcast_item *item = malloc(sizeof(*item));
+    if (item == NULL)
+    {
+        free(object);
+        return;
+    }
+    item->object = object;
+    item->object_len = object_len;
+    bm_queue_push(broadcast_queue, item);
+}
+
 static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                                        const cJSON *params, char **out_error)
 {
@@ -1179,28 +1207,18 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                 uint64_t gp_target = bm_pow_get_target(getpubkey_len, BM_GETPUBKEY_REQUEST_TTL_SECONDS,
                                                         BM_GETPUBKEY_NONCE_TRIALS_PER_BYTE,
                                                         BM_GETPUBKEY_PAYLOAD_LENGTH_EXTRA_BYTES);
-                uint64_t gp_nonce = bm_pow_run(getpubkey_payload, getpubkey_len, gp_target);
-
-                size_t gp_object_len = 8 + getpubkey_len;
-                unsigned char *gp_object = malloc(gp_object_len);
-                for (int i = 0; i < 8; i++)
-                {
-                    gp_object[i] = (unsigned char)((gp_nonce >> (56 - 8 * i)) & 0xff);
-                }
-                memcpy(gp_object + 8, getpubkey_payload, getpubkey_len);
-                free(getpubkey_payload);
-
-                if (config->broadcast_queue != NULL)
-                {
-                    struct bm_broadcast_item *gp_item = malloc(sizeof(*gp_item));
-                    gp_item->object = gp_object;
-                    gp_item->object_len = gp_object_len;
-                    bm_queue_push(config->broadcast_queue, gp_item);
-                }
-                else
-                {
-                    free(gp_object);
-                }
+                /* §11 2026-11-03 項目38: 以前はここでbm_pow_runを同期実行しており、PoWの間
+                 * api_server_threadが止まっていた(ピア接続は落ちないが、その間APIが一切
+                 * 応答しない)。pow_queueへ投げ、完了したobjectは従来通りbroadcast_queueへ
+                 * 積む(getpubkey_request_done)。dedupキーは宛先のripe。cooldown
+                 * (record_request)はPoWの完了を待たずに投入時点で記録する: 完了前に
+                 * sendMessageが呼び直されても2本目を積まないため(dedupでも弾けるが、
+                 * cooldownの方が「直近に要求した」という意味に合う) */
+                unsigned char gp_key[1 + BM_RIPE_LEN];
+                gp_key[0] = 'G';
+                memcpy(gp_key + 1, to_ripe, BM_RIPE_LEN);
+                bm_pow_queue_submit(config->pow_queue, getpubkey_payload, getpubkey_len, gp_target, gp_key,
+                                    sizeof(gp_key), getpubkey_request_done, config->broadcast_queue, now);
                 bm_pubkey_cache_record_request(config->identity_db, to_ripe, to_version, to_stream, now);
             }
         }

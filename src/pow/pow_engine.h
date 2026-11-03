@@ -5,6 +5,7 @@
  * Proof of Work計算エンジン。DESIGN.md §4。
  */
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -23,5 +24,15 @@ uint64_t bm_pow_trial_value(uint64_t nonce, const unsigned char initial_hash[64]
  * CPUコア数取得に失敗した場合は1スレッド(従来のシングルスレッド探索と同じ経路)にフォールバックする。
  */
 uint64_t bm_pow_run(const unsigned char *payload, size_t payload_len, uint64_t target);
+
+/*
+ * §11 2026-11-03 項目38: bm_pow_runの打ち切り可能版。cancel(NULL可)が立ったら探索を
+ * 打ち切って-1を返す(各ワーカーは既存のfound確認と同じく64回に1回だけcancelを見るので、
+ * 立ててから戻るまでの遅れは高々数十マイクロ秒)。見つかれば*out_nonceへ書いて0を返す。
+ * pow_queue(pow_queue.h)のshutdownで、走行中のv5 pubkey(期待141秒、DESIGN-PQ.md §8.4)の
+ * ようなPoWの完了をjoinが待たされないようにするために足した。
+ */
+int bm_pow_run_cancellable(const unsigned char *payload, size_t payload_len, uint64_t target,
+                           const atomic_bool *cancel, uint64_t *out_nonce);
 
 #endif /* BM_POW_ENGINE_H */

@@ -102,6 +102,12 @@ add_executable(test_pow_engine test_pow_engine.c)
 target_link_libraries(test_pow_engine PRIVATE bm_pow bm_common OpenSSL::Crypto)
 add_test(NAME pow_engine COMMAND test_pow_engine)
 
+# §11 2026-11-03 項目38 PoWのワーカースレッド化(pow_queue)。object_sync経由の
+# getpubkey自応答・onionpeer announceも検証するのでbm_core/bm_infraもリンクする
+add_executable(test_pow_queue test_pow_queue.c)
+target_link_libraries(test_pow_queue PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+add_test(NAME pow_queue COMMAND test_pow_queue)
+
 add_executable(test_getpubkey_automation test_getpubkey_automation.c)
 target_link_libraries(test_getpubkey_automation PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)

@@ -1,5 +1,6 @@
 add_library(bm_pow STATIC
     pow_engine.c
+    pow_queue.c
 )
 
 target_include_directories(bm_pow PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

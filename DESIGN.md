@@ -134,7 +134,9 @@ dispatchに流す→sent.statusがackreceivedへ遷移」までのack往復をen
 (`network_epoll_thread`のハンドラとして動作)から`trial_decrypt`/`pow_engine`を直接関数呼び出しする
 形に単純化されている(1プロセス内スレッド分離という前提上、キュー越しの非同期化より直接呼び出しの
 方がシンプルで、v1では並列度より実装の見通しを優先した)。`pow_worker_thread`の非同期化は
-§11項目38のTODO。
+§11項目38のTODO。**2026-11-03**: 項目38のTier 1として`pow_worker_thread`(1本)を
+`src/pow/pow_queue.c`で実装した。getpubkey自応答・onionpeer announce・getpubkey自動要求の
+PoWはここで行う。send_pipelineのPoWはまだ直接呼び出しのまま(Tier 2)。
 
 **上記の`pow_worker_thread × NumCPU`という記述は誤りなので、実装時に踏襲しないこと
 (2026-09-18追記)**。`bm_pow_run`が既に内部で`sysconf(_SC_NPROCESSORS_ONLN)`本へ探索空間を
@@ -157,6 +159,11 @@ stride分割しているため、ワーカースレッドをNumCPU本立てる�
 | `pow_request_queue` | send_pipeline_thread → pow_worker_thread | `{unsigned char *payload_with_header, size_t len, uint64_t target}` |
 | `pow_result_queue` | pow_worker_thread → send_pipeline_thread | `{uint64_t nonce, unsigned char hash[32]}` |
 | `broadcast_queue` | send_pipeline_thread → network_epoll_thread(送信担当) | `{unsigned char *object_bytes, size_t len}` |
+
+**2026-11-03**: `pow_request_queue`/`pow_result_queue`は使われないまま削除し、`bm_queue_t`ではない
+専用の`struct bm_pow_queue`(`src/pow/pow_queue.h`)に置き換えた。結果は結果キューではなく、
+ワーカースレッド上で呼ばれる完了コールバックで受け取る。dedupと上限の判定のためにリストを
+走査する必要があるので、`bm_queue_t`は使っていない(§11項目38)。
 
 **`broadcast_queue`のみ実際に配線済み(2026-08-22)**。他のキューは上記「実装上の注記」の通り
 未使用のまま。実際のproducerは`api_server.c`の`h_sendMessage`(send_pipeline_threadという
@@ -598,6 +605,9 @@ broadcast_queueへ投入すること・pubkey_requestsへ登録すること・co
 かかる(16コア環境)。実際のBitmessageクライアントでもアドレス作成時のpubkey告知に同程度の
 時間がかかることが知られており設計としては妥当だが、その間`network_epoll_thread`(単一スレッド)
 がブロックされる点は既存のsend_pipeline PoW(APIスレッドをブロック)と同じ性質のトレードオフ。
+**2026-11-03 解消(§11項目38 Tier 1)**: 自応答のPoWは`pow_queue`のワーカースレッドで
+行うようになり、network_epoll_threadは止まらない(getpubkey自動要求のPoWも同じ。
+send_pipelineのPoWは引き続きAPIスレッドで同期実行)。
 (b) 同一宛先への短時間repeated getpubkeyに対する応答側スロットリングは無い。受信object全般の
 PoW検証(§1、2026-08-23実装)により無償のPoW無しobjectでの負荷はかけられなくなったが、
 相手が正規のPoWを払ってgetpubkeyを連投した場合の応答側スロットリングは依然として無い
@@ -3206,6 +3216,51 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       `cancel`フラグを追加するのは10行程度。
     - (既知の割り切り)ジョブは直列処理なので、長いジョブ(v5 pubkey)が先行すると後続の
       msgが待たされる。v1では優先度キューまでは作らない。
+
+    **Tier 1 実装済み(2026-11-03)。** ポスト量子拡張をdaemon本体へ繋ぐ順番をユーザーと
+    相談した結果、v5の前提条件であるこの項目から着手した(PQの有無はブランチではなく
+    master上の実行時フラグで分ける方針。DESIGN-PQ.md §9)。
+
+    - **`src/pow/pow_queue.[ch]`(新規)。** ワーカー1本、FIFOの直列処理。ジョブは
+      「payload(nonce抜き)+target+完了コールバック+dedupキー」で、PoWが終わると
+      ワーカースレッド上で`done(user_data, object, object_len, now)`を呼ぶ
+      (objectは`nonce || payload`。3箇所で重複していた組み立てループを1箇所に寄せた)。
+      Tier 1の3箇所はどれも結果を待つ呼び出し元がいないので、§1.2の
+      `pow_request_queue`/`pow_result_queue`(定義・init済みで未使用だった)は使わず削除し、
+      結果キューの代わりに完了コールバックにした。
+    - **cancel。** `bm_pow_run_cancellable`(`bm_pow_run`はこれの`cancel=NULL`版)を足し、
+      各ワーカーが既存のfound確認と同じ64回に1回の間隔でcancelも見る。
+      `bm_pow_queue_shutdown`は走行中のPoWを打ち切り、待ちジョブを破棄してからjoinする。
+      main.cでは他のどの終了処理より先に呼ぶ(完了コールバックがbroadcast_queue・
+      peer_registry・各DBを使うため)。`bm_pow_queue_destroy`は呼ばない:
+      detachしたnetwork_epoll_threadが終了まで動き続けてsubmitしうるので、mutexを生かしておく。
+    - **dedupキー(設計時に見落としていた点)。** 同期実装では、getpubkey自応答のPoW中は
+      network_epoll_threadが止まっていたので、同じアドレス宛の後続の要求は応答キャッシュ
+      (`self_pubkey_response_cache`)ができてから処理され、自然に再利用されていた。
+      非同期化するとこの暗黙の直列化が無くなり、PoW完了前に届いた要求のたびに同じ応答PoWが
+      積まれる(正規のPoWを払ったgetpubkeyを連打するだけで、v5なら1本141秒のPoWを何本でも
+      積ませられる)。そこで、待ち中か走行中のジョブと同じキーのジョブは投入時に破棄する
+      ようにした。キーは自応答なら応答キャッシュと同じ(ripe, version, stream)、
+      APIのgetpubkey自動要求なら宛先ripe、onionpeerは定数。runningを下ろすのは完了
+      コールバックの後なので、キャッシュの書き込みが終わるまでは再投入が弾かれる。
+    - **待ちジョブの上限は256。** v5 pubkey(約7.8KB)で埋まっても2MB程度。溢れた自応答は
+      捨てる(要求側は応答が来なければ自分で再送する)。
+    - **`ctx->pow_queue == NULL`なら呼び出し元スレッドで同期実行する。**
+      `broadcast_queue == NULL`ならネットワークへ流さない、という既存の慣習と同じ形で、
+      既存テスト(`test_object_sync`/`test_getpubkey_*`等、同期完了が前提)は無改修のまま通る。
+      main.cだけが`object_sync_ctx.pow_queue`と`api_config.pow_queue`をセットする。
+    - **テスト**: `tests/test_pow_queue.c`。ワーカーを塞ぐジョブとして`target=0`
+      (満たすnonceが事実上無く、cancelされるまで終わらない)を使い、「getpubkeyの受信処理が
+      PoWを待たずに戻る」ことを時間計測ではなく「待つ実装なら永遠に戻らない」形で
+      決定的に検証した。他にdedup(走行中・待ち中)、上限、shutdownでのcancel、
+      shutdown後のsubmit、キュー経由の自応答がobject_pool.dbと応答キャッシュへ入ること、
+      その後の同じ要求がキャッシュを再利用してPoWを積まないこと、onionpeer announce。
+      dedupの判定を無効にすると、object_sync経由の検査を含む5件が落ちることも確認した。
+      ASan/UBSan・TSanのビルドでも通過。
+    - **残り(Tier 2)。** send_pipelineの3箇所(msg・broadcast・ack)は引き続き
+      api_server_threadで同期実行する。ピア接続は止めないのでv5のブロッカーではないが、
+      v5 msgのPoW(期待26秒)の間APIが応答しなくなる。フェーズ3(送信側)の前に
+      片付けるのが望ましい。
 
 39. **v5オブジェクトが「v5を理解しないノードを経由して」届くことの実地検証**: 2026-09-18、
     ユーザーとの議論で構成が決まったのでbacklogへ登録。項目37・[DESIGN-PQ.md](DESIGN-PQ.md) §2の

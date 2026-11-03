@@ -15,6 +15,7 @@
 #include "keyring.h"
 
 struct bm_peer_registry; /* infra/peer_registry.h、循環includeを避けるため前方宣言のみ */
+struct bm_pow_queue;     /* pow/pow_queue.h。公開ヘッダからpthreadの実体を引き込まないため前方宣言のみ */
 
 struct bm_api_server_config
 {
@@ -53,6 +54,10 @@ struct bm_api_server_config
     /* §11 2026-08-23 backlog項目5。NULL可(その場合listConnectionsはエラーを返す。testや
      * ネットワーク無効構成用)。listConnectionsが現在の接続一覧を読むために使う。 */
     struct bm_peer_registry *registry;
+    /* §11 2026-11-03 項目38: sendMessageがpubkey未取得の宛先へ自動発行するgetpubkey要求の
+     * PoWを投げる先(src/pow/pow_queue.h)。NULL可(その場合は従来通りapi_server_threadで
+     * 同期実行する。testやCLI単体動作用)。 */
+    struct bm_pow_queue *pow_queue;
 };
 
 /*
