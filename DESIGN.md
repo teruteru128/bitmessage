@@ -4338,3 +4338,47 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     (例: `DB初期化完了`→`DB initialized`、`シグナル %d を受信`→`received signal %d`、
     `idle_sweep(handshake未完了)`→`idle_sweep(handshake incomplete)`)。
     `tests/test_data_dir.sh`が`DB初期化完了`を待っていたので合わせて直した。
+
+    **(2) bitmessage-cliのgettext化(実装済み)**: `src/cli/main.c`の利用者向けメッセージ(約130箇所)を
+    英語のmsgidに書き直して`_()`で囲み、従来の日本語を`po/ja.po`の訳にした。
+    - **usageはコマンド表(`CLI_COMMANDS`)にまとめた**。従来は`print_usage`の巨大な文字列と、
+      各コマンドの引数エラー時の個別の`"使い方: ..."`(27箇所)に同じ書式を二重に書いており、
+      既に食い違いもあった(例: `create-address`の`<version:3|4>`と`<version>`)。書式
+      (synopsis)は翻訳せず表に1回だけ書き、説明(help)だけを`N_()`で翻訳対象にした。
+      引数エラー時は`print_command_usage`が表から該当コマンドの書式を出す。説明文の各行の
+      字下げは表示側で付ける(msgidに字下げの空白を含めると、訳す側も空白を揃える必要が
+      出るため)。英語のmsgidはASCIIだけにした(`§`は"section"と書く。gettextはmsgidが
+      ASCIIである前提の箇所があるため)。
+    - **`setlocale(LC_ALL, "")`にせず、`LC_MESSAGES`と`LC_CTYPE`だけを設定する**
+      (`src/cli/i18n.c`)。`common/json.c`は数値の読み書きに`strtod`/`"%.17g"`を使っており、
+      `LC_NUMERIC`まで環境に合わせると、小数点が`,`のロケール(de_DE等)でdaemonへ送る
+      JSONが壊れる。`LC_CTYPE`は、glibcのgettextが訳(UTF-8)を端末の文字コードへ変換する
+      ために要る(Cのままだと`?`だらけになる)。
+    - **訳(.mo)の探し方**: `BM_LOCALEDIR`環境変数 → 実行ファイルの隣の`locale/`
+      (`/proc/self/exe`基準。ビルドツリーではここに.moを置く) → インストール先
+      (`${CMAKE_INSTALL_FULL_LOCALEDIR}`、既定`/usr/local/share/locale`)。インストール
+      していない`build-*`のCLIでも訳が出るようにしつつ、ビルドツリーの絶対パスを実行ファイルに
+      埋め込まないため。テキストドメイン名は`bitmessage`。
+    - **ビルド**: `BM_ENABLE_NLS`(既定ON)。libintl(glibcは内蔵)かmsgfmtが見つからなければ
+      自動でOFFになり、CLIは英語だけで動く(ビルドは失敗させない)。.moは`msgfmt --check`で
+      作るので、訳の書式指定子がmsgidと食い違うとビルドが落ちる。
+      `cmake --build <dir> --target update-po`でソースから`po/bitmessage.pot`を作り直し、
+      `po/ja.po`へ反映する(`--add-location=file`で行番号は書かない。無関係な変更のたびに
+      差分が出るのを避けるため)。
+    - **「以上」の差し込み**: 本文が長すぎるときのエラーは、従来`"以上"`の有無を`%s`で
+      差し込んでいたが、語順が言語ごとに違うため文の断片は翻訳できない。文ごと2通りに分けた。
+    - **テスト**: `tests/test_cli_i18n.sh`(新規)で、Cロケールでは英語(ASCIIのみ)・日本語
+      ロケールでは日本語(usageの説明文・コマンドごとのusage・不明なコマンド)、引数入りの
+      訳文への埋め込み(接続失敗の`host:port`、IPv6の`[]`)、`BM_LOCALEDIR`での上書きと
+      英語への戻りを確かめる。日本語の検証には実際の`ja_JP.UTF-8`ロケールが要る:
+      `C.UTF-8`+`LANGUAGE=ja`で代用しようとしたが、glibcはC.UTF-8もCロケールとして扱って
+      `LANGUAGE`を無視し、英語のままだった。ロケールが無い環境ではskip(77)する。
+      `tests/test_po_up_to_date.sh`(新規)は、ソースからその場でxgettextしたテンプレートと
+      比べて、`po/ja.po`に未訳・fuzzy・欠落が無いことと、`po/bitmessage.pot`が古くないことを
+      確かめる(msgidを変えて訳を忘れると、そのメッセージだけ黙って英語で出るため)。
+      既存の`tests/test_cli_integration.sh`は`LC_ALL=C`に固定し、英語のメッセージをgrepする
+      ように直した(開発機の`LANG=ja_JP.UTF-8`で結果が変わらないように)。
+      テストが本当に検出できるか、わざと壊して確認した: msgidを1つ変えると`po_up_to_date`が、
+      実行ファイルの隣の`locale/`を探さないようにすると`cli_i18n`が失敗する。
+      CIは全ジョブにgettextとja_JP.UTF-8ロケールを入れた(入れないとNLSが自動でOFFになり、
+      訳の検査が黙って回らなくなるため)。ビルド警告ゼロ、ctest 56件全通過。

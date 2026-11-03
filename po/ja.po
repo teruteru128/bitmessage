@@ -1,0 +1,412 @@
+# Japanese translations for bitmessage-cli.
+# This file is distributed under the same license as the bitmessage package.
+# Automatically generated, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: bitmessage 1.3.0\n"
+"Report-Msgid-Bugs-To: https://github.com/teruteru128/bitmessage/issues\n"
+"POT-Creation-Date: 2026-11-03 22:09+0900\n"
+"PO-Revision-Date: 2026-11-03 22:09+0900\n"
+"Last-Translator: \n"
+"Language-Team: none\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: src/cli/main.c
+msgid ""
+"Import an address from a WIF key pair taken from keys.dat (PyBitmessage).\n"
+"Fails if the ripe derived from the address does not match the ripe of the\n"
+"WIF public keys"
+msgstr ""
+"keys.dat(PyBitmessage本家)由来のWIF鍵ペアからアドレスをインポートする。\n"
+"addressから復元したripeとWIFの公開鍵ripeが一致しないと失敗する"
+
+#: src/cli/main.c
+msgid ""
+"Bulk-import an entire keys.dat (PyBitmessage, INI format). The same\n"
+"storePassphrase is used for every address (assumes bulk unlock with the\n"
+"vault scheme in DESIGN.md section 7.4). Addresses are sent in batches with\n"
+"importAddressesBulk"
+msgstr ""
+"keys.dat(PyBitmessage本家、INI形式)を丸ごと一括インポートする。全アドレスへ\n"
+"共通のstorePassphraseを使う(§7.4のvault方式による一括unlockを前提)。\n"
+"importAddressesBulkで一定件数ずつまとめて送信する"
+
+#: src/cli/main.c
+msgid ""
+"Change only the label of an address (private keys are not touched; offers\n"
+"through the API what PyBitmessage offers in its GUI)"
+msgstr ""
+"アドレスのラベルのみ変更する(秘密鍵には触れない、PyBitmessage本家のGUI相当の\n"
+"機能を本実装独自にAPI経由で提供)"
+
+#: src/cli/main.c
+msgid ""
+"Re-parse keys.dat and update only the labels of existing addresses to the\n"
+"correct values. Meant for repairing labels garbled by import-keys-dat"
+msgstr ""
+"keys.datを再パースし、既存アドレスのラベルだけを一括で正しい値に更新する。\n"
+"import-keys-datで文字化けしたラベルを後から修正する用途を想定"
+
+#: src/cli/main.c
+msgid ""
+"Join or create a chan (private group channel). Everyone who uses the same\n"
+"passphrase shares the same address and keys. Post with\n"
+"send-message <chanAddr> <chanAddr> ... (sending to itself); once unlocked,\n"
+"other members' posts can be read with get-inbox"
+msgstr ""
+"chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
+"同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> ...\n"
+"(自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める"
+
+#: src/cli/main.c
+msgid ""
+"Decrypt with the passphrase on the spot and return the WIF key pair, "
+"whether\n"
+"or not the address is unlocked (a one-shot operation that does not touch\n"
+"the keyring; the counterpart of importAddress)"
+msgstr ""
+"unlock中かどうかに関わらず、その場でpassphrase復号しWIF鍵ペアを返す\n"
+"(keyringには触れない一回性操作、importAddressと対称)"
+
+#: src/cli/main.c
+msgid ""
+"Try to unlock every row of identity.db with a common passphrase. Each row\n"
+"keeps its own kdf_salt, so rows that do not match are silently skipped (not\n"
+"an error). Returns an array of [{address, unlocked}], so you can tell which\n"
+"rows did not match.\n"
+"If identity.db has more than 10,000 entries, nothing is unlocked and an\n"
+"error is returned (trial decryption of received msgs gets heavier in\n"
+"proportion to the count; unlock the addresses you need with\n"
+"unlock-addresses)"
+msgstr ""
+"identity.db全件に対し共通passphraseでunlockを試みる。行ごとのkdf_saltは\n"
+"個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
+"戻り値は[{address, unlocked}]の配列で、どの行が不一致だったか判別できる。\n"
+"identity.dbが10,000件を超える場合は何もunlockせずエラーになる(受信msgの\n"
+"試行復号が件数に比例して重くなるため。必要なアドレスはunlock-addressesで)"
+
+#: src/cli/main.c
+msgid ""
+"Unlock the addresses listed one per line in a file (\"-\" for stdin) with a\n"
+"common passphrase (blank lines and lines starting with # are ignored).\n"
+"Calling unlock repeatedly runs scrypt every time; this runs it once per\n"
+"1,000 addresses. Failed addresses and the reason (address not found /\n"
+"passphrase mismatch) are printed to stderr, and the exit status is non-zero\n"
+"if any address failed. With --backfill, past msgs addressed to the unlocked\n"
+"addresses are looked up in object_pool.db and put into the inbox (unlike\n"
+"unlock, this is off by default because it takes time proportional to\n"
+"msgs x addresses)"
+msgstr ""
+"ファイル(\"-\"なら標準入力)に1行1アドレスで並べたアドレスを、共通passphraseで\n"
+"まとめてunlockする(空行と#で始まる行は無視)。unlockを1件ずつ繰り返すと毎回\n"
+"scryptが走るが、こちらは1,000件ごとに1回で済む。失敗したアドレスと理由\n"
+"(address not found / passphrase mismatch)をstderrへ出し、1件でも失敗すれば\n"
+"終了コードは非0。--backfillを付けると、unlockできたアドレス宛の過去msgを\n"
+"object_pool.dbから探してinboxへ入れる(unlockと違い既定では行わない。\n"
+"msg数×アドレス数に比例して時間がかかるため)"
+
+#: src/cli/main.c
+msgid ""
+"Move a v3 address to the v4 address with the same keys (creating the v4 if\n"
+"missing, rewriting the addresses in inbox/sent, and deleting the v3).\n"
+"Needed because v3 and v4 share the ripe, so received msgs cannot be told\n"
+"apart by their destination"
+msgstr ""
+"v3アドレスを同じ鍵のv4アドレスへ移す(v4が無ければ作り、inbox/sentのアドレスを\n"
+"書き換え、v3を削除する)。v3とv4はripeが共通で受信msgの宛先を区別できないため"
+
+#: src/cli/main.c
+msgid ""
+"Run convert-to-v4 on up to limit v3 addresses in identity.db, oldest first\n"
+"(default 1000, at most 10000). Repeat until remaining in the result is 0"
+msgstr ""
+"identity.dbのv3を古い順に最大limit件(既定1000、上限10000)まとめてconvert-to-v4する。\n"
+"戻り値のremainingが0になるまで繰り返し実行する"
+
+#: src/cli/main.c
+msgid ""
+"Manually register a peer's public keys (130 hex digits each) in\n"
+"pubkey_cache. Normally send-message sends a getpubkey request automatically\n"
+"when the key is unknown and caches the reply, so this command is for when\n"
+"you already know the keys or want to skip that wait"
+msgstr ""
+"相手の公開鍵(いずれも130桁hex)を手動でpubkey_cacheへ登録する。\n"
+"通常はsend-messageが未登録ならgetpubkey要求を自動送出し応答を自動キャッシュ\n"
+"するため、本コマンドは事前に鍵を知っている場合や、その待ち時間を省きたい\n"
+"場合の手動登録手段"
+
+#: src/cli/main.c
+msgid ""
+"The recipient's public encryption key is always resolved from\n"
+"pubkey_cache. If it is not there, a getpubkey request is sent\n"
+"automatically; wait for the reply and run the same command again, or\n"
+"register the key first with cache-pubkey.\n"
+"With --body-file <path>, the body is read from the file instead of the\n"
+"<body> argument (\"-\" for stdin). Use it for long or multi-line bodies: a\n"
+"body passed as an argument is visible in ps(1) and stays in the shell\n"
+"history. subject + body may be up to 261644 bytes in total (2^18-500, the\n"
+"same as PyBitmessage)"
+msgstr ""
+"宛先の公開暗号鍵は常にpubkey_cacheから解決する。未登録ならgetpubkey要求を\n"
+"自動送出するので、応答を待ってから同じコマンドを再実行するか、先にcache-pubkeyで\n"
+"鍵を登録しておく。\n"
+"--body-file <path>を付けると<body>の位置引数の代わりにファイルから本文を読む\n"
+"(pathが\"-\"なら標準入力)。長文・改行を含む本文はこちらを使うこと。位置引数で\n"
+"渡すと本文がps(1)から見えシェル履歴にも残る。subject+本文の合計は\n"
+"261644バイトまで(PyBitmessage本家と同じ2^18-500)"
+
+#: src/cli/main.c
+msgid ""
+"List the sent box (sent table). Each element has msgId/toAddress/\n"
+"fromAddress/subject/body/status (sent|ackreceived|msgsentnoackexpected)/\n"
+"sentTime/ttl/resendCount"
+msgstr ""
+"送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
+"fromAddress/subject/body/status(sent|ackreceived|msgsentnoackexpected)/\n"
+"sentTime/ttl/resendCount"
+
+#: src/cli/main.c
+msgid ""
+"Move the message to folder='trash' in both inbox and sent (as\n"
+"PyBitmessage's trashMessage does). Not an error if nothing matches"
+msgstr ""
+"inbox/sent両方に対してfolder='trash'化を試みる(PyBitmessage本家trashMessage準拠)。\n"
+"該当が無くてもエラーにしない"
+
+#: src/cli/main.c
+msgid ""
+"--body-file works as in send-message (the body is read from the file, or\n"
+"from stdin for \"-\")"
+msgstr "--body-fileの意味はsend-messageと同じ(ファイル、\"-\"なら標準入力から本文を読む)"
+
+#: src/cli/main.c
+msgid ""
+"Subscribe to broadcasts (DESIGN.md section 5.4) from the address. Broadcasts\n"
+"received from it are saved to the inbox from then on"
+msgstr ""
+"broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
+"受信したらinboxへ保存する"
+
+#: src/cli/main.c
+msgid ""
+"Fails if the same address is already registered (no duplicates, as in\n"
+"PyBitmessage)"
+msgstr "既に同じaddressが登録済みならエラーになる(重複禁止、PyBitmessage本家準拠)"
+
+#: src/cli/main.c
+msgid ""
+"Outbound SOCKS5 proxy (Tor etc.) used only for onion peers (.onion).\n"
+"Stored in config.db and picked up by a running bitmessaged at its next\n"
+"reconnect cycle (within 30 seconds by default; no restart needed)"
+msgstr ""
+"onion peer(.onion宛)専用のoutbound SOCKS5プロキシ(Tor等)設定。config.dbへ\n"
+"永続化され、稼働中のbitmessagedにも次の再接続サイクル(既定30秒以内)で\n"
+"反映される(再起動不要)"
+
+#: src/cli/main.c
+msgid ""
+"Outbound SOCKS5 proxy used only for clearnet IPs. Disabled (direct) by\n"
+"default. It is separate from the onion one because enabling it sends even\n"
+"clearnet connections through Tor exit nodes, where rate limits on the\n"
+"shared IPs hurt connectivity to other nodes (see DESIGN.md section 11)"
+msgstr ""
+"クリアネットIP宛専用のoutbound SOCKS5プロキシ設定。既定disabled(直結)。\n"
+"onion用と分離しているのは、有効にするとクリアネットIP宛の接続まで\n"
+"Tor出口ノード経由になり、共有IPゆえのレート制限で外部ノードへの接続性が\n"
+"悪化するため(DESIGN.md §11参照)"
+
+#: src/cli/main.c
+msgid ""
+"Manually add to peers.db a peer you have personally confirmed to exist\n"
+"(through a channel where you actually know the operator, not an anonymous\n"
+"list on a message board). A last resort when all mainnet seeds are down"
+msgstr ""
+"個人的に存在を確認した(掲示板等の匿名リストではなく実際に運用者と面識のある\n"
+"経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段"
+
+#: src/cli/main.c
+msgid ""
+"Return the currently connected peers ({inbound:[...], outbound:[...]},\n"
+"each element host/port/fd/fullyEstablished/userAgent/sentBytes/\n"
+"receivedBytes). fd is the real fd number in the registry (for debugging;\n"
+"the \"fd=N\" in broadcast_inv failure logs is a throwaway dup() number\n"
+"unrelated to it). sentBytes may not include what was sent via\n"
+"broadcast_inv (the overall total in get-network-stats does)"
+msgstr ""
+"現在接続中のpeer一覧({inbound:[...], outbound:[...]}、各要素host/port/fd/\n"
+"fullyEstablished/userAgent/sentBytes/receivedBytes)を返す。fdはregistry上の\n"
+"実fd番号(デバッグ用。broadcast_inv失敗ログの\"fd=N\"はdup()した使い捨て番号\n"
+"なのでこの値とは無関係)。sentBytesはbroadcast_inv経由の分だけ含まれない\n"
+"場合がある(get-network-statsの全体累積には含まれる)"
+
+#: src/cli/main.c
+msgid ""
+"Total bytes sent/received since the process started ({sentBytes,\n"
+"receivedBytes}, including connections already closed)"
+msgstr ""
+"プロセス起動時からの送受信バイト数の全体累積({sentBytes,\n"
+"receivedBytes}、切断済みの接続ぶんも含む)"
+
+#: src/cli/main.c
+#, c-format
+msgid "Usage: %s <command> [args...]\n"
+msgstr "使い方: %s <command> [args...]\n"
+
+#: src/cli/main.c
+msgid ""
+"Environment variables: BM_API_HOST (default 127.0.0.1) BM_API_PORT (default "
+"8442) BM_API_USER BM_API_PASS\n"
+msgstr ""
+"環境変数: BM_API_HOST(既定127.0.0.1) BM_API_PORT(既定8442) BM_API_USER BM_API_PASS\n"
+
+#: src/cli/main.c
+msgid "Commands:\n"
+msgstr "コマンド:\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Usage: %s %s\n"
+msgstr "使い方: %s %s\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Could not connect to %s%s%s:%d (is bitmessaged running?)"
+msgstr "接続に失敗しました(%s%s%s:%d、bitmessagedは起動していますか?)"
+
+#: src/cli/main.c
+msgid "Authentication failed (check BM_API_USER/BM_API_PASS)"
+msgstr "認証に失敗しました(BM_API_USER/BM_API_PASSを確認してください)"
+
+#: src/cli/main.c
+#, c-format
+msgid "Could not parse the server response as JSON (HTTP %d)"
+msgstr "サーバー応答をJSONとして解釈できませんでした(HTTP %d)"
+
+#: src/cli/main.c
+msgid "(unknown error)"
+msgstr "(不明なエラー)"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s"
+msgstr "エラー: %s"
+
+#: src/cli/main.c
+#, c-format
+msgid "Entire batch failed (%zu entries): %s\n"
+msgstr "バッチ全体が失敗しました(%zu件): %s\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Malformed batch response (counting %zu entries as skipped)\n"
+msgstr "バッチ応答の形式が不正です(%zu件をスキップ扱いにします)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Skipped: %s (%s)\n"
+msgstr "スキップ: %s (%s)\n"
+
+#: src/cli/main.c
+msgid "unknown error"
+msgstr "不明なエラー"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: cannot open %s\n"
+msgstr "エラー: %s を開けません\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Import finished: %d succeeded, %d failed, %d skipped (missing keys)\n"
+msgstr "インポート完了: 成功%d件, 失敗%d件, 鍵欠落でスキップ%d件\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Malformed batch response (counting %zu entries as failed)\n"
+msgstr "バッチ応答の形式が不正です(%zu件を失敗扱いにします)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Failed: %s (%s)\n"
+msgstr "失敗: %s (%s)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: out of memory\n"
+msgstr "エラー: メモリ確保に失敗しました\n"
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Unlock finished: %d succeeded, %d failed, %d msg(s) newly added to the inbox "
+"by backfill\n"
+msgstr "unlock完了: 成功%d件, 失敗%d件, backfillで新たにinboxへ入ったmsg %d件\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Unlock finished: %d succeeded, %d failed\n"
+msgstr "unlock完了: 成功%d件, 失敗%d件\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Label fix finished: %d succeeded, %d failed\n"
+msgstr "ラベル修正完了: 成功%d件, 失敗%d件\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: failed to read %s\n"
+msgstr "エラー: %s の読み込みに失敗しました\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s contains a NUL byte (specify a text file)\n"
+msgstr "エラー: %s にNULバイトが含まれています(テキストファイルを指定してください)\n"
+
+#: src/cli/main.c
+msgid "standard input"
+msgstr "標準入力"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: no file path given for --body-file\n"
+msgstr "エラー: --body-file にファイルパスが指定されていません\n"
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: even with --body-file, all positional arguments before the body are "
+"required\n"
+msgstr "エラー: --body-file を使う場合でも、本文より前の位置引数は全て指定してください\n"
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: body too long (subject %zu bytes + body %zu bytes or more; the limit "
+"is %zu bytes in total)\n"
+msgstr "エラー: 本文が長すぎます(subject %zuバイト + 本文 %zuバイト以上、上限は合計%zuバイト)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: body too long (subject %zu bytes + body %zu bytes; the limit is %zu "
+"bytes in total)\n"
+msgstr "エラー: 本文が長すぎます(subject %zuバイト + 本文 %zuバイト、上限は合計%zuバイト)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s must be a number (got: %s)\n"
+msgstr "エラー: %s には数値を指定してください(指定値: %s)\n"
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Unknown command: %s\n"
+"\n"
+msgstr ""
+"不明なコマンド: %s\n"
+"\n"

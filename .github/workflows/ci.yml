@@ -13,6 +13,11 @@ on:
 # pkg-config自体はubuntu-latestイメージにはプリインストールされているが、Fedoraコンテナには
 # 入っていないため明示的にインストールする(暗黙のイメージ依存を作らないよう、Ubuntu側でも
 # 省略せず書いておく)。
+#
+# §11 2026-11-03 項目54(国際化): gettext(msgfmt/xgettext/msgcmp)とja_JP.UTF-8ロケールを
+# 全ジョブに入れている。gettextが無いとBM_ENABLE_NLSが自動でOFFになり、訳のビルドと
+# tests/test_po_up_to_date.sh・test_cli_i18n.shが黙って登録されない/skipされるため
+# (CIで訳の検査が回らないまま緑になるのを防ぐ)。
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -24,7 +29,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config \
                                   libssl-dev libsqlite3-dev \
-                                  libmicrohttpd-dev libcjson-dev
+                                  libmicrohttpd-dev libcjson-dev \
+                                  gettext locales
+          sudo locale-gen ja_JP.UTF-8
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -51,7 +58,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config \
                                   libssl-dev libsqlite3-dev \
-                                  libmicrohttpd-dev libcjson-dev
+                                  libmicrohttpd-dev libcjson-dev \
+                                  gettext locales
+          sudo locale-gen ja_JP.UTF-8
 
       - name: Configure (ASan+UBSan)
         run: cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_ASAN=ON -DBM_ENABLE_UBSAN=ON
@@ -84,7 +93,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config \
                                   libssl-dev libsqlite3-dev \
-                                  libmicrohttpd-dev libcjson-dev
+                                  libmicrohttpd-dev libcjson-dev \
+                                  gettext locales
+          sudo locale-gen ja_JP.UTF-8
 
       - name: Configure (TSan)
         run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DBM_ENABLE_TSAN=ON
@@ -121,7 +132,8 @@ jobs:
         run: |
           dnf install -y cmake gcc make git pkgconf-pkg-config \
                          openssl-devel sqlite-devel \
-                         libmicrohttpd-devel cjson-devel
+                         libmicrohttpd-devel cjson-devel \
+                         gettext glibc-langpack-ja
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

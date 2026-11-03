@@ -72,12 +72,14 @@ v1.1で実装済み)
   自動的に除外され、daemon本体には影響しない。DESIGN-PQ.md §6.1)
 - libmicrohttpd、cJSON(JSON-RPC APIサーバーのHTTPトランスポートとJSON処理、
   `pkg-config`経由で検出する。DESIGN.md §6.3参照)
+- gettext(任意。`bitmessage-cli`のメッセージの日本語訳をビルドする。無ければCLIは
+  英語だけで動く。DESIGN.md §11項目54)
 
 Debian/Ubuntu系なら以下で揃う。
 
 ```sh
 sudo apt install cmake ninja-build build-essential pkg-config \
-                 libssl-dev libsqlite3-dev libmicrohttpd-dev libcjson-dev
+                 libssl-dev libsqlite3-dev libmicrohttpd-dev libcjson-dev gettext
 ```
 
 ```sh

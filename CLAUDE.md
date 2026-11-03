@@ -26,7 +26,7 @@ cmake --build build-Debug --parallel
 cd build-Debug && ctest --output-on-failure
 ```
 
-**必ず全件(現在54件。OpenSSL 3.5未満の環境ではPQ関連の3件が除外され51件)が100%通過することを確認してから完了とすること。** 1件でも失敗した状態で
+**必ず全件(現在56件。OpenSSL 3.5未満の環境ではPQ関連の3件が除外され53件、gettextが無い環境では訳の検査2件も登録されない)が100%通過することを確認してから完了とすること。** 1件でも失敗した状態で
 「実装できました」と報告しない。特定のテストだけ再実行する場合:
 
 ```
@@ -63,6 +63,10 @@ ctest -R <test_name> --output-on-failure   # 例: ctest -R object_sync
 - **DBスキーマへの列追加は`CREATE TABLE IF NOT EXISTS`を変更するだけでなく、`ALTER TABLE ...
   ADD COLUMN ... DEFAULT ...`を`init_schema`内に追記し、エラー(既存カラムとの重複)は無視する。**
   既に稼働中のDBファイルに新しい列を反映するための必須パターン(`is_self`, `last_attempt`等)。
+- **`bitmessage-cli`(`src/cli/`)の利用者向けメッセージは英語で書いて`_()`で囲み、
+  `cmake --build build-Debug --target update-po`の後に`po/ja.po`へ日本語訳を書く**
+  (訳し忘れは`po_up_to_date`テストが落とす)。daemon(`bitmessaged`)のログ・usageは
+  翻訳せず英語で書く(DESIGN.md §11項目54)。
 - 新しいstruct/ctxフィールドが「単一スレッドからのみ触られる前提で排他制御をしない」場合は、
   必ずそれをコメントで明記する(`last_gc`, `last_onion_announce`等)。sqlite3ハンドルは
   `SQLITE_OPEN_FULLMUTEX`(`common/db_common.c`)でスレッド間共有が安全な前提。

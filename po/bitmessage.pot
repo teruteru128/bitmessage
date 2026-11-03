@@ -1,0 +1,347 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the bitmessage package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: bitmessage 1.3.0\n"
+"Report-Msgid-Bugs-To: https://github.com/teruteru128/bitmessage/issues\n"
+"POT-Creation-Date: 2026-11-03 22:12+0900\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=CHARSET\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/cli/main.c
+msgid ""
+"Import an address from a WIF key pair taken from keys.dat (PyBitmessage).\n"
+"Fails if the ripe derived from the address does not match the ripe of the\n"
+"WIF public keys"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Bulk-import an entire keys.dat (PyBitmessage, INI format). The same\n"
+"storePassphrase is used for every address (assumes bulk unlock with the\n"
+"vault scheme in DESIGN.md section 7.4). Addresses are sent in batches with\n"
+"importAddressesBulk"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Change only the label of an address (private keys are not touched; offers\n"
+"through the API what PyBitmessage offers in its GUI)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Re-parse keys.dat and update only the labels of existing addresses to the\n"
+"correct values. Meant for repairing labels garbled by import-keys-dat"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Join or create a chan (private group channel). Everyone who uses the same\n"
+"passphrase shares the same address and keys. Post with\n"
+"send-message <chanAddr> <chanAddr> ... (sending to itself); once unlocked,\n"
+"other members' posts can be read with get-inbox"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Decrypt with the passphrase on the spot and return the WIF key pair, "
+"whether\n"
+"or not the address is unlocked (a one-shot operation that does not touch\n"
+"the keyring; the counterpart of importAddress)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Try to unlock every row of identity.db with a common passphrase. Each row\n"
+"keeps its own kdf_salt, so rows that do not match are silently skipped (not\n"
+"an error). Returns an array of [{address, unlocked}], so you can tell which\n"
+"rows did not match.\n"
+"If identity.db has more than 10,000 entries, nothing is unlocked and an\n"
+"error is returned (trial decryption of received msgs gets heavier in\n"
+"proportion to the count; unlock the addresses you need with\n"
+"unlock-addresses)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Unlock the addresses listed one per line in a file (\"-\" for stdin) with a\n"
+"common passphrase (blank lines and lines starting with # are ignored).\n"
+"Calling unlock repeatedly runs scrypt every time; this runs it once per\n"
+"1,000 addresses. Failed addresses and the reason (address not found /\n"
+"passphrase mismatch) are printed to stderr, and the exit status is non-zero\n"
+"if any address failed. With --backfill, past msgs addressed to the unlocked\n"
+"addresses are looked up in object_pool.db and put into the inbox (unlike\n"
+"unlock, this is off by default because it takes time proportional to\n"
+"msgs x addresses)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Move a v3 address to the v4 address with the same keys (creating the v4 if\n"
+"missing, rewriting the addresses in inbox/sent, and deleting the v3).\n"
+"Needed because v3 and v4 share the ripe, so received msgs cannot be told\n"
+"apart by their destination"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Run convert-to-v4 on up to limit v3 addresses in identity.db, oldest first\n"
+"(default 1000, at most 10000). Repeat until remaining in the result is 0"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Manually register a peer's public keys (130 hex digits each) in\n"
+"pubkey_cache. Normally send-message sends a getpubkey request automatically\n"
+"when the key is unknown and caches the reply, so this command is for when\n"
+"you already know the keys or want to skip that wait"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"The recipient's public encryption key is always resolved from\n"
+"pubkey_cache. If it is not there, a getpubkey request is sent\n"
+"automatically; wait for the reply and run the same command again, or\n"
+"register the key first with cache-pubkey.\n"
+"With --body-file <path>, the body is read from the file instead of the\n"
+"<body> argument (\"-\" for stdin). Use it for long or multi-line bodies: a\n"
+"body passed as an argument is visible in ps(1) and stays in the shell\n"
+"history. subject + body may be up to 261644 bytes in total (2^18-500, the\n"
+"same as PyBitmessage)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"List the sent box (sent table). Each element has msgId/toAddress/\n"
+"fromAddress/subject/body/status (sent|ackreceived|msgsentnoackexpected)/\n"
+"sentTime/ttl/resendCount"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Move the message to folder='trash' in both inbox and sent (as\n"
+"PyBitmessage's trashMessage does). Not an error if nothing matches"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"--body-file works as in send-message (the body is read from the file, or\n"
+"from stdin for \"-\")"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Subscribe to broadcasts (DESIGN.md section 5.4) from the address. "
+"Broadcasts\n"
+"received from it are saved to the inbox from then on"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Fails if the same address is already registered (no duplicates, as in\n"
+"PyBitmessage)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Outbound SOCKS5 proxy (Tor etc.) used only for onion peers (.onion).\n"
+"Stored in config.db and picked up by a running bitmessaged at its next\n"
+"reconnect cycle (within 30 seconds by default; no restart needed)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Outbound SOCKS5 proxy used only for clearnet IPs. Disabled (direct) by\n"
+"default. It is separate from the onion one because enabling it sends even\n"
+"clearnet connections through Tor exit nodes, where rate limits on the\n"
+"shared IPs hurt connectivity to other nodes (see DESIGN.md section 11)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Manually add to peers.db a peer you have personally confirmed to exist\n"
+"(through a channel where you actually know the operator, not an anonymous\n"
+"list on a message board). A last resort when all mainnet seeds are down"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Return the currently connected peers ({inbound:[...], outbound:[...]},\n"
+"each element host/port/fd/fullyEstablished/userAgent/sentBytes/\n"
+"receivedBytes). fd is the real fd number in the registry (for debugging;\n"
+"the \"fd=N\" in broadcast_inv failure logs is a throwaway dup() number\n"
+"unrelated to it). sentBytes may not include what was sent via\n"
+"broadcast_inv (the overall total in get-network-stats does)"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Total bytes sent/received since the process started ({sentBytes,\n"
+"receivedBytes}, including connections already closed)"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Usage: %s <command> [args...]\n"
+msgstr ""
+
+#: src/cli/main.c
+msgid ""
+"Environment variables: BM_API_HOST (default 127.0.0.1) BM_API_PORT (default "
+"8442) BM_API_USER BM_API_PASS\n"
+msgstr ""
+
+#: src/cli/main.c
+msgid "Commands:\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Usage: %s %s\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Could not connect to %s%s%s:%d (is bitmessaged running?)"
+msgstr ""
+
+#: src/cli/main.c
+msgid "Authentication failed (check BM_API_USER/BM_API_PASS)"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Could not parse the server response as JSON (HTTP %d)"
+msgstr ""
+
+#: src/cli/main.c
+msgid "(unknown error)"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Entire batch failed (%zu entries): %s\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Malformed batch response (counting %zu entries as skipped)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Skipped: %s (%s)\n"
+msgstr ""
+
+#: src/cli/main.c
+msgid "unknown error"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: cannot open %s\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Import finished: %d succeeded, %d failed, %d skipped (missing keys)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Malformed batch response (counting %zu entries as failed)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Failed: %s (%s)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: out of memory\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Unlock finished: %d succeeded, %d failed, %d msg(s) newly added to the inbox "
+"by backfill\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Unlock finished: %d succeeded, %d failed\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Label fix finished: %d succeeded, %d failed\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: failed to read %s\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s contains a NUL byte (specify a text file)\n"
+msgstr ""
+
+#: src/cli/main.c
+msgid "standard input"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: no file path given for --body-file\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: even with --body-file, all positional arguments before the body are "
+"required\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: body too long (subject %zu bytes + body %zu bytes or more; the limit "
+"is %zu bytes in total)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Error: body too long (subject %zu bytes + body %zu bytes; the limit is %zu "
+"bytes in total)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid "Error: %s must be a number (got: %s)\n"
+msgstr ""
+
+#: src/cli/main.c
+#, c-format
+msgid ""
+"Unknown command: %s\n"
+"\n"
+msgstr ""

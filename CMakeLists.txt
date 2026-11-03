@@ -73,6 +73,25 @@ if(BM_SANITIZE_FLAGS)
     add_link_options("-fsanitize=${BM_SANITIZE_FLAGS_JOINED}")
 endif()
 
+# §11 2026-11-03 項目54(国際化): bitmessage-cliのメッセージをgettextで翻訳する(daemonは
+# 翻訳せず英語、DESIGN.md §11項目54)。glibcはlibintlを内蔵しているのでFindIntlは通常
+# 追加のライブラリ無しで見つかる。.moの生成にはmsgfmt(gettextパッケージ)が要る。どちらかが
+# 無い環境ではBM_ENABLE_NLSを自動でOFFにし、CLIは英語だけで動く(ビルドは失敗させない。
+# 翻訳は付加機能で、無くてもdaemon・CLIの機能は欠けないため)。
+option(BM_ENABLE_NLS "Translate bitmessage-cli messages with gettext" ON)
+if(BM_ENABLE_NLS)
+    find_package(Intl)
+    find_package(Gettext)
+    if(NOT Intl_FOUND OR NOT GETTEXT_MSGFMT_EXECUTABLE)
+        message(STATUS "libintl or msgfmt not found: bitmessage-cli translations are disabled")
+        set(BM_ENABLE_NLS OFF)
+    endif()
+endif()
+
+# GNUInstallDirsはinstall()(下記)に加えて、src/cli/がCMAKE_INSTALL_FULL_LOCALEDIR
+# (訳の.moのインストール先)を使うので、add_subdirectory(src)より前でincludeする。
+include(GNUInstallDirs)
+
 add_subdirectory(src)
 
 # §11 2026-08-24 backlog項目10の3/5: cmake --install用のinstall()定義。GNUInstallDirsで
@@ -81,7 +100,7 @@ add_subdirectory(src)
 # 置き場所(BM_DATA_DIR/BM_CONFIG_FILE)はユーザー状態データのためインストール対象に
 # 含めない(backlog項目10の2/5、main.c参照。既定はCWDのまま、systemdユニット
 # ファイル(backlog項目10の4/5、下記)側でEnvironment=として明示指定する)。
-include(GNUInstallDirs)
+# include(GNUInstallDirs)自体はsrc/cli/でも使うため、add_subdirectory(src)の前へ移した。
 
 install(TARGETS bitmessaged bitmessage-cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

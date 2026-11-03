@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+# §11 2026-11-03 項目54(国際化): CLIのメッセージはロケールに応じて翻訳されるようになったため、
+# 実行環境のロケール(開発機のLANG=ja_JP.UTF-8等)に左右されないよう英語(msgid)に固定し、
+# 以下では英語のメッセージをgrepする。日本語表示はtest_cli_i18n.shで別に検証している。
+# LC_ALLにしてもCLIはLC_MESSAGES/LC_CTYPEしか使わない(i18n.c参照)。日本語の本文・ラベルは
+# バイト列のまま通るので、このテスト内の日本語のgrepもCロケールで問題なく一致する。
+export LC_ALL=C
+unset LANGUAGE
+
 BITMESSAGED="$1"
 CLI="$2"
 
@@ -82,7 +90,7 @@ echo "$LIST2" | grep -q '"unlocked":true' || fail "address should be unlocked no
 # `cmd | grep -q` の形にするとgrepがマッチしてもcmd側の非ゼロ終了が伝播して
 # if全体が偽になってしまう。先に出力を変数へ捕まえてからgrepする。
 AUTH_FAIL_OUTPUT=$(BM_API_PASS="wrongpassword" "$CLI" list-addresses 2>&1 || true)
-echo "$AUTH_FAIL_OUTPUT" | grep -q "認証に失敗" \
+echo "$AUTH_FAIL_OUTPUT" | grep -q "Authentication failed" \
     || fail "wrong credentials should be rejected with an auth error (got: $AUTH_FAIL_OUTPUT)"
 
 # get-inbox: 空のDBでは空配列
@@ -106,14 +114,14 @@ ADDR2B=$(echo "$ADDR2B_JSON" | tr -d '"')
 "$CLI" delete "$ADDR2B" >/dev/null
 
 SEND_UNCACHED_OUTPUT=$("$CLI" send-message "$ADDR2" "$ADDR2B" "subj" "body" 2>&1 || true)
-echo "$SEND_UNCACHED_OUTPUT" | grep -q "エラー" \
+echo "$SEND_UNCACHED_OUTPUT" | grep -q "Error: " \
     || fail "send-message to an address with no cached pubkey should fail with an error (got: $SEND_UNCACHED_OUTPUT)"
 
 "$CLI" delete "$ADDR2" >/dev/null
 
 # cache-pubkey: 引数検証を確認する。
 CACHE_USAGE_OUTPUT=$("$CLI" cache-pubkey "onlyoneparam" 2>&1 || true)
-echo "$CACHE_USAGE_OUTPUT" | grep -q "使い方" \
+echo "$CACHE_USAGE_OUTPUT" | grep -q "^Usage: " \
     || fail "cache-pubkey with wrong arg count should print usage (got: $CACHE_USAGE_OUTPUT)"
 
 ADDR4_JSON=$("$CLI" create-address "cli cache-pubkey test receiver" 4 1 1 "recv4" "storepass4")
@@ -122,7 +130,7 @@ ADDR4=$(echo "$ADDR4_JSON" | tr -d '"')
 # create-addressはpubkeyを返さないため、cache-pubkeyの成功パス自体はtests/test_api_server.cで
 # 既にカバーしている(cachePubkey + sendMessageのHTTPテスト)。ここではCLI引数の配線のみ確認する。
 CACHE_BAD_HEX_OUTPUT=$("$CLI" cache-pubkey "$ADDR4" "abcd" "abcd" 2>&1 || true)
-echo "$CACHE_BAD_HEX_OUTPUT" | grep -q "エラー" \
+echo "$CACHE_BAD_HEX_OUTPUT" | grep -q "Error: " \
     || fail "cache-pubkey with invalid hex should report an error (got: $CACHE_BAD_HEX_OUTPUT)"
 
 "$CLI" delete "$ADDR4" >/dev/null
@@ -140,7 +148,7 @@ ENCRYPTION_WIF=$(echo "$EXPORT_JSON" | grep -oP '"encryptionWIF":"\K[^"]+')
 [ -n "$SIGNING_WIF" ] && [ -n "$ENCRYPTION_WIF" ] || fail "export-address should return signingWIF/encryptionWIF (got: $EXPORT_JSON)"
 
 EXPORT_WRONG_OUTPUT=$("$CLI" export-address "$ADDR5" "wrongpass" 2>&1 || true)
-echo "$EXPORT_WRONG_OUTPUT" | grep -q "エラー" \
+echo "$EXPORT_WRONG_OUTPUT" | grep -q "Error: " \
     || fail "export-address with wrong passphrase should fail with an error (got: $EXPORT_WRONG_OUTPUT)"
 
 "$CLI" delete "$ADDR5" >/dev/null
@@ -170,7 +178,7 @@ EOF
 # passphraseでないとvault canary検証に落ちて失敗する(誤ったmaster KEKでの保存を防ぐ
 # ための意図した挙動、DESIGN.md §7.4参照)ため、ここでも"newpass5"を使う。
 IMPORT_KEYS_DAT_OUTPUT=$("$CLI" import-keys-dat test_keys.dat "newpass5")
-echo "$IMPORT_KEYS_DAT_OUTPUT" | grep -q "成功1件, 失敗0件" \
+echo "$IMPORT_KEYS_DAT_OUTPUT" | grep -q "1 succeeded, 0 failed" \
     || fail "import-keys-dat should report 1 success (got: $IMPORT_KEYS_DAT_OUTPUT)"
 [ "$("$CLI" unlock "$ADDR5" "newpass5")" = "true" ] || fail "unlock after import-keys-dat should succeed"
 
@@ -192,7 +200,7 @@ privencryptionkey = $ENCRYPTION_WIF
 EOF
 
 IMPORT_CHAN_OUTPUT=$("$CLI" import-keys-dat test_keys_chan.dat "newpass5")
-echo "$IMPORT_CHAN_OUTPUT" | grep -q "成功1件, 失敗0件" \
+echo "$IMPORT_CHAN_OUTPUT" | grep -q "1 succeeded, 0 failed" \
     || fail "import-keys-dat (chan) should report 1 success (got: $IMPORT_CHAN_OUTPUT)"
 LIST_AFTER_CHAN_IMPORT=$("$CLI" list-addresses)
 echo "$LIST_AFTER_CHAN_IMPORT" | grep -q "\"isChan\":true" \
@@ -212,14 +220,14 @@ privsigningkey = $SIGNING_WIF
 privencryptionkey = $ENCRYPTION_WIF
 EOF
 FIX_LABEL_OUTPUT=$("$CLI" fix-labels-from-keys-dat test_keys_fixlabel.dat)
-echo "$FIX_LABEL_OUTPUT" | grep -q "成功1件, 失敗0件" \
+echo "$FIX_LABEL_OUTPUT" | grep -q "1 succeeded, 0 failed" \
     || fail "fix-labels-from-keys-dat should report 1 success (got: $FIX_LABEL_OUTPUT)"
 LIST_AFTER_FIX_LABEL=$("$CLI" list-addresses)
 echo "$LIST_AFTER_FIX_LABEL" | grep -q "修正後ラベル" \
     || fail "fix-labels-from-keys-dat should update the label (got: $LIST_AFTER_FIX_LABEL)"
 
 SET_LABEL_UNKNOWN_OUTPUT=$("$CLI" set-label "BM-2cWzSnwjJ7yRP3nLEWUV5LisTZyREWSzUK" "x" 2>&1 || true)
-echo "$SET_LABEL_UNKNOWN_OUTPUT" | grep -q "エラー" \
+echo "$SET_LABEL_UNKNOWN_OUTPUT" | grep -q "Error: " \
     || fail "set-label on unknown address should fail with an error (got: $SET_LABEL_UNKNOWN_OUTPUT)"
 
 "$CLI" delete "$ADDR5" >/dev/null
@@ -231,7 +239,7 @@ LIST_AB=$("$CLI" list-address-book-entries)
 echo "$LIST_AB" | grep -q "\"address\":\"$ADDR5\"" || fail "address book should contain $ADDR5 (got: $LIST_AB)"
 
 DUP_AB_OUTPUT=$("$CLI" add-address-book-entry "$ADDR5" "dup" 2>&1 || true)
-echo "$DUP_AB_OUTPUT" | grep -q "エラー" \
+echo "$DUP_AB_OUTPUT" | grep -q "Error: " \
     || fail "adding a duplicate address book entry should fail with an error (got: $DUP_AB_OUTPUT)"
 
 "$CLI" delete-address-book-entry "$ADDR5" >/dev/null
@@ -282,30 +290,30 @@ echo "$BCAST_BODY_FILE_OUTPUT" | grep -q '"inventoryHash"' \
 
 # エラー系: 存在しないファイル
 BODY_FILE_MISSING_OUTPUT=$("$CLI" send-message --body-file no_such_file.txt "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
-echo "$BODY_FILE_MISSING_OUTPUT" | grep -q "開けません" \
+echo "$BODY_FILE_MISSING_OUTPUT" | grep -q "cannot open" \
     || fail "--body-file with a missing file should fail (got: $BODY_FILE_MISSING_OUTPUT)"
 
 # エラー系: パスを書き忘れた
 BODY_FILE_NOPATH_OUTPUT=$("$CLI" send-message --body-file 2>&1 || true)
-echo "$BODY_FILE_NOPATH_OUTPUT" | grep -q "ファイルパスが指定されていません" \
+echo "$BODY_FILE_NOPATH_OUTPUT" | grep -q "no file path given for --body-file" \
     || fail "--body-file without a path should fail (got: $BODY_FILE_NOPATH_OUTPUT)"
 
 # エラー系: NULバイトを含むファイル(黙って切り詰めず弾くこと)
 printf 'abc\0def' > body_with_nul.bin
 BODY_FILE_NUL_OUTPUT=$("$CLI" send-message --body-file body_with_nul.bin "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
-echo "$BODY_FILE_NUL_OUTPUT" | grep -q "NULバイト" \
+echo "$BODY_FILE_NUL_OUTPUT" | grep -q "NUL byte" \
     || fail "--body-file with NUL bytes should fail (got: $BODY_FILE_NUL_OUTPUT)"
 
 # エラー系: 上限(subject+本文で2^18-500バイト)超過。CLI側でHTTPへ載せる前に弾く
 head -c 262000 /dev/zero | tr '\0' 'a' > body_too_long.txt
 BODY_FILE_TOOLONG_OUTPUT=$("$CLI" send-message --body-file body_too_long.txt "$ADDR6" "$ADDR6" "subj" 2>&1 || true)
-echo "$BODY_FILE_TOOLONG_OUTPUT" | grep -q "本文が長すぎます" \
+echo "$BODY_FILE_TOOLONG_OUTPUT" | grep -q "body too long" \
     || fail "--body-file over the size limit should fail (got: $BODY_FILE_TOOLONG_OUTPUT)"
 
 # エラー系: --body-fileを指定しつつ位置引数の<body>も書いてしまった場合。本文がttlSecondsの
 # 位置へずれ込むので、数値でないと分かった時点で弾く(従来のatof()では黙って0になっていた)
 BODY_FILE_DUP_OUTPUT=$("$CLI" send-message --body-file body_multiline.txt "$ADDR6" "$ADDR6" "subj" "positional body" 2>&1 || true)
-echo "$BODY_FILE_DUP_OUTPUT" | grep -q "ttlSeconds には数値を指定してください" \
+echo "$BODY_FILE_DUP_OUTPUT" | grep -q "ttlSeconds must be a number" \
     || fail "--body-file plus a positional body should be rejected (got: $BODY_FILE_DUP_OUTPUT)"
 
 "$CLI" delete "$ADDR6" >/dev/null
@@ -326,7 +334,7 @@ UNLOCK_ADDRS_OUTPUT=$("$CLI" unlock-addresses unlock_list.txt "storepass7" 2>unl
     || UNLOCK_ADDRS_RC=$?
 UNLOCK_ADDRS_ERR=$(cat unlock_addrs_err.txt)
 [ "$UNLOCK_ADDRS_RC" -ne 0 ] || fail "unlock-addresses with failures should exit non-zero"
-echo "$UNLOCK_ADDRS_OUTPUT" | grep -q "成功2件, 失敗2件" \
+echo "$UNLOCK_ADDRS_OUTPUT" | grep -q "2 succeeded, 2 failed" \
     || fail "unlock-addresses should report 2 successes / 2 failures (got: $UNLOCK_ADDRS_OUTPUT)"
 echo "$UNLOCK_ADDRS_OUTPUT" | grep -q "backfill" \
     && fail "unlock-addresses should not backfill by default (got: $UNLOCK_ADDRS_OUTPUT)"
@@ -345,11 +353,11 @@ echo "$LIST_AFTER_UNLOCK_ADDRS" | grep -qP "\"address\":\"$ADDR7C\"[^}]*\"unlock
 # 標準入力 + --backfill(全件成功なので終了コード0)
 UNLOCK_STDIN_OUTPUT=$(printf '%s\n' "$ADDR7C" | "$CLI" unlock-addresses --backfill - "otherpass7") \
     || fail "unlock-addresses from stdin should succeed (got: $UNLOCK_STDIN_OUTPUT)"
-echo "$UNLOCK_STDIN_OUTPUT" | grep -q "成功1件, 失敗0件, backfill" \
+echo "$UNLOCK_STDIN_OUTPUT" | grep -q "1 succeeded, 0 failed, [0-9]* msg(s) newly added to the inbox by backfill" \
     || fail "unlock-addresses --backfill should report the backfill count (got: $UNLOCK_STDIN_OUTPUT)"
 
 UNLOCK_ADDRS_USAGE_OUTPUT=$("$CLI" unlock-addresses onlyone 2>&1 || true)
-echo "$UNLOCK_ADDRS_USAGE_OUTPUT" | grep -q "使い方" \
+echo "$UNLOCK_ADDRS_USAGE_OUTPUT" | grep -q "^Usage: " \
     || fail "unlock-addresses with wrong arg count should print usage (got: $UNLOCK_ADDRS_USAGE_OUTPUT)"
 
 for a in "$ADDR7A" "$ADDR7B" "$ADDR7C"; do

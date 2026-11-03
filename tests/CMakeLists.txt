@@ -56,6 +56,24 @@ add_test(NAME cli_integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_integration.sh
                  $<TARGET_FILE:bitmessaged> $<TARGET_FILE:bitmessage-cli>)
 
+# §11 2026-11-03 項目54(国際化): CLIの表示言語の切り替え。訳(.mo)をビルドしたときだけ意味が
+# あるのでBM_ENABLE_NLSのときだけ登録する。ja_JP.UTF-8ロケールが無い環境では77でskipする。
+if(BM_ENABLE_NLS)
+    add_test(NAME cli_i18n
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_i18n.sh $<TARGET_FILE:bitmessage-cli>)
+    set_tests_properties(cli_i18n PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# 訳(po/*.po)がソースの文字列に追いついているか。xgettext/msgcmp(gettextパッケージ)が
+# あれば、BM_ENABLE_NLSに関わらず登録する(訳を使わないビルドでも、訳の更新漏れは検出したい)
+find_program(BM_XGETTEXT_EXECUTABLE xgettext)
+find_program(BM_MSGCMP_EXECUTABLE msgcmp)
+if(BM_XGETTEXT_EXECUTABLE AND BM_MSGCMP_EXECUTABLE)
+    add_test(NAME po_up_to_date
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_po_up_to_date.sh
+                     ${PROJECT_SOURCE_DIR} ${BM_XGETTEXT_EXECUTABLE} ${BM_MSGCMP_EXECUTABLE})
+endif()
+
 add_executable(test_http_client test_http_client.c ../src/cli/http_client.c)
 target_link_libraries(test_http_client PRIVATE OpenSSL::Crypto Threads::Threads)
 add_test(NAME http_client COMMAND test_http_client)

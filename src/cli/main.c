@@ -13,6 +13,7 @@
 #include "../common/json.h"
 #include "../common/message_limits.h"
 #include "http_client.h"
+#include "i18n.h"
 
 struct bm_cli_env
 {
@@ -22,118 +23,195 @@ struct bm_cli_env
     const char *pass;
 };
 
+/*
+ * §11 2026-11-03 項目54(国際化): コマンド一覧の表。従来はprint_usageの1つの巨大な日本語
+ * 文字列と、各コマンドの引数エラー時の個別の"使い方: ..."文字列に、同じ書式を二重に
+ * 書いていた。翻訳のために文字列を英語のmsgidへ書き直すついでに、書式(synopsis)は
+ * ここ1か所にまとめ、print_usageと引数エラー時のprint_command_usageの両方がこの表を引く
+ * ようにした。
+ *
+ * synopsisは翻訳しない(コマンド名・引数名はそのまま打ち込むものなので)。helpは
+ * 翻訳対象で、N_()で印を付けておき表示時に_()を通す。helpは改行区切りの複数行で、
+ * 各行の字下げはprint_usage側で付ける(msgidに字下げの空白を含めないため)。
+ */
+struct cli_command_help
+{
+    const char *synopsis;
+    const char *help; /* NULLなら説明なし */
+};
+
+static const struct cli_command_help CLI_COMMANDS[] = {
+    {"list-addresses", NULL},
+    {"create-address <passphrase> <version:3|4> <stream> <ripeNullBytes> <label> <storePassphrase>", NULL},
+    {"import-address <address> <signingWIF> <encryptionWIF> <label> <storePassphrase> "
+     "[nonceTrialsPerByte] [payloadLengthExtraBytes]",
+     N_("Import an address from a WIF key pair taken from keys.dat (PyBitmessage).\n"
+        "Fails if the ripe derived from the address does not match the ripe of the\n"
+        "WIF public keys")},
+    {"import-keys-dat <keys.dat path> <storePassphrase>",
+     N_("Bulk-import an entire keys.dat (PyBitmessage, INI format). The same\n"
+        "storePassphrase is used for every address (assumes bulk unlock with the\n"
+        "vault scheme in DESIGN.md section 7.4). Addresses are sent in batches with\n"
+        "importAddressesBulk")},
+    {"set-label <address> <label>",
+     N_("Change only the label of an address (private keys are not touched; offers\n"
+        "through the API what PyBitmessage offers in its GUI)")},
+    {"fix-labels-from-keys-dat <keys.dat path>",
+     N_("Re-parse keys.dat and update only the labels of existing addresses to the\n"
+        "correct values. Meant for repairing labels garbled by import-keys-dat")},
+    {"join-chan <passphrase> <label> <storePassphrase>",
+     N_("Join or create a chan (private group channel). Everyone who uses the same\n"
+        "passphrase shares the same address and keys. Post with\n"
+        "send-message <chanAddr> <chanAddr> ... (sending to itself); once unlocked,\n"
+        "other members' posts can be read with get-inbox")},
+    {"unlock <address> <passphrase>", NULL},
+    {"export-address <address> <passphrase>",
+     N_("Decrypt with the passphrase on the spot and return the WIF key pair, whether\n"
+        "or not the address is unlocked (a one-shot operation that does not touch\n"
+        "the keyring; the counterpart of importAddress)")},
+    {"unlock-all <passphrase>",
+     N_("Try to unlock every row of identity.db with a common passphrase. Each row\n"
+        "keeps its own kdf_salt, so rows that do not match are silently skipped (not\n"
+        "an error). Returns an array of [{address, unlocked}], so you can tell which\n"
+        "rows did not match.\n"
+        "If identity.db has more than 10,000 entries, nothing is unlocked and an\n"
+        "error is returned (trial decryption of received msgs gets heavier in\n"
+        "proportion to the count; unlock the addresses you need with\n"
+        "unlock-addresses)")},
+    {"unlock-addresses [--backfill] <address-list path|-> <passphrase>",
+     N_("Unlock the addresses listed one per line in a file (\"-\" for stdin) with a\n"
+        "common passphrase (blank lines and lines starting with # are ignored).\n"
+        "Calling unlock repeatedly runs scrypt every time; this runs it once per\n"
+        "1,000 addresses. Failed addresses and the reason (address not found /\n"
+        "passphrase mismatch) are printed to stderr, and the exit status is non-zero\n"
+        "if any address failed. With --backfill, past msgs addressed to the unlocked\n"
+        "addresses are looked up in object_pool.db and put into the inbox (unlike\n"
+        "unlock, this is off by default because it takes time proportional to\n"
+        "msgs x addresses)")},
+    {"lock <address>", NULL},
+    {"lock-all", NULL},
+    {"delete <address>", NULL},
+    {"convert-to-v4 <v3Address> <passphrase>",
+     N_("Move a v3 address to the v4 address with the same keys (creating the v4 if\n"
+        "missing, rewriting the addresses in inbox/sent, and deleting the v3).\n"
+        "Needed because v3 and v4 share the ripe, so received msgs cannot be told\n"
+        "apart by their destination")},
+    {"convert-all-v3-to-v4 <passphrase> [limit]",
+     N_("Run convert-to-v4 on up to limit v3 addresses in identity.db, oldest first\n"
+        "(default 1000, at most 10000). Repeat until remaining in the result is 0")},
+    {"cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>",
+     N_("Manually register a peer's public keys (130 hex digits each) in\n"
+        "pubkey_cache. Normally send-message sends a getpubkey request automatically\n"
+        "when the key is unknown and caches the reply, so this command is for when\n"
+        "you already know the keys or want to skip that wait")},
+    {"send-message [--body-file <path>] <fromAddress> <toAddress> <subject> [<body>] "
+     "[ttlSeconds] [ackStealthLevel]",
+     N_("The recipient's public encryption key is always resolved from\n"
+        "pubkey_cache. If it is not there, a getpubkey request is sent\n"
+        "automatically; wait for the reply and run the same command again, or\n"
+        "register the key first with cache-pubkey.\n"
+        "With --body-file <path>, the body is read from the file instead of the\n"
+        "<body> argument (\"-\" for stdin). Use it for long or multi-line bodies: a\n"
+        "body passed as an argument is visible in ps(1) and stays in the shell\n"
+        "history. subject + body may be up to 261644 bytes in total (2^18-500, the\n"
+        "same as PyBitmessage)")},
+    {"get-inbox [folder]", NULL},
+    {"get-sent",
+     N_("List the sent box (sent table). Each element has msgId/toAddress/\n"
+        "fromAddress/subject/body/status (sent|ackreceived|msgsentnoackexpected)/\n"
+        "sentTime/ttl/resendCount")},
+    {"trash-message <msgId(hex)>",
+     N_("Move the message to folder='trash' in both inbox and sent (as\n"
+        "PyBitmessage's trashMessage does). Not an error if nothing matches")},
+    {"send-broadcast [--body-file <path>] <fromAddress> <subject> [<body>] [ttlSeconds]",
+     N_("--body-file works as in send-message (the body is read from the file, or\n"
+        "from stdin for \"-\")")},
+    {"add-subscription <address> [label]",
+     N_("Subscribe to broadcasts (DESIGN.md section 5.4) from the address. Broadcasts\n"
+        "received from it are saved to the inbox from then on")},
+    {"remove-subscription <address>", NULL},
+    {"list-subscriptions", NULL},
+    {"add-address-book-entry <address> <label>",
+     N_("Fails if the same address is already registered (no duplicates, as in\n"
+        "PyBitmessage)")},
+    {"delete-address-book-entry <address>", NULL},
+    {"list-address-book-entries", NULL},
+    {"get-socks-proxy-onion", NULL},
+    {"set-socks-proxy-onion <enabled:0|1> <host> <port>",
+     N_("Outbound SOCKS5 proxy (Tor etc.) used only for onion peers (.onion).\n"
+        "Stored in config.db and picked up by a running bitmessaged at its next\n"
+        "reconnect cycle (within 30 seconds by default; no restart needed)")},
+    {"get-socks-proxy-clearnet", NULL},
+    {"set-socks-proxy-clearnet <enabled:0|1> <host> <port>",
+     N_("Outbound SOCKS5 proxy used only for clearnet IPs. Disabled (direct) by\n"
+        "default. It is separate from the onion one because enabling it sends even\n"
+        "clearnet connections through Tor exit nodes, where rate limits on the\n"
+        "shared IPs hurt connectivity to other nodes (see DESIGN.md section 11)")},
+    {"add-peer <ipAddress> <port> [stream]",
+     N_("Manually add to peers.db a peer you have personally confirmed to exist\n"
+        "(through a channel where you actually know the operator, not an anonymous\n"
+        "list on a message board). A last resort when all mainnet seeds are down")},
+    {"list-connections",
+     N_("Return the currently connected peers ({inbound:[...], outbound:[...]},\n"
+        "each element host/port/fd/fullyEstablished/userAgent/sentBytes/\n"
+        "receivedBytes). fd is the real fd number in the registry (for debugging;\n"
+        "the \"fd=N\" in broadcast_inv failure logs is a throwaway dup() number\n"
+        "unrelated to it). sentBytes may not include what was sent via\n"
+        "broadcast_inv (the overall total in get-network-stats does)")},
+    {"get-network-stats",
+     N_("Total bytes sent/received since the process started ({sentBytes,\n"
+        "receivedBytes}, including connections already closed)")},
+};
+
+#define CLI_COMMAND_COUNT (sizeof(CLI_COMMANDS) / sizeof(CLI_COMMANDS[0]))
+
 static void print_usage(const char *prog)
 {
-    fprintf(stderr,
-            "使い方: %s <command> [args...]\n"
-            "\n"
-            "環境変数: BM_API_HOST(既定127.0.0.1) BM_API_PORT(既定8442) BM_API_USER BM_API_PASS\n"
-            "\n"
-            "コマンド:\n"
-            "  list-addresses\n"
-            "  create-address <passphrase> <version:3|4> <stream> <ripeNullBytes> <label> <storePassphrase>\n"
-            "  import-address <address> <signingWIF> <encryptionWIF> <label> <storePassphrase> "
-            "[nonceTrialsPerByte] [payloadLengthExtraBytes]\n"
-            "      keys.dat(PyBitmessage本家)由来のWIF鍵ペアからアドレスをインポートする。\n"
-            "      addressから復元したripeとWIFの公開鍵ripeが一致しないと失敗する\n"
-            "  import-keys-dat <keys.datのパス> <storePassphrase>\n"
-            "      keys.dat(PyBitmessage本家、INI形式)を丸ごと一括インポートする。全アドレスへ\n"
-            "      共通のstorePassphraseを使う(§7.4のvault方式による一括unlockを前提)。\n"
-            "      importAddressesBulkでKEYS_DAT_BATCH_SIZE件ずつまとめて送信する\n"
-            "  set-label <address> <label>\n"
-            "      アドレスのラベルのみ変更する(秘密鍵には触れない、PyBitmessage本家のGUI相当の\n"
-            "      機能を本実装独自にAPI経由で提供)\n"
-            "  fix-labels-from-keys-dat <keys.datのパス>\n"
-            "      keys.datを再パースし、既存アドレスのラベルだけを一括で正しい値に更新する。\n"
-            "      import-keys-datで文字化けしたラベルを後から修正する用途を想定\n"
-            "  join-chan <passphrase> <label> <storePassphrase>\n"
-            "      chan(私設グループチャンネル)へ参加/作成する。同じpassphraseで呼んだ全員が\n"
-            "      同じアドレス・鍵を共有する。投稿はsend-message <chanAddr> <chanAddr> ...\n"
-            "      (自分自身宛の送信)で行い、他メンバーの投稿はunlock済みならget-inboxで読める\n"
-            "  unlock <address> <passphrase>\n"
-            "  export-address <address> <passphrase>\n"
-            "      unlock中かどうかに関わらず、その場でpassphrase復号しWIF鍵ペアを返す\n"
-            "      (keyringには触れない一回性操作、importAddressと対称)\n"
-            "  unlock-all <passphrase>\n"
-            "      identity.db全件に対し共通passphraseでunlockを試みる。行ごとのkdf_saltは\n"
-            "      個別のままなので、一致しない行は黙ってスキップされる(エラーにしない)。\n"
-            "      戻り値は[{address, unlocked}]の配列で、どの行が不一致だったか判別できる\n"
-            "      identity.dbが10,000件を超える場合は何もunlockせずエラーになる(受信msgの\n"
-            "      試行復号が件数に比例して重くなるため。必要なアドレスはunlock-addressesで)\n"
-            "  unlock-addresses [--backfill] <アドレス一覧のパス|-> <passphrase>\n"
-            "      ファイル(\"-\"なら標準入力)に1行1アドレスで並べたアドレスを、共通passphraseで\n"
-            "      まとめてunlockする(空行と#で始まる行は無視)。unlockを1件ずつ繰り返すと毎回\n"
-            "      scryptが走るが、こちらは1,000件ごとに1回で済む。失敗したアドレスと理由\n"
-            "      (address not found / passphrase mismatch)をstderrへ出し、1件でも失敗すれば\n"
-            "      終了コードは非0。--backfillを付けると、unlockできたアドレス宛の過去msgを\n"
-            "      object_pool.dbから探してinboxへ入れる(unlockと違い既定では行わない。\n"
-            "      msg数×アドレス数に比例して時間がかかるため)\n"
-            "  lock <address>\n"
-            "  lock-all\n"
-            "  delete <address>\n"
-            "  convert-to-v4 <v3Address> <passphrase>\n"
-            "      v3アドレスを同じ鍵のv4アドレスへ移す(v4が無ければ作り、inbox/sentのアドレスを\n"
-            "      書き換え、v3を削除する)。v3とv4はripeが共通で受信msgの宛先を区別できないため\n"
-            "  convert-all-v3-to-v4 <passphrase> [limit]\n"
-            "      identity.dbのv3を古い順に最大limit件(既定1000、上限10000)まとめてconvert-to-v4する。\n"
-            "      戻り値のremainingが0になるまで繰り返し実行する\n"
-            "  cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n"
-            "      相手の公開鍵(いずれも130桁hex)を手動でpubkey_cacheへ登録する。\n"
-            "      通常はsend-messageが未登録ならgetpubkey要求を自動送出し応答を自動キャッシュ\n"
-            "      するため、本コマンドは事前に鍵を知っている場合や、その待ち時間を省きたい\n"
-            "      場合の手動登録手段\n"
-            "  send-message [--body-file <path>] <fromAddress> <toAddress> <subject> [<body>] "
-            "[ttlSeconds] [ackStealthLevel]\n"
-            "      宛先の公開暗号鍵は常にpubkey_cacheから解決する。未登録ならgetpubkey要求を\n"
-            "      自動送出するので、応答を待ってから同じコマンドを再実行するか、先にcache-pubkeyで\n"
-            "      鍵を登録しておく。\n"
-            "      --body-file <path>を付けると<body>の位置引数の代わりにファイルから本文を読む\n"
-            "      (pathが\"-\"なら標準入力)。長文・改行を含む本文はこちらを使うこと。位置引数で\n"
-            "      渡すと本文がps(1)から見えシェル履歴にも残る。subject+本文の合計は\n"
-            "      261644バイトまで(PyBitmessage本家と同じ2^18-500)\n"
-            "  get-inbox [folder]\n"
-            "  get-sent\n"
-            "      送信済みボックス(sentテーブル)を一覧する。各要素はmsgId/toAddress/\n"
-            "      fromAddress/subject/body/status(sent|ackreceived|msgsentnoackexpected)/\n"
-            "      sentTime/ttl/resendCount\n"
-            "  trash-message <msgId(hex)>\n"
-            "      inbox/sent両方に対してfolder='trash'化を試みる(PyBitmessage本家trashMessage準拠)。\n"
-            "      該当が無くてもエラーにしない\n"
-            "  send-broadcast [--body-file <path>] <fromAddress> <subject> [<body>] [ttlSeconds]\n"
-            "      --body-fileの意味はsend-messageと同じ(ファイル、\"-\"なら標準入力から本文を読む)\n"
-            "  add-subscription <address> [label]\n"
-            "      broadcast(§5.4)の購読先を登録する。以後そのアドレスからのbroadcastを\n"
-            "      受信したらinboxへ保存する\n"
-            "  remove-subscription <address>\n"
-            "  list-subscriptions\n"
-            "  add-address-book-entry <address> <label>\n"
-            "      既に同じaddressが登録済みならエラーになる(重複禁止、PyBitmessage本家準拠)\n"
-            "  delete-address-book-entry <address>\n"
-            "  list-address-book-entries\n"
-            "  get-socks-proxy-onion\n"
-            "  set-socks-proxy-onion <enabled:0|1> <host> <port>\n"
-            "      onion peer(.onion宛)専用のoutbound SOCKS5プロキシ(Tor等)設定。config.dbへ\n"
-            "      永続化され、稼働中のbitmessagedにも次の再接続サイクル(既定30秒以内)で\n"
-            "      反映される(再起動不要)\n"
-            "  get-socks-proxy-clearnet\n"
-            "  set-socks-proxy-clearnet <enabled:0|1> <host> <port>\n"
-            "      クリアネットIP宛専用のoutbound SOCKS5プロキシ設定。既定disabled(直結)。\n"
-            "      onion用と分離しているのは、有効にするとクリアネットIP宛の接続まで\n"
-            "      Tor出口ノード経由になり、共有IPゆえのレート制限で外部ノードへの接続性が\n"
-            "      悪化するため(DESIGN.md §11参照)\n"
-            "  add-peer <ipAddress> <port> [stream]\n"
-            "      個人的に存在を確認した(掲示板等の匿名リストではなく実際に運用者と面識のある\n"
-            "      経路で)peerを手動でpeers.dbへ追加する。mainnetシード全滅時の最後の手段\n"
-            "  list-connections\n"
-            "      現在接続中のpeer一覧({inbound:[...], outbound:[...]}、各要素host/port/fd/\n"
-            "      fullyEstablished/userAgent/sentBytes/receivedBytes)を返す。fdはregistry上の\n"
-            "      実fd番号(デバッグ用。broadcast_inv失敗ログの\"fd=N\"はdup()した使い捨て番号\n"
-            "      なのでこの値とは無関係)。sentBytesはbroadcast_inv経由の分だけ含まれない\n"
-            "      場合がある(get-network-statsの全体累積には含まれる)\n"
-            "  get-network-stats\n"
-            "      プロセス起動時からの送受信バイト数の全体累積({sentBytes,\n"
-            "      receivedBytes}、切断済みの接続ぶんも含む)\n",
-            prog);
+    fprintf(stderr, _("Usage: %s <command> [args...]\n"), prog);
+    fputs("\n", stderr);
+    fputs(_("Environment variables: BM_API_HOST (default 127.0.0.1) BM_API_PORT (default 8442) "
+            "BM_API_USER BM_API_PASS\n"),
+          stderr);
+    fputs("\n", stderr);
+    fputs(_("Commands:\n"), stderr);
+    for (size_t i = 0; i < CLI_COMMAND_COUNT; i++)
+    {
+        fprintf(stderr, "  %s\n", CLI_COMMANDS[i].synopsis);
+        if (CLI_COMMANDS[i].help == NULL)
+        {
+            continue;
+        }
+        /* 訳文の各行に字下げを付けて出す */
+        const char *line = _(CLI_COMMANDS[i].help);
+        while (*line != '\0')
+        {
+            const char *nl = strchr(line, '\n');
+            int len = nl != NULL ? (int)(nl - line) : (int)strlen(line);
+            fprintf(stderr, "      %.*s\n", len, line);
+            line += len;
+            if (*line == '\n')
+            {
+                line++;
+            }
+        }
+    }
+}
+
+/* 引数の数が合わないときに、そのコマンドの書式だけを表示する。nameはCLI_COMMANDSに
+ * 必ず載っているコマンド名(載っていなければ一覧全体を出す) */
+static void print_command_usage(const char *prog, const char *name)
+{
+    size_t name_len = strlen(name);
+    for (size_t i = 0; i < CLI_COMMAND_COUNT; i++)
+    {
+        const char *synopsis = CLI_COMMANDS[i].synopsis;
+        if (strncmp(synopsis, name, name_len) == 0 && (synopsis[name_len] == ' ' || synopsis[name_len] == '\0'))
+        {
+            fprintf(stderr, _("Usage: %s %s\n"), prog, synopsis);
+            return;
+        }
+    }
+    print_usage(prog);
 }
 
 /*
@@ -165,7 +243,7 @@ static int call_rpc_raw(const struct bm_cli_env *env, const char *method, bm_jso
          * 分からなくなる。RFC 3986慣習に合わせ"[host]:port"の形にする */
         int host_is_ipv6 = strchr(env->host, ':') != NULL;
         char buf[256];
-        snprintf(buf, sizeof(buf), "接続に失敗しました(%s%s%s:%d、bitmessagedは起動していますか?)",
+        snprintf(buf, sizeof(buf), _("Could not connect to %s%s%s:%d (is bitmessaged running?)"),
                  host_is_ipv6 ? "[" : "", env->host, host_is_ipv6 ? "]" : "", env->port);
         *out_error_msg = strdup(buf);
         return 0;
@@ -173,7 +251,7 @@ static int call_rpc_raw(const struct bm_cli_env *env, const char *method, bm_jso
     if (status == 401)
     {
         free(resp);
-        *out_error_msg = strdup("認証に失敗しました(BM_API_USER/BM_API_PASSを確認してください)");
+        *out_error_msg = strdup(_("Authentication failed (check BM_API_USER/BM_API_PASS)"));
         return 0;
     }
 
@@ -182,7 +260,7 @@ static int call_rpc_raw(const struct bm_cli_env *env, const char *method, bm_jso
     if (v == NULL)
     {
         char buf[128];
-        snprintf(buf, sizeof(buf), "サーバー応答をJSONとして解釈できませんでした(HTTP %d)", status);
+        snprintf(buf, sizeof(buf), _("Could not parse the server response as JSON (HTTP %d)"), status);
         *out_error_msg = strdup(buf);
         return 0;
     }
@@ -192,7 +270,7 @@ static int call_rpc_raw(const struct bm_cli_env *env, const char *method, bm_jso
     {
         const char *msg = bm_json_as_string(bm_json_object_get(error, "message"));
         char buf[512];
-        snprintf(buf, sizeof(buf), "エラー: %s", msg != NULL ? msg : "(不明なエラー)");
+        snprintf(buf, sizeof(buf), _("Error: %s"), msg != NULL ? msg : _("(unknown error)"));
         *out_error_msg = strdup(buf);
         bm_json_free(v);
         return 0;
@@ -320,7 +398,7 @@ static void flush_keys_dat_batch(const struct bm_cli_env *env, const struct keys
     bm_json_value_t *response = NULL;
     if (!call_rpc_raw(env, "importAddressesBulk", params, &response, &error_msg))
     {
-        fprintf(stderr, "バッチ全体が失敗しました(%zu件): %s\n", batch_count, error_msg);
+        fprintf(stderr, _("Entire batch failed (%zu entries): %s\n"), batch_count, error_msg);
         free(error_msg);
         *failed += (int)batch_count;
         return;
@@ -329,7 +407,7 @@ static void flush_keys_dat_batch(const struct bm_cli_env *env, const struct keys
     bm_json_value_t *result = bm_json_object_get(response, "result");
     if (result == NULL || result->type != BM_JSON_ARRAY)
     {
-        fprintf(stderr, "バッチ応答の形式が不正です(%zu件をスキップ扱いにします)\n", batch_count);
+        fprintf(stderr, _("Malformed batch response (counting %zu entries as skipped)\n"), batch_count);
         *failed += (int)batch_count;
         bm_json_free(response);
         return;
@@ -347,8 +425,8 @@ static void flush_keys_dat_batch(const struct bm_cli_env *env, const struct keys
         {
             const char *addr = bm_json_as_string(bm_json_object_get(item, "address"));
             const char *err = bm_json_as_string(bm_json_object_get(item, "error"));
-            fprintf(stderr, "スキップ: %s (%s)\n", addr != NULL ? addr : "?",
-                    err != NULL ? err : "不明なエラー");
+            fprintf(stderr, _("Skipped: %s (%s)\n"), addr != NULL ? addr : "?",
+                    err != NULL ? err : _("unknown error"));
             (*failed)++;
         }
     }
@@ -360,7 +438,7 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
     FILE *f = fopen(path, "r");
     if (f == NULL)
     {
-        fprintf(stderr, "エラー: %s を開けません\n", path);
+        fprintf(stderr, _("Error: cannot open %s\n"), path);
         return EXIT_FAILURE;
     }
 
@@ -483,7 +561,7 @@ static int import_keys_dat(const struct bm_cli_env *env, const char *path, const
 
     fclose(f);
 
-    printf("インポート完了: 成功%d件, 失敗%d件, 鍵欠落でスキップ%d件\n", imported, failed, skipped_no_keys);
+    printf(_("Import finished: %d succeeded, %d failed, %d skipped (missing keys)\n"), imported, failed, skipped_no_keys);
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -527,7 +605,7 @@ static void flush_unlock_addresses_batch(const struct bm_cli_env *env, char **ba
     bm_json_value_t *response = NULL;
     if (!call_rpc_raw(env, "unlockAddresses", params, &response, &error_msg))
     {
-        fprintf(stderr, "バッチ全体が失敗しました(%zu件): %s\n", batch_count, error_msg);
+        fprintf(stderr, _("Entire batch failed (%zu entries): %s\n"), batch_count, error_msg);
         free(error_msg);
         *failed += (int)batch_count;
         return;
@@ -537,7 +615,7 @@ static void flush_unlock_addresses_batch(const struct bm_cli_env *env, char **ba
     bm_json_value_t *results = bm_json_object_get(result, "results");
     if (results == NULL || results->type != BM_JSON_ARRAY)
     {
-        fprintf(stderr, "バッチ応答の形式が不正です(%zu件を失敗扱いにします)\n", batch_count);
+        fprintf(stderr, _("Malformed batch response (counting %zu entries as failed)\n"), batch_count);
         *failed += (int)batch_count;
         bm_json_free(response);
         return;
@@ -555,7 +633,7 @@ static void flush_unlock_addresses_batch(const struct bm_cli_env *env, char **ba
         {
             const char *addr = bm_json_as_string(bm_json_object_get(item, "address"));
             const char *err = bm_json_as_string(bm_json_object_get(item, "error"));
-            fprintf(stderr, "失敗: %s (%s)\n", addr != NULL ? addr : "?", err != NULL ? err : "不明なエラー");
+            fprintf(stderr, _("Failed: %s (%s)\n"), addr != NULL ? addr : "?", err != NULL ? err : _("unknown error"));
             (*failed)++;
         }
     }
@@ -573,7 +651,7 @@ static int unlock_addresses_from_file(const struct bm_cli_env *env, const char *
     FILE *f = (strcmp(path, "-") == 0) ? stdin : fopen(path, "r");
     if (f == NULL)
     {
-        fprintf(stderr, "エラー: %s を開けません\n", path);
+        fprintf(stderr, _("Error: cannot open %s\n"), path);
         return EXIT_FAILURE;
     }
 
@@ -584,7 +662,7 @@ static int unlock_addresses_from_file(const struct bm_cli_env *env, const char *
         {
             fclose(f);
         }
-        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        fprintf(stderr, _("Error: out of memory\n"));
         return EXIT_FAILURE;
     }
     size_t batch_count = 0;
@@ -608,7 +686,7 @@ static int unlock_addresses_from_file(const struct bm_cli_env *env, const char *
         batch[batch_count] = strdup(trimmed);
         if (batch[batch_count] == NULL)
         {
-            fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+            fprintf(stderr, _("Error: out of memory\n"));
             break;
         }
         batch_count++;
@@ -636,12 +714,12 @@ static int unlock_addresses_from_file(const struct bm_cli_env *env, const char *
 
     if (backfill)
     {
-        printf("unlock完了: 成功%d件, 失敗%d件, backfillで新たにinboxへ入ったmsg %d件\n", unlocked, failed,
+        printf(_("Unlock finished: %d succeeded, %d failed, %d msg(s) newly added to the inbox by backfill\n"), unlocked, failed,
                backfilled);
     }
     else
     {
-        printf("unlock完了: 成功%d件, 失敗%d件\n", unlocked, failed);
+        printf(_("Unlock finished: %d succeeded, %d failed\n"), unlocked, failed);
     }
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -657,7 +735,7 @@ static void set_address_label(const struct bm_cli_env *env, const char *address,
     bm_json_value_t *response = NULL;
     if (!call_rpc_raw(env, "setAddressLabel", params, &response, &error_msg))
     {
-        fprintf(stderr, "スキップ: %s (%s)\n", address, error_msg);
+        fprintf(stderr, _("Skipped: %s (%s)\n"), address, error_msg);
         free(error_msg);
         (*failed)++;
         return;
@@ -678,7 +756,7 @@ static int fix_labels_from_keys_dat(const struct bm_cli_env *env, const char *pa
     FILE *f = fopen(path, "r");
     if (f == NULL)
     {
-        fprintf(stderr, "エラー: %s を開けません\n", path);
+        fprintf(stderr, _("Error: cannot open %s\n"), path);
         return EXIT_FAILURE;
     }
 
@@ -752,7 +830,7 @@ static int fix_labels_from_keys_dat(const struct bm_cli_env *env, const char *pa
 
     fclose(f);
 
-    printf("ラベル修正完了: 成功%d件, 失敗%d件\n", fixed, failed);
+    printf(_("Label fix finished: %d succeeded, %d failed\n"), fixed, failed);
     return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -787,7 +865,7 @@ static char *read_stream_all(FILE *f, const char *path, size_t *out_len)
     char *buf = malloc(cap);
     if (buf == NULL)
     {
-        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        fprintf(stderr, _("Error: out of memory\n"));
         return NULL;
     }
 
@@ -799,7 +877,7 @@ static char *read_stream_all(FILE *f, const char *path, size_t *out_len)
             char *grown = realloc(buf, new_cap);
             if (grown == NULL)
             {
-                fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+                fprintf(stderr, _("Error: out of memory\n"));
                 free(buf);
                 return NULL;
             }
@@ -812,7 +890,7 @@ static char *read_stream_all(FILE *f, const char *path, size_t *out_len)
         {
             if (ferror(f))
             {
-                fprintf(stderr, "エラー: %s の読み込みに失敗しました\n", path);
+                fprintf(stderr, _("Error: failed to read %s\n"), path);
                 free(buf);
                 return NULL;
             }
@@ -832,7 +910,7 @@ static char *read_stream_all(FILE *f, const char *path, size_t *out_len)
      * 本文の一部だけが送信されてしまうので、ここで明示的に弾く */
     if (strlen(buf) != len)
     {
-        fprintf(stderr, "エラー: %s にNULバイトが含まれています(テキストファイルを指定してください)\n",
+        fprintf(stderr, _("Error: %s contains a NUL byte (specify a text file)\n"),
                 path);
         free(buf);
         return NULL;
@@ -847,14 +925,14 @@ static char *load_body_file(const char *path, size_t *out_len)
 {
     if (strcmp(path, "-") == 0)
     {
-        return read_stream_all(stdin, "標準入力", out_len);
+        return read_stream_all(stdin, _("standard input"), out_len);
     }
     /* テキスト前提だが"rb"で開く。改行変換を挟まず、ファイルの内容をそのまま本文にする
      * (末尾の改行も勝手に落とさない) */
     FILE *f = fopen(path, "rb");
     if (f == NULL)
     {
-        fprintf(stderr, "エラー: %s を開けません\n", path);
+        fprintf(stderr, _("Error: cannot open %s\n"), path);
         return NULL;
     }
     char *buf = read_stream_all(f, path, out_len);
@@ -892,7 +970,7 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
     }
     if (opt_index + 1 >= argc)
     {
-        fprintf(stderr, "エラー: --body-file にファイルパスが指定されていません\n");
+        fprintf(stderr, _("Error: no file path given for --body-file\n"));
         return -1;
     }
     const char *path = argv[opt_index + 1];
@@ -901,7 +979,7 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
     char **rest = malloc(sizeof(char *) * (size_t)(argc + 1));
     if (rest == NULL)
     {
-        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        fprintf(stderr, _("Error: out of memory\n"));
         return -1;
     }
     int rest_argc = 0;
@@ -916,7 +994,7 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
 
     if (rest_argc < body_index)
     {
-        fprintf(stderr, "エラー: --body-file を使う場合でも、本文より前の位置引数は全て指定してください\n");
+        fprintf(stderr, _("Error: even with --body-file, all positional arguments before the body are required\n"));
         free(rest);
         return -1;
     }
@@ -937,12 +1015,23 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
     {
         /* read_stream_allは上限を超えた時点で読むのをやめるので、body_lenが上限を超えている
          * 場合の値はファイル全体の大きさとは限らない。「以上」を付けて実サイズだと
-         * 誤解させないようにする */
-        fprintf(stderr,
-                "エラー: 本文が長すぎます(subject %zuバイト + 本文 %zuバイト%s、上限は合計%zuバイト)\n",
-                subject_len, body_len,
-                body_len > BM_MAX_SUBJECT_PLUS_BODY_LEN ? "以上" : "",
-                BM_MAX_SUBJECT_PLUS_BODY_LEN);
+         * 誤解させないようにする。
+         * §11 2026-11-03 項目54: 従来は「以上」の有無を%sで差し込んでいたが、語順が言語ごとに
+         * 違うため断片の差し込みは翻訳できない。文ごと2通りに分けた */
+        if (body_len > BM_MAX_SUBJECT_PLUS_BODY_LEN)
+        {
+            fprintf(stderr,
+                    _("Error: body too long (subject %zu bytes + body %zu bytes or more; the limit is %zu "
+                      "bytes in total)\n"),
+                    subject_len, body_len, BM_MAX_SUBJECT_PLUS_BODY_LEN);
+        }
+        else
+        {
+            fprintf(stderr,
+                    _("Error: body too long (subject %zu bytes + body %zu bytes; the limit is %zu bytes in "
+                      "total)\n"),
+                    subject_len, body_len, BM_MAX_SUBJECT_PLUS_BODY_LEN);
+        }
         free(body);
         free(rest);
         return -1;
@@ -951,7 +1040,7 @@ static int apply_body_file_option(int argc, char **argv, int subject_index, int 
     char **result = malloc(sizeof(char *) * (size_t)(rest_argc + 2));
     if (result == NULL)
     {
-        fprintf(stderr, "エラー: メモリ確保に失敗しました\n");
+        fprintf(stderr, _("Error: out of memory\n"));
         free(body);
         free(rest);
         return -1;
@@ -987,7 +1076,7 @@ static int parse_number_arg(const char *s, const char *name, double *out)
     double v = strtod(s, &end);
     if (end == s || *end != '\0' || errno == ERANGE)
     {
-        fprintf(stderr, "エラー: %s には数値を指定してください(指定値: %s)\n", name, s);
+        fprintf(stderr, _("Error: %s must be a number (got: %s)\n"), name, s);
         return -1;
     }
     *out = v;
@@ -996,6 +1085,9 @@ static int parse_number_arg(const char *s, const char *name, double *out)
 
 int main(int argc, char **argv)
 {
+    /* §11 2026-11-03 項目54: どのメッセージを出すよりも前にロケールと訳の置き場所を決める */
+    bm_cli_i18n_init();
+
     struct bm_cli_env env;
     env.host = getenv("BM_API_HOST");
     if (env.host == NULL)
@@ -1064,10 +1156,7 @@ int main(int argc, char **argv)
     {
         if (argc != 8)
         {
-            fprintf(stderr,
-                    "使い方: %s create-address <passphrase> <version> <stream> <ripeNullBytes> "
-                    "<label> <storePassphrase>\n",
-                    argv[0]);
+            print_command_usage(argv[0], "create-address");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1084,10 +1173,7 @@ int main(int argc, char **argv)
     {
         if (argc < 7 || argc > 9)
         {
-            fprintf(stderr,
-                    "使い方: %s import-address <address> <signingWIF> <encryptionWIF> <label> "
-                    "<storePassphrase> [nonceTrialsPerByte] [payloadLengthExtraBytes]\n",
-                    argv[0]);
+            print_command_usage(argv[0], "import-address");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1111,7 +1197,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s import-keys-dat <keys.datのパス> <storePassphrase>\n", argv[0]);
+            print_command_usage(argv[0], "import-keys-dat");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1123,7 +1209,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s set-label <address> <label>\n", argv[0]);
+            print_command_usage(argv[0], "set-label");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1136,7 +1222,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s fix-labels-from-keys-dat <keys.datのパス>\n", argv[0]);
+            print_command_usage(argv[0], "fix-labels-from-keys-dat");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1148,7 +1234,7 @@ int main(int argc, char **argv)
     {
         if (argc != 5)
         {
-            fprintf(stderr, "使い方: %s join-chan <passphrase> <label> <storePassphrase>\n", argv[0]);
+            print_command_usage(argv[0], "join-chan");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1162,7 +1248,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s unlock <address> <passphrase>\n", argv[0]);
+            print_command_usage(argv[0], "unlock");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1175,7 +1261,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s export-address <address> <passphrase>\n", argv[0]);
+            print_command_usage(argv[0], "export-address");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1188,7 +1274,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s unlock-all <passphrase>\n", argv[0]);
+            print_command_usage(argv[0], "unlock-all");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1204,8 +1290,7 @@ int main(int argc, char **argv)
         bm_json_free(params);
         if (argc != first + 2)
         {
-            fprintf(stderr, "使い方: %s unlock-addresses [--backfill] <アドレス一覧のパス|-> <passphrase>\n",
-                    argv[0]);
+            print_command_usage(argv[0], "unlock-addresses");
             return EXIT_FAILURE;
         }
         return unlock_addresses_from_file(&env, argv[first], argv[first + 1], backfill);
@@ -1215,7 +1300,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s lock <address>\n", argv[0]);
+            print_command_usage(argv[0], "lock");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1232,7 +1317,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s delete <address>\n", argv[0]);
+            print_command_usage(argv[0], "delete");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1244,7 +1329,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s convert-to-v4 <v3Address> <passphrase>\n", argv[0]);
+            print_command_usage(argv[0], "convert-to-v4");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1257,7 +1342,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3 && argc != 4)
         {
-            fprintf(stderr, "使い方: %s convert-all-v3-to-v4 <passphrase> [limit]\n", argv[0]);
+            print_command_usage(argv[0], "convert-all-v3-to-v4");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1273,8 +1358,7 @@ int main(int argc, char **argv)
     {
         if (argc != 5)
         {
-            fprintf(stderr, "使い方: %s cache-pubkey <address> <signingPubkeyHex> <encryptionPubkeyHex>\n",
-                    argv[0]);
+            print_command_usage(argv[0], "cache-pubkey");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1288,10 +1372,7 @@ int main(int argc, char **argv)
     {
         if (argc < 6 || argc > 8)
         {
-            fprintf(stderr,
-                    "使い方: %s send-message [--body-file <path>] <fromAddress> <toAddress> "
-                    "<subject> [<body>] [ttlSeconds] [ackStealthLevel]\n",
-                    argv[0]);
+            print_command_usage(argv[0], "send-message");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1326,7 +1407,7 @@ int main(int argc, char **argv)
     {
         if (argc > 3)
         {
-            fprintf(stderr, "使い方: %s get-inbox [folder]\n", argv[0]);
+            print_command_usage(argv[0], "get-inbox");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1341,7 +1422,7 @@ int main(int argc, char **argv)
     {
         if (argc != 2)
         {
-            fprintf(stderr, "使い方: %s get-sent\n", argv[0]);
+            print_command_usage(argv[0], "get-sent");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1352,7 +1433,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s trash-message <msgId(hex)>\n", argv[0]);
+            print_command_usage(argv[0], "trash-message");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1364,10 +1445,7 @@ int main(int argc, char **argv)
     {
         if (argc < 5 || argc > 6)
         {
-            fprintf(stderr,
-                    "使い方: %s send-broadcast [--body-file <path>] <fromAddress> <subject> "
-                    "[<body>] [ttlSeconds]\n",
-                    argv[0]);
+            print_command_usage(argv[0], "send-broadcast");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1391,7 +1469,7 @@ int main(int argc, char **argv)
     {
         if (argc < 3 || argc > 4)
         {
-            fprintf(stderr, "使い方: %s add-subscription <address> [label]\n", argv[0]);
+            print_command_usage(argv[0], "add-subscription");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1404,7 +1482,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s remove-subscription <address>\n", argv[0]);
+            print_command_usage(argv[0], "remove-subscription");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1421,7 +1499,7 @@ int main(int argc, char **argv)
     {
         if (argc != 4)
         {
-            fprintf(stderr, "使い方: %s add-address-book-entry <address> <label>\n", argv[0]);
+            print_command_usage(argv[0], "add-address-book-entry");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1434,7 +1512,7 @@ int main(int argc, char **argv)
     {
         if (argc != 3)
         {
-            fprintf(stderr, "使い方: %s delete-address-book-entry <address>\n", argv[0]);
+            print_command_usage(argv[0], "delete-address-book-entry");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1456,7 +1534,7 @@ int main(int argc, char **argv)
     {
         if (argc != 5)
         {
-            fprintf(stderr, "使い方: %s set-socks-proxy-onion <enabled:0|1> <host> <port>\n", argv[0]);
+            print_command_usage(argv[0], "set-socks-proxy-onion");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1475,7 +1553,7 @@ int main(int argc, char **argv)
     {
         if (argc != 5)
         {
-            fprintf(stderr, "使い方: %s set-socks-proxy-clearnet <enabled:0|1> <host> <port>\n", argv[0]);
+            print_command_usage(argv[0], "set-socks-proxy-clearnet");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1489,7 +1567,7 @@ int main(int argc, char **argv)
     {
         if (argc < 4 || argc > 5)
         {
-            fprintf(stderr, "使い方: %s add-peer <ipAddress> <port> [stream]\n", argv[0]);
+            print_command_usage(argv[0], "add-peer");
             bm_json_free(params);
             return EXIT_FAILURE;
         }
@@ -1512,7 +1590,7 @@ int main(int argc, char **argv)
         return call_rpc(&env, "getNetworkStats", params);
     }
 
-    fprintf(stderr, "不明なコマンド: %s\n\n", cmd);
+    fprintf(stderr, _("Unknown command: %s\n\n"), cmd);
     print_usage(argv[0]);
     bm_json_free(params);
     return EXIT_FAILURE;
