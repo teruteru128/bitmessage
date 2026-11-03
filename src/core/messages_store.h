@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../common/address_limits.h"
+
 int bm_messages_store_init_schema(sqlite3 *db);
 
 /* §11 再送(resend)ロジックの既定パラメータ。初回送信からBM_RESEND_INITIAL_INTERVAL_SECONDS
@@ -52,8 +54,8 @@ int bm_messages_store_try_mark_ack_received(sqlite3 *db, const unsigned char rec
 struct bm_sent_resend_candidate
 {
     unsigned char msg_id[32];
-    char to_address[40];
-    char from_address[40];
+    char to_address[BM_ADDRESS_STR_MAX];
+    char from_address[BM_ADDRESS_STR_MAX];
     char *subject; /* malloc */
     char *body;    /* malloc */
     int ack_stealth_level;
@@ -72,7 +74,7 @@ int bm_messages_store_list_resend_candidates(sqlite3 *db, int64_t now, int max_a
                                               struct bm_sent_resend_candidate **out_list, size_t *out_count);
 void bm_sent_resend_candidate_list_free(struct bm_sent_resend_candidate *list, size_t count);
 
-#define BM_MESSAGES_ADDRESS_MAX 40
+#define BM_MESSAGES_ADDRESS_MAX BM_ADDRESS_STR_MAX /* §11 2026-11-04 40から変更、address_limits.h参照 */
 #define BM_MESSAGES_FOLDER_MAX 16
 
 struct bm_inbox_message

@@ -8,7 +8,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BM_IDENTITY_ADDRESS_MAX 40
+#include "../common/address_limits.h"
+
+#define BM_IDENTITY_ADDRESS_MAX BM_ADDRESS_STR_MAX /* §11 2026-11-04 40から変更、address_limits.h参照 */
 #define BM_IDENTITY_LABEL_MAX 128
 #define BM_IDENTITY_KDF_ALGO_MAX 16
 #define BM_IDENTITY_KDF_PARAMS_MAX 128

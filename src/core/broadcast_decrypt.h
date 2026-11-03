@@ -15,11 +15,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../common/address_limits.h"
+
 struct bm_decoded_broadcast
 {
     uint64_t from_address_version;
     uint64_t from_stream;
-    char from_address[40];
+    char from_address[BM_ADDRESS_STR_MAX];
     char *subject; /* malloc、bm_decoded_broadcast_freeで解放 */
     char *body;    /* malloc */
 };

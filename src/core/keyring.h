@@ -15,7 +15,9 @@
 #include <stdint.h>
 #include <time.h>
 
-#define BM_KEYRING_MAX_ADDRESS_LEN 40
+#include "../common/address_limits.h"
+
+#define BM_KEYRING_MAX_ADDRESS_LEN BM_ADDRESS_STR_MAX /* §11 2026-11-04 40から変更、address_limits.h参照 */
 
 struct bm_unlocked_identity
 {

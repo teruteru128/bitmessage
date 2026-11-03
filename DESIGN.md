@@ -4526,3 +4526,26 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     リークではない)。freeしない設計は変えず、配列をファイルスコープの`g_body_file_argv`にも
     保持して、LSanの探索の起点から常に到達できるようにした。手元のASan+UBSanビルドで再現し、
     修正後に56件全通過(Debugビルドも56件全通過)を確認した。
+
+55. **ポスト量子拡張のフェーズ2(受信側)をdaemon本体へ入れる(進行中)**: 2026-11-04、ユーザーとの
+    相談で着手。[DESIGN-PQ.md](DESIGN-PQ.md) §9.1のフェーズ2。前提だった項目38(PoWのワーカー化)は
+    Tier 1・2とも2026-11-03に実装済み。進め方(PQ用ブランチを並走させず、master上の実行時フラグで
+    切り替える)とv5鍵の保存方式(展開済みの秘密鍵ではなく成分seedを保存する)はDESIGN-PQ.md §9に
+    記録した。次の段に分け、段ごとにテストを通してコミットする。
+
+    1. **アドレス文字列のバッファ幅を揃える(実装済み、2026-11-04)。** v5アドレスは53〜54文字
+       (DESIGN-PQ.md §4.3)だが、identity_store/keyring/messages_storeの定数と、
+       trial_decrypt.h・broadcast_decrypt.h・messages_store.hの即値はどれも40で、v5アドレスが
+       snprintf/strncpyで黙って途中で切れる状態だった。`src/common/address_limits.h`の
+       `BM_ADDRESS_STR_MAX`(64)へ全てを揃えた(既存の3つの定数名は残し、値をこれにした)。
+       SQLiteのTEXT列には長さの制約が無いのでスキーマの変更は無く、v4以前の動作は変わらない。
+       `tests/test_address_width.c`で、54文字のアドレスがidentity行・inbox・sent・再送候補・
+       購読の各経路を往復しても切れないことを確かめた(値を40に戻すと8件落ちることも確認)。
+    2. 実行時フラグ(既定は無効)と、`BM_ENABLE_PQ`のときだけ`bm_pq`をdaemonへリンクする配線
+    3. v5 identityの保存(identity.dbの新しい表、成分seedを既存と同じKEKでラップ)とkeyring
+    4. API: `createDeterministicAddress`のversion 5、listAddresses・unlock・lockのv5対応。
+       アドレス生成でバージョンを指定できるのは現状`createDeterministicAddress`
+       (CLI: `create-address`)だけで、3と4以外は拒否している。ランダム生成のAPI(本家の
+       `createRandomAddress`相当)はv4でも存在せず、`joinChan`はv4固定(2026-11-04確認)
+    5. object_syncの受信分岐(v5のgetpubkeyへの自応答、pubkeyのキャッシュ、msg v2の試行復号、
+       broadcast v6の購読)

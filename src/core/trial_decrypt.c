@@ -215,7 +215,8 @@ static int trial_decrypt_body(const struct bm_unlocked_identity *identity, const
     if (from_addr_str != NULL)
     {
         /* §11 2026-08-24 backlog項目10(Releaseビルド検証)で発覚: to_address側は
-         * matched.address(固定長char[40]、out->to_addressと同サイズ)がsrcとなるため
+         * matched.address(固定長char[40]、out->to_addressと同サイズ。§11 2026-11-04に
+         * BM_ADDRESS_STR_MAXへ広げた後も両者は同サイズ)がsrcとなるため
          * -Wstringop-truncationが警告する。snprintfなら常にNUL終端されるため警告が
          * 出ない(from_addr_strはmalloc由来でGCCが長さを静的に追えず元々警告されないが、
          * 統一のためこちらもsnprintfにした)。 */

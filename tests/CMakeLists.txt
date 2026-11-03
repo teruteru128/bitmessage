@@ -113,6 +113,11 @@ add_executable(test_send_async test_send_async.c)
 target_link_libraries(test_send_async PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME send_async COMMAND test_send_async)
 
+# §11 2026-11-04 アドレス文字列のバッファ幅(BM_ADDRESS_STR_MAX)。ポスト量子v5の前提
+add_executable(test_address_width test_address_width.c)
+target_link_libraries(test_address_width PRIVATE bm_core)
+add_test(NAME address_width COMMAND test_address_width)
+
 add_executable(test_getpubkey_automation test_getpubkey_automation.c)
 target_link_libraries(test_getpubkey_automation PRIVATE bm_core bm_infra bm_pow Threads::Threads)
 add_test(NAME getpubkey_automation COMMAND test_getpubkey_automation)

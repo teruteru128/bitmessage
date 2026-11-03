@@ -10,14 +10,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../common/address_limits.h"
+
 #include "keyring.h"
 
 struct bm_decoded_msg
 {
     uint64_t from_address_version;
     uint64_t from_stream;
-    char from_address[40];
-    char to_address[40];
+    char from_address[BM_ADDRESS_STR_MAX];
+    char to_address[BM_ADDRESS_STR_MAX];
     char *subject;              /* malloc、bm_decoded_msg_freeで解放 */
     char *body;                 /* malloc、bm_decoded_msg_freeで解放 */
     unsigned char *ack_payload; /* malloc、NULL可(ack_payload_len=0のとき) */
