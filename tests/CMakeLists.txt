@@ -264,4 +264,9 @@ if(BM_ENABLE_PQ)
     add_executable(test_pq_keyring test_pq_keyring.c)
     target_link_libraries(test_pq_keyring PRIVATE bm_core Threads::Threads)
     add_test(NAME pq_keyring COMMAND test_pq_keyring)
+
+    # §11 2026-11-04 項目55の段4: v5のアドレスをJSON-RPC APIで扱う
+    add_executable(test_pq_api test_pq_api.c)
+    target_link_libraries(test_pq_api PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+    add_test(NAME pq_api COMMAND test_pq_api)
 endif()

@@ -15,6 +15,7 @@
 #include "keyring_internal.h"
 #include "logging.h"
 #ifdef BM_HAVE_PQ
+#include "pq_identity_store.h"
 #include "pq_keyring.h"
 #endif
 
@@ -860,7 +861,15 @@ void bm_keyring_lock_all(bm_keyring_t *kr)
 
 int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *address)
 {
-    bm_keyring_lock(kr, address); /* 見つからなくても(既にロック中でも)問題ない */
+    bm_keyring_lock(kr, address); /* 見つからなくても(既にロック中でも)問題ない(v5も外れる) */
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5の行(pq_identities)も消す。アドレスの形でどちらの表か
+     * 決まるが、両方に同じアドレスが入ることは無いので、両方に対してDELETEしてよい */
+    if (bm_pq_identity_store_delete(db, address) != 0)
+    {
+        return -1;
+    }
+#endif
     return bm_identity_store_delete(db, address);
 }
 

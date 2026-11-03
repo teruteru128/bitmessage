@@ -4598,9 +4598,39 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
        - **まだやっていないこと(段4以降)。** v5の行のvault方式への移行(v4のunlock時の
          lazy migration)、`unlockAllAddresses`・`deleteAddress`・`listAddresses`でのv5の扱い、
          APIからの作成。
-    4. API: `createDeterministicAddress`のversion 5、listAddresses・unlock・lockのv5対応。
-       アドレス生成でバージョンを指定できるのは現状`createDeterministicAddress`
-       (CLI: `create-address`)だけで、3と4以外は拒否している。ランダム生成のAPI(本家の
-       `createRandomAddress`相当)はv4でも存在せず、`joinChan`はv4固定(2026-11-04確認)
+    4. **APIのv5対応(実装済み、2026-11-04)。** 着手前の確認: アドレス生成でバージョンを指定
+       できるのは`createDeterministicAddress`(CLI: `create-address`)だけで、3と4以外は拒否して
+       いた。ランダム生成のAPI(本家の`createRandomAddress`相当)はv4でも存在せず、`joinChan`は
+       v4固定。v5はこの既存の入口に足した(ランダム生成とchanは対象外のまま)。
+       - **見分け方。** v5かどうかはアドレス文字列の形(`bm_pqv5_address_decode`、version 5と
+         checksumまで検証)で決め、v5のkeyring・表へ振り分ける。実行時フラグ
+         (`config->pq_enabled`)が無効なら、v5を扱う操作は「post-quantum (v5) support is
+         disabled」の明示的なエラーにする(黙って「見つからない」にすると、フラグの
+         設定忘れとアドレスの間違いを区別できないため)。
+       - **`createDeterministicAddress`のversion 5**: v4と同じく1つのパスフレーズから1本
+         (start_nonce=0)を作り、storePassphraseで行ごとのscryptでラップして保存する。
+         作成時にunlockしないのもv4と同じ。null_bytesの探索はAPIスレッドで同期的に行う
+         (1で期待125ms、2で期待32秒。v4の探索も同じくAPIスレッドで、作成時の1回だけ)。
+       - **`unlockAddress`/`unlockAddresses`/`unlockAllAddresses`**: v5はv5のkeyringへ。
+         `unlockAddresses`はv4以前だけを従来の一括unlock(vaultのmaster KEKを1回だけ導出)へ渡し、
+         結果を要求の並びへ戻す。フラグ無効でv5が混ざっていれば、何もunlockせずに呼び出し
+         全体を断る。`unlockAllAddresses`の件数上限(項目44)はv5をv4以前とは別に数え、
+         v5を先に数えて超えていればv4以前もunlockしない(v4以前の件数を数えるには全行を
+         読む必要があり、実運用で数十万行あるため)。unlock直後の過去MSGのbackfillは、
+         v5のmsgの試行復号と一緒に段5で入れる(この段ではv5に対しては行わない)。
+       - **`listAddresses`**: v5も同じ形で続けて返す。フラグ無効でも出す(作った後で
+         フラグを切った場合に、行が残っていることが分かるように)。
+       - **`deleteAddress`/`setAddressLabel`**: v5の表も対象(`bm_keyring_delete_identity`が
+         pq_identitiesも消す、`bm_pq_identity_store_update_label`を追加)。
+         `lockAddress`/`lockAllAddresses`は段3で`bm_keyring_lock`がv5も外すようにしてある。
+       - **`exportAddress`**: v5の鍵はWIF(secp256k1の32byte)で表せず、書き出し形式も
+         決めていないので明示的に断る。
+       - CLIの`create-address`は数値をそのまま渡すのでversion 5もAPIへ届く。使い方の表示
+         (`<version:3|4>`)は、READMEと同じくv5が実際に動く段まで直さない。
+       - **テスト**: `tests/test_pq_api.c`(HTTP越し。フラグ有効のサーバーで上の各操作、
+         フラグ無効のサーバーでv5を扱う操作のエラー)。`unlockAddresses`のv5の振り分けを
+         無効にすると3件落ちることを確認した。ASan/UBSanでAPI・keyring・PQ関連の11件も通過。
+         `api_server.c`・`keyring.c`は`BM_HAVE_PQ`無しで`-Werror`のコンパイルが通ることも
+         確かめた。
     5. object_syncの受信分岐(v5のgetpubkeyへの自応答、pubkeyのキャッシュ、msg v2の試行復号、
        broadcast v6の購読)

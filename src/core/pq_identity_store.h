@@ -57,6 +57,10 @@ int bm_pq_identity_store_load(sqlite3 *db, const char *address, struct bm_pq_ide
 /* 該当行が無くてもエラーにしない。成功時0 */
 int bm_pq_identity_store_delete(sqlite3 *db, const char *address);
 
+/* §11 2026-11-04 項目55の段4: setAddressLabel用(identity_store.hの同名関数のv5版)。
+ * 該当addressが無ければ非0。成功時0 */
+int bm_pq_identity_store_update_label(sqlite3 *db, const char *address, const char *label);
+
 /* 全v5 identityの一覧(identity_store.hのbm_identity_summaryと同じ形、is_chanは常に0)。
  * *out_listはmalloc、呼び出し側でfreeする。成功時0(0件でも成功) */
 int bm_pq_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count);

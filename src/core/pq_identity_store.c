@@ -136,6 +136,21 @@ int bm_pq_identity_store_delete(sqlite3 *db, const char *address)
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+int bm_pq_identity_store_update_label(sqlite3 *db, const char *address, const char *label)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE pq_identities SET label = ?1 WHERE address = ?2;", -1, &stmt, NULL)
+        != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, label, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, address, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE && sqlite3_changes(db) > 0) ? 0 : -1;
+}
+
 int bm_pq_identity_store_list(sqlite3 *db, struct bm_identity_summary **out_list, size_t *out_count)
 {
     *out_list = NULL;

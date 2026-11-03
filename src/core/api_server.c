@@ -34,6 +34,10 @@
 #include "peer_manager.h"
 #include "pubkey_cache.h"
 #include "send_pipeline.h"
+#ifdef BM_HAVE_PQ
+#include "pq_identity_store.h"
+#include "pq_keyring.h"
+#endif
 
 /* getpubkey要求自体のPoW難易度。誰が受け取るか分からない匿名objectのため、宛先固有の
  * 難易度ではなくネットワーク既定値(send_pipeline.cのack生成と同じ考え方)を使う */
@@ -205,6 +209,44 @@ static int hex_decode_fixed(const char *hex, unsigned char *out, size_t out_len)
     return 0;
 }
 
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-04 項目55の段4: ポスト量子拡張(v5)のアドレスをAPIで扱うための小道具。
+ * v5のアドレスはアドレス文字列の形(version=5、checksumまで検証)で見分け、v5のkeyring
+ * (pq_keyring.c)と表(pq_identities)へ振り分ける。実行時フラグ(config->pq_enabled)が
+ * 無効なら、v5のアドレスを扱う操作は明示的なエラーにする(黙って「見つからない」には
+ * しない。設定を有効にし忘れているのか、アドレスを間違えているのかを区別できるように)。
+ */
+static int is_v5_address(const char *address)
+{
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char id[BM_PQV5_ID_LEN];
+    return address != NULL && bm_pqv5_address_decode(address, &version, &stream, id) == 0;
+}
+
+#define BM_API_PQ_DISABLED_ERROR                                                                                   \
+    "post-quantum (v5) support is disabled (set [pq] enabled = 1 in bitmessage.conf, or BM_PQ_ENABLED=1)"
+
+/* v5のアドレス1件をunlockし、結果をunlockAddressesの1要素と同じ形でoutへ書く */
+static void pq_unlock_one(const struct bm_api_server_config *config, const char *address, const char *passphrase,
+                          struct bm_unlock_all_entry *out)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->address, sizeof(out->address), "%s", address);
+    struct bm_pq_identity_row *row = malloc(sizeof(*row)); /* 3KB超なのでスタックに置かない */
+    int exists = row != NULL && bm_pq_identity_store_load(config->identity_db, address, row) == 0;
+    free(row);
+    if (!exists)
+    {
+        out->not_found = 1;
+        return;
+    }
+    out->unlocked =
+        bm_pq_keyring_unlock(config->keyring, config->identity_db, address, passphrase, (int64_t)time(NULL)) == 0;
+}
+#endif
+
 static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
                                          const cJSON *params, char **out_error)
 {
@@ -215,6 +257,21 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
         *out_error = dup_cstr("unlockAddress requires [address, passphrase]");
         return NULL;
     }
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5はv5のkeyringへ。過去MSGのbackfill(下のv4の経路のコメント
+     * 参照)は、v5のmsgの試行復号と一緒に段5で入れる */
+    if (is_v5_address(address))
+    {
+        if (!config->pq_enabled)
+        {
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return NULL;
+        }
+        return cJSON_CreateBool(
+            bm_pq_keyring_unlock(config->keyring, config->identity_db, address, passphrase, (int64_t)time(NULL))
+            == 0);
+    }
+#endif
     int rc = bm_keyring_unlock(config->keyring, config->identity_db, address, passphrase);
     if (rc == 0 && config->object_pool_db != NULL)
     {
@@ -251,6 +308,33 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
         return NULL;
     }
 
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5のidentityも対象にする(pq_enabledのときだけ)。件数の上限
+     * (項目44)はv4以前とは別に数える。v4以前の件数をここで数えるには全行を読む必要があり
+     * (実運用で数十万行)、上限の目的(受信msgごとの試行復号がネットワークスレッドを止めない
+     * こと)に対しては、v5が別に上限内であれば十分なため。v5はv4以前より先に数え、超えて
+     * いればv4以前もunlockせずに拒否する(途中まで処理してから断ると、どこまでunlockされたか
+     * 分からなくなるため) */
+    struct bm_identity_summary *pq_list = NULL;
+    size_t pq_count = 0;
+    if (config->pq_enabled && bm_pq_identity_store_list(config->identity_db, &pq_list, &pq_count) != 0)
+    {
+        *out_error = dup_cstr("failed to list v5 identities");
+        return NULL;
+    }
+    if (pq_count > BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES)
+    {
+        free(pq_list);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "unlockAllAddresses refused: %zu v5 identities exceeds the limit of %d; unlock the addresses you "
+                 "need with unlockAddresses",
+                 pq_count, BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES);
+        *out_error = dup_cstr(msg);
+        return NULL;
+    }
+#endif
+
     struct bm_unlock_all_entry *results = NULL;
     size_t count = 0;
     int rc = bm_keyring_unlock_all(config->keyring, config->identity_db, passphrase, &results, &count);
@@ -263,11 +347,17 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
                 "incoming msg would stall the network thread); unlock the addresses you need with unlockAddresses",
                 count, BM_KEYRING_UNLOCK_ALL_MAX_IDENTITIES);
         *out_error = dup_cstr(msg);
+#ifdef BM_HAVE_PQ
+        free(pq_list);
+#endif
         return NULL;
     }
     if (rc != 0)
     {
         *out_error = dup_cstr("failed to list identities");
+#ifdef BM_HAVE_PQ
+        free(pq_list);
+#endif
         return NULL;
     }
 
@@ -293,6 +383,18 @@ static cJSON *h_unlockAllAddresses(const struct bm_api_server_config *config,
         cJSON_AddItemToArray(arr, entry);
     }
     free(results);
+#ifdef BM_HAVE_PQ
+    for (size_t i = 0; i < pq_count; i++)
+    {
+        struct bm_unlock_all_entry one;
+        pq_unlock_one(config, pq_list[i].address, passphrase, &one);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddItemToObject(entry, "address", json_str(one.address));
+        cJSON_AddItemToObject(entry, "unlocked", cJSON_CreateBool(one.unlocked));
+        cJSON_AddItemToArray(arr, entry);
+    }
+    free(pq_list);
+#endif
     return arr;
 }
 
@@ -372,7 +474,61 @@ static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
         }
     }
 
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5のアドレスはv5のkeyringへ振り分け、v4以前だけを従来の一括
+     * unlock(vaultのmaster KEKを1回だけ導出する)へ渡し、結果を元の並びへ戻す。v5の行は
+     * 行ごとのscryptなので、まとめても速くならない(段3) */
+    size_t legacy_count = 0;
+    size_t *legacy_index = malloc(sizeof(*legacy_index) * (count > 0 ? count : 1));
+    const char **legacy = malloc(sizeof(*legacy) * (count > 0 ? count : 1));
+    struct bm_unlock_all_entry *legacy_results = malloc(sizeof(*legacy_results) * (count > 0 ? count : 1));
+    if (legacy_index == NULL || legacy == NULL || legacy_results == NULL)
+    {
+        free(legacy_index);
+        free(legacy);
+        free(legacy_results);
+        free(addresses);
+        free(results);
+        *out_error = dup_cstr("out of memory");
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        if (is_v5_address(addresses[i]) && !config->pq_enabled)
+        {
+            free(legacy_index);
+            free(legacy);
+            free(legacy_results);
+            free(addresses);
+            free(results);
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return NULL;
+        }
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        if (is_v5_address(addresses[i]))
+        {
+            pq_unlock_one(config, addresses[i], passphrase, &results[i]);
+        }
+        else
+        {
+            legacy_index[legacy_count] = i;
+            legacy[legacy_count++] = addresses[i];
+        }
+    }
+    bm_keyring_unlock_addresses(config->keyring, config->identity_db, passphrase, legacy, legacy_count,
+                                legacy_results);
+    for (size_t j = 0; j < legacy_count; j++)
+    {
+        results[legacy_index[j]] = legacy_results[j];
+    }
+    free(legacy_index);
+    free(legacy);
+    free(legacy_results);
+#else
     bm_keyring_unlock_addresses(config->keyring, config->identity_db, passphrase, addresses, count, results);
+#endif
 
     cJSON *arr = cJSON_CreateArray();
     size_t unlocked_count = 0;
@@ -389,7 +545,13 @@ static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
         else
         {
             /* backfill対象は今回unlockできたものに詰めて渡す(addressesは以後使わないので上書きしてよい) */
-            addresses[unlocked_count++] = addresses[i];
+#ifdef BM_HAVE_PQ
+            /* §11 2026-11-04 項目55の段4: v5のbackfillは段5(v5のmsgの試行復号)で入れる */
+            if (!is_v5_address(addresses[i]))
+#endif
+            {
+                addresses[unlocked_count++] = addresses[i];
+            }
         }
         cJSON_AddItemToArray(arr, entry);
     }
@@ -427,6 +589,16 @@ static cJSON *h_exportAddress(const struct bm_api_server_config *config,
         *out_error = dup_cstr("exportAddress requires [address, passphrase]");
         return NULL;
     }
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5の鍵はWIF(secp256k1の32byte)で表せず、書き出し形式も
+     * まだ決めていない。v4以前の経路に流すと「address not found」になって紛らわしいので
+     * 明示的に断る */
+    if (is_v5_address(address))
+    {
+        *out_error = dup_cstr("exportAddress does not support v5 (post-quantum) addresses yet");
+        return NULL;
+    }
+#endif
 
     unsigned char priv_signing[BM_PRIVATE_KEY_LEN];
     unsigned char priv_encryption[BM_PRIVATE_KEY_LEN];
@@ -691,8 +863,72 @@ static cJSON *h_listAddresses(const struct bm_api_server_config *config,
         cJSON_AddItemToArray(arr, entry);
     }
     free(list);
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: v5のidentity(pq_identities)も同じ形で続けて返す。実行時フラグが
+     * 無効でも一覧には出す(作った後でフラグを切った場合に、行が残っていることが分かるように) */
+    if (bm_pq_identity_store_list(config->identity_db, &list, &count) == 0)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddItemToObject(entry, "address", json_str(list[i].address));
+            cJSON_AddItemToObject(entry, "label", json_str(list[i].label));
+            cJSON_AddItemToObject(entry, "enabled", cJSON_CreateBool(list[i].enabled));
+            int unlocked = bm_pq_keyring_find_by_address(config->keyring, list[i].address, NULL) ? 1 : 0;
+            cJSON_AddItemToObject(entry, "unlocked", cJSON_CreateBool(unlocked));
+            cJSON_AddItemToObject(entry, "isChan", cJSON_CreateBool(0));
+            cJSON_AddItemToArray(arr, entry);
+        }
+        free(list);
+    }
+#endif
     return arr;
 }
+
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-04 項目55の段4: createDeterministicAddressのversion 5。v4と同じく1つの
+ * パスフレーズから1本(start_nonce=0)を作り、passphraseとは別のstorePassphraseでラップして
+ * 保存する(DESIGN-PQ.md §4.2)。v4と同じくunlockはしない(呼び出し側がunlockAddressする)。
+ * 探索(null_bytes)はこのAPIスレッドで同期的に行う: null_bytes=1で期待125ms、2で期待32秒
+ * (DESIGN-PQ.md §8.2)。v4の探索も同じくAPIスレッドで行っている(PoWと違い、作成時に1回だけ)。
+ */
+static cJSON *create_deterministic_v5(const struct bm_api_server_config *config, const char *passphrase,
+                                      uint64_t stream, int null_bytes, const char *label,
+                                      const char *store_passphrase, char **out_error)
+{
+    if (stream < 1 || null_bytes < 0 || null_bytes > BM_PQV5_ID_LEN)
+    {
+        *out_error = dup_cstr("invalid stream or ripeNullBytes for a v5 address");
+        return NULL;
+    }
+    struct bm_pqv5_identity *gen = malloc(sizeof(*gen)); /* 10KB超なのでスタックに置かない */
+    if (gen == NULL)
+    {
+        *out_error = dup_cstr("out of memory");
+        return NULL;
+    }
+    if (bm_pqv5_identity_generate_deterministic(passphrase, stream, 0, null_bytes, gen) != 0)
+    {
+        OPENSSL_cleanse(gen, sizeof(*gen));
+        free(gen);
+        *out_error = dup_cstr("address generation failed");
+        return NULL;
+    }
+    char address[BM_KEYRING_MAX_ADDRESS_LEN];
+    int rc = bm_pq_keyring_create_identity(config->identity_db, gen, label != NULL ? label : "", store_passphrase,
+                                           config->default_nonce_trials_per_byte,
+                                           config->default_payload_length_extra_bytes, (int64_t)time(NULL), address);
+    OPENSSL_cleanse(gen, sizeof(*gen));
+    free(gen);
+    if (rc != 0)
+    {
+        *out_error = dup_cstr("failed to store identity (duplicate address?)");
+        return NULL;
+    }
+    return json_str(address);
+}
+#endif
 
 static cJSON *h_createDeterministicAddress(const struct bm_api_server_config *config,
                                                        const cJSON *params, char **out_error)
@@ -715,6 +951,18 @@ static cJSON *h_createDeterministicAddress(const struct bm_api_server_config *co
     uint64_t version = (uint64_t)json_num(version_v);
     uint64_t stream = (uint64_t)json_num(stream_v);
     int null_bytes = (int)json_num(null_bytes_v);
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段4: version 5(ポスト量子)。実行時フラグが無効なら拒否する */
+    if (version == BM_PQV5_ADDRESS_VERSION)
+    {
+        if (!config->pq_enabled)
+        {
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return NULL;
+        }
+        return create_deterministic_v5(config, passphrase, stream, null_bytes, label, store_passphrase, out_error);
+    }
+#endif
     if (version < 3 || version > 4)
     {
         *out_error = dup_cstr("addressVersion must be 3 or 4");
@@ -768,7 +1016,12 @@ static cJSON *h_setAddressLabel(const struct bm_api_server_config *config,
         *out_error = dup_cstr("setAddressLabel requires [address, label]");
         return NULL;
     }
-    if (bm_identity_store_update_label(config->identity_db, address, label) != 0)
+    if (bm_identity_store_update_label(config->identity_db, address, label) != 0
+#ifdef BM_HAVE_PQ
+        /* §11 2026-11-04 項目55の段4: v4以前の表に無ければv5の表 */
+        && bm_pq_identity_store_update_label(config->identity_db, address, label) != 0
+#endif
+    )
     {
         *out_error = dup_cstr("address not found");
         return NULL;
