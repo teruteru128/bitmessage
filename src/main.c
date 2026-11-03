@@ -159,15 +159,20 @@ static uint64_t env_or_u64(const char *env_name, uint64_t file_value)
     return (env_value != NULL) ? strtoull(env_value, NULL, 10) : file_value;
 }
 
+/* §11 2026-11-03(項目54、国際化): daemon側の出力(このusageとbm_log_*のログ)は翻訳せず英語に
+ * 統一した。ログは言語によってgrep・監視スクリプトの照合文字列が変わると困るうえ、バグ報告に
+ * そのまま貼って誰でも読める方が有用なため。それまでは起動・終了まわりだけ日本語が混在していた。
+ * 翻訳対象は人が対話的に使うbitmessage-cliのみ(src/cli/main.c、gettext)。 */
 static void print_usage(const char *prog)
 {
-    printf("使い方: %s [--version|-v] [--help|-h]\n"
+    printf("Usage: %s [--version|-v] [--help|-h]\n"
            "\n"
-           "bitmessagedはコマンドライン引数を取らず、環境変数と設定ファイル\n"
-           "(既定bitmessage.conf、BM_CONFIG_FILEで変更可)で動作を設定するdaemonです。\n"
-           "引数無しで起動するとdaemonとして動き続けます。主な環境変数はREADME.mdの\n"
-           "「環境変数一覧」を参照してください(BM_DATA_DIR/BM_TESTNET/BM_MAX_OUTBOUND/\n"
-           "BM_API_PORT/BM_INBOUND_PORT/BM_TOR_CONTROL等)。\n",
+           "bitmessaged takes no command-line arguments; it is configured through\n"
+           "environment variables and a config file (bitmessage.conf by default,\n"
+           "overridable with BM_CONFIG_FILE). Started without arguments, it keeps running\n"
+           "as a daemon. See \"Environment variables\" in README.md for the main variables\n"
+           "(BM_DATA_DIR/BM_TESTNET/BM_MAX_OUTBOUND/BM_API_PORT/BM_INBOUND_PORT/\n"
+           "BM_TOR_CONTROL etc.).\n",
             prog);
 }
 
@@ -191,7 +196,7 @@ int main(int argc, char **argv)
             print_usage(argv[0]);
             return EXIT_SUCCESS;
         }
-        fprintf(stderr, "不明な引数: %s\n\n", argv[1]);
+        fprintf(stderr, "Unknown argument: %s\n\n", argv[1]);
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -250,10 +255,10 @@ int main(int argc, char **argv)
     if (peers_db == NULL || object_pool_db == NULL || identity_db == NULL || messages_db == NULL
         || config_db == NULL)
     {
-        bm_log_error("DB初期化に失敗しました\n");
+        bm_log_error("DB initialization failed\n");
         return EXIT_FAILURE;
     }
-    bm_log_info("DB初期化完了: peers.db, object_pool.db, identity.db, messages.db, config.db (data_dir=%s)\n",
+    bm_log_info("DB initialized: peers.db, object_pool.db, identity.db, messages.db, config.db (data_dir=%s)\n",
                 data_dir);
 
     /* §11 起動時設定ファイル(既定"bitmessage.conf"、BM_CONFIG_FILEで別の場所を指定可能)。
@@ -267,7 +272,7 @@ int main(int argc, char **argv)
     struct bm_config_file cfg;
     int config_file_found = bm_config_file_load(config_file_path, &cfg);
     bm_log_info("[config] %s (%s)\n", config_file_path,
-            config_file_found ? "読み込み完了" : "見つからないため既定値を使用");
+            config_file_found ? "loaded" : "not found, using defaults");
 
     /* §11 outbound接続用SOCKS5プロキシ設定。起動時ログ用に一度読むだけで、実際に
      * peer_connector_threadが使う値は再接続サイクルのたびconfig_dbから読み直される
@@ -344,7 +349,7 @@ int main(int argc, char **argv)
     api_config.default_payload_length_extra_bytes =
         env_or_u64("BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES", cfg.default_payload_length_extra_bytes);
     api_config.registry = &peer_registry;
-    bm_log_info("[api] apiusername=bitmessage apipassword=%s port=%d (この起動でのみ有効、認証情報は意図的に非永続)\n",
+    bm_log_info("[api] apiusername=bitmessage apipassword=%s port=%d (valid for this run only; credentials are intentionally not persisted)\n",
             api_password, api_port);
 
     /* testnet切り替え。bitmessage.confの[network] testnet、またはBM_TESTNET=1で切り替える
@@ -533,8 +538,8 @@ int main(int argc, char **argv)
         tor_control_fd = bm_tor_control_connect_and_authenticate(&tor_config);
         if (tor_control_fd < 0)
         {
-            bm_log_warn("[tor_control] hidden serviceの自動作成をスキップします(ControlPortに"
-                            "接続できませんでした)\n");
+            bm_log_warn("[tor_control] skipping automatic hidden service creation (could not connect "
+                            "to ControlPort)\n");
         }
         else
         {
@@ -548,7 +553,7 @@ int main(int argc, char **argv)
                                                           &new_private_key);
             if (add_onion_rc != 0)
             {
-                bm_log_error("[tor_control] hidden serviceの作成に失敗しました\n");
+                bm_log_error("[tor_control] failed to create hidden service\n");
                 close(tor_control_fd);
                 tor_control_fd = -1;
             }
@@ -617,7 +622,7 @@ int main(int argc, char **argv)
          * 逸脱(接続を全くしない特殊モード)であり、INFOの大量出力に紛れて見落とされると
          * 「なぜ全く繋がらないのか」の調査で遠回りになるため、DESIGN.md §11 backlog項目28の
          * NOTICE設計方針(設定値のフォールバック/特殊モード発動)に沿ってNOTICEにした。 */
-        bm_log_notice("[peer_connector] BM_NO_CONNECT=1のため接続をスキップします\n");
+        bm_log_notice("[peer_connector] BM_NO_CONNECT=1, skipping outbound connections\n");
     }
     else
     {
@@ -653,7 +658,7 @@ int main(int argc, char **argv)
     /* §11 2026-09-12: 8段階化に伴う移行。プロセス生存期間で1回しか出ない終了処理開始の
      * 節目であり、意図した終了(シグナル)かクラッシュかを見分ける手掛かりとして他のINFOより
      * 目立たせたいのでNOTICEにした。 */
-    bm_log_notice("シグナル %d を受信、終了処理を開始します\n", sig);
+    bm_log_notice("received signal %d, shutting down\n", sig);
 
     queues_shutdown(&queues);
     peer_connector_stop = 1;

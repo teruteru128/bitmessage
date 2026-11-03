@@ -39,12 +39,12 @@ BM_NO_CONNECT=1 BM_API_PORT=18446 BM_DATA_DIR="$WORKDIR/data" "$BITMESSAGED" >bi
 PID=$!
 
 for _ in $(seq 1 50); do
-    if grep -q "DB初期化完了" bitmessaged.log 2>/dev/null; then
+    if grep -q "DB initialized" bitmessaged.log 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
-grep -q "DB初期化完了" bitmessaged.log || fail "daemon did not report DB init within timeout"
+grep -q "DB initialized" bitmessaged.log || fail "daemon did not report DB init within timeout"
 grep -q "data_dir=$WORKDIR/data" bitmessaged.log || fail "daemon did not log the expected data_dir"
 
 for name in $DB_NAMES; do
@@ -62,7 +62,7 @@ BM_NO_CONNECT=1 BM_API_PORT=18447 "$BITMESSAGED" >bitmessaged.log 2>&1 &
 PID=$!
 
 for _ in $(seq 1 50); do
-    if grep -q "DB初期化完了" bitmessaged.log 2>/dev/null; then
+    if grep -q "DB initialized" bitmessaged.log 2>/dev/null; then
         break
     fi
     sleep 0.1

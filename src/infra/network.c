@@ -513,8 +513,8 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_addr_message addr_msg;
         if (bm_parse_addr_message(msg->payload, msg->length, &addr_msg) == 0)
         {
-            bm_log_debug("[network] addr: %" PRIu64 " entries (テスト用スタブのため保存はしない、"
-                                                    "production側の処理はobject_sync.c参照)\n",
+            bm_log_debug("[network] addr: %" PRIu64 " entries (test stub: not stored, "
+                                                    "see object_sync.c for the production path)\n",
                     addr_msg.count);
             bm_free_addr_message(&addr_msg);
         }
@@ -524,16 +524,16 @@ static void default_dispatch(struct bm_fd_data *conn, const struct bm_message *m
         struct bm_inventory_message inv_msg;
         if (bm_parse_inventory_message(msg->payload, msg->length, &inv_msg) == 0)
         {
-            bm_log_debug("[network] inv: %" PRIu64 " items (テスト用スタブのためgetdataは送らない、"
-                                                   "production側の処理はobject_sync.c参照)\n",
+            bm_log_debug("[network] inv: %" PRIu64 " items (test stub: no getdata sent, "
+                                                   "see object_sync.c for the production path)\n",
                     inv_msg.count);
             bm_free_inventory_message(&inv_msg);
         }
     }
     else if (strncmp(msg->command, "object", 12) == 0)
     {
-        bm_log_debug("[network] object received, %u bytes (テスト用スタブのため保存・復号はしない、"
-                                                 "production側の処理はobject_sync.c参照)\n",
+        bm_log_debug("[network] object received, %u bytes (test stub: not stored or decrypted, "
+                                                 "see object_sync.c for the production path)\n",
                 msg->length);
     }
     else
@@ -1001,7 +1001,7 @@ static void idle_sweep_one(struct bm_fd_data *conn, void *user_data)
          * 呼ばれるたび(1秒間隔ポーリング)に出る調査専用ログだが、対象は通常個体数が
          * 少ないハンドシェイク未完了接続に限られる(object_sync.cの重複object受信ログ等、
          * 全接続・全objectを対象にするDEBUG3ほどの量にはならない)ためDEBUG2にした。 */
-        bm_log_debug2("[network] idle_sweep(handshake未完了): fd=%d %s idle=%" PRId64 "s threshold=%ds\n", conn->fd,
+        bm_log_debug2("[network] idle_sweep(handshake incomplete): fd=%d %s idle=%" PRId64 "s threshold=%ds\n", conn->fd,
                 conn->type == BM_FD_SERVER_SOCKET ? "inbound" : "outbound", idle_seconds,
                 BM_HANDSHAKE_TIMEOUT_SECONDS);
         if (idle_seconds > BM_HANDSHAKE_TIMEOUT_SECONDS)

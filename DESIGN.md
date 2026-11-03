@@ -4318,3 +4318,23 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     記録される(項目23の症状そのもの)、(d)handshake完了済みの接続では出ない。余裕を無視して常に
     WARNを出す改変でテスト(a)が、WARNの呼び出しを消す改変でテスト(b)(c)が失敗することを確かめた。
     ビルド警告ゼロ、ctest 54件全通過。daemon Aへは未デプロイ。
+
+54. **国際化(i18n)(進行中)**: 2026-11-03、ユーザー依頼。範囲と方式はユーザーと相談して次のように決めた。
+    - **翻訳対象は`bitmessage-cli`の出力だけ**。gettextを使い、msgid(ソース上の文字列)は英語、
+      日本語訳は`po/ja.po`に置く。`LANG`/`LC_MESSAGES`が日本語なら従来どおり日本語で表示し、
+      それ以外は英語で表示する。msgidを今の日本語のままにして英語訳を足す案もあったが、
+      訳が無い・ロケールが合わないときの表示が日本語になる非標準な形になるため採らなかった。
+    - **daemon(`bitmessaged`)の出力は翻訳せず英語に統一する**。ログは言語によってgrepや監視
+      スクリプトの照合文字列が変わると困るうえ、バグ報告にそのまま貼って誰でも読める方が
+      有用なため。JSON-RPCのエラー文字列も、クライアントが機械的に扱うものなので英語のまま。
+    - **ドキュメント**: READMEをv1.3の内容に合わせて更新してから、英語の`README.md`と日本語の
+      `README-ja.md`に分ける。
+
+    **(1) daemonの出力を英語に統一(実装済み)**: daemon側に日本語が残っていたのは、`src/main.c`の
+    `--help`・不明な引数・起動/終了まわりのログ(DB初期化、設定ファイルの読み込み結果、APIの
+    認証情報、Tor hidden service作成の失敗、`BM_NO_CONNECT`、シグナル受信)と、`src/infra/network.c`の
+    テスト用スタブのDEBUGログ・`idle_sweep(handshake未完了)`のDEBUG2ログだった。これらを英語にした。
+    **ログの文言が変わる**ので、従来の文言でjournalをgrepしている監視や手順は読み替えが必要
+    (例: `DB初期化完了`→`DB initialized`、`シグナル %d を受信`→`received signal %d`、
+    `idle_sweep(handshake未完了)`→`idle_sweep(handshake incomplete)`)。
+    `tests/test_data_dir.sh`が`DB初期化完了`を待っていたので合わせて直した。
