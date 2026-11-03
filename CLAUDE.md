@@ -67,6 +67,8 @@ ctest -R <test_name> --output-on-failure   # 例: ctest -R object_sync
   `cmake --build build-Debug --target update-po`の後に`po/ja.po`へ日本語訳を書く**
   (訳し忘れは`po_up_to_date`テストが落とす)。daemon(`bitmessaged`)のログ・usageは
   翻訳せず英語で書く(DESIGN.md §11項目54)。
+- **READMEは英語版`README.md`と日本語版`README-ja.md`の2つがあり、変更するときは必ず両方を
+  同時に更新する。**
 - 新しいstruct/ctxフィールドが「単一スレッドからのみ触られる前提で排他制御をしない」場合は、
   必ずそれをコメントで明記する(`last_gc`, `last_onion_announce`等)。sqlite3ハンドルは
   `SQLITE_OPEN_FULLMUTEX`(`common/db_common.c`)でスレッド間共有が安全な前提。

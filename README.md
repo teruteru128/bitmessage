@@ -3,79 +3,129 @@
 [![CI](https://github.com/teruteru128/bitmessage/actions/workflows/ci.yml/badge.svg)](https://github.com/teruteru128/bitmessage/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Bitmessage P2Pメッセージングプロトコルの、C言語によるフルスクラッチ実装。
+English | [日本語](README-ja.md)
 
-[PyBitmessage](https://github.com/Bitmessage/PyBitmessage) と実ネットワーク越しに相互運用できることを目標に、
-暗号層(ECIES/ECDSA)・PoW・全objectワイヤーフォーマット・P2Pネットワーク層・JSON-RPC API・CLIを一から実装した。
+A from-scratch implementation of the Bitmessage P2P messaging protocol in C.
 
-設計(アーキテクチャ・現在のbacklog)は [DESIGN.md](DESIGN.md)、日付入りの開発経緯
-(バグの発覚経緯・議論の顛末等)は [DESIGN-LOG.md](DESIGN-LOG.md)、リリースごとの
-変更点は [CHANGELOG.md](CHANGELOG.md) を参照。
+Aiming to interoperate with [PyBitmessage](https://github.com/Bitmessage/PyBitmessage) over the real network,
+it implements the crypto layer (ECIES/ECDSA), PoW, every object wire format, the P2P network layer,
+a JSON-RPC API and a CLI from the ground up.
 
-## 現状: v1完成(2026-08-23)
+The design (architecture, current backlog) is in [DESIGN.md](DESIGN.md), the dated development history
+(how bugs were found, how discussions concluded, etc.) in [DESIGN-LOG.md](DESIGN-LOG.md), and the
+changes in each release in [CHANGELOG.md](CHANGELOG.md). These documents are written in Japanese.
 
-以下が実装・実ネットワーク(testnet)で動作確認済み。
+## Status
 
-- **鍵ライフサイクル**: アドレス生成(v3/v4)、パスフレーズ由来KEKによる秘密鍵の暗号化保存、unlock/lock/delete
-- **暗号層**: ECIES暗号化・ECDSA署名(SHA256)。PyBitmessage(pyelliptic/highlevelcrypto)とバイト完全一致を検証済み
-- **全objectワイヤーフォーマット**の構築・解析: `getpubkey` / `pubkey`(v2/v3/v4) / `msg` / `broadcast` / `ack`
-- **PoW計算エンジン**: マルチスレッド並列探索(NumCPU本)
-- **P2Pネットワーク層**: version/verack/addr/inv/getdata/objectのハンドシェイクと配線。実testnetノードとの
-  相互運用を確認済み。接続の常駐維持・再接続、受信objectの他peerへの中継(inv flooding)に対応
-- **direct message送受信**: 送信時のPoW計算・ack機構、getpubkey要求の自動発行/自動応答、ack未着時の
-  自動再送(間隔を倍々に)。宛先の公開鍵は常に`pubkey_cache`経由で解決する(`cachePubkey`で
-  事前登録可能。誤った鍵での暗号化・cache汚染を防ぐため、`sendMessage`への直接指定は廃止した)
-- **broadcast購読・送信**: 購読先アドレスからのbroadcastを自動復号してinboxへ、`sendBroadcast`での送信
-- **chan(私設グループチャンネル)**: 共有passphraseから同じアドレス・鍵を導出して複数人が
-  参加(`joinChan`)、自分自身宛のsendMessageで投稿、他メンバーはtrial_decryptで自動復号
-- **受信objectのPoW検証**: ネットワーク既定の最低難易度未満のobjectは受信時点で拒否
-- **outbound SOCKS5プロキシ**: Tor等をoutbound接続に使う設定を`config.db`へ永続化。onion peer
-  (`.onion`宛)専用設定(`set-socks-proxy-onion`)とクリアネットIP宛専用設定
-  (`set-socks-proxy-clearnet`、既定disabled=直結)を分離しており、onionだけ有効化しても
-  クリアネットIPへの接続は直結のまま維持される(PyBitmessage本家のsocksproxytype/
-  onionsocksproxytype分離に合わせた設計、DESIGN.md §11参照)。設定変更はdaemon再起動
-  なしで次の再接続サイクル(既定30秒以内)から反映される
-- **v3 onionピア探索**: PyBitmessage準拠の`OBJECT_ONIONPEER`(専用object type)を受信し、
-  ネットワーク上で生存しているv3 onionピアを`peers.db`へ自動登録(受信のみ、自身のonion
-  hidden serviceの運用・announceはinbound Tor同様スコープ外)
-- **手動peer追加・観測済みノードリスト**: 個人的に存在を確認したノードを`addPeer`で手動追加。
-  加えて`seeds/observed_nodes.txt`(出自・限界を明記した別ファイル、公式seedとは別枠)を
-  新規インストール時にmainnetシード全滅していても最初の1本を繋げるための足がかりとして同梱
-- **addrホストのフィルタリング**: 受信した`addr`情報からprivate/loopback/link-local等の
-  アドレスを除外(内部ネットワークへの誤接続防止)
-- **getpubkey応答のスロットリング**: 同一宛先への短時間の連続要求に対し、有効期限内の応答を
-  再利用しPoWを都度計算し直さない
-- **DoS上限**: P2Pメッセージのlengthフィールド申告を実データ到着前に検査し、巨大な値を
-  申告するpeerを即座に切断(受信バッファの無制限確保を防止)
-- **JSON-RPC 2.0 API + CLI**: 上記すべてを`bitmessage-cli`から操作可能
+The latest release is v1.3.0 (2026-08-26). master also contains later changes (bulk unlock,
+v3-to-v4 migration, `--body-file`, Japanese/English CLI messages, etc., described below). The
+following is implemented and has been confirmed to work on the real network.
 
-### スコープ外(既知の制限、backlog)
+### Protocol and cryptography
 
-- GPU/OpenCL PoW — §8で明示的にv1スコープ外と決めた項目、引き続き見送り
-- LAN内UDP broadcastによるpeer発見 — 手動peer追加で代替可能なため当分見送り(凍結)
-- `core/crypto.c`のEC_KEY/ECDSA系のEVP_PKEYベースAPIへの移行 — OpenSSLが実際に
-  非推奨API削除を予告するまでは見送り(凍結)
+- **Key lifecycle**: address generation (v3/v4), private keys stored encrypted with a passphrase-derived
+  KEK, unlock/lock/delete
+- **Crypto layer**: ECIES encryption and ECDSA signatures (SHA256). Verified to match PyBitmessage
+  (pyelliptic/highlevelcrypto) byte for byte
+- **Building and parsing every object wire format**: `getpubkey` / `pubkey` (v2/v3/v4) / `msg` /
+  `broadcast` / `ack` / `onionpeer`
+- **PoW engine**: multithreaded parallel search (one thread per CPU). The PoW of received objects is
+  checked too, and objects below the network's minimum difficulty are rejected on arrival
 
-(inbound接続(Tor hidden service)・Dandelion++のstem機能は、当初はv1スコープ外だったが
-v1.1で実装済み)
+### Messaging
 
-詳細は [DESIGN.md §11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) 参照
+- **Direct messages**: PoW on send, acks, automatic getpubkey requests and replies, automatic resend
+  when no ack arrives (with doubling intervals). The recipient's public key is always resolved through
+  `pubkey_cache` (it can be registered in advance with `cachePubkey`; passing it directly to
+  `sendMessage` was removed to prevent encrypting with a wrong key and polluting the cache)
+- **Broadcast subscription and sending**: broadcasts from subscribed addresses are decrypted into the
+  inbox automatically; send with `sendBroadcast`
+- **Chans (private group channels)**: everyone derives the same address and keys from a shared
+  passphrase (`joinChan`), posts by sending a message to the chan itself, and other members decrypt it
+  automatically with trial decryption
+- **Inbox and sent box**: `getInboxMessages`/`getSentMessages`, `trashMessage` (soft delete)
+- **Address book**: add, delete, list (duplicates are rejected, as in PyBitmessage)
+- **Long messages**: `--body-file` reads the body from a file or stdin (so the body does not show up in
+  `ps` or the shell history). subject + body may be up to 261,644 bytes, the same as PyBitmessage
 
-## ビルド
+### Key migration and large-scale use
 
-### 依存
+- **Migrating from PyBitmessage**: bulk import of `keys.dat` (`import-keys-dat`), per-address
+  import/export of WIF key pairs, chan settings from `keys.dat` preserved, repair of garbled labels
+  (`fix-labels-from-keys-dat`)
+- **Bulk unlock**: a two-stage KDF (the vault scheme, DESIGN.md section 7.4) unlocks thousands of
+  addresses with a single key derivation. `unlock-all` (every row of identity.db, up to 10,000) and
+  `unlock-addresses` (only the addresses listed in a file). The more addresses are unlocked, the
+  heavier trial decryption of incoming msgs becomes, so if you hold many addresses, unlock only the
+  ones you need with `unlock-addresses`
+- **v3-to-v4 migration**: move a v3 address to the v4 address with the same keys (`convert-to-v4` /
+  `convert-all-v3-to-v4`)
 
-- CMake 3.25以降、Ninja(または他のCMake対応ビルドシステム)
-- Cコンパイラ(GCC/Clang、C11)
-- OpenSSL、SQLite3、pthread
-  (ポスト量子プロトタイプ`src/pq`はOpenSSL 3.5以降でのみビルドされる。それ未満では
-  自動的に除外され、daemon本体には影響しない。DESIGN-PQ.md §6.1)
-- libmicrohttpd、cJSON(JSON-RPC APIサーバーのHTTPトランスポートとJSON処理、
-  `pkg-config`経由で検出する。DESIGN.md §6.3参照)
-- gettext(任意。`bitmessage-cli`のメッセージの日本語訳をビルドする。無ければCLIは
-  英語だけで動く。DESIGN.md §11項目54)
+### Network
 
-Debian/Ubuntu系なら以下で揃う。
+- **P2P network layer**: handshake and wiring of version/verack/addr/inv/getdata/object. Keeps
+  connections up and reconnects, relays received objects to other peers, and sends the list of held
+  objects to new peers. Peers are chosen by rating-weighted random sampling, as in PyBitmessage
+- **Inbound connections**: listening on TCP (`BM_INBOUND_PORT`). Supports automatic creation of a hidden
+  service through the Tor ControlPort (`BM_TOR_CONTROL=1`) or a static torrc setup
+  (`BM_ONION_ADDRESS`). With idle/handshake timeouts, keepalive, and rate limits on concurrent
+  connections and accepts
+- **Dandelion++**: the stem/fluff state machine, advertising the `NODE_DANDELION` service bit
+- **Onion peers**: receives PyBitmessage-compatible `onionpeer` objects and records v3 onion peers in
+  `peers.db`, and periodically announces its own onion address
+- **Outbound SOCKS5 proxy**: the setting for using Tor etc. for outbound connections is stored in
+  `config.db`. The setting for onion peers (`.onion`, `set-socks-proxy-onion`) and the one for clearnet
+  IPs (`set-socks-proxy-clearnet`, disabled = direct by default) are separate, so enabling only the
+  onion one keeps clearnet connections direct (matching PyBitmessage's split between socksproxytype
+  and onionsocksproxytype; see DESIGN.md section 11). Changes take effect at the next reconnect cycle
+  (within 30 seconds by default) without restarting the daemon
+- **Manually added peers and observed node list**: add a node you have personally confirmed to exist with
+  `addPeer`. In addition, `seeds/observed_nodes.txt` (a separate file that states its origin and
+  limits, apart from the official seeds) is shipped as a foothold for making the first connection on a
+  fresh install even if all mainnet seeds are down
+- **Defenses**: filtering of private/loopback/link-local etc. addresses learned from `addr`, throttling
+  of getpubkey replies, checking the declared length of P2P messages before the data arrives
+  (disconnecting peers that declare huge values), preventing connections to itself
+
+### Operation
+
+- **JSON-RPC 2.0 API + CLI**: everything above can be operated from `bitmessage-cli`. CLI messages are
+  shown in Japanese under a Japanese locale and in English otherwise (gettext). Daemon logs are in
+  English
+- **Logging**: eight log levels (`BM_LOG_LEVEL`). Under systemd, timestamps are left to journald
+- **Installation**: `cmake --install`, systemd unit file (`systemd/bitmessaged.service`)
+
+### Experimental: post-quantum extension prototype
+
+`src/pq/` holds a proposal for address and object formats using ML-DSA/ML-KEM (OpenSSL 3.5 or later)
+and a prototype of it. The daemon does not use it, and it is not used on the network. See
+[DESIGN-PQ.md](DESIGN-PQ.md) for details.
+
+### Out of scope (known limitations, backlog)
+
+- GPU/OpenCL PoW — explicitly ruled out of the v1 scope in section 8; still deferred
+- Peer discovery by UDP broadcast on the LAN — deferred for now since manually adding peers covers it
+  (frozen)
+- Migrating the EC_KEY/ECDSA code in `core/crypto.c` to the EVP_PKEY-based API — deferred until
+  OpenSSL actually announces the removal of the deprecated API (frozen)
+
+See [DESIGN.md section 11](DESIGN.md#11-次にやること引き継ぎメモ随時更新) for details.
+
+## Building
+
+### Dependencies
+
+- CMake 3.25 or later, Ninja (or another build system supported by CMake)
+- A C compiler (GCC/Clang, C11)
+- OpenSSL, SQLite3, pthread
+  (the post-quantum prototype `src/pq` is built only with OpenSSL 3.5 or later. With older versions it
+  is excluded automatically, with no effect on the daemon. DESIGN-PQ.md section 6.1)
+- libmicrohttpd, cJSON (HTTP transport and JSON handling for the JSON-RPC API server, detected through
+  `pkg-config`. See DESIGN.md section 6.3)
+- gettext (optional; builds the Japanese translation of `bitmessage-cli` messages. Without it the CLI
+  runs in English only. DESIGN.md section 11, item 54)
+
+On Debian/Ubuntu:
 
 ```sh
 sudo apt install cmake ninja-build build-essential pkg-config \
@@ -87,145 +137,168 @@ cmake -B build-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 ninja -C build-Debug
 ```
 
-## テスト
+## Testing
 
 ```sh
 ctest --test-dir build-Debug --output-on-failure
 ```
 
-## 使い方
+## Usage
 
-daemon(`bitmessaged`)を起動すると、JSON-RPC APIの認証情報(ユーザー名は固定`bitmessage`、パスワードは
-起動毎にランダム生成)が標準エラー出力に表示される(意図的に非永続。認証情報だけは設定ファイルに書けない)。
+When the daemon (`bitmessaged`) starts, it prints the JSON-RPC API credentials (the user name is always
+`bitmessage`; the password is generated randomly at each start) to standard error. They are
+intentionally not persisted; the credentials are the one thing that cannot be set in the config file.
 
-起動時設定は`bitmessage.conf`(INI形式、`bitmessaged`のカレントディレクトリに置く。無ければ既定値で
-起動する)で行う。`bitmessage.conf.example`をコピーして使うと早い。各項目は環境変数でも指定でき、
-その場合は環境変数がファイルの値より優先される(優先順位: 環境変数 > `bitmessage.conf` > 既定値)。
+Startup settings go in `bitmessage.conf` (INI format, placed in the current directory of `bitmessaged`;
+without it the daemon starts with defaults). Copying `bitmessage.conf.example` is the quickest way to
+start. Every item can also be set with an environment variable, which takes precedence over the file
+(precedence: environment variable > `bitmessage.conf` > default).
 
 ```sh
 cp bitmessage.conf.example bitmessage.conf
-# 必要な項目だけ編集する(testnet切り替え、APIポート、Tor hidden service連携等)
+# Edit only what you need (testnet, API port, Tor hidden service integration, etc.)
 
-# 環境変数での一時的な上書きも可能。例: 既定はmainnet、testnetに繋ぎたい場合は BM_TESTNET=1
-# JSON-RPC APIのポートは既定8442。他プロセスと衝突する場合は BM_API_PORT で変更可能
-# (bitmessage-cli側も同じ環境変数を読むので揃えること)
+# Environment variables override settings for a single run. For example, the default is mainnet;
+# set BM_TESTNET=1 to connect to testnet.
+# The JSON-RPC API listens on port 8442 by default. Change it with BM_API_PORT if it clashes with
+# another process (bitmessage-cli reads the same variable, so set it there too)
 ./build-Debug/src/bitmessaged
 ```
 
-### 環境変数一覧
+### Environment variables
 
-`bitmessaged`向け(`bitmessage.conf`の値をこの起動限りで上書きする。優先順位: 環境変数 >
-`bitmessage.conf` > 既定値):
+For `bitmessaged` (overrides the value in `bitmessage.conf` for this run; precedence: environment
+variable > `bitmessage.conf` > default):
 
-| 環境変数 | 既定値 | 説明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `BM_CONFIG_FILE` | `bitmessage.conf` | 起動時設定ファイルの場所 |
-| `BM_DATA_DIR` | `.`(CWD) | DBファイル(`peers.db`等5種)の置き場所。systemd等での固定パス運用(例`/var/lib/bitmessage`)向け |
-| `BM_SEEDS_FILE` | `seeds/observed_nodes.txt` | 「開発者が確認した身元不明のノード」リストの場所(§11、mainnetのみ・無くても起動には支障ない) |
-| `BM_TESTNET` | (mainnet) | `1`でtestnetへ切り替え |
-| `BM_NO_CONNECT` | (接続する) | `1`で実際のP2P接続を一切行わない(主にテスト用) |
-| `BM_MAX_OUTBOUND` | `3` | 同時に確立する最大outbound接続数 |
-| `BM_API_PORT` | `8442` | JSON-RPC APIのlisten port |
-| `BM_INBOUND_PORT` | (無効) | Tor hidden service等からのinbound接続を受け付けるport。0または未設定で無効 |
-| `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | 新規アドレス作成時の既定PoW難易度(nonce trials/byte) |
-| `BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES` | `1000` | 同上(payload length extra bytes) |
-| `BM_TOR_CONTROL` | (無効) | `1`でTor ControlPort経由のhidden service自動作成を試みる(`BM_INBOUND_PORT`が前提。systemd配下での実行時はTorのControlPortソケットへアクセスできるグループ権限が必要、下記systemd節参照) |
-| `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | ControlPortのUnixドメインソケットパス(Debian/Ubuntu系torパッケージの既定パス。Fedora/Arch等では異なりうるため、他ディストリで`BM_TOR_CONTROL=1`を使う場合は実際のパスを明示指定すること) |
-| `BM_TOR_CONTROL_HOST` | `127.0.0.1` | 上記に接続できない場合のTCPフォールバック先ホスト |
-| `BM_TOR_CONTROL_PORT` | `9051` | 同上ポート |
-| `BM_TOR_VIRTUAL_PORT` | `8444` | 他peerが自分のonionアドレスへ接続してくるポート番号 |
-| `BM_ONION_ADDRESS` | (未設定) | 静的torrc設定を使う場合、自分のonionアドレスを直接指定(`BM_TOR_CONTROL`より優先) |
+| `BM_CONFIG_FILE` | `bitmessage.conf` | Location of the startup config file |
+| `BM_DATA_DIR` | `.` (CWD) | Where the DB files (five of them, such as `peers.db`) live. For fixed-path setups under systemd etc. (e.g. `/var/lib/bitmessage`) |
+| `BM_SEEDS_FILE` | `seeds/observed_nodes.txt` | Location of the list of "nodes of unknown identity confirmed by the developer" (section 11; mainnet only; startup works without it) |
+| `BM_TESTNET` | (mainnet) | `1` switches to testnet |
+| `BM_NO_CONNECT` | (connect) | `1` makes no P2P connections at all (mainly for tests) |
+| `BM_MAX_OUTBOUND` | `3` | Maximum number of concurrent outbound connections |
+| `BM_API_PORT` | `8442` | Listen port of the JSON-RPC API |
+| `BM_INBOUND_PORT` | (disabled) | Port accepting inbound connections from a Tor hidden service etc. Disabled when 0 or unset |
+| `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | Default PoW difficulty for new addresses (nonce trials per byte) |
+| `BM_DEFAULT_PAYLOAD_LENGTH_EXTRA_BYTES` | `1000` | Same (payload length extra bytes) |
+| `BM_TOR_CONTROL` | (disabled) | `1` tries to create a hidden service automatically through the Tor ControlPort (requires `BM_INBOUND_PORT`. Under systemd, the service needs group permission to access Tor's ControlPort socket; see the systemd section below) |
+| `BM_TOR_CONTROL_SOCKET` | `/run/tor/control` | Path of the ControlPort Unix domain socket (the default of the Debian/Ubuntu tor package. It may differ on Fedora/Arch etc., so set the actual path when using `BM_TOR_CONTROL=1` on other distributions) |
+| `BM_TOR_CONTROL_HOST` | `127.0.0.1` | TCP fallback host when the socket above cannot be reached |
+| `BM_TOR_CONTROL_PORT` | `9051` | Same, port |
+| `BM_TOR_VIRTUAL_PORT` | `8444` | Port other peers use to connect to your onion address |
+| `BM_ONION_ADDRESS` | (unset) | With a static torrc setup, your onion address given directly (takes precedence over `BM_TOR_CONTROL`) |
+| `BM_LOG_LEVEL` | `INFO` | Minimum log level to print. From most to least verbose: `DEBUG3`/`DEBUG2`/`DEBUG1`/`DEBUG`/`INFO`/`NOTICE`/`WARN`/`ERROR` (case-insensitive) |
+| `BM_LOG_TIMESTAMPS` | (auto) | `1`/`0` turns timestamps at the start of log lines on/off. When unset, they are omitted under systemd (journald) and added otherwise |
 
-### systemdサービス化(`systemd/bitmessaged.service`)
+For `bitmessage-cli`:
 
-`cmake --install`後、生成される`.service`ファイルは`DynamicUser=yes`でサービス専用ユーザーを
-自動生成する。`BM_TOR_CONTROL=1`でTor ControlPortのUnixドメインソケット(既定
-`/run/tor/control`、Debian/Ubuntu系torパッケージでは`debian-tor`グループ所有)へ接続する
-場合、`DynamicUser`が生成するユーザーは既定でどのグループにも属さないため、ユニットファイル
-側で`SupplementaryGroups=debian-tor`を指定してグループ参加させる必要がある(同梱の
-`.service`ファイルには既に記載済み)。他ディストリでTorのControlPortソケットの所有グループが
-異なる場合は、ここを実際のグループ名に置き換えること。BM_TOR_CONTROLを使わない
-(SOCKS5 outboundのみ、またはTor自体を使わない)運用では不要だが、既定で入れておいても
-実害は無い。
-
-`.service`ファイルは`After=tor.service`/`Wants=tor.service`でTorの起動を待つ(Torを使わない
-運用でも`tor.service`が無効/未インストールなら本体の起動を妨げないソフト依存)。
-
-`bitmessage-cli`向け:
-
-| 環境変数 | 既定値 | 説明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `BM_API_HOST` | `127.0.0.1` | 接続先daemonのホスト |
-| `BM_API_PORT` | `8442` | 接続先daemonのポート(daemon起動時と揃えること) |
-| `BM_API_USER` | (必須) | JSON-RPC APIのユーザー名(daemon起動時の表示に合わせる) |
-| `BM_API_PASS` | (必須) | 同パスワード |
+| `BM_API_HOST` | `127.0.0.1` | Host of the daemon to connect to |
+| `BM_API_PORT` | `8442` | Port of the daemon (match the daemon's setting) |
+| `BM_API_USER` | (required) | JSON-RPC API user name (as printed by the daemon at startup) |
+| `BM_API_PASS` | (required) | Its password |
+| `BM_LOCALEDIR` | (auto) | Directory to look for message translations (.mo) in. When unset, `locale/` next to the executable (build tree), otherwise the install location (`/usr/local/share/locale` by default) |
 
-別ターミナルから `bitmessage-cli` で操作する(`BM_API_USER`/`BM_API_PASS` は daemon 起動時の表示に合わせる)。
+The display language follows the usual locale settings (`LANG`/`LC_MESSAGES`/`LC_ALL`/`LANGUAGE`).
+To get English in a Japanese environment, set e.g. `LC_MESSAGES=C`.
+
+### Running as a systemd service (`systemd/bitmessaged.service`)
+
+After `cmake --install`, the installed `.service` file uses `DynamicUser=yes` to create a dedicated
+service user automatically. When connecting to the Tor ControlPort Unix domain socket with
+`BM_TOR_CONTROL=1` (`/run/tor/control` by default, owned by the `debian-tor` group in the Debian/Ubuntu
+tor package), the user created by `DynamicUser` belongs to no group by default, so the unit file must
+add it to the group with `SupplementaryGroups=debian-tor` (the shipped `.service` file already does).
+If the group owning Tor's ControlPort socket differs on your distribution, replace it with the actual
+group name. It is not needed if you do not use `BM_TOR_CONTROL` (SOCKS5 outbound only, or no Tor at
+all), but leaving it in does no harm.
+
+The `.service` file waits for Tor with `After=tor.service`/`Wants=tor.service` (a soft dependency: if
+`tor.service` is disabled or not installed, the daemon still starts).
+
+### Using the CLI
+
+Operate the daemon with `bitmessage-cli` from another terminal (set `BM_API_USER`/`BM_API_PASS` to what
+the daemon printed at startup).
 
 ```sh
 export BM_API_USER=bitmessage
-export BM_API_PASS=<daemon起動時に表示されたパスワード>
+export BM_API_PASS=<password printed by the daemon at startup>
 
 CLI=./build-Debug/src/cli/bitmessage-cli
 
-# アドレス作成・unlock
+# Create and unlock an address
 $CLI create-address "my passphrase" 4 1 1 "label" "store passphrase"
 $CLI unlock BM-xxxxxxxx "store passphrase"
 $CLI list-addresses
 
-# 相手の公開鍵が未取得でも送信すればgetpubkeyが自動発行される(その回の送信は失敗するので、
-# pubkeyが届いてから再送する)
+# Sending to someone whose public key you don't have yet sends a getpubkey request automatically
+# (that send fails; send again once the pubkey has arrived)
 $CLI send-message BM-fromAddress BM-toAddress "subject" "body" 3600 1
 $CLI get-inbox
 $CLI get-sent
 
-# 長文・改行を含む本文は--body-fileでファイル(pathが"-"なら標準入力)から読ませる。
-# 位置引数で渡すと本文がps(1)から他ユーザーに見え、シェル履歴にも残る
+# For long or multi-line bodies, read the body from a file with --body-file ("-" for stdin).
+# A body passed as an argument is visible to other users via ps(1) and stays in the shell history
 $CLI send-message --body-file ./body.txt BM-fromAddress BM-toAddress "subject" 3600 1
 $CLI send-message --body-file - BM-fromAddress BM-toAddress "subject" < ./body.txt
 
-# broadcast購読・送信
+# Subscribe to and send broadcasts
 $CLI add-subscription BM-someAddress "label"
 $CLI send-broadcast BM-fromAddress "subject" "body" 3600
 $CLI send-broadcast --body-file ./body.txt BM-fromAddress "subject" 3600
 
-# chan(私設グループチャンネル): 同じpassphraseで呼んだ全員が同じアドレス・鍵を共有する
+# Chans (private group channels): everyone using the same passphrase shares the same address and keys
 CHAN=$($CLI join-chan "my chan passphrase" "my chan" "store passphrase" | tr -d '"')
 $CLI unlock "$CHAN" "store passphrase"
 $CLI send-message "$CHAN" "$CHAN" "subject" "body" 3600 1
 
-# onion peer(.onion宛)向けのoutbound接続をSOCKS5プロキシ(Tor等)経由にする。クリアネットIP
-# 宛は既定disabled(直結)のまま維持される。次の再接続サイクル(既定30秒以内)でdaemon
-# 再起動なしに反映される
+# Bulk-import PyBitmessage's keys.dat, then unlock only the addresses you need
+# (addresses.txt has one address per line; "-" reads from stdin)
+$CLI import-keys-dat ~/.config/PyBitmessage/keys.dat "store passphrase"
+$CLI unlock-addresses ./addresses.txt "store passphrase"
+
+# Route outbound connections to onion peers (.onion) through a SOCKS5 proxy (Tor etc.). Clearnet IPs
+# stay direct (disabled) by default. Takes effect at the next reconnect cycle (within 30 seconds by
+# default) without restarting the daemon
 $CLI set-socks-proxy-onion 1 127.0.0.1 9050
 $CLI get-socks-proxy-onion
-# クリアネットIP宛も匿名化したい場合のみ明示的に有効化する(Tor出口ノード経由になり
-# 外部ノードへの接続性が悪化しうる、README上記参照)
+# Enable this only if you also want to anonymize clearnet connections (they go through Tor exit nodes,
+# which can hurt connectivity to other nodes; see "Outbound SOCKS5 proxy" above)
 $CLI set-socks-proxy-clearnet 1 127.0.0.1 9050
 $CLI get-socks-proxy-clearnet
 
-# 個人的に存在を確認したノードを手動で追加する(mainnetシード全滅時の最後の手段)
+# Manually add a node you have personally confirmed to exist (a last resort when all mainnet seeds are down)
 $CLI add-peer 203.0.113.1 8444
 
-# その他
+# Others
 $CLI cache-pubkey BM-address <signingPubkeyHex> <encryptionPubkeyHex>
 $CLI list-subscriptions
+$CLI list-connections
 $CLI lock BM-address
 $CLI delete BM-address
 ```
 
-全コマンドは `bitmessage-cli` を引数無しで実行すると一覧表示される。
+`bitmessage-cli --help` (or running it without arguments) lists every command.
 
-## ディレクトリ構成
+## Directory layout
 
 ```
 src/
-  common/   共通ユーティリティ(varint、hash、JSON、キュー等)
-  core/     鍵管理・暗号・object構築/解析・送受信パイプライン・peer管理・JSON-RPC API
-  infra/    P2Pネットワーク層(接続管理・object同期)
-  pow/      PoW計算エンジン
-  cli/      CLIクライアント
-tests/      ctestベースのテストスイート
-seeds/      mainnetシード全滅時のフォールバック用ノードリスト(observed_nodes.txt)
-DESIGN.md   設計文書(グランドデザイン、随時更新される実装状況・決定事項)
+  common/   Shared utilities (varint, hash, JSON, queues, logging, etc.)
+  core/     Key management, crypto, building/parsing objects, send/receive pipeline, peer management, JSON-RPC API
+  infra/    P2P network layer (connection management, object sync, Dandelion++, Tor integration)
+  pow/      PoW engine
+  cli/      CLI client
+  pq/       Post-quantum extension prototype (not used by the daemon)
+po/         Translations of bitmessage-cli messages (gettext)
+tests/      ctest-based test suite
+seeds/      Fallback node list for when all mainnet seeds are down (observed_nodes.txt)
+systemd/    systemd unit file
+DESIGN.md       Design document (overall design, implementation status and decisions, backlog)
+DESIGN-LOG.md   Dated development history
+DESIGN-PQ.md    Post-quantum extension proposal
+CHANGELOG.md    Changes in each release
 ```

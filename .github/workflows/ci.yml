@@ -9,7 +9,7 @@ on:
 # §11 2026-09-15 API層をlibmicrohttpd + cJSONへ移行した際(DESIGN.md §6.3)、このワークフロー
 # への依存追加を忘れており、全4ジョブがConfigure段階(pkg_check_modules(... REQUIRED))で
 # 落ちる状態になっていた(ユーザーの指摘で発覚)。ライブラリ依存を増やすときはCMakeLists.txtと
-# README.mdの「依存」節に加えて、ここも必ず同時に更新すること。
+# README.md(英語)・README-ja.md(日本語)の「依存」節に加えて、ここも必ず同時に更新すること。
 # pkg-config自体はubuntu-latestイメージにはプリインストールされているが、Fedoraコンテナには
 # 入っていないため明示的にインストールする(暗黙のイメージ依存を作らないよう、Ubuntu側でも
 # 省略せず書いておく)。
