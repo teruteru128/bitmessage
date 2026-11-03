@@ -543,7 +543,11 @@ int main(void)
             int epfd = epoll_create1(0);
             struct bm_peer_registry registry;
             bm_peer_registry_init(&registry);
-            int server_fd, client_fd;
+            /* §11 2026-11-03: CHECKは失敗しても先へ進むので、make_tcp_pairが失敗すると未初期化の
+             * fdでwrite/closeすることになる(RelWithDebInfoビルドの-Wmaybe-uninitializedで発覚、
+             * -O0のDebugビルドでは警告が出ない)。-1で初期化し、失敗時は無効なfdとして扱わせる */
+            int server_fd = -1;
+            int client_fd = -1;
             CHECK(make_tcp_pair(&server_fd, &client_fd) == 0, "(c) a loopback TCP pair should be created");
             struct bm_fd_data *conn = bm_fd_data_new(BM_FD_SERVER_SOCKET, server_fd);
             CHECK(conn != NULL, "(c) bm_fd_data_new should succeed");
