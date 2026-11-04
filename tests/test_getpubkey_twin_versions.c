@@ -340,6 +340,25 @@ static void test_cache_schema_migration(void)
           "v4 cached response survives re-init");
     CHECK(bm_pubkey_cache_get_self_response(db, ripe, 4, 2, 0, out) == 0, "different stream is a separate key");
 
+    /* §11 2026-11-05 does_ack列が無い時点のDBの行(自応答のbitfieldが0だった時期のobject)は、
+     * 列の追加後に再利用されないこと。作り直せば再利用されること */
+    CHECK(sqlite3_exec(db,
+                       "DROP TABLE self_pubkey_response_cache;"
+                       "CREATE TABLE self_pubkey_response_cache (ripe BLOB NOT NULL, address_version INTEGER NOT NULL, "
+                       "stream INTEGER NOT NULL, object_hash BLOB NOT NULL, expires_time INTEGER NOT NULL, "
+                       "PRIMARY KEY (ripe, address_version, stream));"
+                       "INSERT INTO self_pubkey_response_cache VALUES (zeroblob(20), 4, 1, zeroblob(32), 9999999999);",
+                       NULL, NULL, NULL)
+              == SQLITE_OK,
+          "create the schema without does_ack");
+    CHECK(bm_identity_store_init_schema(db) == 0, "the does_ack column is added to an existing table");
+    CHECK(bm_pubkey_cache_get_self_response(db, ripe, 4, 1, 0, out) == 0,
+          "a response made before does_ack existed is not reused");
+    CHECK(bm_identity_store_init_schema(db) == 0, "initializing again ignores the existing column");
+    CHECK(bm_pubkey_cache_set_self_response(db, ripe, 4, 1, hash4, 9999999999) == 0, "make the response again");
+    CHECK(bm_pubkey_cache_get_self_response(db, ripe, 4, 1, 0, out) == 1 && memcmp(out, hash4, 32) == 0,
+          "the remade response is reused");
+
     sqlite3_close(db);
     unlink(TEST_MIGRATION_DB);
 }

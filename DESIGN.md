@@ -4681,3 +4681,24 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
          届いていたobjectは開封されず、相手が応答キャッシュを再広告してもhashが既知なので届き直さない。
          v4にも同じ問題がある(v5はPoWが141秒なので影響が大きい)。要求を記録するときに
          プールをtagで探す形が候補。
+
+56. **自応答とbroadcastのbitfieldにBITFIELD_DOESACKが立っていなかった(修正済み、2026-11-05)**: 項目55の
+    段5の実装中に発覚(v5の応答を書くためにv4の自応答を読み直した)。`handle_incoming_getpubkey`と
+    `bm_send_pipeline_send_broadcast_async`が`bm_identity_info.does_ack`を設定しておらず、0のままだった
+    (`bm_send_pipeline_send_message_async`だけが1にしていた)。
+    - **実害。** 本家(`class_singleWorker.py`のsendMsg、l.1215〜)は相手のbitfieldにDOESACKが無いと
+      "Not bothering to include ackdata because the receiver said that they won't relay it anyway." として
+      ackを埋め込まず、`msgsentnoackexpected`扱いにする。本家は`processbroadcast`(`class_objectProcessor.py`
+      l.939)でも受信した鍵をbitfieldごと保存するので、どちらの経路で鍵を得ても、本家の送信者からのmsgには
+      ackが付かなかった。このノードはackを処理するので(`validate_and_store_ack`)、宣言だけが実態と
+      違っていた。うちの送信側は相手のbitfieldを見ずに常にackを付けるので、この実装同士では表に出ない。
+    - **修正。** どちらも常に1にする(`dontsendack`相当の設定は未実装で、msgの送信側と同じ扱い)。
+    - **応答キャッシュの無効化。** 1行直すだけでは、`self_pubkey_response_cache`が既存のbit 0のobjectを
+      期限まで(最長28日)再利用し続ける。`does_ack`列(既定0)を足し(ALTER TABLE)、再利用は`does_ack=1`の
+      行だけにした。修正前に作った応答は次の要求で1回PoWし直す(捨てても1回PoWするだけ、という項目の
+      性質は§11 2026-09-24のスキーマ変更と同じ)。
+    - **まだ残ること。** ネットワーク上に既に流れたbit 0のpubkey objectは期限まで残り、本家が保存した鍵も
+      新しいpubkeyを受け取るまで0のまま。これは取り消せない。
+    - **テスト**: `test_getpubkey_automation`(自応答のbitfield)、`test_broadcast`(send_pipelineのbroadcastを
+      復号してbitfieldを確認)、`test_getpubkey_twin_versions`(列の無いDBの行を再利用しないこと)。
+      3つの修正をそれぞれ戻すと対応する検査が落ちることを確認した。

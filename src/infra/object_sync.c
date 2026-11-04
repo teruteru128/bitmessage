@@ -695,6 +695,12 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     memcpy(info.priv_signing, id.priv_signing, 32);
     info.nonce_trials_per_byte = id.nonce_trials_per_byte;
     info.payload_length_extra_bytes = id.payload_length_extra_bytes;
+    /* §11 2026-11-05 以前は設定しておらず、自応答のpubkeyのbitfieldが0になっていた。本家
+     * (class_singleWorker.pyのsendMsg)はBITFIELD_DOESACKの立っていない相手にはackを埋め込まず
+     * 'msgsentnoackexpected'扱いにするので、この経路で鍵を得た送信者にはackが返らなかった。
+     * このノードはmsgに埋め込まれたackを処理する(validate_and_store_ack)。send_pipeline.cと同じく、
+     * dontsendack相当の設定はまだ無いので常に立てる */
+    info.does_ack = 1;
     uint64_t address_version = hdr->version;
     uint64_t stream = id.stream;
     OPENSSL_cleanse(&id, sizeof(id));

@@ -79,7 +79,7 @@ ctest -R <test_name> --output-on-failure   # 例: ctest -R object_sync
 2. `cmake --build build-Debug --parallel`(警告ゼロ)
 3. `ctest --output-on-failure`(100%通過)
 4. `DESIGN.md`の該当節(通常は§11、無ければ該当章)へ日本語で経緯・根拠を追記
-5. `git commit`(日本語メッセージ、末尾に`Co-Authored-By: Claude Sonnet 5
+5. `git commit`(日本語メッセージ、末尾に実際に作業したモデルの名前で`Co-Authored-By: Claude <モデル名>
    <noreply@anthropic.com>`)。コミットメッセージが長い/特殊文字を含む場合はheredocを避け、
    Writeツールで一時ファイルに書いてから`git commit -F <file>`する
 6. `git push origin master`は実行前にユーザーへ確認する

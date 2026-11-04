@@ -323,6 +323,8 @@ int main(void)
                   "self-issued pubkey response signing key matches our identity");
             CHECK(memcmp(parsed.encryption_pubkey, recv_gen.pub_encryption, 65) == 0,
                   "self-issued pubkey response encryption key matches our identity");
+            /* §11 2026-11-05 以前は0で、本家の送信者がackを埋め込まなくなっていた */
+            CHECK(parsed.behavior_bitfield == 1, "self-issued pubkey response advertises BITFIELD_DOESACK");
         }
     }
     else

@@ -249,10 +249,10 @@ int bm_pubkey_cache_set_self_response_id(sqlite3 *db, const unsigned char *id, s
                                          uint64_t stream, const unsigned char object_hash[32], int64_t expires_time)
 {
     static const char *SQL =
-        "INSERT INTO self_pubkey_response_cache (ripe, address_version, stream, object_hash, expires_time) "
-        "VALUES (?1,?2,?3,?4,?5) "
+        "INSERT INTO self_pubkey_response_cache (ripe, address_version, stream, object_hash, expires_time, does_ack) "
+        "VALUES (?1,?2,?3,?4,?5,1) "
         "ON CONFLICT(ripe, address_version, stream) DO UPDATE SET object_hash=excluded.object_hash, "
-        "expires_time=excluded.expires_time;";
+        "expires_time=excluded.expires_time, does_ack=1;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
@@ -279,8 +279,10 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
 int bm_pubkey_cache_get_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
                                          uint64_t stream, int64_t now, unsigned char out_hash[32])
 {
+    /* §11 2026-11-05 does_ack=0の行は、自応答のbitfieldが0だった時期に作ったobject。再利用すると
+     * 期限まで(最長28日)ackを要求しないpubkeyを配り続けるので、無いものとして作り直す */
     static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache "
-                             "WHERE ripe = ?1 AND address_version = ?2 AND stream = ?3;";
+                             "WHERE ripe = ?1 AND address_version = ?2 AND stream = ?3 AND does_ack = 1;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
     {

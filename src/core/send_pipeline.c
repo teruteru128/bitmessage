@@ -451,6 +451,10 @@ int bm_send_pipeline_send_broadcast_async(struct bm_pow_queue *pow_queue, bm_key
     memcpy(from_info.priv_signing, from_id.priv_signing, 32);
     from_info.nonce_trials_per_byte = from_id.nonce_trials_per_byte;
     from_info.payload_length_extra_bytes = from_id.payload_length_extra_bytes;
+    /* §11 2026-11-05 以前は設定しておらずbitfieldが0だった。本家のprocessbroadcastは受信した鍵を
+     * bitfieldごとpubkeysへ保存するので、この鍵で返信する本家の送信者がackを埋め込まなくなる
+     * (object_sync.cの自応答と同じ問題)。msgの送信側と同じく常に立てる */
+    from_info.does_ack = 1;
 
     uint64_t expires_time = (uint64_t)now + ttl_seconds;
 

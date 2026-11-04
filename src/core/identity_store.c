@@ -56,6 +56,7 @@ static const char *SCHEMA_SQL =
     "stream INTEGER NOT NULL, "
     "object_hash BLOB NOT NULL, "
     "expires_time INTEGER NOT NULL, "
+    "does_ack INTEGER NOT NULL DEFAULT 0, "
     "PRIMARY KEY (ripe, address_version, stream)"
     ");"
     /* §7.4 2026-08-29 単一行(id=0固定)。DESIGN.md §11-19の2段階KDF方式で全identityが
@@ -89,6 +90,11 @@ int bm_identity_store_init_schema(sqlite3 *db)
     {
         return -1;
     }
+    /* §11 2026-11-05 self_pubkey_response_cache.does_ack。自応答のbitfieldが0だった時期に作った
+     * pubkey objectは、この列が既定の0になるので再利用されない(pubkey_cache.cの
+     * bm_pubkey_cache_get_self_response_id)。既に列があるDBではエラーになるが無視してよい */
+    sqlite3_exec(db, "ALTER TABLE self_pubkey_response_cache ADD COLUMN does_ack INTEGER NOT NULL DEFAULT 0;", NULL, NULL,
+                 NULL);
 #ifdef BM_HAVE_PQ
     /* §11 2026-11-04 項目55の段3: v5 identityの表(pq_identity_store.c)。PQの無いビルドでは
      * 作らない(作っても読み手がいない)。PQ有りのビルドで作ったDBをPQ無しのビルドで開いても、

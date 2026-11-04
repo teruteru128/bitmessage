@@ -23,10 +23,12 @@
 #include "../src/common/json.h"
 #include "../src/core/address.h"
 #include "../src/core/api_server.h"
+#include "../src/core/crypto.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
 #include "../src/core/message_builder.h"
 #include "../src/core/messages_store.h"
+#include "../src/core/send_pipeline.h"
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
 #include "../src/infra/object_sync.h"
@@ -38,6 +40,7 @@
 #define TEST_IDENTITY_DB "test_broadcast_identity.db"
 #define TEST_MESSAGES_DB "test_broadcast_messages.db"
 #define TEST_OBJECT_POOL_DB "test_broadcast_pool.db"
+#define TEST_DOES_ACK_DB "test_broadcast_does_ack.db"
 
 static int failures = 0;
 
@@ -404,6 +407,49 @@ int main(void)
     unlink(TEST_MESSAGES_DB);
     unlink(TEST_OBJECT_POOL_DB);
 
+
+    /* §11 2026-11-05 send_pipelineのbroadcastのbitfieldにBITFIELD_DOESACKが立っていること。本家の
+     * processbroadcastは受信した鍵をbitfieldごと保存するので、0だと返信にackが付かなくなる。
+     * 復号済みのbitfieldはbm_decoded_broadcastへ出していないので、ここで開いて見る */
+    {
+        struct bm_generated_address gen;
+        CHECK(bm_address_generate_deterministic("broadcast does_ack", 1, &gen) == 0, "generate does_ack identity");
+        char *address = bm_address_encode(4, 1, gen.ripe, BM_RIPE_LEN);
+        unlink(TEST_DOES_ACK_DB);
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(TEST_DOES_ACK_DB, &db) == SQLITE_OK && bm_identity_store_init_schema(db) == 0,
+              "open does_ack identity db");
+        bm_keyring_t kr;
+        bm_keyring_init(&kr);
+        CHECK(bm_keyring_create_identity(db, address, "x", 4, 1, gen.pub_signing, gen.pub_encryption, gen.priv_signing,
+                                         gen.priv_encryption, "p", 1, 1)
+                  == 0
+                  && bm_keyring_unlock(&kr, db, address, "p") == 0,
+              "create and unlock does_ack identity");
+        unsigned char *object = NULL;
+        size_t object_len = 0;
+        CHECK(bm_send_pipeline_send_broadcast(&kr, address, "s", "b", 3600, &object, &object_len) == 0,
+              "send_pipeline builds a broadcast");
+        struct bm_object_header hdr;
+        unsigned char secret[32];
+        unsigned char *plain = NULL;
+        size_t plain_len = 0;
+        bm_address_derive_secret_and_tag(4, 1, gen.ripe, secret, NULL);
+        CHECK(object != NULL && bm_object_parse_header(object, object_len, &hdr) == 0
+                  && bm_crypto_ecies_decrypt(object + hdr.header_len + 32, object_len - hdr.header_len - 32, secret, &plain,
+                                             &plain_len)
+                         == 0,
+              "the broadcast opens with the address secret");
+        /* varint(version=4) || varint(stream=1) || bitfield(4byte BE) */
+        CHECK(plain != NULL && plain_len > 6 && memcmp(plain + 2, "\x00\x00\x00\x01", 4) == 0,
+              "the broadcast advertises BITFIELD_DOESACK");
+        free(plain);
+        free(object);
+        free(address);
+        bm_keyring_destroy(&kr);
+        sqlite3_close(db);
+        unlink(TEST_DOES_ACK_DB);
+    }
     if (failures == 0)
     {
         printf("ALL OK\n");
