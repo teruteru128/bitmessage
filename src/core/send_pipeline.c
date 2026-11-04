@@ -71,7 +71,7 @@ struct send_msg_job
     unsigned char to_ripe[BM_RIPE_LEN];
     unsigned char to_pub_encryption[65];
 #ifdef BM_HAVE_PQ
-    /* §11 2026-11-05 項目57: v5の送信ならpq_fromが非NULL(上のfrom_info・to_ripe・to_pub_encryptionは
+    /* §11 2026-11-04 項目57: v5の送信ならpq_fromが非NULL(上のfrom_info・to_ripe・to_pub_encryptionは
      * 使わない)。pq_fromは秘密署名鍵を含み、from_infoと同じくmsgを組み立てた直後に消す */
     struct bm_pqv5_identity *pq_from;
     uint64_t pq_from_nonce_trials;
@@ -142,7 +142,7 @@ static unsigned char *build_msg_payload(struct send_msg_job *job, const unsigned
         unsigned char *payload = NULL;
         if (message != NULL)
         {
-            /* bitfieldはBITFIELD_DOESACK(§11 2026-11-05 項目56) */
+            /* bitfieldはBITFIELD_DOESACK(§11 2026-11-04 項目56) */
             struct bm_pq_sender_info info;
             info.identity = job->pq_from;
             info.bitfield = 1;
@@ -400,7 +400,7 @@ static int prepare_legacy_msg(struct send_msg_job *job, bm_keyring_t *kr, sqlite
 
 #ifdef BM_HAVE_PQ
 /*
- * §11 2026-11-05 項目57: v5の送信の準備。宛先の扱いはv4と同じで、自分のidentityなら表の公開鍵を
+ * §11 2026-11-04 項目57: v5の送信の準備。宛先の扱いはv4と同じで、自分のidentityなら表の公開鍵を
  * 使い(unlock不要)、それ以外はキャッシュから引く(無ければ失敗で、呼び出し側がgetpubkeyを発行する)。
  * 難易度も同じく送信元と宛先の大きい方。pq_keyring.hのとおり秘密鍵はここで初めて展開されることがある。
  */
@@ -506,7 +506,7 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
 
     int prepare_rc;
 #ifdef BM_HAVE_PQ
-    /* §11 2026-11-05 項目57: v5はv5としか送り合えない。v5の鍵はv4以前のmsgへ載らず、v4以前の鍵は
+    /* §11 2026-11-04 項目57: v5はv5としか送り合えない。v5の鍵はv4以前のmsgへ載らず、v4以前の鍵は
      * v5のmsgの形式へ載らない(受信側もfromAddressVersionが5でなければ拒否する)。宛先のデコードは
      * 送信元と同じ世代のものしか通さないので、混ざっていれば下の準備で失敗する */
     if (is_v5_address(from_address))
@@ -576,7 +576,7 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
     }
 
     size_t ack_payload_len = 0;
-    /* §11 2026-11-05 項目57: v5のmsgのackもv4と同じ形にする(DESIGN-PQ.md §7.5)。既定のlevel 1はv4の
+    /* §11 2026-11-04 項目57: v5のmsgのackもv4と同じ形にする(DESIGN-PQ.md §7.5)。既定のlevel 1はv4の
      * getpubkeyに見えるが、サイズはv5のgetpubkeyと同じで、流れている量はv4の方がずっと多いので
      * 紛れやすい。受信側はackの中身を見ずにobjectとして扱う(validate_and_store_ack) */
     unsigned char *ack_payload =
@@ -643,7 +643,7 @@ static unsigned char *build_legacy_broadcast(bm_keyring_t *kr, const char *from_
     memcpy(from_info.priv_signing, from_id.priv_signing, 32);
     from_info.nonce_trials_per_byte = from_id.nonce_trials_per_byte;
     from_info.payload_length_extra_bytes = from_id.payload_length_extra_bytes;
-    /* §11 2026-11-05 以前は設定しておらずbitfieldが0だった。本家のprocessbroadcastは受信した鍵を
+    /* §11 2026-11-04 以前は設定しておらずbitfieldが0だった。本家のprocessbroadcastは受信した鍵を
      * bitfieldごとpubkeysへ保存するので、この鍵で返信する本家の送信者がackを埋め込まなくなる
      * (object_sync.cの自応答と同じ問題)。msgの送信側と同じく常に立てる */
     from_info.does_ack = 1;
@@ -662,7 +662,7 @@ static unsigned char *build_legacy_broadcast(bm_keyring_t *kr, const char *from_
 }
 
 #ifdef BM_HAVE_PQ
-/* §11 2026-11-05 項目57: build_legacy_broadcastのv5版。bitfieldは項目56と同じくDOESACK */
+/* §11 2026-11-04 項目57: build_legacy_broadcastのv5版。bitfieldは項目56と同じくDOESACK */
 static unsigned char *build_pq_broadcast(bm_keyring_t *kr, const char *from_address, const char *subject,
                                          const char *body, uint64_t ttl_seconds, int64_t now, size_t *out_len,
                                          uint64_t *out_target)

@@ -340,7 +340,7 @@ static void test_cache_schema_migration(void)
           "v4 cached response survives re-init");
     CHECK(bm_pubkey_cache_get_self_response(db, ripe, 4, 2, 0, out) == 0, "different stream is a separate key");
 
-    /* §11 2026-11-05 does_ack列が無い時点のDBの行(自応答のbitfieldが0だった時期のobject)は、
+    /* §11 2026-11-04 does_ack列が無い時点のDBの行(自応答のbitfieldが0だった時期のobject)は、
      * 列の追加後に再利用されないこと。作り直せば再利用されること */
     CHECK(sqlite3_exec(db,
                        "DROP TABLE self_pubkey_response_cache;"

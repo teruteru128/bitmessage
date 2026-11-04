@@ -53,7 +53,7 @@ int bm_pq_pubkey_cache_upsert(sqlite3 *db, const unsigned char id[BM_PQV5_ID_LEN
                               const struct bm_pq_pubkey_parsed *pubkey, int64_t received_time);
 
 /*
- * §11 2026-11-05 項目57: v5のmsg/broadcastに載っていた差出人の公開鍵を保存し、同じ宛先の未解決の
+ * §11 2026-11-04 項目57: v5のmsg/broadcastに載っていた差出人の公開鍵を保存し、同じ宛先の未解決の
  * 要求があれば消す。v5のmsgが公開鍵(3200byte)を丸ごと運ぶのは、返信のためにgetpubkeyを出さずに
  * 済ませるため(DESIGN-PQ.md §10.4)で、本家もprocessmsg/processbroadcastで同じことをしている
  * ("Let's store the public key in case we want to reply to this person.")。呼び出し側は署名を

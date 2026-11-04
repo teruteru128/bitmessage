@@ -1632,7 +1632,7 @@ static cJSON *send_slot_end(struct api_send_slot *slot, int submit_rc, const cha
 
 #ifdef BM_HAVE_PQ
 /*
- * §11 2026-11-05 項目57: h_sendMessageのgetpubkey自動要求のv5版。v4と違う点が2つある:
+ * §11 2026-11-04 項目57: h_sendMessageのgetpubkey自動要求のv5版。v4と違う点が2つある:
  *   - 宛先が自分のidentityなら要求しない(send_pipelineが表の公開鍵を使う)
  *   - 要求の前にプールを探す(bm_object_sync_resolve_pq_pubkey_from_pool。解決すれば要求は要らない)
  */
@@ -1714,7 +1714,7 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
         "received, or supply it directly via cachePubkey. Otherwise the PoW queue may be full)";
     size_t length_limit = BM_MAX_SUBJECT_PLUS_BODY_LEN;
 #ifdef BM_HAVE_PQ
-    /* §11 2026-11-05 項目57: v5はv5としか送り合えない(send_pipeline.c)。送れないと分かっている
+    /* §11 2026-11-04 項目57: v5はv5としか送り合えない(send_pipeline.c)。送れないと分かっている
      * メッセージのためにgetpubkeyを流さないよう、ここで断る */
     int from_is_v5 = is_v5_address(from_address);
     int to_is_v5 = is_v5_address(to_address);
@@ -1863,7 +1863,7 @@ static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
  * 購読・アドレス帳に登録するアドレスの検査。問題なければ0。
  * §11 2026-11-04 項目55の段5: v5のアドレスも受け付ける(購読の受信はobject_sync.cの
  * handle_incoming_broadcast_v6)。bm_address_decodeはversion 5を受け付けないので先に見分ける。
- * §11 2026-11-05 項目57: アドレス帳でも使うよう関数にした。
+ * §11 2026-11-04 項目57: アドレス帳でも使うよう関数にした。
  */
 static int check_known_address(const struct bm_api_server_config *config, const char *address, char **out_error)
 {

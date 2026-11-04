@@ -53,7 +53,7 @@ int bm_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned ch
  * 開封し、成功したらinboxへ保存する。tagが合わなければ開封を試みずに失敗する(DESIGN-PQ.md §7.4)。
  * 保存の形はbm_trial_decrypt_broadcast_and_storeと同じ(to_address=from_address)。差出人のアドレスは
  * 候補そのもの(開封できて、中の公開鍵からidを再計算して一致を確かめた相手)を使う。成功時0。
- * §11 2026-11-05 項目57: identity_dbが非NULLなら、載っていた公開鍵を保存する(msgと同じ、
+ * §11 2026-11-04 項目57: identity_dbが非NULLなら、載っていた公開鍵を保存する(msgと同じ、
  * bm_pq_pubkey_cache_store_sender)。
  */
 int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *identity_db, sqlite3 *messages_db, const unsigned char *object,

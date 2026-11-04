@@ -90,7 +90,7 @@ int bm_identity_store_init_schema(sqlite3 *db)
     {
         return -1;
     }
-    /* §11 2026-11-05 self_pubkey_response_cache.does_ack。自応答のbitfieldが0だった時期に作った
+    /* §11 2026-11-04 self_pubkey_response_cache.does_ack。自応答のbitfieldが0だった時期に作った
      * pubkey objectは、この列が既定の0になるので再利用されない(pubkey_cache.cの
      * bm_pubkey_cache_get_self_response_id)。既に列があるDBではエラーになるが無視してよい */
     sqlite3_exec(db, "ALTER TABLE self_pubkey_response_cache ADD COLUMN does_ack INTEGER NOT NULL DEFAULT 0;", NULL, NULL,

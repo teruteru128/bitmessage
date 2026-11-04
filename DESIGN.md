@@ -4682,7 +4682,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
          v4にも同じ問題がある(v5はPoWが141秒なので影響が大きい)。要求を記録するときに
          プールをtagで探す形が候補。
 
-56. **自応答とbroadcastのbitfieldにBITFIELD_DOESACKが立っていなかった(修正済み、2026-11-05)**: 項目55の
+56. **自応答とbroadcastのbitfieldにBITFIELD_DOESACKが立っていなかった(修正済み、2026-11-04)**: 項目55の
     段5の実装中に発覚(v5の応答を書くためにv4の自応答を読み直した)。`handle_incoming_getpubkey`と
     `bm_send_pipeline_send_broadcast_async`が`bm_identity_info.does_ack`を設定しておらず、0のままだった
     (`bm_send_pipeline_send_message_async`だけが1にしていた)。
@@ -4703,7 +4703,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
       復号してbitfieldを確認)、`test_getpubkey_twin_versions`(列の無いDBの行を再利用しないこと)。
       3つの修正をそれぞれ戻すと対応する検査が落ちることを確認した。
 
-57. **ポスト量子拡張のフェーズ3(送信側)(実装済み、2026-11-05)**: [DESIGN-PQ.md](DESIGN-PQ.md) §9.1の
+57. **ポスト量子拡張のフェーズ3(送信側)(実装済み、2026-11-04)**: [DESIGN-PQ.md](DESIGN-PQ.md) §9.1の
     フェーズ3。項目55の段5で送った2点もここで解決した。これでv5のアドレス同士でmsg・broadcastの送受信が
     一通りできる。実行時フラグ`[pq] enabled`の後ろにあるのは変わらない。
     - **`send_pipeline`。** 既存のジョブチェーン(ackのPoW→msgの組み立てとPoW→sentへの記録)をそのまま使い、

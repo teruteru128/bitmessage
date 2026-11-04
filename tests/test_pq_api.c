@@ -18,7 +18,7 @@
  * 8. deleteAddressでv5の行が消えること
  * 9. §11 2026-11-04 項目55の段5: unlockAddress・unlockAddresses(backfill=true)がプールの過去のv5 msgを
  *    読むこと、addSubscriptionがv5のアドレスを受け付けること
- * 10. §11 2026-11-05 項目57: sendMessage: v5とv4以前の間は断ること、本文長の上限がv5の値であること、
+ * 10. §11 2026-11-04 項目57: sendMessage: v5とv4以前の間は断ること、本文長の上限がv5の値であること、
  *    鍵の分からない宛先にはgetpubkey(objectVersion 5)を自動で発行しcooldown中は繰り返さないこと、
  *    プールにpubkeyがあれば発行しないこと、自分宛はobjectが返りbroadcast_queueへ積まれること。
  *    sendBroadcast: v5から送れること。addAddressBookEntry: v5を受け付けること

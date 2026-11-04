@@ -25,7 +25,7 @@ int bm_object_store_get(sqlite3 *db, const unsigned char hash[32],
                          unsigned char **out_payload, size_t *out_len);
 
 /*
- * §11 2026-11-05 項目57: object_typeのobjectのうち、payloadのtag_offset(0始まり)からの32byteがtagと
+ * §11 2026-11-04 項目57: object_typeのobjectのうち、payloadのtag_offset(0始まり)からの32byteがtagと
  * 一致するものを、期限の遅い順に*out_hashes(malloc)へ返す。列挙してから1件ずつ読むより安い
  * (BLOBを丸ごとCへ読み出さずに比べられる)。成功時0、*out_countに件数(0件でも成功)。
  */

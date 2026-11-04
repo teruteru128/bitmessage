@@ -123,7 +123,7 @@ PyBitmessageの型別検査(`src/network/bmobject.py`)と処理層(`src/class_ob
 | msg | 検査なし | `processmsg`が `if msgVersion != 1: return` で**復号を試みる前に**捨てる |
 | broadcast | `len < 180`、`version < 2` で無効 | `processbroadcast`が `if broadcastVersion < 4 or > 5: return` で捨てる |
 
-**2026-11-05 実機で確認。** v5のノード2本をPyBitmessage(dcbcc4a2、PyPy 2.7上)だけを挟んで接続し、
+**2026-11-04 実機で確認。** v5のノード2本をPyBitmessage(dcbcc4a2、PyPy 2.7上)だけを挟んで接続し、
 4種類すべてが中継されて相手に届くことと、PyBitmessageのログに上の表どおりの行が出ることを確かめた:
 getpubkeyは "The requestedAddressVersionNumber of the pubkey request is too high."、pubkey(7776byte)は
 "pubkey object too short or too long. Ignoring."、msgは "Cannot understand message versions other than one."、
@@ -581,7 +581,7 @@ v4の3段階(DESIGN.md §5.5)をそのまま使える。既定のlevel 1(getpubk
 v4 getpubkeyとv5 getpubkeyでサイズが同じ(54byte)なので、どちらに偽装しても
 区別はつかない。ここは実装時の選択に委ねる(本プロトタイプでは未実装)。
 受信側はフェーズ2で実装済みで、msgに埋め込まれたackはv4と同じ経路で扱う(DESIGN.md §11項目55の段5)。
-**2026-11-05 送信側はv4と同じackをそのまま使うことにした(DESIGN.md §11項目57)。** 既定のlevel 1はv4の
+**2026-11-04 送信側はv4と同じackをそのまま使うことにした(DESIGN.md §11項目57)。** 既定のlevel 1はv4の
 getpubkeyに見える。サイズはv5のgetpubkeyと同じで、流れている量はv4の方がずっと多いので紛れやすい。
 
 ---
@@ -802,10 +802,10 @@ PoWの所要時間は指数分布に従うので、
    `identity.db` に保存できるようにする。この段階までなら既存ネットワークに何も影響しない。
 3. **送信側の実装** — `send_pipeline.c` / API / CLI にv5アドレス対応を足す。
    PoWコストが上がるので、TTL既定値の見直し(§9.3)もここで行う。
-   **2026-11-05 実装済み(DESIGN.md §11項目57)。**
+   **2026-11-04 実装済み(DESIGN.md §11項目57)。**
 4. **相互運用テスト** — testnet上で2ノード間のv5 msg往復と、v4しか知らないノードを
    経由した場合の中継が壊れないことを確認する。
-   **2026-11-05 確認済み(DESIGN.md §11項目57)。** 外部ネットワークの無い環境で、この実装同士の往復、
+   **2026-11-04 確認済み(DESIGN.md §11項目57)。** 外部ネットワークの無い環境で、この実装同士の往復、
    フラグ無効のノードを経由した中継、PyBitmessage(dcbcc4a2)だけを経由した中継を確認した(§2.3の末尾)。
    MiNode-Refinedはソースの確認のみ(§2.2)で、実際に動かしてはいない。
 5. **提案の公開** — ここまでの実測値を添えてBitmessageコミュニティへ提案。
@@ -829,7 +829,7 @@ v4とv5は別アドレスとして共存する。同一ユーザーが両方を�
 
 - **本文長上限の再設定。** msgオブジェクトの固定オーバーヘッドが増える分、
   `BM_MAX_SUBJECT_PLUS_BODY_LEN`(現在 2^18-500)をv5用に下げる必要がある(§8.3に実測値)。
-  **2026-11-05 `BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN`(2^18-9000)を追加。** 固定部約7.8KBと最大のack約1KBを
+  **2026-11-04 `BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN`(2^18-9000)を追加。** 固定部約7.8KBと最大のack約1KBを
   確保した値で、§8.3の254363byteより少し小さい(§8.3はackを含めていない)。
 - **pubkey v5のPoWが重い(v5実装の前提条件)。** 28日TTL×7.8KBで現行の6倍以上の
   試行回数になる(§8.3)。単に待ち時間が伸びるだけでなく、**現在の実装ではPoWが
@@ -839,7 +839,7 @@ v4とv5は別アドレスとして共存する。同一ユーザーが両方を�
   その間停止してしまうため、**v5を実装する前にPoWを専用ワーカーへ追い出す改修が必須**
   (これまでは「許容できるトレードオフ」だったものが、v5では許容できなくなる)。
   合わせてTTLを短くする(例: 7日)+再告知の頻度を上げる運用も検討する。
-  **2026-11-05 v5の自応答のTTLを7日にした(DESIGN.md §11項目57)。** PoWはTTLにほぼ比例するので、期待
+  **2026-11-04 v5の自応答のTTLを7日にした(DESIGN.md §11項目57)。** PoWはTTLにほぼ比例するので、期待
   141秒が約36秒になり、その間pow_queueの他のジョブが待たされる時間も短くなる。自応答は要求があったときに
   作るので、再告知の仕組みは足していない。
   **2026-11-03 前提条件を解消(DESIGN.md §11項目38 Tier 1)**: getpubkey自応答のPoWは

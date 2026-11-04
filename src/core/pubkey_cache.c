@@ -279,7 +279,7 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
 int bm_pubkey_cache_get_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
                                          uint64_t stream, int64_t now, unsigned char out_hash[32])
 {
-    /* §11 2026-11-05 does_ack=0の行は、自応答のbitfieldが0だった時期に作ったobject。再利用すると
+    /* §11 2026-11-04 does_ack=0の行は、自応答のbitfieldが0だった時期に作ったobject。再利用すると
      * 期限まで(最長28日)ackを要求しないpubkeyを配り続けるので、無いものとして作り直す */
     static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache "
                              "WHERE ripe = ?1 AND address_version = ?2 AND stream = ?3 AND does_ack = 1;";

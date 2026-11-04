@@ -80,7 +80,7 @@
 /* 自分のpubkeyで応答する際のobjectのTTL(§11 getpubkey要求の自動化)。PyBitmessageの
  * pubkey告知の目安(数週間)を参考にした固定値。 */
 #define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
-/* §11 2026-11-05 項目57: v5の応答は7日(DESIGN-PQ.md §9.3)。28日だとPoWが期待141秒(§8.4)で、その間
+/* §11 2026-11-04 項目57: v5の応答は7日(DESIGN-PQ.md §9.3)。28日だとPoWが期待141秒(§8.4)で、その間
  * pow_queueの他のジョブ(送信を含む)が待たされる。PoWはTTLにほぼ比例するので期待約36秒になる。
  * 全ノードが保持する7.8KBのobjectの滞留も短くなる。代わりに、要求を受けたときにアドレスの持ち主が
  * オフラインでも応答できる期間が短くなるが、既に相手の鍵を持つノードには影響しない
@@ -701,7 +701,7 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     memcpy(info.priv_signing, id.priv_signing, 32);
     info.nonce_trials_per_byte = id.nonce_trials_per_byte;
     info.payload_length_extra_bytes = id.payload_length_extra_bytes;
-    /* §11 2026-11-05 以前は設定しておらず、自応答のpubkeyのbitfieldが0になっていた。本家
+    /* §11 2026-11-04 以前は設定しておらず、自応答のpubkeyのbitfieldが0になっていた。本家
      * (class_singleWorker.pyのsendMsg)はBITFIELD_DOESACKの立っていない相手にはackを埋め込まず
      * 'msgsentnoackexpected'扱いにするので、この経路で鍵を得た送信者にはackが返らなかった。
      * このノードはmsgに埋め込まれたackを処理する(validate_and_store_ack)。send_pipeline.cと同じく、
@@ -2277,7 +2277,7 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
 }
 
 #ifdef BM_HAVE_PQ
-/* §11 2026-11-05 項目57(object_sync.h参照) */
+/* §11 2026-11-04 項目57(object_sync.h参照) */
 int bm_object_sync_resolve_pq_pubkey_from_pool(sqlite3 *object_pool_db, sqlite3 *identity_db, uint64_t address_version,
                                                uint64_t stream, const unsigned char id[32], int64_t now)
 {

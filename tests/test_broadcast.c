@@ -408,7 +408,7 @@ int main(void)
     unlink(TEST_OBJECT_POOL_DB);
 
 
-    /* §11 2026-11-05 send_pipelineのbroadcastのbitfieldにBITFIELD_DOESACKが立っていること。本家の
+    /* §11 2026-11-04 send_pipelineのbroadcastのbitfieldにBITFIELD_DOESACKが立っていること。本家の
      * processbroadcastは受信した鍵をbitfieldごと保存するので、0だと返信にackが付かなくなる。
      * 復号済みのbitfieldはbm_decoded_broadcastへ出していないので、ここで開いて見る */
     {
