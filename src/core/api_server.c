@@ -258,8 +258,8 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
         return NULL;
     }
 #ifdef BM_HAVE_PQ
-    /* §11 2026-11-04 項目55の段4: v5はv5のkeyringへ。過去MSGのbackfill(下のv4の経路のコメント
-     * 参照)は、v5のmsgの試行復号と一緒に段5で入れる */
+    /* §11 2026-11-04 項目55の段4: v5はv5のkeyringへ。段5: unlock直後のbackfillもv4と同じく行う
+     * (下のv4の経路のコメント参照) */
     if (is_v5_address(address))
     {
         if (!config->pq_enabled)
@@ -267,9 +267,14 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
             *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
             return NULL;
         }
-        return cJSON_CreateBool(
-            bm_pq_keyring_unlock(config->keyring, config->identity_db, address, passphrase, (int64_t)time(NULL))
-            == 0);
+        int64_t pq_now = (int64_t)time(NULL);
+        int pq_rc = bm_pq_keyring_unlock(config->keyring, config->identity_db, address, passphrase, pq_now);
+        if (pq_rc == 0 && config->object_pool_db != NULL)
+        {
+            bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address,
+                                                  pq_now);
+        }
+        return cJSON_CreateBool(pq_rc == 0);
     }
 #endif
     int rc = bm_keyring_unlock(config->keyring, config->identity_db, address, passphrase);
@@ -286,7 +291,8 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
          * 積まれた状態だと「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり、
          * 実運用で9時間以上RPCサーバーをブロックする問題が発覚したため。詳細はDESIGN.mdおよび
          * object_sync.hのbm_object_sync_backfill_trial_decryptコメント参照)。 */
-        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address);
+        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address,
+                                              (int64_t)time(NULL));
     }
     return cJSON_CreateBool(rc == 0);
 }
@@ -545,13 +551,7 @@ static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
         else
         {
             /* backfill対象は今回unlockできたものに詰めて渡す(addressesは以後使わないので上書きしてよい) */
-#ifdef BM_HAVE_PQ
-            /* §11 2026-11-04 項目55の段4: v5のbackfillは段5(v5のmsgの試行復号)で入れる */
-            if (!is_v5_address(addresses[i]))
-#endif
-            {
-                addresses[unlocked_count++] = addresses[i];
-            }
+            addresses[unlocked_count++] = addresses[i];
         }
         cJSON_AddItemToArray(arr, entry);
     }
@@ -563,7 +563,8 @@ static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
         /* object_pool_dbが無い構成(api_server.hのとおりNULL可)では探す対象が無いので0件 */
         int n = (config->object_pool_db != NULL)
                     ? bm_object_sync_backfill_trial_decrypt_addresses(config->object_pool_db, config->messages_db,
-                                                                      config->keyring, addresses, unlocked_count)
+                                                                      config->keyring, addresses, unlocked_count,
+                                                                      (int64_t)time(NULL))
                     : 0;
         cJSON_AddItemToObject(out, "backfilledMessages", cJSON_CreateNumber(n > 0 ? n : 0));
     }
@@ -1766,10 +1767,22 @@ static cJSON *h_addSubscription(const struct bm_api_server_config *config,
         return NULL;
     }
 
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段5: v5のアドレスも購読できる(受信はobject_sync.cの
+     * handle_incoming_broadcast_v6)。bm_address_decodeはversion 5を受け付けないので先に見分ける */
+    int is_v5 = is_v5_address(address);
+    if (is_v5 && !config->pq_enabled)
+    {
+        *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+        return NULL;
+    }
+#else
+    int is_v5 = 0;
+#endif
     uint64_t version = 0;
     uint64_t stream = 0;
     unsigned char ripe[BM_RIPE_LEN];
-    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    if (!is_v5 && bm_address_decode(address, &version, &stream, ripe) != 0)
     {
         *out_error = dup_cstr("invalid address");
         return NULL;

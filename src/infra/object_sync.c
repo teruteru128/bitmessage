@@ -23,6 +23,11 @@
 #include "../core/pubkey_cache.h"
 #include "../core/send_pipeline.h"
 #include "../core/trial_decrypt.h"
+#ifdef BM_HAVE_PQ
+#include "../core/pq_keyring.h"
+#include "../core/pq_pubkey_cache.h"
+#include "../pq/pq_object.h"
+#endif
 #include "../pow/pow_engine.h"
 #include "../pow/pow_queue.h"
 #include "dandelion.h"
@@ -324,7 +329,9 @@ static void validate_and_store_ack(struct bm_object_sync_ctx *ctx, const struct 
 struct pubkey_response_job
 {
     struct bm_object_sync_ctx *ctx;
-    unsigned char ripe[BM_RIPE_LEN];
+    /* v4以前はripe(20byte)、v5はid(32byte)。応答キャッシュのキーの先頭列 */
+    unsigned char id[32];
+    size_t id_len;
     uint64_t address_version;
     uint64_t stream;
     uint64_t expires_time;
@@ -345,8 +352,8 @@ static void pubkey_response_done(void *user_data, unsigned char *object, size_t 
         {
             bm_object_store_insert(ctx->object_pool_db, hash, BM_OBJECT_PUBKEY, (int)job->stream, object, object_len,
                                    (int64_t)job->expires_time, now);
-            bm_pubkey_cache_set_self_response(ctx->identity_db, job->ripe, job->address_version, job->stream, hash,
-                                              (int64_t)job->expires_time);
+            bm_pubkey_cache_set_self_response_id(ctx->identity_db, job->id, job->id_len, job->address_version,
+                                                 job->stream, hash, (int64_t)job->expires_time);
             if (ctx->registry != NULL)
             {
                 bm_peer_registry_broadcast_inv(ctx->registry, &hash, 1, NULL, now);
@@ -360,6 +367,235 @@ static void pubkey_response_done(void *user_data, unsigned char *object, size_t 
 }
 
 /*
+ * §11 getpubkey応答のスロットリング: 直近作った応答がまだ有効期限内ならPoWを計算し直さず、
+ * 既存objectのinvを再broadcastするだけにする(同じ宛先への短時間の連続要求に対し、正規のPoWを
+ * 払われた場合でも毎回計算し直させられないようにするため)。再利用したら1を返す。
+ * §11 2026-11-04 項目55の段5: v5と共通にするため関数へ切り出した。
+ */
+static int reuse_cached_pubkey_response(struct bm_object_sync_ctx *ctx, const unsigned char *id, size_t id_len,
+                                        uint64_t address_version, uint64_t stream, int64_t now)
+{
+    unsigned char cached_hash[32];
+    if (bm_pubkey_cache_get_self_response_id(ctx->identity_db, id, id_len, address_version, stream, now, cached_hash)
+            != 1
+        || !bm_object_store_has(ctx->object_pool_db, cached_hash))
+    {
+        return 0;
+    }
+    if (ctx->registry != NULL)
+    {
+        bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL, now);
+    }
+    /* §11 2026-09-12: 8段階化に伴う移行。getpubkey応答1回につき1行のサマリなので
+     * 無番号のDEBUG(常時見たい詳細情報)にした。 */
+    bm_log_debug("[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
+                 address_version);
+    return 1;
+}
+
+/*
+ * §11 2026-11-03 項目38: 以前はここでbm_pow_runを同期実行しており、PoWの間
+ * network_epoll_thread(このハンドラを呼んでいるスレッド)が止まって全ピア接続が停止していた
+ * (v4で実測20秒超、ポスト量子v5では期待141秒、DESIGN-PQ.md §8.4)。pow_queueへ投げて
+ * すぐ戻り、object_pool.dbへの登録・応答キャッシュの更新・inv broadcastは完了コールバック
+ * (pubkey_response_done、ワーカースレッド上)で行う。ctx->pow_queue==NULL(テスト)なら
+ * 従来通りこの場で同期実行される。payloadの所有権はこの関数へ移る。
+ *
+ * dedupキーは同じ要求が応答のPoW完了前に重ねて届いても、PoWを2本積まないためのもの。同期実装では
+ * network_epoll_threadがPoW中に止まっていたので、後続の要求はキャッシュができてから
+ * 処理されて自然に再利用されていたが、非同期化でその暗黙の直列化が無くなる
+ * (放置すると、正規のPoWを払ったgetpubkeyを連打されるだけで同じ応答PoWを何本も
+ * 積まされる。pow_queue.h参照)
+ * §11 2026-11-04 項目55の段5: v5と共通にするため関数へ切り出した。
+ */
+static void submit_pubkey_response(struct bm_object_sync_ctx *ctx, unsigned char *payload, size_t payload_len,
+                                   uint64_t target, const unsigned char *id, size_t id_len, uint64_t address_version,
+                                   uint64_t stream, uint64_t expires_time, const unsigned char *key, size_t key_len,
+                                   int64_t now)
+{
+    struct pubkey_response_job *job = malloc(sizeof(*job));
+    if (job == NULL)
+    {
+        free(payload);
+        return;
+    }
+    job->ctx = ctx;
+    memcpy(job->id, id, id_len);
+    job->id_len = id_len;
+    job->address_version = address_version;
+    job->stream = stream;
+    job->expires_time = expires_time;
+
+    int rc = bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, key_len, pubkey_response_done, job,
+                                 now);
+    if (rc != 0)
+    {
+        free(job); /* 拒否ではdoneが呼ばれないので、ここで片付ける(pow_queue.h参照) */
+    }
+    if (rc == 1)
+    {
+        bm_log_debug("[object_sync] getpubkey response PoW (v%" PRIu64 ") is already queued, not queuing again\n",
+                     address_version);
+    }
+    else if (rc < 0)
+    {
+        /* TTLを短くすれば要求側のPoWは安いので、溢れる状況ではこの行も大量に出うる。
+         * 時計ずれのWARN(項目46)と同じく一定間隔に1回へ間引く */
+        uint64_t suppressed = 0;
+        if (bm_log_throttle_check(&ctx->pow_queue_full_log_throttle, now, BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDS,
+                                  &suppressed))
+        {
+            bm_log_warn("[object_sync] PoW queue is full or shutting down, dropping getpubkey response (v%" PRIu64
+                        ", %" PRIu64 " more dropped since the last report)\n",
+                        address_version, suppressed);
+        }
+    }
+}
+
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-04 項目55の段5: v5のgetpubkey(objectVersion 5)への自応答。流れはv4と同じ
+ * (tagで引く→version/streamの照合→応答キャッシュ→pubkeyの組み立て→PoWはpow_queueへ)。
+ * 署名に秘密鍵が要るので、ここで初めて遅延展開が走ることがある(pq_keyring.h)。
+ */
+static void handle_incoming_getpubkey_v5(struct bm_object_sync_ctx *ctx, const struct bm_object_header *hdr,
+                                         const struct bm_message *msg, int64_t now)
+{
+    const unsigned char *body = msg->payload + hdr->header_len;
+    size_t body_len = msg->length - hdr->header_len;
+    if (body_len < 32)
+    {
+        return;
+    }
+
+    /* どちらも公開鍵だけで3KB超あるのでスタックに置かない。identityには署名鍵が入る */
+    struct bm_pq_identity_public *pub = malloc(sizeof(*pub));
+    struct bm_pqv5_identity *identity = calloc(1, sizeof(*identity));
+    if (pub == NULL || identity == NULL)
+    {
+        goto out;
+    }
+    if (!bm_pq_keyring_find_by_tag(ctx->keyring, body, pub) || pub->address_version != BM_PQV5_ADDRESS_VERSION
+        || pub->stream != hdr->stream)
+    {
+        goto out; /* 自分宛てではない、ロックされたままのアドレス宛、またはstreamの不一致 */
+    }
+    if (reuse_cached_pubkey_response(ctx, pub->id, BM_PQV5_ID_LEN, pub->address_version, pub->stream, now))
+    {
+        goto out;
+    }
+
+    identity->version = pub->address_version;
+    identity->stream = pub->stream;
+    memcpy(identity->id, pub->id, BM_PQV5_ID_LEN);
+    memcpy(identity->sig_pk, pub->sig_pk, BM_PQV5_SIG_PK_LEN);
+    memcpy(identity->kem_pk, pub->kem_pk, BM_PQV5_KEM_PK_LEN);
+    if (bm_pq_keyring_get_secret_keys(ctx->keyring, pub->address, identity->sig_sk, NULL) != 0)
+    {
+        goto out; /* ここまでの間にlockされた、または展開に失敗した */
+    }
+
+    /* bitfieldはBITFIELD_DOESACK(§5.2)。v5のmsgのackはこのノードが処理する */
+    struct bm_pq_sender_info info;
+    info.identity = identity;
+    info.bitfield = 1;
+    info.nonce_trials_per_byte = pub->nonce_trials_per_byte;
+    info.payload_length_extra_bytes = pub->payload_length_extra_bytes;
+    uint64_t expires_time = (uint64_t)now + BM_PUBKEY_RESPONSE_TTL_SECONDS;
+    size_t payload_len = 0;
+    unsigned char *payload = bm_pq_build_pubkey(&info, expires_time, &payload_len);
+    if (payload == NULL)
+    {
+        goto out;
+    }
+    uint64_t target = bm_pow_get_target(payload_len, BM_PUBKEY_RESPONSE_TTL_SECONDS, pub->nonce_trials_per_byte,
+                                        pub->payload_length_extra_bytes);
+
+    /* dedupキーはtag(version・stream・idから決まる)。v4の形(version+stream+ripe)ではidが32byteの
+     * 分だけBM_POW_QUEUE_KEY_MAXを超える */
+    unsigned char key[1 + 32];
+    key[0] = 'Q';
+    memcpy(key + 1, pub->tag, 32);
+    submit_pubkey_response(ctx, payload, payload_len, target, pub->id, BM_PQV5_ID_LEN, pub->address_version,
+                           pub->stream, expires_time, key, sizeof(key), now);
+
+out:
+    if (identity != NULL)
+    {
+        OPENSSL_cleanse(identity, sizeof(*identity));
+    }
+    free(identity);
+    free(pub);
+}
+
+/*
+ * §11 2026-11-04 項目55の段5: v5のpubkey(objectVersion 5)。自分がgetpubkeyを発行した宛先の分だけ
+ * 開封して保存する。tagが平文なので、要求の表をtagで直接引ける(v4のように要求を全件試さない)。
+ * 要求していないpubkeyは開封しない(誰でも作れるので、保存すると表を埋められる)。
+ */
+static void handle_incoming_pubkey_v5(struct bm_object_sync_ctx *ctx, const struct bm_object_header *hdr,
+                                      const struct bm_message *msg, int64_t now)
+{
+    size_t body_len = msg->length - hdr->header_len;
+    if (body_len < 32)
+    {
+        return;
+    }
+    const unsigned char *tag = msg->payload + hdr->header_len;
+
+    struct bm_pq_pubkey_request request;
+    if (bm_pq_pubkey_cache_find_request(ctx->identity_db, tag, &request) != 0)
+    {
+        return;
+    }
+    struct bm_pq_pubkey_parsed *parsed = malloc(sizeof(*parsed)); /* 公開鍵だけで3KB超 */
+    if (parsed == NULL)
+    {
+        return;
+    }
+    if (bm_pq_parse_pubkey(msg->payload, msg->length, request.address_version, request.stream, request.id, parsed) == 0
+        && bm_pq_pubkey_cache_upsert(ctx->identity_db, request.id, parsed, now) == 0)
+    {
+        bm_pq_pubkey_cache_clear_request(ctx->identity_db, tag);
+        bm_log_info("[object_sync] pubkey (v%" PRIu64 ") cached\n", request.address_version);
+    }
+    free(parsed);
+}
+
+/*
+ * §11 2026-11-04 項目55の段5: v5のbroadcast(objectVersion 6)。購読中のv5アドレスを候補として順に
+ * 試す。tagの比較で外れるので、候補が多くても開封するのは一致した1件だけ。
+ */
+static void handle_incoming_broadcast_v6(struct bm_object_sync_ctx *ctx, const struct bm_message *msg, int64_t now)
+{
+    struct bm_subscription *subs = NULL;
+    size_t sub_count = 0;
+    if (bm_messages_store_list_subscriptions(ctx->messages_db, &subs, &sub_count) != 0)
+    {
+        return;
+    }
+    for (size_t i = 0; i < sub_count; i++)
+    {
+        uint64_t version = 0;
+        uint64_t stream = 0;
+        unsigned char id[BM_PQV5_ID_LEN];
+        if (bm_pqv5_address_decode(subs[i].address, &version, &stream, id) != 0)
+        {
+            continue; /* v4以前の購読 */
+        }
+        if (bm_pq_trial_decrypt_broadcast_and_store(ctx->messages_db, msg->payload, msg->length, version, stream, id,
+                                                    now)
+            == 0)
+        {
+            bm_log_info("[object_sync] broadcast decrypted (subscribed address %s)\n", subs[i].address);
+            break;
+        }
+    }
+    bm_subscription_list_free(subs);
+}
+#endif
+
+/*
  * §5.1/§11: 受信したgetpubkeyが自分の(keyringでunlock済みの)アドレス宛かどうかを判定し、
  * 該当すれば自分のpubkeyオブジェクトを組み立ててPoWし、object_pool.dbへ登録した上で
  * 全peer(除外無し、自分が新たに作った物なので§1の他object同様except=NULL)へbroadcastする。
@@ -371,6 +607,16 @@ static void pubkey_response_done(void *user_data, unsigned char *object, size_t 
 static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const struct bm_object_header *hdr,
                                        const struct bm_message *msg)
 {
+#ifdef BM_HAVE_PQ
+    if (hdr->version == BM_PQ_GETPUBKEY_OBJECT_VERSION)
+    {
+        if (ctx->pq_enabled)
+        {
+            handle_incoming_getpubkey_v5(ctx, hdr, msg, (int64_t)time(NULL));
+        }
+        return;
+    }
+#endif
     const unsigned char *body = msg->payload + hdr->header_len;
     size_t body_len = msg->length - hdr->header_len;
 
@@ -453,23 +699,9 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     uint64_t stream = id.stream;
     OPENSSL_cleanse(&id, sizeof(id));
 
-    /* §11 getpubkey応答のスロットリング: 直近作った応答がまだ有効期限内ならPoWを計算し
-     * 直さず、既存objectのinvを再broadcastするだけにする(同じ宛先への短時間の連続要求に
-     * 対し、正規のPoWを払われた場合でも毎回計算し直させられないようにするため) */
     int64_t now = (int64_t)time(NULL);
-    unsigned char cached_hash[32];
-    if (bm_pubkey_cache_get_self_response(ctx->identity_db, ripe, address_version, stream, now, cached_hash) == 1
-        && bm_object_store_has(ctx->object_pool_db, cached_hash))
+    if (reuse_cached_pubkey_response(ctx, ripe, BM_RIPE_LEN, address_version, stream, now))
     {
-        if (ctx->registry != NULL)
-        {
-            bm_peer_registry_broadcast_inv(ctx->registry, &cached_hash, 1, NULL, now);
-        }
-        /* §11 2026-09-12: 8段階化に伴う移行。getpubkey応答1回につき1行のサマリなので
-         * 無番号のDEBUG(常時見たい詳細情報)にした。 */
-        bm_log_debug(
-                "[object_sync] reused cached getpubkey response (v%" PRIu64 ", no PoW recomputation)\n",
-                address_version);
         return;
     }
 
@@ -496,30 +728,8 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     uint64_t target = bm_pow_get_target(payload_len, BM_PUBKEY_RESPONSE_TTL_SECONDS,
                                          info.nonce_trials_per_byte, info.payload_length_extra_bytes);
 
-    /* §11 2026-11-03 項目38: 以前はここでbm_pow_runを同期実行しており、PoWの間
-     * network_epoll_thread(このハンドラを呼んでいるスレッド)が止まって全ピア接続が停止していた
-     * (v4で実測20秒超、ポスト量子v5では期待141秒、DESIGN-PQ.md §8.4)。pow_queueへ投げて
-     * すぐ戻り、object_pool.dbへの登録・応答キャッシュの更新・inv broadcastは完了コールバック
-     * (pubkey_response_done、ワーカースレッド上)で行う。ctx->pow_queue==NULL(テスト)なら
-     * 従来通りこの場で同期実行される。 */
-    struct pubkey_response_job *job = malloc(sizeof(*job));
-    if (job == NULL)
-    {
-        free(payload);
-        return;
-    }
-    job->ctx = ctx;
-    memcpy(job->ripe, ripe, sizeof(job->ripe));
-    job->address_version = address_version;
-    job->stream = stream;
-    job->expires_time = expires_time;
-
-    /* dedupキーは応答キャッシュ(self_pubkey_response_cache)と同じ(ripe, version, stream)。
-     * 同じ要求が応答のPoW完了前に重ねて届いても、PoWを2本積まない。同期実装では
-     * network_epoll_threadがPoW中に止まっていたので、後続の要求はキャッシュができてから
-     * 処理されて自然に再利用されていたが、非同期化でその暗黙の直列化が無くなる
-     * (放置すると、正規のPoWを払ったgetpubkeyを連打されるだけで同じ応答PoWを何本も
-     * 積まされる。pow_queue.h参照) */
+    /* dedupキーは応答キャッシュ(self_pubkey_response_cache)と同じ(ripe, version, stream)
+     * (submit_pubkey_responseのコメント参照) */
     unsigned char key[1 + 1 + 8 + BM_RIPE_LEN];
     key[0] = 'P';
     key[1] = (unsigned char)address_version;
@@ -528,30 +738,8 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
         key[2 + i] = (unsigned char)((stream >> (56 - 8 * i)) & 0xff);
     }
     memcpy(key + 10, ripe, BM_RIPE_LEN);
-    int rc = bm_pow_queue_submit(ctx->pow_queue, payload, payload_len, target, key, sizeof(key),
-                                 pubkey_response_done, job, now);
-    if (rc != 0)
-    {
-        free(job); /* 拒否ではdoneが呼ばれないので、ここで片付ける(pow_queue.h参照) */
-    }
-    if (rc == 1)
-    {
-        bm_log_debug("[object_sync] getpubkey response PoW (v%" PRIu64 ") is already queued, not queuing again\n",
-                     address_version);
-    }
-    else if (rc < 0)
-    {
-        /* TTLを短くすれば要求側のPoWは安いので、溢れる状況ではこの行も大量に出うる。
-         * 時計ずれのWARN(項目46)と同じく一定間隔に1回へ間引く */
-        uint64_t suppressed = 0;
-        if (bm_log_throttle_check(&ctx->pow_queue_full_log_throttle, now, BM_POW_QUEUE_FULL_LOG_INTERVAL_SECONDS,
-                                  &suppressed))
-        {
-            bm_log_warn("[object_sync] PoW queue is full or shutting down, dropping getpubkey response (v%" PRIu64
-                        ", %" PRIu64 " more dropped since the last report)\n",
-                        address_version, suppressed);
-        }
-    }
+    submit_pubkey_response(ctx, payload, payload_len, target, ripe, BM_RIPE_LEN, address_version, stream, expires_time,
+                           key, sizeof(key), now);
 }
 
 /*
@@ -910,8 +1098,25 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     {
         unsigned char *ack_payload = NULL;
         size_t ack_payload_len = 0;
-        if (bm_trial_decrypt_and_store(ctx->keyring, ctx->messages_db, msg->payload, msg->length,
-                                        &ack_payload, &ack_payload_len) == 0)
+        int decrypted = -1;
+#ifdef BM_HAVE_PQ
+        /* §11 2026-11-04 項目55の段5: v5のmsg。フラグが無効なら中身を見ない(中継の判定はここより
+         * 前で済んでいる、DESIGN-PQ.md §9.1)。v4の試行復号はversionで弾くので、どちらかだけを呼ぶ */
+        if (hdr.version == BM_PQ_MSG_OBJECT_VERSION)
+        {
+            if (ctx->pq_enabled)
+            {
+                decrypted = bm_pq_trial_decrypt_and_store(ctx->keyring, NULL, ctx->messages_db, msg->payload,
+                                                          msg->length, now0, &ack_payload, &ack_payload_len);
+            }
+        }
+        else
+#endif
+        {
+            decrypted = bm_trial_decrypt_and_store(ctx->keyring, ctx->messages_db, msg->payload, msg->length,
+                                                   &ack_payload, &ack_payload_len);
+        }
+        if (decrypted == 0)
         {
             bm_log_info("[object_sync] msg decrypted and stored to inbox\n");
             if (ack_payload_len > 0)
@@ -923,6 +1128,16 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     }
     else if (hdr.object_type == BM_OBJECT_PUBKEY)
     {
+#ifdef BM_HAVE_PQ
+        if (hdr.version == BM_PQ_PUBKEY_OBJECT_VERSION)
+        {
+            if (ctx->pq_enabled)
+            {
+                handle_incoming_pubkey_v5(ctx, &hdr, msg, now0);
+            }
+            return;
+        }
+#endif
         struct bm_cached_pubkey cached;
         int parsed = -1;
         if (hdr.version == 2)
@@ -963,6 +1178,16 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
     }
     else if (hdr.object_type == BM_OBJECT_BROADCAST)
     {
+#ifdef BM_HAVE_PQ
+        if (hdr.version == BM_PQ_BROADCAST_OBJECT_VERSION)
+        {
+            if (ctx->pq_enabled)
+            {
+                handle_incoming_broadcast_v6(ctx, msg, now0);
+            }
+            return;
+        }
+#endif
         handle_incoming_broadcast(ctx, msg);
     }
     else if (hdr.object_type == BM_OBJECT_ONIONPEER)
@@ -1854,7 +2079,7 @@ void *bm_object_sync_broadcast_thread(void *arg)
 }
 
 int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
-                                           const char *address_filter)
+                                           const char *address_filter, int64_t now)
 {
     /* §11 2026-08-31 address_filterが指定されていれば、そのidentity1件だけに絞って
      * bm_trial_decrypt_and_store_singleを使う(bm_trial_decrypt_and_store経由でkeyring全体を
@@ -1866,7 +2091,8 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
      * 共通にした。1件だけのリストとして渡す。 */
     if (address_filter != NULL)
     {
-        return bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db, messages_db, kr, &address_filter, 1);
+        return bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db, messages_db, kr, &address_filter, 1,
+                                                               now);
     }
 
     unsigned char(*hashes)[32] = NULL;
@@ -1885,7 +2111,18 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
         {
             continue;
         }
-        if (bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL) == 0)
+        int rc = bm_trial_decrypt_and_store(kr, messages_db, payload, payload_len, NULL, NULL);
+#ifdef BM_HAVE_PQ
+        /* §11 2026-11-04 項目55の段5: v4の試行復号はversionで弾くので、失敗したらv5としても試す。
+         * このkeyringにv5が無ければ(フラグ無効のときも)すぐ戻る */
+        if (rc != 0)
+        {
+            rc = bm_pq_trial_decrypt_and_store(kr, NULL, messages_db, payload, payload_len, now, NULL, NULL);
+        }
+#else
+        (void)now;
+#endif
+        if (rc == 0)
         {
             decrypted_count++;
         }
@@ -1904,7 +2141,7 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
 /* §11 2026-09-28 項目48(object_sync.h参照) */
 int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *messages_db,
                                                     bm_keyring_t *kr, const char *const *addresses,
-                                                    size_t address_count)
+                                                    size_t address_count, int64_t now)
 {
     unsigned char(*hashes)[32] = NULL;
     size_t count = 0;
@@ -1918,24 +2155,55 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
      * 通常は見つかるが、防御的に扱う) */
     struct bm_unlocked_identity *identities = NULL;
     size_t identity_count = 0;
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-04 項目55の段5: v5の対象はアドレスのまま持つ。秘密鍵はkeyringの中で使い、
+     * ここへは写さない(bm_pq_keyring_open_msg)。keyringに無いものを除くのはv4と同じ */
+    const char **pq_addresses = NULL;
+    size_t pq_count = 0;
+#endif
     if (address_count > 0)
     {
         identities = malloc(sizeof(*identities) * address_count);
+#ifdef BM_HAVE_PQ
+        pq_addresses = malloc(sizeof(*pq_addresses) * address_count);
+        if (pq_addresses == NULL)
+        {
+            free(identities);
+            free(hashes);
+            return -1;
+        }
+#endif
         if (identities == NULL)
         {
+#ifdef BM_HAVE_PQ
+            free(pq_addresses);
+#endif
             free(hashes);
             return -1;
         }
     }
+    size_t target_count = 0;
     for (size_t i = 0; i < address_count; i++)
     {
+#ifdef BM_HAVE_PQ
+        if (bm_pq_keyring_find_by_address(kr, addresses[i], NULL))
+        {
+            pq_addresses[pq_count++] = addresses[i];
+            target_count++;
+            continue;
+        }
+#endif
         if (bm_keyring_find_by_address(kr, addresses[i], &identities[identity_count]))
         {
             identity_count++;
+            target_count++;
         }
     }
-    if (identity_count == 0)
+    if (target_count == 0)
     {
+#ifdef BM_HAVE_PQ
+        free(pq_addresses);
+#endif
         free(identities);
         free(hashes);
         return 0;
@@ -1953,14 +2221,24 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
         {
             continue;
         }
-        for (size_t j = 0; j < identity_count; j++)
+        int matched = 0;
+        for (size_t j = 0; j < identity_count && !matched; j++)
         {
-            if (bm_trial_decrypt_and_store_single(&identities[j], messages_db, payload, payload_len, NULL, NULL)
-                == 0)
-            {
-                decrypted_count++;
-                break;
-            }
+            matched = bm_trial_decrypt_and_store_single(&identities[j], messages_db, payload, payload_len, now, NULL,
+                                                        NULL)
+                      == 0;
+        }
+#ifdef BM_HAVE_PQ
+        for (size_t j = 0; j < pq_count && !matched; j++)
+        {
+            matched = bm_pq_trial_decrypt_and_store(kr, pq_addresses[j], messages_db, payload, payload_len, now, NULL,
+                                                    NULL)
+                      == 0;
+        }
+#endif
+        if (matched)
+        {
+            decrypted_count++;
         }
         free(payload);
     }
@@ -1968,6 +2246,9 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
 
     OPENSSL_cleanse(identities, sizeof(*identities) * identity_count);
     free(identities);
+#ifdef BM_HAVE_PQ
+    free(pq_addresses);
+#endif
 
     if (decrypted_count > 0)
     {

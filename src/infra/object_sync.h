@@ -277,7 +277,7 @@ void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t 
  * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙に失敗した場合のみ-1。
  */
 int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
-                                           const char *address_filter);
+                                           const char *address_filter, int64_t now);
 
 /*
  * §11 2026-09-28 項目48: address_filterの複数アドレス版(unlockAddressesのbackfill=true用)。
@@ -285,10 +285,11 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
  * ECDHの試行回数は「MSGオブジェクト数×対象アドレス数」で、アドレスごとに1件版を呼ぶのと
  * 変わらないが、object_pool.dbからの読み出しはMSG1件につき1回で済む。keyringに既に
  * 載っている他のidentityは対象にしない(unlock-all済みの数千件まで巻き込まないため)。
+ * §11 2026-11-04 項目55の段5: v5のアドレスも渡せる(v5のmsgをv5のkeyringで試す)。
  * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙やメモリ確保に失敗した場合は-1。
  */
 int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *messages_db,
                                                     bm_keyring_t *kr, const char *const *addresses,
-                                                    size_t address_count);
+                                                    size_t address_count, int64_t now);
 
 #endif /* BM_INFRA_OBJECT_SYNC_H */

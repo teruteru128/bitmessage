@@ -240,8 +240,13 @@ int bm_pubkey_cache_clear_request(sqlite3 *db, const unsigned char ripe[20])
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
-                                       uint64_t stream, const unsigned char object_hash[32], int64_t expires_time)
+/*
+ * §11 2026-11-04 項目55の段5: self_pubkey_response_cacheのキーの先頭列はBLOBなので、長さだけ
+ * 引数にして20byteのripeと32byteのv5 idの両方を同じ表で扱う(スキーマの変更は要らない。
+ * キーにaddress_versionが含まれるので、v4以前の行とv5の行が混ざることもない)。
+ */
+int bm_pubkey_cache_set_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
+                                         uint64_t stream, const unsigned char object_hash[32], int64_t expires_time)
 {
     static const char *SQL =
         "INSERT INTO self_pubkey_response_cache (ripe, address_version, stream, object_hash, expires_time) "
@@ -254,7 +259,7 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
     {
         return -1;
     }
-    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 1, id, (int)id_len, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)address_version);
     sqlite3_bind_int64(stmt, 3, (sqlite3_int64)stream);
     sqlite3_bind_blob(stmt, 4, object_hash, 32, SQLITE_TRANSIENT);
@@ -265,8 +270,14 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
-                                       uint64_t stream, int64_t now, unsigned char out_hash[32])
+int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, const unsigned char object_hash[32], int64_t expires_time)
+{
+    return bm_pubkey_cache_set_self_response_id(db, ripe, 20, address_version, stream, object_hash, expires_time);
+}
+
+int bm_pubkey_cache_get_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
+                                         uint64_t stream, int64_t now, unsigned char out_hash[32])
 {
     static const char *SQL = "SELECT object_hash, expires_time FROM self_pubkey_response_cache "
                              "WHERE ripe = ?1 AND address_version = ?2 AND stream = ?3;";
@@ -275,7 +286,7 @@ int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20],
     {
         return -1;
     }
-    sqlite3_bind_blob(stmt, 1, ripe, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 1, id, (int)id_len, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)address_version);
     sqlite3_bind_int64(stmt, 3, (sqlite3_int64)stream);
 
@@ -300,6 +311,12 @@ int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20],
         return -1;
     }
     return found;
+}
+
+int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
+                                       uint64_t stream, int64_t now, unsigned char out_hash[32])
+{
+    return bm_pubkey_cache_get_self_response_id(db, ripe, 20, address_version, stream, now, out_hash);
 }
 
 /* --- objectパース --- */

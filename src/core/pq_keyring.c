@@ -283,6 +283,81 @@ out:
     return rc;
 }
 
+/*
+ * addressで絞った範囲(NULLなら全件)の未展開identityを展開する。一覧を写してロックを外してから
+ * 展開する(bm_pq_keyring_get_secret_keysのコメントと同じ理由)。展開に失敗したidentity
+ * (seedと公開鍵の不一致)は未展開のまま残り、呼び出し側の試行から外れる。
+ */
+static void expand_pending(bm_keyring_t *kr, const char *address)
+{
+    pthread_rwlock_rdlock(&kr->lock);
+    size_t pending = 0;
+    for (struct bm_unlocked_pq_identity *cur = kr->pq_head; cur != NULL; cur = cur->next)
+    {
+        if (!cur->expanded && (address == NULL || strncmp(cur->address, address, BM_KEYRING_MAX_ADDRESS_LEN) == 0))
+        {
+            pending++;
+        }
+    }
+    if (pending == 0)
+    {
+        pthread_rwlock_unlock(&kr->lock);
+        return;
+    }
+    char(*addresses)[BM_KEYRING_MAX_ADDRESS_LEN] = malloc(BM_KEYRING_MAX_ADDRESS_LEN * pending);
+    size_t count = 0;
+    if (addresses != NULL)
+    {
+        for (struct bm_unlocked_pq_identity *cur = kr->pq_head; cur != NULL; cur = cur->next)
+        {
+            if (!cur->expanded && (address == NULL || strncmp(cur->address, address, BM_KEYRING_MAX_ADDRESS_LEN) == 0))
+            {
+                memcpy(addresses[count++], cur->address, BM_KEYRING_MAX_ADDRESS_LEN);
+            }
+        }
+    }
+    pthread_rwlock_unlock(&kr->lock);
+
+    for (size_t i = 0; i < count; i++)
+    {
+        (void)bm_pq_keyring_get_secret_keys(kr, addresses[i], NULL, NULL);
+    }
+    free(addresses);
+}
+
+int bm_pq_keyring_open_msg(bm_keyring_t *kr, const char *address, const unsigned char *object, size_t object_len,
+                           struct bm_pq_msg_parsed *out, char out_to_address[BM_KEYRING_MAX_ADDRESS_LEN])
+{
+    expand_pending(kr, address);
+
+    /* 開封(decaps 1回あたり約0.2ms、DESIGN-PQ.md §8.1.1)は読み取りロックの中で行う。
+     * v4のbm_trial_decrypt_msgと同じ形で、止まるのはunlock/lockだけ(他の読み手は止まらない)。
+     * 署名検証も同じ関数の中なのでロック内になるが、自分宛てに開封できた1件でしか走らない */
+    int rc = -1;
+    pthread_rwlock_rdlock(&kr->lock);
+    for (struct bm_unlocked_pq_identity *cur = kr->pq_head; cur != NULL; cur = cur->next)
+    {
+        if (!cur->expanded || (address != NULL && strncmp(cur->address, address, BM_KEYRING_MAX_ADDRESS_LEN) != 0))
+        {
+            continue;
+        }
+        if (bm_pq_parse_msg(object, object_len, cur->kem_sk, out) != 0)
+        {
+            continue;
+        }
+        if (out->from_address_version != BM_PQV5_ADDRESS_VERSION || memcmp(out->to_id, cur->id, BM_PQV5_ID_LEN) != 0)
+        {
+            bm_pq_msg_parsed_free(out);
+            continue;
+        }
+        memcpy(out_to_address, cur->address, BM_KEYRING_MAX_ADDRESS_LEN);
+        rc = 0;
+        break;
+    }
+    pthread_rwlock_unlock(&kr->lock);
+    return rc;
+}
+
 static void free_entry(struct bm_unlocked_pq_identity *entry)
 {
     OPENSSL_cleanse(entry, sizeof(*entry));

@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "../pq/address_v5.h"
+#include "../pq/pq_object.h"
 #include "keyring.h"
 
 struct bm_unlocked_pq_identity
@@ -82,6 +83,22 @@ bool bm_pq_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32], st
  */
 int bm_pq_keyring_get_secret_keys(bm_keyring_t *kr, const char *address, unsigned char *out_sig_sk,
                                   unsigned char *out_kem_sk);
+
+/*
+ * §11 2026-11-04 項目55の段5: v5のmsg(objectVersion 2、nonce込みの完全なobject)を、unlock済みの
+ * v5 identityの鍵で開封する。addressがNULLなら全identityを試し、非NULLならその1件だけを試す
+ * (unlock直後のbackfill用。v4のbm_trial_decrypt_msg_singleと同じ理由で、keyring全体を
+ * 総当たりしない)。未展開の鍵は先に展開する(1件0.4〜0.6ms、そのidentityで初回だけ)。
+ *
+ * 次の場合は成功にしない: 開封や署名検証の失敗 / 平文のto_idがそのidentityのidと違う
+ * (なりすまし転送対策、DESIGN-PQ.md §7.3) / fromAddressVersionが5でない(v5の鍵はv4以前の
+ * アドレスとして表せない。これを通すと、署名は正しいのに鍵と対応しない差出人アドレスが作れる)。
+ *
+ * 成功時0でoutを埋め(bm_pq_msg_parsed_freeで解放すること)、宛先のアドレスをout_to_addressへ
+ * 書く。失敗時は非0で、outは解放済み。
+ */
+int bm_pq_keyring_open_msg(bm_keyring_t *kr, const char *address, const unsigned char *object, size_t object_len,
+                           struct bm_pq_msg_parsed *out, char out_to_address[BM_KEYRING_MAX_ADDRESS_LEN]);
 
 /* 以下2つはkeyring.cから、kr->lockを書き込みで握った状態で呼ぶ */
 void bm_pq_keyring_clear_locked(bm_keyring_t *kr);

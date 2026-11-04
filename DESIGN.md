@@ -4527,7 +4527,7 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     保持して、LSanの探索の起点から常に到達できるようにした。手元のASan+UBSanビルドで再現し、
     修正後に56件全通過(Debugビルドも56件全通過)を確認した。
 
-55. **ポスト量子拡張のフェーズ2(受信側)をdaemon本体へ入れる(進行中)**: 2026-11-04、ユーザーとの
+55. **ポスト量子拡張のフェーズ2(受信側)をdaemon本体へ入れる(段1〜5を実装済み、送信はフェーズ3)**: 2026-11-04、ユーザーとの
     相談で着手。[DESIGN-PQ.md](DESIGN-PQ.md) §9.1のフェーズ2。前提だった項目38(PoWのワーカー化)は
     Tier 1・2とも2026-11-03に実装済み。進め方(PQ用ブランチを並走させず、master上の実行時フラグで
     切り替える)とv5鍵の保存方式(展開済みの秘密鍵ではなく成分seedを保存する)はDESIGN-PQ.md §9に
@@ -4632,5 +4632,52 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
          無効にすると3件落ちることを確認した。ASan/UBSanでAPI・keyring・PQ関連の11件も通過。
          `api_server.c`・`keyring.c`は`BM_HAVE_PQ`無しで`-Werror`のコンパイルが通ることも
          確かめた。
-    5. object_syncの受信分岐(v5のgetpubkeyへの自応答、pubkeyのキャッシュ、msg v2の試行復号、
-       broadcast v6の購読)
+    5. **object_syncの受信分岐(実装済み、2026-11-04)。** 4種類のv5のobjectを`handle_object`の型別処理
+       (保存・中継の判定より後)で分岐した。`object_sync_ctx.pq_enabled`が0なら中身を見ないので、
+       フラグ無効のノードの中継は変わらない(DESIGN-PQ.md §9.1)。
+       - **getpubkey(objectVersion 5)への自応答。** 流れはv4と同じ(tagで引く→version/streamの
+         照合→応答キャッシュ→pubkeyの組み立て→PoWはpow_queueへ)。キャッシュの再利用とPoWの投入は
+         `reuse_cached_pubkey_response`/`submit_pubkey_response`へ切り出してv4と共有した。
+         応答キャッシュは既存の`self_pubkey_response_cache`をそのまま使う(キーの先頭列はBLOB、
+         キーにaddress_versionが含まれるのでv4以前の行と混ざらない)。dedupキーは`'Q'+tag`
+         (v4の形だとidが32byteの分だけ`BM_POW_QUEUE_KEY_MAX`を超える)。TTLはv4と同じ28日のまま
+         (DESIGN-PQ.md §9.3の短縮案は送信側と一緒に検討する)。bitfieldはDOESACK固定。
+       - **pubkey(objectVersion 5)。** `src/core/pq_pubkey_cache.c`の新しい2表
+         (`pq_pubkey_cache`・`pq_pubkey_requests`)。v4の表はripe(20byte)がキーで鍵も65byte固定なので
+         混ぜない(段3のidentityと同じ理由)。キーはどちらもtag。tagは平文なので、受信したobjectから
+         要求を直接引ける(v4は要求を全件試している)。要求していないpubkeyは開封しない
+         (idが分からないので開封できないうえ、保存すると誰でも表を埋められる)。
+         要求を記録する側(`bm_pq_pubkey_cache_record_request`の呼び出し)はフェーズ3で足す。
+       - **msg(objectVersion 2)の試行復号。** `bm_pq_keyring_open_msg`(`pq_keyring.c`)。未展開の鍵は
+         ロックの外で先に展開し、開封は読み取りロックの中で行う(v4の`bm_trial_decrypt_msg`と同じ形)。
+         受け取らないもの: to_idが自分のidと違う(なりすまし転送対策)、fromAddressVersionが5でない
+         (v5の鍵はv4以前のアドレスとして表せない)、差出人のアドレスの文字列が列の幅
+         (`BM_ADDRESS_STR_MAX`)を超える(streamは送信者が署名するだけの任意の値で、9byteのvarintだと
+         66文字になる。切り詰めると別のアドレスに見える)。埋め込まれたackの扱いはv4と同じ
+         (`validate_and_store_ack`)。
+       - **broadcast(objectVersion 6)。** 購読中のv5アドレスを候補として試す。tagの比較で外れるので、
+         開封するのは一致した1件だけ。`addSubscription`がv5のアドレスを受け付けるようにした
+         (フラグ無効なら段4と同じ明示的なエラー)。購読の表はアドレスの文字列を持つだけなので変更なし。
+       - **backfill。** `unlockAddress`と`unlockAddresses`(backfill=true)がv5も対象にする。
+         `bm_object_sync_backfill_trial_decrypt`/`_addresses`はアドレスの種類で振り分ける。秘密鍵は
+         keyringの中で使い、v4のようにbackfill側へ写さない。`unlockAllAddresses`はv4と同じく
+         backfillしない(項目19の理由)。`now`を引数に足した(inboxの受信時刻を`time(NULL)`で
+         取らないため。`bm_trial_decrypt_and_store_single`も同様)。
+       - **テスト**: `tests/test_pq_receive.c`(ネットワーク既定の難易度のPoWを払ったobjectを
+         `bm_object_sync_dispatch`へ渡す。7.8KBのobjectは約900万試行なので、同じobjectをプールから
+         消して使い回す)、`tests/test_pq_api.c`にbackfillと`addSubscription`を追加。to_id・
+         fromAddressVersion・列の幅・ヘッダのstream・フラグ(msgとgetpubkey)・応答キャッシュ・
+         backfillの各検査を1つずつ無効にすると対応するテストが落ちることを確認した。
+         ASan/UBSanでも受信関連の13件が通過。変更した7ファイルは`BM_HAVE_PQ`無しで`-Werror`の
+         コンパイルが通ることも確かめた。
+       - **性能は最適化していない。** 開封は1 identityあたり約0.3ms(`EVP_PKEY`を毎回取り込む、
+         DESIGN-PQ.md §8.1.1)で、v4(約0.6ms)より重くはない。v5 identityが数十万本ある運用
+         (項目44の規模)では受信msgごとに分単位で止まるのはv4と同じで、`unlockAllAddresses`の
+         件数上限はv5にも掛かる。取り込み済みの鍵のキャッシュは必要になってから入れる。
+       - **フェーズ3へ送ること。** (a) 差出人の公開鍵のキャッシュ: v5のmsgは差出人の公開鍵(3200byte)を
+         丸ごと運ぶが(DESIGN-PQ.md §10.4の理由)、この段では保存していないので、返信にはgetpubkeyが
+         要る。v4もmsgから保存していない。返信の経路を作るときに決める。
+         (b) 要求した時点で既にプールにあるpubkey: pubkeyの開封は受信時の1回だけなので、要求より前に
+         届いていたobjectは開封されず、相手が応答キャッシュを再広告してもhashが既知なので届き直さない。
+         v4にも同じ問題がある(v5はPoWが141秒なので影響が大きい)。要求を記録するときに
+         プールをtagで探す形が候補。

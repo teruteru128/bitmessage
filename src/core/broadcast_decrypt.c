@@ -11,6 +11,9 @@
 #include "address.h"
 #include "crypto.h"
 #include "messages_store.h"
+#ifdef BM_HAVE_PQ
+#include "../pq/pq_object.h"
+#endif
 
 static char *dup_bytes_as_cstr(const unsigned char *data, size_t len)
 {
@@ -289,3 +292,49 @@ int bm_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned ch
     bm_decoded_broadcast_free(&decoded);
     return rc;
 }
+
+#ifdef BM_HAVE_PQ
+/* §11 2026-11-04 項目55の段5(broadcast_decrypt.h参照) */
+int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned char *object, size_t object_len,
+                                            uint64_t candidate_version, uint64_t candidate_stream,
+                                            const unsigned char candidate_id[32], int64_t now)
+{
+    struct bm_pq_broadcast_parsed *parsed = malloc(sizeof(*parsed)); /* 公開鍵だけで3KB超 */
+    if (parsed == NULL)
+    {
+        return -1;
+    }
+    if (bm_pq_parse_broadcast(object, object_len, candidate_version, candidate_stream, candidate_id, parsed) != 0)
+    {
+        free(parsed);
+        return -1;
+    }
+
+    int rc = -1;
+    char *from = bm_pqv5_address_encode(candidate_version, candidate_stream, candidate_id);
+    /* 列の幅を超えるアドレスを切り詰めて保存しない(bm_pq_trial_decrypt_and_storeと同じ理由) */
+    if (from != NULL && strlen(from) < BM_ADDRESS_STR_MAX)
+    {
+        char *subject = NULL;
+        char *body = NULL;
+        if (parsed->encoding == 2)
+        {
+            decode_simple(parsed->message, parsed->message_len, &subject, &body);
+        }
+        else
+        {
+            subject = dup_bytes_as_cstr(NULL, 0);
+            body = dup_bytes_as_cstr(parsed->message, parsed->message_len);
+        }
+        unsigned char msg_id[32];
+        bm_inventory_hash(object, object_len, msg_id);
+        rc = bm_messages_store_insert_inbox(messages_db, msg_id, from, from, subject, body, now);
+        free(subject);
+        free(body);
+    }
+    free(from);
+    bm_pq_broadcast_parsed_free(parsed);
+    free(parsed);
+    return rc;
+}
+#endif

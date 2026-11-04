@@ -47,4 +47,16 @@ int bm_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned ch
                                           uint64_t candidate_version, uint64_t candidate_stream,
                                           const unsigned char candidate_ripe[20]);
 
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-04 項目55の段5: v5のbroadcast(objectVersion 6)を、購読中のv5アドレス1件を候補として
+ * 開封し、成功したらinboxへ保存する。tagが合わなければ開封を試みずに失敗する(DESIGN-PQ.md §7.4)。
+ * 保存の形はbm_trial_decrypt_broadcast_and_storeと同じ(to_address=from_address)。差出人のアドレスは
+ * 候補そのもの(開封できて、中の公開鍵からidを再計算して一致を確かめた相手)を使う。成功時0。
+ */
+int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned char *object, size_t object_len,
+                                            uint64_t candidate_version, uint64_t candidate_stream,
+                                            const unsigned char candidate_id[32], int64_t now);
+#endif
+
 #endif /* BM_CORE_BROADCAST_DECRYPT_H */

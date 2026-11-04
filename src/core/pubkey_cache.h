@@ -92,6 +92,13 @@ int bm_pubkey_cache_set_self_response(sqlite3 *db, const unsigned char ripe[20],
 int bm_pubkey_cache_get_self_response(sqlite3 *db, const unsigned char ripe[20], uint64_t address_version,
                                        uint64_t stream, int64_t now, unsigned char out_hash[32]);
 
+/* §11 2026-11-04 項目55の段5: 上の2つの、キーの長さを指定する版。v5のid(32byte)を同じ表で
+ * 扱うために使う(ripeが20byte固定なだけで、キーの意味は同じ) */
+int bm_pubkey_cache_set_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
+                                         uint64_t stream, const unsigned char object_hash[32], int64_t expires_time);
+int bm_pubkey_cache_get_self_response_id(sqlite3 *db, const unsigned char *id, size_t id_len, uint64_t address_version,
+                                         uint64_t stream, int64_t now, unsigned char out_hash[32]);
+
 /* --- objectパース(§5.2の逆方向) --- */
 
 /* type=pubkey, version=2の完全なobject(nonce込み)をパースする。署名が無いため構造検証のみ。成功時0 */

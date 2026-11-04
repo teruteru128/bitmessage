@@ -12,6 +12,9 @@
 #include "address.h"
 #include "crypto.h"
 #include "messages_store.h"
+#ifdef BM_HAVE_PQ
+#include "pq_keyring.h"
+#endif
 
 static char *dup_bytes_as_cstr(const unsigned char *data, size_t len)
 {
@@ -352,14 +355,14 @@ void bm_decoded_msg_free(struct bm_decoded_msg *msg)
 }
 
 static int store_decoded_msg(sqlite3 *db, const unsigned char *object, size_t object_len,
-                              struct bm_decoded_msg *decoded,
+                              struct bm_decoded_msg *decoded, int64_t now,
                               unsigned char **out_ack_payload, size_t *out_ack_payload_len)
 {
     unsigned char msg_id[32];
     bm_inventory_hash(object, object_len, msg_id);
 
     int rc = bm_messages_store_insert_inbox(db, msg_id, decoded->to_address, decoded->from_address,
-                                             decoded->subject, decoded->body, (int64_t)time(NULL));
+                                             decoded->subject, decoded->body, now);
 
     if (out_ack_payload != NULL && out_ack_payload_len != NULL && decoded->ack_payload_len > 0)
     {
@@ -388,12 +391,13 @@ int bm_trial_decrypt_and_store(bm_keyring_t *kr, sqlite3 *db,
     {
         return -1;
     }
-    return store_decoded_msg(db, object, object_len, &decoded, out_ack_payload, out_ack_payload_len);
+    return store_decoded_msg(db, object, object_len, &decoded, (int64_t)time(NULL), out_ack_payload,
+                             out_ack_payload_len);
 }
 
 /* §11 2026-08-31 bm_trial_decrypt_msg_singleと対になる単一identity版(理由はそちらのコメント参照) */
 int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identity, sqlite3 *db,
-                                       const unsigned char *object, size_t object_len,
+                                       const unsigned char *object, size_t object_len, int64_t now,
                                        unsigned char **out_ack_payload, size_t *out_ack_payload_len)
 {
     struct bm_decoded_msg decoded;
@@ -401,8 +405,62 @@ int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identit
     {
         return -1;
     }
-    return store_decoded_msg(db, object, object_len, &decoded, out_ack_payload, out_ack_payload_len);
+    return store_decoded_msg(db, object, object_len, &decoded, now, out_ack_payload, out_ack_payload_len);
 }
+
+#ifdef BM_HAVE_PQ
+/* §11 2026-11-04 項目55の段5(trial_decrypt.h参照) */
+int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3 *db, const unsigned char *object,
+                                  size_t object_len, int64_t now, unsigned char **out_ack_payload,
+                                  size_t *out_ack_payload_len)
+{
+    struct bm_pq_msg_parsed *parsed = malloc(sizeof(*parsed)); /* 公開鍵だけで3KB超 */
+    if (parsed == NULL)
+    {
+        return -1;
+    }
+    char to_address[BM_KEYRING_MAX_ADDRESS_LEN];
+    if (bm_pq_keyring_open_msg(kr, address, object, object_len, parsed, to_address) != 0)
+    {
+        free(parsed);
+        return -1;
+    }
+
+    /* streamは送信者が署名するだけの任意の値(9byteのvarintまでありうる)で、アドレスの文字列が
+     * 列の幅を超えることがある。切り詰めると「別のアドレスに見える差出人」になるので受け取らない。
+     * 通常のアドレスは53〜54文字(DESIGN-PQ.md §4.3)で、この検査には掛からない */
+    int rc = -1;
+    struct bm_decoded_msg decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    char *from = bm_pqv5_address_encode(parsed->from_address_version, parsed->from_stream, parsed->from_id);
+    if (from != NULL && strlen(from) < sizeof(decoded.from_address))
+    {
+        decoded.from_address_version = parsed->from_address_version;
+        decoded.from_stream = parsed->from_stream;
+        snprintf(decoded.from_address, sizeof(decoded.from_address), "%s", from);
+        snprintf(decoded.to_address, sizeof(decoded.to_address), "%s", to_address);
+        if (parsed->encoding == 2)
+        {
+            decode_simple(parsed->message, parsed->message_len, &decoded.subject, &decoded.body);
+        }
+        else
+        {
+            decoded.subject = dup_bytes_as_cstr(NULL, 0);
+            decoded.body = dup_bytes_as_cstr(parsed->message, parsed->message_len);
+        }
+        /* ackの所有権はparsedからdecodedへ移す(store_decoded_msgが呼び出し側へ渡すか解放する) */
+        decoded.ack_payload = parsed->ack;
+        decoded.ack_payload_len = parsed->ack_len;
+        parsed->ack = NULL;
+        parsed->ack_len = 0;
+        rc = store_decoded_msg(db, object, object_len, &decoded, now, out_ack_payload, out_ack_payload_len);
+    }
+    free(from);
+    bm_pq_msg_parsed_free(parsed);
+    free(parsed);
+    return rc;
+}
+#endif
 
 void *bm_trial_decrypt_thread(void *arg)
 {

@@ -16,8 +16,10 @@
  * 6. exportAddressはv5を明示的に断ること
  * 7. lockAllAddressesの後、unlockAllAddressesでv5もunlockされること
  * 8. deleteAddressでv5の行が消えること
- * 検証観点(フラグ無効): createDeterministicAddress(version 5)・unlockAddress・unlockAddressesが
- * v5について「post-quantum (v5) support is disabled」のエラーを返すこと。
+ * 9. §11 2026-11-04 項目55の段5: unlockAddress・unlockAddresses(backfill=true)がプールの過去のv5 msgを
+ *    読むこと、addSubscriptionがv5のアドレスを受け付けること
+ * 検証観点(フラグ無効): createDeterministicAddress(version 5)・unlockAddress・unlockAddresses・
+ * addSubscriptionがv5について「post-quantum (v5) support is disabled」のエラーを返すこと。
  */
 
 #include <arpa/inet.h>
@@ -29,17 +31,24 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
+#include "../src/core/messages_store.h"
 #include "../src/core/pq_identity_store.h"
+#include "../src/infra/object.h"
+#include "../src/infra/object_store.h"
 #include "../src/pq/address_v5.h"
+#include "../src/pq/pq_object.h"
 
 #define TEST_PORT_ENABLED 18454
 #define TEST_PORT_DISABLED 18455
 #define TEST_IDENTITY_DB "test_pq_api_identity.db"
+#define TEST_MESSAGES_DB "test_pq_api_messages.db"
+#define TEST_OBJECT_POOL_DB "test_pq_api_pool.db"
 #define STORE_PASS "pq api store pass"
 
 static int failures = 0;
@@ -142,7 +151,20 @@ struct server
     pthread_t thread;
 };
 
-static void server_start(struct server *s, sqlite3 *db, bm_keyring_t *kr, int port, int pq_enabled)
+static size_t inbox_count(sqlite3 *messages_db)
+{
+    struct bm_inbox_message *list = NULL;
+    size_t count = 0;
+    if (bm_messages_store_list_inbox(messages_db, NULL, &list, &count) != 0)
+    {
+        return (size_t)-1;
+    }
+    bm_inbox_message_list_free(list, count);
+    return count;
+}
+
+static void server_start(struct server *s, sqlite3 *db, sqlite3 *messages_db, sqlite3 *object_pool_db, bm_keyring_t *kr,
+                         int port, int pq_enabled)
 {
     memset(&s->config, 0, sizeof(s->config));
     s->config.bind_address = "127.0.0.1";
@@ -150,6 +172,8 @@ static void server_start(struct server *s, sqlite3 *db, bm_keyring_t *kr, int po
     s->config.username = NULL; /* 認証なし(テスト用) */
     s->config.keyring = kr;
     s->config.identity_db = db;
+    s->config.messages_db = messages_db;
+    s->config.object_pool_db = object_pool_db;
     s->config.default_nonce_trials_per_byte = 1000;
     s->config.default_payload_length_extra_bytes = 1000;
     s->config.pq_enabled = pq_enabled;
@@ -177,11 +201,21 @@ int main(void)
         fprintf(stderr, "failed to open db\n");
         return EXIT_FAILURE;
     }
+    unlink(TEST_MESSAGES_DB);
+    unlink(TEST_OBJECT_POOL_DB);
+    sqlite3 *messages_db = NULL;
+    sqlite3 *pool_db = NULL;
+    if (sqlite3_open(TEST_MESSAGES_DB, &messages_db) != SQLITE_OK || bm_messages_store_init_schema(messages_db) != 0
+        || sqlite3_open(TEST_OBJECT_POOL_DB, &pool_db) != SQLITE_OK || bm_object_store_init_schema(pool_db) != 0)
+    {
+        fprintf(stderr, "failed to open db\n");
+        return EXIT_FAILURE;
+    }
     bm_keyring_t kr;
     bm_keyring_init(&kr);
 
     static struct server enabled;
-    server_start(&enabled, db, &kr, TEST_PORT_ENABLED, 1);
+    server_start(&enabled, db, messages_db, pool_db, &kr, TEST_PORT_ENABLED, 1);
 
     /* 1. 作成 */
     char *resp = rpc("createDeterministicAddress", "[\"pq api passphrase\",5,1,1,\"pqlabel\",\"" STORE_PASS "\"]");
@@ -254,6 +288,71 @@ int main(void)
     CHECK(contains(resp, expect_v5), "unlockAllAddresses also unlocks v5");
     free(resp);
 
+    /* 9. backfill(段5)。createDeterministicAddressと同じ引数で鍵を作り直してv5宛のmsgを組み立て、
+     * プールへ直接入れる(backfillはPoWを見ない) */
+    static struct bm_pqv5_identity v5_keys;
+    CHECK(bm_pqv5_identity_generate_deterministic("pq api passphrase", 1, 0, 1, &v5_keys) == 0, "regenerate the v5 keys");
+    char *v5_again = bm_pqv5_address_encode(5, 1, v5_keys.id);
+    CHECK(v5_again != NULL && strcmp(v5_again, v5) == 0, "sanity: the regenerated keys are the API's address");
+    free(v5_again);
+    struct bm_pq_sender_info info;
+    info.identity = &other;
+    info.bitfield = 1;
+    info.nonce_trials_per_byte = 1000;
+    info.payload_length_extra_bytes = 1000;
+    size_t msg_payload_len = 0;
+    int64_t expires = (int64_t)time(NULL) + 3600;
+    unsigned char *msg_payload = bm_pq_build_msg(&info, 1, v5_keys.id, v5_keys.kem_pk, 2,
+                                                 (const unsigned char *)"Subject:s\nBody:b", 16, NULL, 0,
+                                                 (uint64_t)expires, &msg_payload_len);
+    size_t msg_object_len = 8 + msg_payload_len;
+    unsigned char *msg_object = calloc(1, msg_object_len);
+    memcpy(msg_object + 8, msg_payload, msg_payload_len);
+    free(msg_payload);
+    unsigned char msg_hash[32] = {0x55};
+    CHECK(bm_object_store_insert(pool_db, msg_hash, BM_OBJECT_MSG, 1, msg_object, msg_object_len, expires,
+                                 (int64_t)time(NULL))
+              == 0,
+          "put a v5 msg in the pool");
+    free(msg_object);
+
+    snprintf(params, sizeof(params), "[\"%s\"]", v5);
+    free(rpc("lockAddress", params));
+    snprintf(params, sizeof(params), "[\"%s\",\"%s\"]", v5, STORE_PASS);
+    resp = rpc("unlockAddress", params);
+    CHECK(contains(resp, "\"result\":true"), "unlockAddress with a v5 msg in the pool");
+    free(resp);
+    CHECK(inbox_count(messages_db) == 1, "unlockAddress backfills the old v5 msg");
+    sqlite3_exec(messages_db, "DELETE FROM inbox;", NULL, NULL, NULL);
+
+    snprintf(params, sizeof(params), "[\"%s\"]", v5);
+    free(rpc("lockAddress", params));
+    snprintf(params, sizeof(params), "[[\"%s\",\"%s\"],\"%s\",false]", v4, v5, STORE_PASS);
+    resp = rpc("unlockAddresses", params);
+    CHECK(!contains(resp, "backfilledMessages"), "unlockAddresses does not backfill by default");
+    free(resp);
+    CHECK(inbox_count(messages_db) == 0, "the v5 msg is not read without backfill=true");
+    snprintf(params, sizeof(params), "[\"%s\"]", v5);
+    free(rpc("lockAddress", params));
+    snprintf(params, sizeof(params), "[[\"%s\",\"%s\"],\"%s\",true]", v4, v5, STORE_PASS);
+    resp = rpc("unlockAddresses", params);
+    CHECK(contains(resp, "\"backfilledMessages\":1"), "unlockAddresses with backfill=true reads the v5 msg");
+    free(resp);
+    CHECK(inbox_count(messages_db) == 1, "the v5 msg reached the inbox");
+
+    /* addSubscription(段5) */
+    char *other_address = bm_pqv5_address_encode(5, 1, other.id);
+    snprintf(params, sizeof(params), "[\"%s\",\"pq subscription\"]", other_address);
+    resp = rpc("addSubscription", params);
+    CHECK(contains(resp, "\"result\":true"), "addSubscription accepts a v5 address");
+    free(resp);
+    resp = rpc("listSubscriptions", "[]");
+    CHECK(contains(resp, other_address), "the v5 subscription is listed");
+    free(resp);
+    resp = rpc("addSubscription", "[\"BM-notAnAddress\",\"x\"]");
+    CHECK(contains(resp, "invalid address"), "addSubscription still refuses an invalid address");
+    free(resp);
+
     /* 8. deleteAddress */
     snprintf(params, sizeof(params), "[\"%s\"]", v5);
     resp = rpc("deleteAddress", params);
@@ -270,7 +369,7 @@ int main(void)
 
     /* フラグ無効 */
     static struct server disabled;
-    server_start(&disabled, db, &kr, TEST_PORT_DISABLED, 0);
+    server_start(&disabled, db, messages_db, pool_db, &kr, TEST_PORT_DISABLED, 0);
     resp = rpc("createDeterministicAddress", "[\"pq api passphrase\",5,1,1,\"x\",\"" STORE_PASS "\"]");
     CHECK(contains(resp, "post-quantum (v5) support is disabled"), "version 5 is refused when the flag is off");
     free(resp);
@@ -283,12 +382,21 @@ int main(void)
     CHECK(contains(resp, "post-quantum (v5) support is disabled"),
           "unlockAddresses refuses a list containing v5 when the flag is off");
     free(resp);
+    snprintf(params, sizeof(params), "[\"%s\",\"x\"]", missing);
+    resp = rpc("addSubscription", params);
+    CHECK(contains(resp, "post-quantum (v5) support is disabled"), "addSubscription refuses v5 when the flag is off");
+    free(resp);
     server_stop(&disabled);
 
+    free(other_address);
     free(missing);
     bm_keyring_destroy(&kr);
     sqlite3_close(db);
+    sqlite3_close(messages_db);
+    sqlite3_close(pool_db);
     unlink(TEST_IDENTITY_DB);
+    unlink(TEST_MESSAGES_DB);
+    unlink(TEST_OBJECT_POOL_DB);
 
     if (failures > 0)
     {

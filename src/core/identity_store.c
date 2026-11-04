@@ -6,6 +6,7 @@
 #include "../common/db_common.h"
 #ifdef BM_HAVE_PQ
 #include "pq_identity_store.h"
+#include "pq_pubkey_cache.h"
 #endif
 
 static const char *SCHEMA_SQL =
@@ -92,7 +93,7 @@ int bm_identity_store_init_schema(sqlite3 *db)
     /* §11 2026-11-04 項目55の段3: v5 identityの表(pq_identity_store.c)。PQの無いビルドでは
      * 作らない(作っても読み手がいない)。PQ有りのビルドで作ったDBをPQ無しのビルドで開いても、
      * この表が無視されるだけで既存の表には影響しない */
-    if (bm_pq_identity_store_init_schema(db) != 0)
+    if (bm_pq_identity_store_init_schema(db) != 0 || bm_pq_pubkey_cache_init_schema(db) != 0)
     {
         return -1;
     }
