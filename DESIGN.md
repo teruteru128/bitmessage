@@ -4748,8 +4748,9 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - **実daemonでの確認。** 外部ネットワークの無い名前空間(`unshare -rn`)で`bitmessaged`を立て、CLIから
       操作した。2本の構成で、getpubkeyの自動発行→自応答→再度のsend-message→受信→getpubkey無しの返信→
       broadcastまで通った。3本の三角形の構成で、フラグ無効のノードがv5のobjectを処理せずに中継すること、
-      ackが返って`ackreceived`になることを確認した(DESIGN-PQ.md §9.1の4の一部。別の実装を経由した確認では
-      ない)。
+      ackが返って`ackreceived`になることを確認した。さらに、v5のノード2本をPyBitmessageだけを挟んで一直線に
+      接続し、getpubkey・7.8KBのpubkey・msg・返信・broadcastがすべて中継されて届くことを確認した
+      (DESIGN-PQ.md §2.3の末尾に条件とログ)。この一直線の構成では、下の理由でackは送信者へ届かない。
     - **気づいたこと(未対応)。** 受信側はackのinvを「msgをくれた接続」へ送らない
       (`validate_and_store_ack`の`except`、v4と共通)。そのため接続先が1本だけの相手にはackが届かず、
       2ノードの構成では`ackreceived`にならない。接続先が複数ある通常の構成では別の経路で届く。本家は

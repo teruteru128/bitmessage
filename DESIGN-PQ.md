@@ -123,6 +123,15 @@ PyBitmessageの型別検査(`src/network/bmobject.py`)と処理層(`src/class_ob
 | msg | 検査なし | `processmsg`が `if msgVersion != 1: return` で**復号を試みる前に**捨てる |
 | broadcast | `len < 180`、`version < 2` で無効 | `processbroadcast`が `if broadcastVersion < 4 or > 5: return` で捨てる |
 
+**2026-11-05 実機で確認。** v5のノード2本をPyBitmessage(dcbcc4a2、PyPy 2.7上)だけを挟んで接続し、
+4種類すべてが中継されて相手に届くことと、PyBitmessageのログに上の表どおりの行が出ることを確かめた:
+getpubkeyは "The requestedAddressVersionNumber of the pubkey request is too high."、pubkey(7776byte)は
+"pubkey object too short or too long. Ignoring."、msgは "Cannot understand message versions other than one."、
+broadcastは "Cannot decode incoming broadcast versions less than 4 or higher than 5."。4種類ともinventoryには
+保存され、inboxとpubkeysには何も入らず、例外も出なかった。条件: CPythonではなくPyPyで動かした
+(手元にPython 2.7が無いため)。本体のコードは変更していないが、依存の`six.py`を足し、発信を切っている
+(外部ネットワークの無い環境では発信ありの設定だとブートストラップの段階で待ち受けまで進まなかった)。
+
 **重要な含意**: msg/broadcastは「トライアル復号を試みる前に」versionで弾かれる。つまりPQ
 オブジェクトが流れても、既存ノードに無駄な復号計算を強いることはない。これは新objectTypeを
 定義する案(§10で却下)より優れた性質で、**objectVersionを上げる方式を選ぶ最大の理由**である。
@@ -796,8 +805,9 @@ PoWの所要時間は指数分布に従うので、
    **2026-11-05 実装済み(DESIGN.md §11項目57)。**
 4. **相互運用テスト** — testnet上で2ノード間のv5 msg往復と、v4しか知らないノードを
    経由した場合の中継が壊れないことを確認する。
-   **2026-11-05 一部確認済み(DESIGN.md §11項目57)。** 外部ネットワークの無い環境で、この実装同士の往復と、
-   フラグ無効のノードを経由した中継を確認した。PyBitmessage等の別の実装を経由した中継は未確認。
+   **2026-11-05 確認済み(DESIGN.md §11項目57)。** 外部ネットワークの無い環境で、この実装同士の往復、
+   フラグ無効のノードを経由した中継、PyBitmessage(dcbcc4a2)だけを経由した中継を確認した(§2.3の末尾)。
+   MiNode-Refinedはソースの確認のみ(§2.2)で、実際に動かしてはいない。
 5. **提案の公開** — ここまでの実測値を添えてBitmessageコミュニティへ提案。
 
 **進め方の決定(2026-11-03、ユーザーとの相談)。** フェーズ2以降は、長く並走するPQ用
