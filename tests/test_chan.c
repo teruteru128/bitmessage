@@ -189,7 +189,7 @@ int main(void)
               "member B joins/unlocks the chan identity after the backlog message was received");
 
         int decrypted =
-            bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL));
+            bm_object_sync_backfill_trial_decrypt(object_pool_db_b, NULL, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL));
         CHECK(decrypted == 1, "backfill decrypts exactly the 1 backlog message after unlock (address_filter)");
 
         struct bm_inbox_message *inbox_list = NULL;
@@ -202,7 +202,7 @@ int main(void)
         bm_inbox_message_list_free(inbox_list, inbox_count);
 
         /* 再実行してもinbox側はmsg_idユニーク制約でIGNOREされ、重複挿入されないこと */
-        CHECK(bm_object_sync_backfill_trial_decrypt(object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL))
+        CHECK(bm_object_sync_backfill_trial_decrypt(object_pool_db_b, NULL, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL))
                   == 1,
               "re-running backfill still trial-decrypts successfully (idempotent at this layer)");
         CHECK(bm_messages_store_list_inbox(messages_db_b, NULL, &inbox_list, &inbox_count) == 0
@@ -243,7 +243,7 @@ int main(void)
                   "third backlog object is stored in member B's object_pool.db");
 
             int decrypted_wrong_filter = bm_object_sync_backfill_trial_decrypt(
-                object_pool_db_b, messages_db_b, &kr_b_late, other_address, (int64_t)time(NULL));
+                object_pool_db_b, NULL, messages_db_b, &kr_b_late, other_address, (int64_t)time(NULL));
             CHECK(decrypted_wrong_filter == 0,
                   "backfill with address_filter pointing at the unrelated identity decrypts nothing, "
                   "even though the chan identity is also unlocked in the same keyring");
@@ -254,7 +254,7 @@ int main(void)
              * IGNOREされる、上のシナリオ5のidempotency確認と同じ仕組み)。ここではdecrypted件数の
              * 検証よりも「object3(third chan post)が新たにinboxへ現れたか」を主眼に確認する。 */
             int decrypted_right_filter = bm_object_sync_backfill_trial_decrypt(
-                object_pool_db_b, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL));
+                object_pool_db_b, NULL, messages_db_b, &kr_b_late, chan_address_b, (int64_t)time(NULL));
             CHECK(decrypted_right_filter == 2,
                   "backfill with the correct address_filter re-decrypts both backlog messages "
                   "accumulated so far in object_pool.db");
@@ -280,19 +280,19 @@ int main(void)
              * 試さないこと、keyringに無いアドレスは黙って除かれること、MSG1件は1回だけ
              * 数えられること(リストに複数のidentityがあっても、復号できた時点で打ち切る)。 --- */
             const char *only_other[1] = {other_address};
-            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, NULL, messages_db_b, &kr_b_late,
                                                                   only_other, 1, (int64_t)time(NULL)) == 0,
                   "multi-address backfill with only the unrelated identity decrypts nothing");
             const char *with_missing[2] = {"BM-2cNotUnlockedAnywhere", other_address};
-            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, NULL, messages_db_b, &kr_b_late,
                                                                   with_missing, 2, (int64_t)time(NULL)) == 0,
                   "multi-address backfill silently skips an address that is not in the keyring");
             const char *both[3] = {other_address, "BM-2cNotUnlockedAnywhere", chan_address_b};
-            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, NULL, messages_db_b, &kr_b_late,
                                                                   both, 3, (int64_t)time(NULL)) == 2,
                   "multi-address backfill including the chan address decrypts each of the 2 backlog "
                   "messages exactly once");
-            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, messages_db_b, &kr_b_late,
+            CHECK(bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db_b, NULL, messages_db_b, &kr_b_late,
                                                                   NULL, 0, (int64_t)time(NULL)) == 0,
                   "multi-address backfill with an empty list does nothing");
         }

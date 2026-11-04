@@ -13,6 +13,7 @@
 #include "messages_store.h"
 #ifdef BM_HAVE_PQ
 #include "../pq/pq_object.h"
+#include "pq_pubkey_cache.h"
 #endif
 
 static char *dup_bytes_as_cstr(const unsigned char *data, size_t len)
@@ -295,8 +296,8 @@ int bm_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned ch
 
 #ifdef BM_HAVE_PQ
 /* §11 2026-11-04 項目55の段5(broadcast_decrypt.h参照) */
-int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned char *object, size_t object_len,
-                                            uint64_t candidate_version, uint64_t candidate_stream,
+int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *identity_db, sqlite3 *messages_db, const unsigned char *object,
+                                            size_t object_len, uint64_t candidate_version, uint64_t candidate_stream,
                                             const unsigned char candidate_id[32], int64_t now)
 {
     struct bm_pq_broadcast_parsed *parsed = malloc(sizeof(*parsed)); /* 公開鍵だけで3KB超 */
@@ -331,6 +332,12 @@ int bm_pq_trial_decrypt_broadcast_and_store(sqlite3 *messages_db, const unsigned
         rc = bm_messages_store_insert_inbox(messages_db, msg_id, from, from, subject, body, now);
         free(subject);
         free(body);
+        if (rc == 0 && identity_db != NULL)
+        {
+            bm_pq_pubkey_cache_store_sender(identity_db, candidate_version, candidate_stream, candidate_id,
+                                            parsed->bitfield, parsed->from_sig_pk, parsed->from_kem_pk,
+                                            parsed->nonce_trials_per_byte, parsed->payload_length_extra_bytes, now);
+        }
     }
     free(from);
     bm_pq_broadcast_parsed_free(parsed);

@@ -42,7 +42,7 @@ struct cli_command_help
 
 static const struct cli_command_help CLI_COMMANDS[] = {
     {"list-addresses", NULL},
-    {"create-address <passphrase> <version:3|4> <stream> <ripeNullBytes> <label> <storePassphrase>", NULL},
+    {"create-address <passphrase> <version:3|4|5> <stream> <ripeNullBytes> <label> <storePassphrase>", NULL},
     {"import-address <address> <signingWIF> <encryptionWIF> <label> <storePassphrase> "
      "[nonceTrialsPerByte] [payloadLengthExtraBytes]",
      N_("Import an address from a WIF key pair taken from keys.dat (PyBitmessage).\n"

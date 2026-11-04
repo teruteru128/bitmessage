@@ -34,6 +34,11 @@ int bm_pq_pubkey_cache_init_schema(sqlite3 *db);
 int bm_pq_pubkey_cache_record_request(sqlite3 *db, uint64_t address_version, uint64_t stream,
                                       const unsigned char id[BM_PQV5_ID_LEN], int64_t requested_time);
 
+/* max_age_seconds以内に同じtagのgetpubkeyを発行済みなら1、そうでなければ0
+ * (bm_pubkey_cache_has_recent_requestのv5版。短時間に同じ宛先へ何度も発行しないため) */
+int bm_pq_pubkey_cache_has_recent_request(sqlite3 *db, const unsigned char tag[32], int64_t now,
+                                          int64_t max_age_seconds);
+
 /* tagに対応する未解決の要求があれば0でoutを埋める。無い場合・エラー時は非0 */
 int bm_pq_pubkey_cache_find_request(sqlite3 *db, const unsigned char tag[32], struct bm_pq_pubkey_request *out);
 
@@ -46,6 +51,20 @@ int bm_pq_pubkey_cache_clear_request(sqlite3 *db, const unsigned char tag[32]);
  */
 int bm_pq_pubkey_cache_upsert(sqlite3 *db, const unsigned char id[BM_PQV5_ID_LEN],
                               const struct bm_pq_pubkey_parsed *pubkey, int64_t received_time);
+
+/*
+ * §11 2026-11-05 項目57: v5のmsg/broadcastに載っていた差出人の公開鍵を保存し、同じ宛先の未解決の
+ * 要求があれば消す。v5のmsgが公開鍵(3200byte)を丸ごと運ぶのは、返信のためにgetpubkeyを出さずに
+ * 済ませるため(DESIGN-PQ.md §10.4)で、本家もprocessmsg/processbroadcastで同じことをしている
+ * ("Let's store the public key in case we want to reply to this person.")。呼び出し側は署名を
+ * 検証済みで、idは中の公開鍵から再計算したものを渡すので、別人の鍵をこのアドレスに結び付けることは
+ * できない。行を増やすにはPoWを払って自分宛に開封できるmsgを作る必要がある。成功時0
+ */
+int bm_pq_pubkey_cache_store_sender(sqlite3 *db, uint64_t address_version, uint64_t stream,
+                                    const unsigned char id[BM_PQV5_ID_LEN], uint32_t bitfield,
+                                    const unsigned char sig_pk[BM_PQV5_SIG_PK_LEN],
+                                    const unsigned char kem_pk[BM_PQV5_KEM_PK_LEN], uint64_t nonce_trials_per_byte,
+                                    uint64_t payload_length_extra_bytes, int64_t now);
 
 /* (version, stream, id)のpubkeyがあれば0でoutを埋める。無い場合・エラー時は非0 */
 int bm_pq_pubkey_cache_lookup(sqlite3 *db, uint64_t address_version, uint64_t stream,

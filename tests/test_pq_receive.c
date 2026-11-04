@@ -8,6 +8,9 @@
  * 渡す(7.8KBのobjectは1本あたり約900万回の試行なので、同じobjectをプールから消して使い回す)。
  * dispatchを通す必要が無い検査は、PoW無しのobjectをcore層の関数へ直接渡す。
  *
+ * §11 2026-11-05 項目57: msgとbroadcastの差出人の公開鍵を保存するようになったので、その確認を足した。
+ * 送信側との往復はtest_pq_send.c。
+ *
  * 検証観点:
  * 1. フラグ無効: 4種類とも保存はする(中継は変わらない)が、中身は処理しないこと
  * 2. getpubkey: ロック中は応答しないこと、unlock後は自分のpubkeyを返すこと(tagが合い、
@@ -382,17 +385,21 @@ int main(void)
 
     /* --- 4. msg --- */
     CHECK(bm_pq_keyring_unlock(&e->kr, e->identity_db, other_address, STORE_PASS, now) == 0, "unlock the other identity");
+    sqlite3_exec(e->identity_db, "DELETE FROM pq_pubkey_cache;", NULL, NULL, NULL);
     deliver(e, msg_object, msg_len);
+    CHECK(bm_pq_pubkey_cache_lookup(e->identity_db, 5, 1, sender.id, &cached) == 0
+              && memcmp(cached.kem_pk, sender.kem_pk, BM_PQV5_KEM_PK_LEN) == 0,
+          "the msg's sender key is cached, so a reply needs no getpubkey");
     CHECK(inbox_is_only(e, receiver_address, sender_address, "pq subject", "pq body"),
           "the msg is stored for the right identity, with subject and body decoded");
     CHECK(bm_object_store_has(e->object_pool_db, ack_hash), "the embedded ack is stored in the pool");
     forget_inbox(e);
 
     /* 宛先を絞った場合 */
-    CHECK(bm_pq_trial_decrypt_and_store(&e->kr, other_address, e->messages_db, msg_object, msg_len, now, NULL, NULL) != 0,
+    CHECK(bm_pq_trial_decrypt_and_store(&e->kr, other_address, e->identity_db, e->messages_db, msg_object, msg_len, now, NULL, NULL) != 0,
           "the msg does not open with the other identity's key");
     CHECK(inbox_count(e) == 0, "nothing is stored when it does not open");
-    CHECK(bm_pq_trial_decrypt_and_store(&e->kr, receiver_address, e->messages_db, msg_object, msg_len, now, NULL, NULL) == 0,
+    CHECK(bm_pq_trial_decrypt_and_store(&e->kr, receiver_address, e->identity_db, e->messages_db, msg_object, msg_len, now, NULL, NULL) == 0,
           "the msg opens when narrowed to the receiver");
     forget_inbox(e);
 
@@ -402,7 +409,7 @@ int main(void)
         size_t object_len = 0;
         unsigned char *p = build_msg_payload(&sender, other.id, receiver.kem_pk, NULL, 0, 300, &l);
         unsigned char *object = as_object_without_pow(p, l, &object_len);
-        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->messages_db, object, object_len, now, NULL, NULL) != 0,
+        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->identity_db, e->messages_db, object, object_len, now, NULL, NULL) != 0,
               "a msg whose to_id is someone else's is refused");
         free(object);
     }
@@ -415,7 +422,7 @@ int main(void)
         size_t object_len = 0;
         unsigned char *p = build_msg_payload(&forged, receiver.id, receiver.kem_pk, NULL, 0, 300, &l);
         unsigned char *object = as_object_without_pow(p, l, &object_len);
-        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->messages_db, object, object_len, now, NULL, NULL) != 0,
+        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->identity_db, e->messages_db, object, object_len, now, NULL, NULL) != 0,
               "a msg claiming fromAddressVersion 4 is refused");
         free(object);
     }
@@ -432,7 +439,7 @@ int main(void)
         CHECK(long_address != NULL && strlen(long_address) >= BM_ADDRESS_STR_MAX,
               "sanity: this sender address does not fit the column");
         free(long_address);
-        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->messages_db, object, object_len, now, NULL, NULL) != 0,
+        CHECK(bm_pq_trial_decrypt_and_store(&e->kr, NULL, e->identity_db, e->messages_db, object, object_len, now, NULL, NULL) != 0,
               "a msg whose sender address does not fit is refused");
         free(object);
     }
@@ -446,30 +453,33 @@ int main(void)
 
     /* --- 5. backfill(プールには直前の配送でmsgが入っている) --- */
     CHECK(bm_pq_keyring_unlock(&e->kr, e->identity_db, receiver_address, STORE_PASS, now) == 0, "unlock receiver for backfill");
-    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->messages_db, &e->kr, other_address, now) == 0,
+    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->identity_db, e->messages_db, &e->kr, other_address, now) == 0,
           "backfill for an unrelated v5 address reads nothing");
     CHECK(inbox_count(e) == 0, "still nothing in the inbox");
-    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->messages_db, &e->kr, receiver_address, now) == 1,
+    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->identity_db, e->messages_db, &e->kr, receiver_address, now) == 1,
           "backfill for the receiver reads the old msg");
     CHECK(inbox_is_only(e, receiver_address, sender_address, "pq subject", "pq body"), "the old msg reached the inbox");
     forget_inbox(e);
     {
         const char *only_other[1] = {other_address};
-        CHECK(bm_object_sync_backfill_trial_decrypt_addresses(e->object_pool_db, e->messages_db, &e->kr, only_other, 1, now)
+        CHECK(bm_object_sync_backfill_trial_decrypt_addresses(e->object_pool_db, e->identity_db, e->messages_db, &e->kr, only_other, 1, now)
                   == 0,
               "multi-address backfill without the receiver reads nothing");
         const char *both[3] = {other_address, "BM-2cNotUnlockedAnywhere", receiver_address};
-        CHECK(bm_object_sync_backfill_trial_decrypt_addresses(e->object_pool_db, e->messages_db, &e->kr, both, 3, now) == 1,
+        CHECK(bm_object_sync_backfill_trial_decrypt_addresses(e->object_pool_db, e->identity_db, e->messages_db, &e->kr, both, 3, now) == 1,
               "multi-address backfill reads the msg once");
         forget_inbox(e);
     }
-    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->messages_db, &e->kr, NULL, now) == 1,
+    CHECK(bm_object_sync_backfill_trial_decrypt(e->object_pool_db, e->identity_db, e->messages_db, &e->kr, NULL, now) == 1,
           "backfill over the whole keyring also reads v5 msgs");
     forget_inbox(e);
     forget_pool(e);
 
     /* --- 6. broadcast --- */
+    sqlite3_exec(e->identity_db, "DELETE FROM pq_pubkey_cache;", NULL, NULL, NULL);
     deliver(e, broadcast_object, broadcast_len);
+    CHECK(bm_pq_pubkey_cache_lookup(e->identity_db, 5, 1, sender.id, &cached) != 0,
+          "an unsubscribed broadcast does not cache its sender's key");
     CHECK(inbox_count(e) == 0, "a broadcast from an address we do not subscribe to is not stored");
     forget_pool(e);
 
@@ -485,6 +495,7 @@ int main(void)
     deliver(e, broadcast_object, broadcast_len);
     CHECK(inbox_is_only(e, sender_address, sender_address, "pq subject", "pq body"),
           "a subscribed v5 broadcast is stored, with to_address equal to from_address");
+    CHECK(bm_pq_pubkey_cache_lookup(e->identity_db, 5, 1, sender.id, &cached) == 0, "the broadcast's sender key is cached");
 
     free(broadcast_object);
     free(msg_object);

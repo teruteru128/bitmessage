@@ -29,4 +29,13 @@
  */
 #define BM_MAX_SUBJECT_PLUS_BODY_LEN ((size_t)((1u << 18) - 500))
 
+/*
+ * §11 2026-11-05 項目57: v5(ポスト量子)のmsg/broadcastの上限。v5のobjectは公開鍵と署名だけで
+ * v4より約7.4KB大きいので(DESIGN-PQ.md §8.3)、上の値のままだと2^18を超えるobjectを作り、PoWを
+ * 回し切った後で配信されない。固定部は約7.8KB、埋め込みackは最大(stealth level 2)で約1KB。
+ * 合わせて9000byteを確保した。tests/test_pq_send.cで、この長さと最大のackでも2^18に収まることを
+ * 確かめている。
+ */
+#define BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN ((size_t)((1u << 18) - 9000))
+
 #endif /* BM_MESSAGE_LIMITS_H */

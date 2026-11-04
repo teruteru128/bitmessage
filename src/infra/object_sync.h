@@ -276,8 +276,8 @@ void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t 
  *
  * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙に失敗した場合のみ-1。
  */
-int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
-                                           const char *address_filter, int64_t now);
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *identity_db, sqlite3 *messages_db,
+                                           bm_keyring_t *kr, const char *address_filter, int64_t now);
 
 /*
  * §11 2026-09-28 項目48: address_filterの複数アドレス版(unlockAddressesのbackfill=true用)。
@@ -286,10 +286,24 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
  * 変わらないが、object_pool.dbからの読み出しはMSG1件につき1回で済む。keyringに既に
  * 載っている他のidentityは対象にしない(unlock-all済みの数千件まで巻き込まないため)。
  * §11 2026-11-04 項目55の段5: v5のアドレスも渡せる(v5のmsgをv5のkeyringで試す)。
+ * §11 2026-11-05 項目57: identity_db(NULL可、v4以前では使わない)へ、読めたv5のmsgの差出人の公開鍵を
+ * 保存する(受信時と同じ、返信にgetpubkeyを要らなくするため)。
  * 新規にinboxへ挿入できた件数を返す。object_pool_dbの列挙やメモリ確保に失敗した場合は-1。
  */
-int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *messages_db,
-                                                    bm_keyring_t *kr, const char *const *addresses,
-                                                    size_t address_count, int64_t now);
+int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *identity_db,
+                                                    sqlite3 *messages_db, bm_keyring_t *kr,
+                                                    const char *const *addresses, size_t address_count, int64_t now);
+
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-05 項目57: 宛先のv5のpubkeyがプールに既にあれば開封してキャッシュへ入れる。成功時0
+ * (見つからない・開封できないときは非0)。pubkeyの開封は受信時の1回だけ(要求済みの宛先の分)なので、
+ * 要求より前に届いたobjectはこれが無いと開封されない。相手が応答キャッシュを再広告してもhashが
+ * 既知なので届き直さず、getpubkeyを出しても解決しない。呼び出し側はgetpubkeyを出す前にこれを試す
+ * (解決すれば、誰の鍵を探しているかをネットワークへ出さずに済む)。
+ */
+int bm_object_sync_resolve_pq_pubkey_from_pool(sqlite3 *object_pool_db, sqlite3 *identity_db, uint64_t address_version,
+                                               uint64_t stream, const unsigned char id[32], int64_t now);
+#endif
 
 #endif /* BM_INFRA_OBJECT_SYNC_H */

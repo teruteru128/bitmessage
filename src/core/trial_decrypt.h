@@ -66,10 +66,12 @@ int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identit
  * §11 2026-11-04 項目55の段5: v5のmsg(objectVersion 2)の試行復号とinboxへの保存。address==NULLなら
  * unlock済みの全v5 identityを、非NULLならその1件だけを試す(bm_pq_keyring_open_msg参照)。
  * out_ack_*の扱いはbm_trial_decrypt_and_storeと同じ。成功時0。
+ * §11 2026-11-05 項目57: identity_dbが非NULLなら、msgに載っていた差出人の公開鍵を保存する
+ * (返信にgetpubkeyを要らなくするため。pq_pubkey_cache.hのbm_pq_pubkey_cache_store_sender)。
  */
-int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3 *db, const unsigned char *object,
-                                  size_t object_len, int64_t now, unsigned char **out_ack_payload,
-                                  size_t *out_ack_payload_len);
+int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3 *identity_db, sqlite3 *db,
+                                  const unsigned char *object, size_t object_len, int64_t now,
+                                  unsigned char **out_ack_payload, size_t *out_ack_payload_len);
 #endif
 
 void *bm_trial_decrypt_thread(void *arg);

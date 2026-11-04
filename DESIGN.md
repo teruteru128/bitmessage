@@ -4702,3 +4702,56 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - **テスト**: `test_getpubkey_automation`(自応答のbitfield)、`test_broadcast`(send_pipelineのbroadcastを
       復号してbitfieldを確認)、`test_getpubkey_twin_versions`(列の無いDBの行を再利用しないこと)。
       3つの修正をそれぞれ戻すと対応する検査が落ちることを確認した。
+
+57. **ポスト量子拡張のフェーズ3(送信側)(実装済み、2026-11-05)**: [DESIGN-PQ.md](DESIGN-PQ.md) §9.1の
+    フェーズ3。項目55の段5で送った2点もここで解決した。これでv5のアドレス同士でmsg・broadcastの送受信が
+    一通りできる。実行時フラグ`[pq] enabled`の後ろにあるのは変わらない。
+    - **`send_pipeline`。** 既存のジョブチェーン(ackのPoW→msgの組み立てとPoW→sentへの記録)をそのまま使い、
+      分岐は鍵の解決(`prepare_pq_msg`)とmsgの組み立て(`build_msg_payload`)の2か所だけにした。v5の秘密
+      署名鍵は`from_info`と同じく組み立ての直後に消す。再送(`bm_object_sync_check_resends`)はこの関数を
+      呼ぶだけなので、何も変えずにv5も再送される。
+    - **v5とv4以前の間は送らない。** v5の鍵はv4以前のmsgの形式に載らず、受信側はfromAddressVersionが5で
+      ないv5のmsgを拒否する(項目55の段5)。APIは「can only exchange messages with another v5 address」の
+      明示的なエラーにする(getpubkeyを流す前に)。自分のidentity同士でも同じ。
+    - **ack。** v5のmsgにもv4と同じackを埋め込む(DESIGN-PQ.md §7.5)。受信側はobjectとして扱うだけなので
+      種類を問わない。相手のbitfieldを見ずに常に付けるのはv4と同じ(本家はDOESACKの無い相手には付けない。
+      項目56の逆方向で、未対応のまま)。
+    - **差出人の公開鍵の保存(項目55の段5の(a))。** v5のmsg/broadcastに載っている公開鍵を
+      `pq_pubkey_cache`へ保存する(`bm_pq_pubkey_cache_store_sender`)。受信時とbackfillの両方で行う。
+      msgが3200byteの公開鍵を運ぶのは返信にgetpubkeyを要らなくするためで(DESIGN-PQ.md §10.4)、本家も
+      `processmsg`/`processbroadcast`で同じことをしている。署名を検証済みで、idは中の公開鍵から
+      再計算するので、別人の鍵をこのアドレスに結び付けることはできない。段5では「v4もmsgからは保存して
+      いない」として送ったが、v5で公開鍵を運ぶ前提に合わせて保存することにした(v4はそのまま)。
+    - **要求の前に届いていたpubkey(項目55の段5の(b))。** pubkeyの開封は受信時の1回だけ(要求済みの宛先の
+      分)なので、要求より前に届いたobjectは開封されず、相手が応答キャッシュを再広告してもhashが既知なので
+      届き直さない。`bm_object_sync_resolve_pq_pubkey_from_pool`が、getpubkeyを出す前にプールをtagで探す
+      (`bm_object_store_list_hashes_by_tag`、BLOBをCへ読み出さずSQLで比べる)。解決すれば、誰の鍵を探して
+      いるかをネットワークへ出さずに済む。**v4の同じ問題は未修正**(v4のgetpubkey経路は変えていない)。
+    - **getpubkeyの自動発行。** `pq_request_pubkey_if_unknown`(`api_server.c`)。cooldown・PoWの投入・
+      記録の順序はv4と同じ。v4と違って、宛先が自分のidentityなら発行しない。
+    - **自応答のTTLは7日**(`BM_PQ_PUBKEY_RESPONSE_TTL_SECONDS`、DESIGN-PQ.md §9.3)。v4の28日のままだと
+      PoWが期待141秒で、その間pow_queueの他のジョブ(送信を含む)が待たされる。代わりにアドレスの持ち主が
+      オフラインでも応答できる期間が短くなるが、既に相手の鍵を持つノードには影響しない。定数を
+      変えるだけで戻せる。
+    - **本文長の上限**は`BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN`(2^18-9000)。sendMessage/sendBroadcastがPoWの前に
+      検査する。CLIの事前検査はv4の上限のままで、その間の長さはAPIのエラーになる。
+    - **API。** `sendMessage`・`sendBroadcast`・`addAddressBookEntry`がv5を扱う(フラグ無効なら段4と同じ
+      エラー)。`cachePubkey`はv4の形式の鍵しか受け取らないので対象外で、v5の送信失敗のメッセージでは
+      案内しない。ランダム生成・chan・exportAddressは段4のとおり対象外のまま。
+    - **文書。** 動くようになったので、段2・4で保留したREADME(両方)の環境変数表と使い方、
+      `bitmessage.conf.example`の`[pq]`、CLIの`create-address`の使い方(`<version:3|4|5>`)を更新した。
+    - **テスト**: `tests/test_pq_send.c`(別々のDB・keyringの2ノードで、送信パイプラインのobjectを
+      `bm_object_sync_dispatch`へ渡して往復。プールからの解決・返信・ack・再送・自分宛・broadcast・本文長の
+      上限)、`tests/test_pq_api.c`にHTTP越しの送信を追加、`tests/test_pq_receive.c`に鍵の保存を追加。
+      主要な検査を1つずつ無効にすると対応するテストが落ちることを確認した。ASan/UBSanでも送受信関連の
+      19件が通過。変更したファイルは`BM_HAVE_PQ`無しで`-Werror`のコンパイルが通ることも確かめた。
+    - **実daemonでの確認。** 外部ネットワークの無い名前空間(`unshare -rn`)で`bitmessaged`を立て、CLIから
+      操作した。2本の構成で、getpubkeyの自動発行→自応答→再度のsend-message→受信→getpubkey無しの返信→
+      broadcastまで通った。3本の三角形の構成で、フラグ無効のノードがv5のobjectを処理せずに中継すること、
+      ackが返って`ackreceived`になることを確認した(DESIGN-PQ.md §9.1の4の一部。別の実装を経由した確認では
+      ない)。
+    - **気づいたこと(未対応)。** 受信側はackのinvを「msgをくれた接続」へ送らない
+      (`validate_and_store_ack`の`except`、v4と共通)。そのため接続先が1本だけの相手にはackが届かず、
+      2ノードの構成では`ackreceived`にならない。接続先が複数ある通常の構成では別の経路で届く。本家は
+      ackを除外せずに広告する(`class_objectProcessor.py` l.735〜、`invQueue.put`に送信元を渡さない)ので、
+      ここは本家と異なる。

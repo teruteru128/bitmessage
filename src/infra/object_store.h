@@ -24,6 +24,14 @@ int bm_object_store_has(sqlite3 *db, const unsigned char hash[32]);
 int bm_object_store_get(sqlite3 *db, const unsigned char hash[32],
                          unsigned char **out_payload, size_t *out_len);
 
+/*
+ * §11 2026-11-05 項目57: object_typeのobjectのうち、payloadのtag_offset(0始まり)からの32byteがtagと
+ * 一致するものを、期限の遅い順に*out_hashes(malloc)へ返す。列挙してから1件ずつ読むより安い
+ * (BLOBを丸ごとCへ読み出さずに比べられる)。成功時0、*out_countに件数(0件でも成功)。
+ */
+int bm_object_store_list_hashes_by_tag(sqlite3 *db, int object_type, size_t tag_offset, const unsigned char tag[32],
+                                       unsigned char (**out_hashes)[32], size_t *out_count);
+
 /* 期限切れ(expires_time < now)のobjectを削除する。削除件数を返す(エラー時-1) */
 int bm_object_store_delete_expired(sqlite3 *db, int64_t now);
 

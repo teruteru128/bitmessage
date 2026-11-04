@@ -1,5 +1,6 @@
 #include "pq_pubkey_cache.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "../common/db_common.h"
@@ -56,6 +57,25 @@ int bm_pq_pubkey_cache_record_request(sqlite3 *db, uint64_t address_version, uin
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_pq_pubkey_cache_has_recent_request(sqlite3 *db, const unsigned char tag[32], int64_t now,
+                                          int64_t max_age_seconds)
+{
+    static const char *SQL = "SELECT requested_time FROM pq_pubkey_requests WHERE tag = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return 0;
+    }
+    sqlite3_bind_blob(stmt, 1, tag, 32, SQLITE_TRANSIENT);
+    int recent = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        recent = (now - sqlite3_column_int64(stmt, 0)) < max_age_seconds;
+    }
+    sqlite3_finalize(stmt);
+    return recent;
 }
 
 int bm_pq_pubkey_cache_find_request(sqlite3 *db, const unsigned char tag[32], struct bm_pq_pubkey_request *out)
@@ -124,6 +144,35 @@ int bm_pq_pubkey_cache_upsert(sqlite3 *db, const unsigned char id[BM_PQV5_ID_LEN
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int bm_pq_pubkey_cache_store_sender(sqlite3 *db, uint64_t address_version, uint64_t stream,
+                                    const unsigned char id[BM_PQV5_ID_LEN], uint32_t bitfield,
+                                    const unsigned char sig_pk[BM_PQV5_SIG_PK_LEN],
+                                    const unsigned char kem_pk[BM_PQV5_KEM_PK_LEN], uint64_t nonce_trials_per_byte,
+                                    uint64_t payload_length_extra_bytes, int64_t now)
+{
+    struct bm_pq_pubkey_parsed *pubkey = malloc(sizeof(*pubkey)); /* 3KB超 */
+    if (pubkey == NULL)
+    {
+        return -1;
+    }
+    pubkey->address_version = address_version;
+    pubkey->stream = stream;
+    pubkey->bitfield = bitfield;
+    memcpy(pubkey->sig_pk, sig_pk, BM_PQV5_SIG_PK_LEN);
+    memcpy(pubkey->kem_pk, kem_pk, BM_PQV5_KEM_PK_LEN);
+    pubkey->nonce_trials_per_byte = nonce_trials_per_byte;
+    pubkey->payload_length_extra_bytes = payload_length_extra_bytes;
+    int rc = bm_pq_pubkey_cache_upsert(db, id, pubkey, now);
+    free(pubkey);
+    if (rc == 0)
+    {
+        unsigned char tag[32];
+        bm_pqv5_derive_secret_and_tag(address_version, stream, id, NULL, tag);
+        bm_pq_pubkey_cache_clear_request(db, tag);
+    }
+    return rc;
 }
 
 int bm_pq_pubkey_cache_lookup(sqlite3 *db, uint64_t address_version, uint64_t stream,

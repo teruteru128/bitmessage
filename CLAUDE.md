@@ -4,8 +4,8 @@
 未解決事項(backlog)の全体像は [DESIGN.md](DESIGN.md)(特に§11「次にやること」)、
 日付入りの開発経緯(バグの発覚経緯・議論の顛末・PyBitmessage本家との比較調査結果等、
 2026-08-24に肥大化したDESIGN.md §11から分離)は [DESIGN-LOG.md](DESIGN-LOG.md)
-を参照すること。ポスト量子(ML-DSA/ML-KEM)拡張の提案とプロトタイプ(`src/pq/`、
-daemon本体からは未参照)は [DESIGN-PQ.md](DESIGN-PQ.md)。
+を参照すること。ポスト量子(ML-DSA/ML-KEM)拡張の提案と実装(`src/pq/`、daemon本体では
+実行時フラグ`[pq] enabled`の後ろ)は [DESIGN-PQ.md](DESIGN-PQ.md)。
 本ファイルは「毎回のセッションで機械的に守るべきこと」だけに絞る。
 
 ## Build
@@ -26,7 +26,7 @@ cmake --build build-Debug --parallel
 cd build-Debug && ctest --output-on-failure
 ```
 
-**必ず全件(現在62件。OpenSSL 3.5未満の環境ではPQ関連の6件が除外され56件、gettextが無い環境では訳の検査2件も登録されない)が100%通過することを確認してから完了とすること。** 1件でも失敗した状態で
+**必ず全件(現在63件。OpenSSL 3.5未満の環境ではPQ関連の7件が除外され56件、gettextが無い環境では訳の検査2件も登録されない)が100%通過することを確認してから完了とすること。** 1件でも失敗した状態で
 「実装できました」と報告しない。特定のテストだけ再実行する場合:
 
 ```

@@ -15,6 +15,12 @@
 #include "message_builder.h"
 #include "messages_store.h"
 #include "pubkey_cache.h"
+#ifdef BM_HAVE_PQ
+#include "../pq/pq_object.h"
+#include "pq_identity_store.h"
+#include "pq_keyring.h"
+#include "pq_pubkey_cache.h"
+#endif
 
 /* ackobject自体のPoW難易度。誰宛でもない匿名objectとして偽装するため、宛先固有の難易度
  * ではなくネットワーク既定値(PyBitmessage networkDefaultProofOfWorkNonceTrialsPerByte等)を使う */
@@ -64,6 +70,15 @@ struct send_msg_job
     uint64_t to_stream;
     unsigned char to_ripe[BM_RIPE_LEN];
     unsigned char to_pub_encryption[65];
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-05 項目57: v5の送信ならpq_fromが非NULL(上のfrom_info・to_ripe・to_pub_encryptionは
+     * 使わない)。pq_fromは秘密署名鍵を含み、from_infoと同じくmsgを組み立てた直後に消す */
+    struct bm_pqv5_identity *pq_from;
+    uint64_t pq_from_nonce_trials;
+    uint64_t pq_from_extra_bytes;
+    unsigned char pq_to_id[BM_PQV5_ID_LEN];
+    unsigned char pq_to_kem_pk[BM_PQV5_KEM_PK_LEN];
+#endif
     int is_self;
     char *from_address;
     char *to_address;
@@ -83,9 +98,77 @@ struct send_msg_job
     void *user_data;
 };
 
+#ifdef BM_HAVE_PQ
+static void pq_from_free(struct send_msg_job *job)
+{
+    if (job->pq_from != NULL)
+    {
+        OPENSSL_cleanse(job->pq_from, sizeof(*job->pq_from));
+        free(job->pq_from);
+        job->pq_from = NULL;
+    }
+}
+
+/* BITMESSAGE_ENCODING_SIMPLE(message_builder.cのappend_simple_encoded_messageと同じ形)。
+ * v5のビルダーはエンコード済みのバイト列を受け取るのでここで作る。mallocで返す */
+static unsigned char *build_simple_message(const char *subject, const char *body, size_t *out_len)
+{
+    size_t subject_len = strlen(subject);
+    size_t body_len = strlen(body);
+    size_t len = 8 + subject_len + 6 + body_len;
+    unsigned char *message = malloc(len);
+    if (message != NULL)
+    {
+        memcpy(message, "Subject:", 8);
+        memcpy(message + 8, subject, subject_len);
+        memcpy(message + 8 + subject_len, "\nBody:", 6);
+        memcpy(message + 8 + subject_len + 6, body, body_len);
+        *out_len = len;
+    }
+    return message;
+}
+#endif
+
+/* §4.1/§5.3のmsgのpayload(PoW前)を組み立て、送信元の秘密鍵を消す(署名はここで済むので、以後は
+ * 秘密鍵を持ち歩かない)。ack_packetはNULL可(自分宛) */
+static unsigned char *build_msg_payload(struct send_msg_job *job, const unsigned char *ack_packet,
+                                        size_t ack_packet_len, size_t *out_len)
+{
+#ifdef BM_HAVE_PQ
+    if (job->pq_from != NULL)
+    {
+        size_t message_len = 0;
+        unsigned char *message = build_simple_message(job->subject, job->body, &message_len);
+        unsigned char *payload = NULL;
+        if (message != NULL)
+        {
+            /* bitfieldはBITFIELD_DOESACK(§11 2026-11-05 項目56) */
+            struct bm_pq_sender_info info;
+            info.identity = job->pq_from;
+            info.bitfield = 1;
+            info.nonce_trials_per_byte = job->pq_from_nonce_trials;
+            info.payload_length_extra_bytes = job->pq_from_extra_bytes;
+            payload = bm_pq_build_msg(&info, job->to_stream, job->pq_to_id, job->pq_to_kem_pk, 2, message, message_len,
+                                      ack_packet, ack_packet_len, job->expires_time, out_len);
+            free(message);
+        }
+        pq_from_free(job);
+        return payload;
+    }
+#endif
+    unsigned char *payload = bm_build_msg(&job->from_info, job->to_stream, job->to_ripe, job->to_pub_encryption,
+                                          job->subject, job->body, ack_packet, ack_packet_len, job->expires_time,
+                                          out_len);
+    OPENSSL_cleanse(&job->from_info, sizeof(job->from_info));
+    return payload;
+}
+
 static void msg_job_free(struct send_msg_job *job)
 {
     OPENSSL_cleanse(&job->from_info, sizeof(job->from_info));
+#ifdef BM_HAVE_PQ
+    pq_from_free(job);
+#endif
     free(job->from_address);
     free(job->to_address);
     free(job->subject);
@@ -156,11 +239,7 @@ static void build_and_submit_msg(struct send_msg_job *job, const unsigned char *
                                  int64_t now)
 {
     size_t payload_len = 0;
-    unsigned char *payload = bm_build_msg(&job->from_info, job->to_stream, job->to_ripe, job->to_pub_encryption,
-                                          job->subject, job->body, ack_packet, ack_packet_len, job->expires_time,
-                                          &payload_len);
-    /* 署名はここで済んだので、以後は秘密鍵を持ち歩かない */
-    OPENSSL_cleanse(&job->from_info, sizeof(job->from_info));
+    unsigned char *payload = build_msg_payload(job, ack_packet, ack_packet_len, &payload_len);
     if (payload == NULL)
     {
         msg_job_fail(job, now);
@@ -231,12 +310,9 @@ static unsigned char *build_ack_payload(int stealth_level, uint64_t stream, uint
     return payload;
 }
 
-int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr, sqlite3 *identity_db,
-                                        sqlite3 *messages_db, const char *from_address, const char *to_address,
-                                        const char *subject, const char *body, uint64_t ttl_seconds,
-                                        int ack_stealth_level, const unsigned char reuse_msg_id[32],
-                                        int64_t next_resend_time, int64_t now, bm_send_done_fn done,
-                                        void *user_data)
+/* v4以前の送信の準備: 送信元の鍵と宛先の公開鍵を解決してjobへ入れる。失敗なら非0 */
+static int prepare_legacy_msg(struct send_msg_job *job, bm_keyring_t *kr, sqlite3 *identity_db,
+                              const char *from_address, const char *to_address)
 {
     struct bm_unlocked_identity from_id;
     if (!bm_keyring_find_by_address(kr, from_address, &from_id))
@@ -284,14 +360,6 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
         bm_pubkey_cache_mark_used_personally(identity_db, to_ripe);
     }
 
-    struct send_msg_job *job = calloc(1, sizeof(*job));
-    if (job == NULL)
-    {
-        OPENSSL_cleanse(&from_id, sizeof(from_id));
-        return -1;
-    }
-    job->pow_queue = pow_queue;
-    job->messages_db = messages_db;
     job->from_info.address_version = from_id.address_version;
     job->from_info.stream = from_id.stream;
     memcpy(job->from_info.pub_signing, from_id.pub_signing, 65);
@@ -305,16 +373,6 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
     memcpy(job->to_ripe, to_ripe, sizeof(job->to_ripe));
     memcpy(job->to_pub_encryption, to_pub_encryption, sizeof(job->to_pub_encryption));
     job->is_self = is_self;
-    job->from_address = dup_str(from_address);
-    job->to_address = dup_str(to_address);
-    job->subject = dup_str(subject);
-    job->body = dup_str(body);
-    job->ttl_seconds = ttl_seconds;
-    job->ack_stealth_level = ack_stealth_level;
-    job->expires_time = (uint64_t)now + ttl_seconds;
-    job->next_resend_time = next_resend_time;
-    job->done = done;
-    job->user_data = user_data;
 
     /* §4.1: 宛先pubkeyが要求する難易度とネットワーク既定値(=from_idの既定設定と同値)の
      * 大きい方を使う。pubkey_cacheに宛先の情報があれば(address_version>=3のみ意味を持つ、
@@ -336,6 +394,134 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
                 job->required_extra_bytes = recipient_info.payload_length_extra_bytes;
             }
         }
+    }
+    return 0;
+}
+
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-05 項目57: v5の送信の準備。宛先の扱いはv4と同じで、自分のidentityなら表の公開鍵を
+ * 使い(unlock不要)、それ以外はキャッシュから引く(無ければ失敗で、呼び出し側がgetpubkeyを発行する)。
+ * 難易度も同じく送信元と宛先の大きい方。pq_keyring.hのとおり秘密鍵はここで初めて展開されることがある。
+ */
+static int prepare_pq_msg(struct send_msg_job *job, bm_keyring_t *kr, sqlite3 *identity_db, const char *from_address,
+                          const char *to_address)
+{
+    uint64_t to_version = 0;
+    uint64_t to_stream = 0;
+    unsigned char to_id[BM_PQV5_ID_LEN];
+    if (bm_pqv5_address_decode(to_address, &to_version, &to_stream, to_id) != 0)
+    {
+        return -1;
+    }
+
+    /* どちらも3KB超なのでスタックに置かない */
+    struct bm_pq_identity_public *from = malloc(sizeof(*from));
+    struct bm_pq_identity_row *to_row = malloc(sizeof(*to_row));
+    struct bm_pq_pubkey_parsed *to_key = malloc(sizeof(*to_key));
+    int rc = -1;
+    job->pq_from = calloc(1, sizeof(*job->pq_from));
+    if (from == NULL || to_row == NULL || to_key == NULL || job->pq_from == NULL
+        || !bm_pq_keyring_find_by_address(kr, from_address, from)
+        || bm_pq_keyring_get_secret_keys(kr, from_address, job->pq_from->sig_sk, NULL) != 0)
+    {
+        goto out; /* fromアドレスがunlockされていない等 */
+    }
+
+    uint64_t to_nonce_trials;
+    uint64_t to_extra_bytes;
+    job->is_self = bm_pq_identity_store_load(identity_db, to_address, to_row) == 0;
+    if (job->is_self)
+    {
+        memcpy(job->pq_to_kem_pk, to_row->kem_pk, BM_PQV5_KEM_PK_LEN);
+        to_nonce_trials = to_row->nonce_trials_per_byte;
+        to_extra_bytes = to_row->payload_length_extra_bytes;
+    }
+    else
+    {
+        if (bm_pq_pubkey_cache_lookup(identity_db, to_version, to_stream, to_id, to_key) != 0)
+        {
+            goto out; /* 宛先のpubkeyが分からない */
+        }
+        memcpy(job->pq_to_kem_pk, to_key->kem_pk, BM_PQV5_KEM_PK_LEN);
+        to_nonce_trials = to_key->nonce_trials_per_byte;
+        to_extra_bytes = to_key->payload_length_extra_bytes;
+    }
+
+    job->pq_from->version = from->address_version;
+    job->pq_from->stream = from->stream;
+    memcpy(job->pq_from->id, from->id, BM_PQV5_ID_LEN);
+    memcpy(job->pq_from->sig_pk, from->sig_pk, BM_PQV5_SIG_PK_LEN);
+    memcpy(job->pq_from->kem_pk, from->kem_pk, BM_PQV5_KEM_PK_LEN);
+    job->pq_from_nonce_trials = from->nonce_trials_per_byte;
+    job->pq_from_extra_bytes = from->payload_length_extra_bytes;
+    memcpy(job->pq_to_id, to_id, BM_PQV5_ID_LEN);
+    job->to_stream = to_stream;
+    job->required_nonce_trials =
+        to_nonce_trials > from->nonce_trials_per_byte ? to_nonce_trials : from->nonce_trials_per_byte;
+    job->required_extra_bytes =
+        to_extra_bytes > from->payload_length_extra_bytes ? to_extra_bytes : from->payload_length_extra_bytes;
+    rc = 0;
+
+out:
+    free(from);
+    free(to_row);
+    free(to_key);
+    return rc; /* 失敗時のpq_fromはmsg_job_freeが消す */
+}
+
+static int is_v5_address(const char *address)
+{
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char id[BM_PQV5_ID_LEN];
+    return bm_pqv5_address_decode(address, &version, &stream, id) == 0;
+}
+#endif
+
+int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr, sqlite3 *identity_db,
+                                        sqlite3 *messages_db, const char *from_address, const char *to_address,
+                                        const char *subject, const char *body, uint64_t ttl_seconds,
+                                        int ack_stealth_level, const unsigned char reuse_msg_id[32],
+                                        int64_t next_resend_time, int64_t now, bm_send_done_fn done,
+                                        void *user_data)
+{
+    struct send_msg_job *job = calloc(1, sizeof(*job));
+    if (job == NULL)
+    {
+        return -1;
+    }
+    job->pow_queue = pow_queue;
+    job->messages_db = messages_db;
+    job->from_address = dup_str(from_address);
+    job->to_address = dup_str(to_address);
+    job->subject = dup_str(subject);
+    job->body = dup_str(body);
+    job->ttl_seconds = ttl_seconds;
+    job->ack_stealth_level = ack_stealth_level;
+    job->expires_time = (uint64_t)now + ttl_seconds;
+    job->next_resend_time = next_resend_time;
+    job->done = done;
+    job->user_data = user_data;
+
+    int prepare_rc;
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-05 項目57: v5はv5としか送り合えない。v5の鍵はv4以前のmsgへ載らず、v4以前の鍵は
+     * v5のmsgの形式へ載らない(受信側もfromAddressVersionが5でなければ拒否する)。宛先のデコードは
+     * 送信元と同じ世代のものしか通さないので、混ざっていれば下の準備で失敗する */
+    if (is_v5_address(from_address))
+    {
+        prepare_rc = prepare_pq_msg(job, kr, identity_db, from_address, to_address);
+    }
+    else
+#endif
+    {
+        prepare_rc = prepare_legacy_msg(job, kr, identity_db, from_address, to_address);
+    }
+    if (prepare_rc != 0)
+    {
+        msg_job_free(job);
+        return -1;
     }
 
     /* §11 2026-11-03: msg_idは以前はPoWの後で決めていたが、dedupキーに使うので準備段で決める */
@@ -366,14 +552,12 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
      * (ackを一切生成・埋め込まない)にしている(コメント "Not bothering to include ackdata
      * because we are sending to ourselves or a chan.")。それに合わせ、is_selfの場合は
      * ackのPoW自体を行わない。 */
-    if (is_self)
+    if (job->is_self)
     {
         /* 1段目がmsgになる。組み立ては呼び出し元スレッドで行う(投入時に拒否されれば
          * msg_pow_doneは呼ばれないので、下でjobを片付けて戻り値をそのまま返す) */
         size_t payload_len = 0;
-        unsigned char *payload = bm_build_msg(&job->from_info, job->to_stream, job->to_ripe, job->to_pub_encryption,
-                                              job->subject, job->body, NULL, 0, job->expires_time, &payload_len);
-        OPENSSL_cleanse(&job->from_info, sizeof(job->from_info));
+        unsigned char *payload = build_msg_payload(job, NULL, 0, &payload_len);
         if (payload == NULL)
         {
             msg_job_free(job);
@@ -392,7 +576,11 @@ int bm_send_pipeline_send_message_async(struct bm_pow_queue *pow_queue, bm_keyri
     }
 
     size_t ack_payload_len = 0;
-    unsigned char *ack_payload = build_ack_payload(ack_stealth_level, to_stream, job->expires_time, &ack_payload_len);
+    /* §11 2026-11-05 項目57: v5のmsgのackもv4と同じ形にする(DESIGN-PQ.md §7.5)。既定のlevel 1はv4の
+     * getpubkeyに見えるが、サイズはv5のgetpubkeyと同じで、流れている量はv4の方がずっと多いので
+     * 紛れやすい。受信側はackの中身を見ずにobjectとして扱う(validate_and_store_ack) */
+    unsigned char *ack_payload =
+        build_ack_payload(ack_stealth_level, job->to_stream, job->expires_time, &ack_payload_len);
     if (ack_payload == NULL)
     {
         msg_job_free(job);
@@ -432,14 +620,18 @@ static void broadcast_pow_done(void *user_data, unsigned char *object, size_t ob
     free(job);
 }
 
-int bm_send_pipeline_send_broadcast_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr,
-                                          const char *from_address, const char *subject, const char *body,
-                                          uint64_t ttl_seconds, int64_t now, bm_send_done_fn done, void *user_data)
+/*
+ * from_addressのbroadcastのpayload(PoW前)を組み立て、PoWの目標値を求める。broadcastは1段だけ
+ * (ackが無い)なので、署名・暗号化までは呼び出し元スレッドで済ませ、PoWだけをpow_queueへ投げる
+ */
+static unsigned char *build_legacy_broadcast(bm_keyring_t *kr, const char *from_address, const char *subject,
+                                             const char *body, uint64_t ttl_seconds, int64_t now, size_t *out_len,
+                                             uint64_t *out_target)
 {
     struct bm_unlocked_identity from_id;
     if (!bm_keyring_find_by_address(kr, from_address, &from_id))
     {
-        return -1; /* fromアドレスがunlockされていない */
+        return NULL; /* fromアドレスがunlockされていない */
     }
 
     struct bm_identity_info from_info;
@@ -458,14 +650,76 @@ int bm_send_pipeline_send_broadcast_async(struct bm_pow_queue *pow_queue, bm_key
 
     uint64_t expires_time = (uint64_t)now + ttl_seconds;
 
-    /* broadcastは1段だけ(ackが無い)なので、署名・暗号化までは呼び出し元スレッドで済ませ、
-     * PoWだけをpow_queueへ投げる */
-    size_t payload_len = 0;
-    unsigned char *payload = bm_build_broadcast(&from_info, from_id.ripe, subject, body, expires_time, &payload_len);
+    unsigned char *payload = bm_build_broadcast(&from_info, from_id.ripe, subject, body, expires_time, out_len);
     OPENSSL_cleanse(&from_info, sizeof(from_info));
-    uint64_t target = bm_pow_get_target(payload_len, ttl_seconds, from_id.nonce_trials_per_byte,
+    if (payload != NULL)
+    {
+        *out_target = bm_pow_get_target(*out_len, ttl_seconds, from_id.nonce_trials_per_byte,
                                         from_id.payload_length_extra_bytes);
+    }
     OPENSSL_cleanse(&from_id, sizeof(from_id));
+    return payload;
+}
+
+#ifdef BM_HAVE_PQ
+/* §11 2026-11-05 項目57: build_legacy_broadcastのv5版。bitfieldは項目56と同じくDOESACK */
+static unsigned char *build_pq_broadcast(bm_keyring_t *kr, const char *from_address, const char *subject,
+                                         const char *body, uint64_t ttl_seconds, int64_t now, size_t *out_len,
+                                         uint64_t *out_target)
+{
+    struct bm_pq_identity_public *from = malloc(sizeof(*from));
+    struct bm_pqv5_identity *identity = calloc(1, sizeof(*identity));
+    size_t message_len = 0;
+    unsigned char *message = build_simple_message(subject, body, &message_len);
+    unsigned char *payload = NULL;
+    if (from != NULL && identity != NULL && message != NULL && bm_pq_keyring_find_by_address(kr, from_address, from)
+        && bm_pq_keyring_get_secret_keys(kr, from_address, identity->sig_sk, NULL) == 0)
+    {
+        identity->version = from->address_version;
+        identity->stream = from->stream;
+        memcpy(identity->id, from->id, BM_PQV5_ID_LEN);
+        memcpy(identity->sig_pk, from->sig_pk, BM_PQV5_SIG_PK_LEN);
+        memcpy(identity->kem_pk, from->kem_pk, BM_PQV5_KEM_PK_LEN);
+        struct bm_pq_sender_info info;
+        info.identity = identity;
+        info.bitfield = 1;
+        info.nonce_trials_per_byte = from->nonce_trials_per_byte;
+        info.payload_length_extra_bytes = from->payload_length_extra_bytes;
+        payload = bm_pq_build_broadcast(&info, 2, message, message_len, (uint64_t)now + ttl_seconds, out_len);
+        if (payload != NULL)
+        {
+            *out_target = bm_pow_get_target(*out_len, ttl_seconds, from->nonce_trials_per_byte,
+                                            from->payload_length_extra_bytes);
+        }
+    }
+    if (identity != NULL)
+    {
+        OPENSSL_cleanse(identity, sizeof(*identity));
+    }
+    free(identity);
+    free(from);
+    free(message);
+    return payload;
+}
+#endif
+
+int bm_send_pipeline_send_broadcast_async(struct bm_pow_queue *pow_queue, bm_keyring_t *kr,
+                                          const char *from_address, const char *subject, const char *body,
+                                          uint64_t ttl_seconds, int64_t now, bm_send_done_fn done, void *user_data)
+{
+    size_t payload_len = 0;
+    uint64_t target = 0;
+    unsigned char *payload;
+#ifdef BM_HAVE_PQ
+    if (is_v5_address(from_address))
+    {
+        payload = build_pq_broadcast(kr, from_address, subject, body, ttl_seconds, now, &payload_len, &target);
+    }
+    else
+#endif
+    {
+        payload = build_legacy_broadcast(kr, from_address, subject, body, ttl_seconds, now, &payload_len, &target);
+    }
     if (payload == NULL)
     {
         return -1;

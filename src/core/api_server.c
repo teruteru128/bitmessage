@@ -37,6 +37,8 @@
 #ifdef BM_HAVE_PQ
 #include "pq_identity_store.h"
 #include "pq_keyring.h"
+#include "pq_pubkey_cache.h"
+#include "../pq/pq_object.h"
 #endif
 
 /* getpubkey要求自体のPoW難易度。誰が受け取るか分からない匿名objectのため、宛先固有の
@@ -271,8 +273,8 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
         int pq_rc = bm_pq_keyring_unlock(config->keyring, config->identity_db, address, passphrase, pq_now);
         if (pq_rc == 0 && config->object_pool_db != NULL)
         {
-            bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address,
-                                                  pq_now);
+            bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->identity_db, config->messages_db,
+                                                  config->keyring, address, pq_now);
         }
         return cJSON_CreateBool(pq_rc == 0);
     }
@@ -291,8 +293,8 @@ static cJSON *h_unlockAddress(const struct bm_api_server_config *config,
          * 積まれた状態だと「MSGオブジェクト数×既存unlockedアドレス数」の計算量になり、
          * 実運用で9時間以上RPCサーバーをブロックする問題が発覚したため。詳細はDESIGN.mdおよび
          * object_sync.hのbm_object_sync_backfill_trial_decryptコメント参照)。 */
-        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->messages_db, config->keyring, address,
-                                              (int64_t)time(NULL));
+        bm_object_sync_backfill_trial_decrypt(config->object_pool_db, config->identity_db, config->messages_db,
+                                              config->keyring, address, (int64_t)time(NULL));
     }
     return cJSON_CreateBool(rc == 0);
 }
@@ -562,9 +564,9 @@ static cJSON *h_unlockAddresses(const struct bm_api_server_config *config,
     {
         /* object_pool_dbが無い構成(api_server.hのとおりNULL可)では探す対象が無いので0件 */
         int n = (config->object_pool_db != NULL)
-                    ? bm_object_sync_backfill_trial_decrypt_addresses(config->object_pool_db, config->messages_db,
-                                                                      config->keyring, addresses, unlocked_count,
-                                                                      (int64_t)time(NULL))
+                    ? bm_object_sync_backfill_trial_decrypt_addresses(config->object_pool_db, config->identity_db,
+                                                                      config->messages_db, config->keyring, addresses,
+                                                                      unlocked_count, (int64_t)time(NULL))
                     : 0;
         cJSON_AddItemToObject(out, "backfilledMessages", cJSON_CreateNumber(n > 0 ? n : 0));
     }
@@ -1373,17 +1375,17 @@ static cJSON *h_cachePubkey(const struct bm_api_server_config *config,
  * 実測値と上限を入れているのは、CLIの--body-fileで大きなファイルを指定してしまった場合に
  * 「どれだけ削ればよいか」がその場で分かるようにするため。
  */
-static int check_subject_body_length(const char *subject, const char *body, char **out_error)
+static int check_subject_body_length(const char *subject, const char *body, size_t limit, char **out_error)
 {
     size_t total = strlen(subject) + strlen(body);
-    if (total <= BM_MAX_SUBJECT_PLUS_BODY_LEN)
+    if (total <= limit)
     {
         return 0;
     }
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Message is too long. subject + body = %zu bytes, but the maximum is %zu bytes.",
-             total, BM_MAX_SUBJECT_PLUS_BODY_LEN);
+             total, limit);
     *out_error = dup_cstr(msg);
     return -1;
 }
@@ -1628,6 +1630,66 @@ static cJSON *send_slot_end(struct api_send_slot *slot, int submit_rc, const cha
     return slot->placeholder;
 }
 
+#ifdef BM_HAVE_PQ
+/*
+ * §11 2026-11-05 項目57: h_sendMessageのgetpubkey自動要求のv5版。v4と違う点が2つある:
+ *   - 宛先が自分のidentityなら要求しない(send_pipelineが表の公開鍵を使う)
+ *   - 要求の前にプールを探す(bm_object_sync_resolve_pq_pubkey_from_pool。解決すれば要求は要らない)
+ */
+static void pq_request_pubkey_if_unknown(const struct bm_api_server_config *config, const char *to_address,
+                                         int64_t now)
+{
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char id[BM_PQV5_ID_LEN];
+    if (bm_pqv5_address_decode(to_address, &version, &stream, id) != 0)
+    {
+        return;
+    }
+    struct bm_pq_identity_row *row = malloc(sizeof(*row));
+    struct bm_pq_pubkey_parsed *known = malloc(sizeof(*known));
+    if (row == NULL || known == NULL || bm_pq_identity_store_load(config->identity_db, to_address, row) == 0
+        || bm_pq_pubkey_cache_lookup(config->identity_db, version, stream, id, known) == 0)
+    {
+        free(row);
+        free(known);
+        return;
+    }
+    free(row);
+    free(known);
+    if (config->object_pool_db != NULL
+        && bm_object_sync_resolve_pq_pubkey_from_pool(config->object_pool_db, config->identity_db, version, stream, id,
+                                                      now)
+               == 0)
+    {
+        return;
+    }
+
+    unsigned char tag[32];
+    bm_pqv5_derive_secret_and_tag(version, stream, id, NULL, tag);
+    if (bm_pq_pubkey_cache_has_recent_request(config->identity_db, tag, now, BM_GETPUBKEY_REQUEST_COOLDOWN_SECONDS))
+    {
+        return;
+    }
+    size_t len = 0;
+    unsigned char *payload =
+        bm_pq_build_getpubkey(version, stream, id, (uint64_t)now + BM_GETPUBKEY_REQUEST_TTL_SECONDS, &len);
+    if (payload == NULL)
+    {
+        return;
+    }
+    uint64_t target = bm_pow_get_target(len, BM_GETPUBKEY_REQUEST_TTL_SECONDS, BM_GETPUBKEY_NONCE_TRIALS_PER_BYTE,
+                                        BM_GETPUBKEY_PAYLOAD_LENGTH_EXTRA_BYTES);
+    /* PoWとcooldownの記録の順序はv4の経路のコメント参照。dedupキーはtag */
+    unsigned char key[1 + 32];
+    key[0] = 'H';
+    memcpy(key + 1, tag, 32);
+    bm_pow_queue_submit(config->pow_queue, payload, len, target, key, sizeof(key), getpubkey_request_done,
+                        config->broadcast_queue, now);
+    bm_pq_pubkey_cache_record_request(config->identity_db, version, stream, id, now);
+}
+#endif
+
 static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                                        const cJSON *params, char **out_error)
 {
@@ -1645,12 +1707,47 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                               "resolved from pubkey_cache; register it first via cachePubkey if needed.");
         return NULL;
     }
+    const char *send_failed_message =
+        "send failed (is fromAddress unlocked? is toAddress valid? if "
+        "the recipient's key was not yet cached, a getpubkey request was "
+        "broadcast automatically; retry sendMessage once it has been "
+        "received, or supply it directly via cachePubkey. Otherwise the PoW queue may be full)";
+    size_t length_limit = BM_MAX_SUBJECT_PLUS_BODY_LEN;
+#ifdef BM_HAVE_PQ
+    /* §11 2026-11-05 項目57: v5はv5としか送り合えない(send_pipeline.c)。送れないと分かっている
+     * メッセージのためにgetpubkeyを流さないよう、ここで断る */
+    int from_is_v5 = is_v5_address(from_address);
+    int to_is_v5 = is_v5_address(to_address);
+    if (from_is_v5 || to_is_v5)
+    {
+        if (!config->pq_enabled)
+        {
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return NULL;
+        }
+        if (from_is_v5 != to_is_v5)
+        {
+            *out_error = dup_cstr("a v5 address can only exchange messages with another v5 address");
+            return NULL;
+        }
+        length_limit = BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN;
+        send_failed_message = "send failed (is fromAddress unlocked? if the recipient's key was not yet known, a "
+                              "getpubkey request was broadcast automatically; retry sendMessage once it has been "
+                              "received. Otherwise the PoW queue may be full)";
+    }
+#endif
     /* 長さ検査はgetpubkey要求の自動送出より前に行う。順序を逆にすると、送れないと分かって
      * いるメッセージのためにネットワークへgetpubkeyを流してしまう */
-    if (check_subject_body_length(subject, body, out_error) != 0)
+    if (check_subject_body_length(subject, body, length_limit, out_error) != 0)
     {
         return NULL;
     }
+#ifdef BM_HAVE_PQ
+    if (to_is_v5)
+    {
+        pq_request_pubkey_if_unknown(config, to_address, (int64_t)time(NULL));
+    }
+#endif
 
     /* §11 getpubkey要求の自動化: pubkey_cacheに無ければ能動的にgetpubkeyオブジェクトを
      * 発行してネットワークへ流す(この呼び出し自体はまだ送れないので、以下のsend_pipeline
@@ -1713,12 +1810,7 @@ static cJSON *h_sendMessage(const struct bm_api_server_config *config,
                                                  config->messages_db, from_address, to_address, subject, body,
                                                  ttl_seconds, ack_stealth_level, NULL, next_resend_time, now,
                                                  api_send_done, slot);
-    return send_slot_end(slot, rc,
-                         "send failed (is fromAddress unlocked? is toAddress valid? if "
-                         "the recipient's key was not yet cached, a getpubkey request was "
-                         "broadcast automatically; retry sendMessage once it has been "
-                         "received, or supply it directly via cachePubkey. Otherwise the PoW queue may be full)",
-                         out_error);
+    return send_slot_end(slot, rc, send_failed_message, out_error);
 }
 
 /* sendBroadcast: [fromAddress, subject, body, ttlSeconds?]。§5.4/§11 */
@@ -1735,7 +1827,19 @@ static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
         *out_error = dup_cstr("sendBroadcast requires [fromAddress, subject, body, ttlSeconds?]");
         return NULL;
     }
-    if (check_subject_body_length(subject, body, out_error) != 0)
+    size_t length_limit = BM_MAX_SUBJECT_PLUS_BODY_LEN;
+#ifdef BM_HAVE_PQ
+    if (is_v5_address(from_address))
+    {
+        if (!config->pq_enabled)
+        {
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return NULL;
+        }
+        length_limit = BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN;
+    }
+#endif
+    if (check_subject_body_length(subject, body, length_limit, out_error) != 0)
     {
         return NULL;
     }
@@ -1755,6 +1859,38 @@ static cJSON *h_sendBroadcast(const struct bm_api_server_config *config,
                          out_error);
 }
 
+/*
+ * 購読・アドレス帳に登録するアドレスの検査。問題なければ0。
+ * §11 2026-11-04 項目55の段5: v5のアドレスも受け付ける(購読の受信はobject_sync.cの
+ * handle_incoming_broadcast_v6)。bm_address_decodeはversion 5を受け付けないので先に見分ける。
+ * §11 2026-11-05 項目57: アドレス帳でも使うよう関数にした。
+ */
+static int check_known_address(const struct bm_api_server_config *config, const char *address, char **out_error)
+{
+#ifdef BM_HAVE_PQ
+    if (is_v5_address(address))
+    {
+        if (!config->pq_enabled)
+        {
+            *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
+            return -1;
+        }
+        return 0;
+    }
+#else
+    (void)config;
+#endif
+    uint64_t version = 0;
+    uint64_t stream = 0;
+    unsigned char ripe[BM_RIPE_LEN];
+    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    {
+        *out_error = dup_cstr("invalid address");
+        return -1;
+    }
+    return 0;
+}
+
 /* getInboxMessages: [folder?](省略時は全件、'inbox'/'trash'等で絞り込み可) */
 static cJSON *h_addSubscription(const struct bm_api_server_config *config,
                                            const cJSON *params, char **out_error)
@@ -1767,24 +1903,8 @@ static cJSON *h_addSubscription(const struct bm_api_server_config *config,
         return NULL;
     }
 
-#ifdef BM_HAVE_PQ
-    /* §11 2026-11-04 項目55の段5: v5のアドレスも購読できる(受信はobject_sync.cの
-     * handle_incoming_broadcast_v6)。bm_address_decodeはversion 5を受け付けないので先に見分ける */
-    int is_v5 = is_v5_address(address);
-    if (is_v5 && !config->pq_enabled)
+    if (check_known_address(config, address, out_error) != 0)
     {
-        *out_error = dup_cstr(BM_API_PQ_DISABLED_ERROR);
-        return NULL;
-    }
-#else
-    int is_v5 = 0;
-#endif
-    uint64_t version = 0;
-    uint64_t stream = 0;
-    unsigned char ripe[BM_RIPE_LEN];
-    if (!is_v5 && bm_address_decode(address, &version, &stream, ripe) != 0)
-    {
-        *out_error = dup_cstr("invalid address");
         return NULL;
     }
 
@@ -1847,12 +1967,8 @@ static cJSON *h_addAddressBookEntry(const struct bm_api_server_config *config,
         return NULL;
     }
 
-    uint64_t version = 0;
-    uint64_t stream = 0;
-    unsigned char ripe[BM_RIPE_LEN];
-    if (bm_address_decode(address, &version, &stream, ripe) != 0)
+    if (check_known_address(config, address, out_error) != 0)
     {
-        *out_error = dup_cstr("invalid address");
         return NULL;
     }
 

@@ -14,6 +14,7 @@
 #include "messages_store.h"
 #ifdef BM_HAVE_PQ
 #include "pq_keyring.h"
+#include "pq_pubkey_cache.h"
 #endif
 
 static char *dup_bytes_as_cstr(const unsigned char *data, size_t len)
@@ -410,9 +411,9 @@ int bm_trial_decrypt_and_store_single(const struct bm_unlocked_identity *identit
 
 #ifdef BM_HAVE_PQ
 /* §11 2026-11-04 項目55の段5(trial_decrypt.h参照) */
-int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3 *db, const unsigned char *object,
-                                  size_t object_len, int64_t now, unsigned char **out_ack_payload,
-                                  size_t *out_ack_payload_len)
+int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3 *identity_db, sqlite3 *db,
+                                  const unsigned char *object, size_t object_len, int64_t now,
+                                  unsigned char **out_ack_payload, size_t *out_ack_payload_len)
 {
     struct bm_pq_msg_parsed *parsed = malloc(sizeof(*parsed)); /* 公開鍵だけで3KB超 */
     if (parsed == NULL)
@@ -454,6 +455,12 @@ int bm_pq_trial_decrypt_and_store(bm_keyring_t *kr, const char *address, sqlite3
         parsed->ack = NULL;
         parsed->ack_len = 0;
         rc = store_decoded_msg(db, object, object_len, &decoded, now, out_ack_payload, out_ack_payload_len);
+        if (rc == 0 && identity_db != NULL)
+        {
+            bm_pq_pubkey_cache_store_sender(identity_db, parsed->from_address_version, parsed->from_stream,
+                                            parsed->from_id, parsed->bitfield, parsed->from_sig_pk, parsed->from_kem_pk,
+                                            parsed->nonce_trials_per_byte, parsed->payload_length_extra_bytes, now);
+        }
     }
     free(from);
     bm_pq_msg_parsed_free(parsed);

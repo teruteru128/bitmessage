@@ -83,10 +83,19 @@ Bitmessage P2Pメッセージングプロトコルの、C言語によるフル�
 - **ログ**: 8段階のログレベル(`BM_LOG_LEVEL`)。systemd配下ではタイムスタンプをjournaldに任せる
 - **インストール**: `cmake --install`、systemdユニットファイル(`systemd/bitmessaged.service`)
 
-### 実験的: ポスト量子拡張のプロトタイプ
+### 実験的: ポスト量子拡張(v5アドレス)
 
-ML-DSA/ML-KEM(OpenSSL 3.5以降)を使ったアドレス・object形式の提案と、そのプロトタイプを
-`src/pq/`に置いている。daemon本体からは参照しておらず、ネットワーク上では使われない。
+ML-DSA/ML-KEMとEd25519/X25519を併用するアドレス・object形式の提案で、`src/pq/`とdaemon本体に
+実装している。OpenSSL 3.5以降でのビルドが必要で、有効にしない限り動かない(`[pq] enabled = 1`
+または`BM_PQ_ENABLED=1`)。他のノードはv5のobjectを理解しないまま中継するので、読めるのは有効にした
+ノードだけである。
+
+- これは提案であって、Bitmessageプロトコルの一部ではない。PyBitmessage等の他のクライアントはv5アドレスを
+  使えない。v5アドレスはv5アドレスとしかメッセージをやり取りできない。
+- objectがv4より約7.4KB大きいので、PoWに時間がかかる。msg 1通あたり数倍、getpubkeyへの応答は16コアで
+  30秒程度が目安。
+- v5で使えないもの: ランダムなアドレス生成、chan、`export-address`。
+
 詳細は [DESIGN-PQ.md](DESIGN-PQ.md)。
 
 ### スコープ外(既知の制限、backlog)
@@ -162,6 +171,7 @@ cp bitmessage.conf.example bitmessage.conf
 | `BM_TESTNET` | (mainnet) | `1`でtestnetへ切り替え |
 | `BM_NO_CONNECT` | (接続する) | `1`で実際のP2P接続を一切行わない(主にテスト用) |
 | `BM_MAX_OUTBOUND` | `3` | 同時に確立する最大outbound接続数 |
+| `BM_PQ_ENABLED` | (無効) | `1`で実験的なポスト量子拡張(v5アドレス)を有効にする。OpenSSL 3.5以降でのビルドが必要 |
 | `BM_API_PORT` | `8442` | JSON-RPC APIのlisten port |
 | `BM_INBOUND_PORT` | (無効) | Tor hidden service等からのinbound接続を受け付けるport。0または未設定で無効 |
 | `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | 新規アドレス作成時の既定PoW難易度(nonce trials/byte) |
@@ -217,6 +227,9 @@ CLI=./build-Debug/src/cli/bitmessage-cli
 $CLI create-address "my passphrase" 4 1 1 "label" "store passphrase"
 $CLI unlock BM-xxxxxxxx "store passphrase"
 $CLI list-addresses
+
+# BM_PQ_ENABLED=1のとき、version 5でポスト量子アドレスを作れる(上の「実験的」の節を参照)
+$CLI create-address "my passphrase" 5 1 1 "label" "store passphrase"
 
 # 相手の公開鍵が未取得でも送信すればgetpubkeyが自動発行される(その回の送信は失敗するので、
 # pubkeyが届いてから再送する)
@@ -276,7 +289,7 @@ src/
   infra/    P2Pネットワーク層(接続管理・object同期・Dandelion++・Tor連携)
   pow/      PoW計算エンジン
   cli/      CLIクライアント
-  pq/       ポスト量子拡張のプロトタイプ(daemon本体からは未参照)
+  pq/       ポスト量子拡張(v5のアドレスとobject)
 po/         bitmessage-cliのメッセージの訳(gettext)
 tests/      ctestベースのテストスイート
 seeds/      mainnetシード全滅時のフォールバック用ノードリスト(observed_nodes.txt)

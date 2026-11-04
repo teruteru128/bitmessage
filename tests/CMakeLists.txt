@@ -274,4 +274,9 @@ if(BM_ENABLE_PQ)
     add_executable(test_pq_receive test_pq_receive.c)
     target_link_libraries(test_pq_receive PRIVATE bm_core bm_infra bm_pow Threads::Threads)
     add_test(NAME pq_receive COMMAND test_pq_receive)
+
+    # §11 2026-11-05 項目57: v5の送信(send_pipeline)と2ノードの往復
+    add_executable(test_pq_send test_pq_send.c)
+    target_link_libraries(test_pq_send PRIVATE bm_core bm_infra bm_pow Threads::Threads)
+    add_test(NAME pq_send COMMAND test_pq_send)
 endif()

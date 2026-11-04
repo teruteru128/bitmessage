@@ -18,8 +18,13 @@
  * 8. deleteAddressでv5の行が消えること
  * 9. §11 2026-11-04 項目55の段5: unlockAddress・unlockAddresses(backfill=true)がプールの過去のv5 msgを
  *    読むこと、addSubscriptionがv5のアドレスを受け付けること
+ * 10. §11 2026-11-05 項目57: sendMessage: v5とv4以前の間は断ること、本文長の上限がv5の値であること、
+ *    鍵の分からない宛先にはgetpubkey(objectVersion 5)を自動で発行しcooldown中は繰り返さないこと、
+ *    プールにpubkeyがあれば発行しないこと、自分宛はobjectが返りbroadcast_queueへ積まれること。
+ *    sendBroadcast: v5から送れること。addAddressBookEntry: v5を受け付けること
  * 検証観点(フラグ無効): createDeterministicAddress(version 5)・unlockAddress・unlockAddresses・
- * addSubscriptionがv5について「post-quantum (v5) support is disabled」のエラーを返すこと。
+ * addSubscription・sendMessage・sendBroadcast・addAddressBookEntryがv5について
+ * 「post-quantum (v5) support is disabled」のエラーを返すこと。
  */
 
 #include <arpa/inet.h>
@@ -34,6 +39,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../src/common/broadcast_item.h"
+#include "../src/common/hash.h"
+#include "../src/common/message_limits.h"
+#include "../src/common/queue.h"
 #include "../src/core/api_server.h"
 #include "../src/core/identity_store.h"
 #include "../src/core/keyring.h"
@@ -41,6 +50,7 @@
 #include "../src/core/pq_identity_store.h"
 #include "../src/infra/object.h"
 #include "../src/infra/object_store.h"
+#include "../src/pow/pow_engine.h"
 #include "../src/pq/address_v5.h"
 #include "../src/pq/pq_object.h"
 
@@ -68,8 +78,9 @@ static int current_port;
 /* JSON-RPCを1本送り、応答全体(mallocした文字列)を返す */
 static char *rpc(const char *method, const char *params_json)
 {
-    char body[4096];
-    snprintf(body, sizeof(body), "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":%s,\"id\":1}", method,
+    size_t body_cap = strlen(method) + strlen(params_json) + 64; /* 本文長の上限のテストで256KB級になる */
+    char *body = malloc(body_cap);
+    snprintf(body, body_cap, "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":%s,\"id\":1}", method,
              params_json);
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct timeval tv = {30, 0};
@@ -82,6 +93,7 @@ static char *rpc(const char *method, const char *params_json)
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
     {
         close(sock);
+        free(body);
         return NULL;
     }
     char header[256];
@@ -93,8 +105,10 @@ static char *rpc(const char *method, const char *params_json)
         || write(sock, body, strlen(body)) != (ssize_t)strlen(body))
     {
         close(sock);
+        free(body);
         return NULL;
     }
+    free(body);
     size_t cap = 65536;
     size_t total = 0;
     char *buf = malloc(cap);
@@ -163,6 +177,32 @@ static size_t inbox_count(sqlite3 *messages_db)
     return count;
 }
 
+/* broadcast_queueに積まれたobjectを全部取り出して種類別に数えておき、指定のtype/versionの件数を返して
+ * その分を0に戻す(他の種類の件数は次の呼び出しのために残す) */
+static bm_queue_t broadcast_queue;
+static int queued_counts[4][8];
+
+static int drain_queue(int type, uint64_t version)
+{
+    void *raw = NULL;
+    /* pow_queue==NULLなのでPoWはrpcの中で同期的に終わり、ここで読むときに積んでいるスレッドはいない。
+     * bm_queue_popは空だと待つので先にheadを見る */
+    while (broadcast_queue.head != NULL && bm_queue_pop(&broadcast_queue, &raw))
+    {
+        struct bm_broadcast_item *item = raw;
+        struct bm_object_header hdr;
+        if (bm_object_parse_header(item->object, item->object_len, &hdr) == 0 && hdr.object_type < 4 && hdr.version < 8)
+        {
+            queued_counts[hdr.object_type][hdr.version]++;
+        }
+        free(item->object);
+        free(item);
+    }
+    int count = queued_counts[type][version];
+    queued_counts[type][version] = 0;
+    return count;
+}
+
 static void server_start(struct server *s, sqlite3 *db, sqlite3 *messages_db, sqlite3 *object_pool_db, bm_keyring_t *kr,
                          int port, int pq_enabled)
 {
@@ -174,6 +214,7 @@ static void server_start(struct server *s, sqlite3 *db, sqlite3 *messages_db, sq
     s->config.identity_db = db;
     s->config.messages_db = messages_db;
     s->config.object_pool_db = object_pool_db;
+    s->config.broadcast_queue = &broadcast_queue;
     s->config.default_nonce_trials_per_byte = 1000;
     s->config.default_payload_length_extra_bytes = 1000;
     s->config.pq_enabled = pq_enabled;
@@ -213,6 +254,7 @@ int main(void)
     }
     bm_keyring_t kr;
     bm_keyring_init(&kr);
+    bm_queue_init(&broadcast_queue);
 
     static struct server enabled;
     server_start(&enabled, db, messages_db, pool_db, &kr, TEST_PORT_ENABLED, 1);
@@ -353,6 +395,113 @@ int main(void)
     CHECK(contains(resp, "invalid address"), "addSubscription still refuses an invalid address");
     free(resp);
 
+    /* 10. 送信(項目57)。ここでv5とv4はどちらもunlock済み */
+    char send_params[1024];
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",3600,1]", v5, v4);
+    resp = rpc("sendMessage", send_params);
+    CHECK(contains(resp, "can only exchange messages with another v5"), "sendMessage refuses v5 to v4");
+    free(resp);
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",3600,1]", v4, v5);
+    resp = rpc("sendMessage", send_params);
+    CHECK(contains(resp, "can only exchange messages with another v5"), "sendMessage refuses v4 to v5");
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_GETPUBKEY, 5) == 0 && drain_queue(BM_OBJECT_GETPUBKEY, 4) == 0,
+          "a refused send does not issue a getpubkey");
+
+    /* 本文長: v5の上限を1byte超えると、まだv4の上限内でも断る(PoWを回す前に) */
+    {
+        size_t body_len = BM_PQ_MAX_SUBJECT_PLUS_BODY_LEN + 1;
+        CHECK(body_len < BM_MAX_SUBJECT_PLUS_BODY_LEN, "sanity: the v5 limit is below the v4 limit");
+        char *big_params = malloc(body_len + 256);
+        char *body_text = malloc(body_len + 1);
+        memset(body_text, 'a', body_len);
+        body_text[body_len] = '\0';
+        snprintf(big_params, body_len + 256, "[\"%s\",\"%s\",\"\",\"%s\",3600,1]", v5, other_address, body_text);
+        resp = rpc("sendMessage", big_params);
+        CHECK(contains(resp, "Message is too long"), "sendMessage applies the v5 length limit");
+        free(resp);
+        snprintf(big_params, body_len + 256, "[\"%s\",\"\",\"%s\",3600]", v5, body_text);
+        resp = rpc("sendBroadcast", big_params);
+        CHECK(contains(resp, "Message is too long"), "sendBroadcast applies the v5 length limit");
+        free(resp);
+        free(body_text);
+        free(big_params);
+    }
+
+    /* 鍵の分からない宛先: 送信は失敗し、getpubkeyが1本だけ出る(otherの鍵は上のbackfillで読んだmsgから
+     * 保存済みなので、別のアドレスを使う) */
+    static struct bm_pqv5_identity stranger;
+    CHECK(bm_pqv5_identity_generate_deterministic("nobody we have heard from", 1, 0, 1, &stranger) == 0, "generate");
+    char *stranger_address = bm_pqv5_address_encode(5, 1, stranger.id);
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",3600,1]", v5, stranger_address);
+    resp = rpc("sendMessage", send_params);
+    CHECK(contains(resp, "getpubkey request was broadcast automatically"), "sendMessage fails while the key is unknown");
+    CHECK(!contains(resp, "cachePubkey"), "the error does not suggest cachePubkey, which takes v4 keys");
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_GETPUBKEY, BM_PQ_GETPUBKEY_OBJECT_VERSION) == 1, "a v5 getpubkey is issued");
+    resp = rpc("sendMessage", send_params);
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_GETPUBKEY, BM_PQ_GETPUBKEY_OBJECT_VERSION) == 0, "no second getpubkey during the cooldown");
+    free(stranger_address);
+
+    /* backfillで読んだmsgの差出人にはgetpubkey無しで送れる(項目57) */
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",60,1]", v5, other_address);
+    resp = rpc("sendMessage", send_params);
+    CHECK(contains(resp, "inventoryHash"), "the sender of a backfilled msg can be replied to without a getpubkey");
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_GETPUBKEY, BM_PQ_GETPUBKEY_OBJECT_VERSION) == 0, "no getpubkey for a known sender");
+    CHECK(drain_queue(BM_OBJECT_MSG, BM_PQ_MSG_OBJECT_VERSION) == 1, "the reply reached the broadcast queue");
+
+    /* プールにpubkeyがある宛先: getpubkeyを出さない */
+    {
+        static struct bm_pqv5_identity relayed;
+        CHECK(bm_pqv5_identity_generate_deterministic("relayed before asking", 1, 0, 1, &relayed) == 0, "generate");
+        struct bm_pq_sender_info relayed_info;
+        relayed_info.identity = &relayed;
+        relayed_info.bitfield = 1;
+        relayed_info.nonce_trials_per_byte = 1000;
+        relayed_info.payload_length_extra_bytes = 1000;
+        size_t payload_len = 0;
+        int64_t relayed_expires = (int64_t)time(NULL) + 3600;
+        unsigned char *payload = bm_pq_build_pubkey(&relayed_info, (uint64_t)relayed_expires, &payload_len);
+        unsigned char *pubkey_object = calloc(1, 8 + payload_len);
+        memcpy(pubkey_object + 8, payload, payload_len);
+        free(payload);
+        unsigned char hash[32] = {0x66};
+        CHECK(bm_object_store_insert(pool_db, hash, BM_OBJECT_PUBKEY, 1, pubkey_object, 8 + payload_len, relayed_expires,
+                                     (int64_t)time(NULL))
+                  == 0,
+              "put a relayed pubkey in the pool");
+        free(pubkey_object);
+        char *relayed_address = bm_pqv5_address_encode(5, 1, relayed.id);
+        snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",60,1]", v5, relayed_address);
+        resp = rpc("sendMessage", send_params);
+        CHECK(contains(resp, "inventoryHash"), "sendMessage uses the pubkey found in the pool");
+        free(resp);
+        CHECK(drain_queue(BM_OBJECT_GETPUBKEY, BM_PQ_GETPUBKEY_OBJECT_VERSION) == 0,
+              "no getpubkey is issued for an address whose pubkey is in the pool");
+        free(relayed_address);
+    }
+
+    /* 自分宛: objectが返り、broadcast_queueへ積まれる */
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"%s\",\"s\",\"b\",60,1]", v5, v5);
+    resp = rpc("sendMessage", send_params);
+    CHECK(contains(resp, "inventoryHash"), "sendMessage to our own v5 address succeeds");
+    free(resp);
+    /* 直前のrelayed宛と合わせて2本(自分宛はackを作らない。relayed宛のackはmsgの中に埋め込まれるだけ) */
+    CHECK(drain_queue(BM_OBJECT_MSG, BM_PQ_MSG_OBJECT_VERSION) == 2, "both v5 msgs reached the broadcast queue");
+
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"s\",\"b\",60]", v5);
+    resp = rpc("sendBroadcast", send_params);
+    CHECK(contains(resp, "inventoryHash"), "sendBroadcast from a v5 address succeeds");
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_BROADCAST, BM_PQ_BROADCAST_OBJECT_VERSION) == 1, "the v5 broadcast reached the queue");
+
+    snprintf(send_params, sizeof(send_params), "[\"%s\",\"pq contact\"]", other_address);
+    resp = rpc("addAddressBookEntry", send_params);
+    CHECK(contains(resp, "\"result\":true"), "addAddressBookEntry accepts a v5 address");
+    free(resp);
+
     /* 8. deleteAddress */
     snprintf(params, sizeof(params), "[\"%s\"]", v5);
     resp = rpc("deleteAddress", params);
@@ -386,10 +535,23 @@ int main(void)
     resp = rpc("addSubscription", params);
     CHECK(contains(resp, "post-quantum (v5) support is disabled"), "addSubscription refuses v5 when the flag is off");
     free(resp);
+    resp = rpc("addAddressBookEntry", params);
+    CHECK(contains(resp, "post-quantum (v5) support is disabled"), "addAddressBookEntry refuses v5 when the flag is off");
+    free(resp);
+    snprintf(params, sizeof(params), "[\"%s\",\"%s\",\"s\",\"b\",60,1]", v4, missing);
+    resp = rpc("sendMessage", params);
+    CHECK(contains(resp, "post-quantum (v5) support is disabled"), "sendMessage refuses v5 when the flag is off");
+    free(resp);
+    snprintf(params, sizeof(params), "[\"%s\",\"s\",\"b\",60]", missing);
+    resp = rpc("sendBroadcast", params);
+    CHECK(contains(resp, "post-quantum (v5) support is disabled"), "sendBroadcast refuses v5 when the flag is off");
+    free(resp);
+    CHECK(drain_queue(BM_OBJECT_GETPUBKEY, BM_PQ_GETPUBKEY_OBJECT_VERSION) == 0, "nothing is sent with the flag off");
     server_stop(&disabled);
 
     free(other_address);
     free(missing);
+    bm_queue_destroy(&broadcast_queue);
     bm_keyring_destroy(&kr);
     sqlite3_close(db);
     sqlite3_close(messages_db);

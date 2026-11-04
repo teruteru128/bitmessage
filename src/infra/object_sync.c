@@ -80,6 +80,12 @@
 /* 自分のpubkeyで応答する際のobjectのTTL(§11 getpubkey要求の自動化)。PyBitmessageの
  * pubkey告知の目安(数週間)を参考にした固定値。 */
 #define BM_PUBKEY_RESPONSE_TTL_SECONDS (28 * 24 * 60 * 60)
+/* §11 2026-11-05 項目57: v5の応答は7日(DESIGN-PQ.md §9.3)。28日だとPoWが期待141秒(§8.4)で、その間
+ * pow_queueの他のジョブ(送信を含む)が待たされる。PoWはTTLにほぼ比例するので期待約36秒になる。
+ * 全ノードが保持する7.8KBのobjectの滞留も短くなる。代わりに、要求を受けたときにアドレスの持ち主が
+ * オフラインでも応答できる期間が短くなるが、既に相手の鍵を持つノードには影響しない
+ * (msgが公開鍵を運ぶので、一度やり取りすれば鍵は残る) */
+#define BM_PQ_PUBKEY_RESPONSE_TTL_SECONDS (7 * 24 * 60 * 60)
 
 /* §11 2026-09-25 項目46: version timestampの時計ずれで切断したときのWARNを、この間隔に
  * 1回へ間引く(間に黙った回数は次のWARNに含める)。時計のずれた相手が数秒おきに再接続
@@ -501,14 +507,14 @@ static void handle_incoming_getpubkey_v5(struct bm_object_sync_ctx *ctx, const s
     info.bitfield = 1;
     info.nonce_trials_per_byte = pub->nonce_trials_per_byte;
     info.payload_length_extra_bytes = pub->payload_length_extra_bytes;
-    uint64_t expires_time = (uint64_t)now + BM_PUBKEY_RESPONSE_TTL_SECONDS;
+    uint64_t expires_time = (uint64_t)now + BM_PQ_PUBKEY_RESPONSE_TTL_SECONDS;
     size_t payload_len = 0;
     unsigned char *payload = bm_pq_build_pubkey(&info, expires_time, &payload_len);
     if (payload == NULL)
     {
         goto out;
     }
-    uint64_t target = bm_pow_get_target(payload_len, BM_PUBKEY_RESPONSE_TTL_SECONDS, pub->nonce_trials_per_byte,
+    uint64_t target = bm_pow_get_target(payload_len, BM_PQ_PUBKEY_RESPONSE_TTL_SECONDS, pub->nonce_trials_per_byte,
                                         pub->payload_length_extra_bytes);
 
     /* dedupキーはtag(version・stream・idから決まる)。v4の形(version+stream+ripe)ではidが32byteの
@@ -583,8 +589,8 @@ static void handle_incoming_broadcast_v6(struct bm_object_sync_ctx *ctx, const s
         {
             continue; /* v4以前の購読 */
         }
-        if (bm_pq_trial_decrypt_broadcast_and_store(ctx->messages_db, msg->payload, msg->length, version, stream, id,
-                                                    now)
+        if (bm_pq_trial_decrypt_broadcast_and_store(ctx->identity_db, ctx->messages_db, msg->payload, msg->length,
+                                                    version, stream, id, now)
             == 0)
         {
             bm_log_info("[object_sync] broadcast decrypted (subscribed address %s)\n", subs[i].address);
@@ -1112,8 +1118,9 @@ static void handle_object(struct bm_object_sync_ctx *ctx, const struct bm_fd_dat
         {
             if (ctx->pq_enabled)
             {
-                decrypted = bm_pq_trial_decrypt_and_store(ctx->keyring, NULL, ctx->messages_db, msg->payload,
-                                                          msg->length, now0, &ack_payload, &ack_payload_len);
+                decrypted = bm_pq_trial_decrypt_and_store(ctx->keyring, NULL, ctx->identity_db, ctx->messages_db,
+                                                          msg->payload, msg->length, now0, &ack_payload,
+                                                          &ack_payload_len);
             }
         }
         else
@@ -2084,8 +2091,8 @@ void *bm_object_sync_broadcast_thread(void *arg)
     return NULL;
 }
 
-int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *messages_db, bm_keyring_t *kr,
-                                           const char *address_filter, int64_t now)
+int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *identity_db, sqlite3 *messages_db,
+                                           bm_keyring_t *kr, const char *address_filter, int64_t now)
 {
     /* §11 2026-08-31 address_filterが指定されていれば、そのidentity1件だけに絞って
      * bm_trial_decrypt_and_store_singleを使う(bm_trial_decrypt_and_store経由でkeyring全体を
@@ -2097,8 +2104,8 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
      * 共通にした。1件だけのリストとして渡す。 */
     if (address_filter != NULL)
     {
-        return bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db, messages_db, kr, &address_filter, 1,
-                                                               now);
+        return bm_object_sync_backfill_trial_decrypt_addresses(object_pool_db, identity_db, messages_db, kr,
+                                                               &address_filter, 1, now);
     }
 
     unsigned char(*hashes)[32] = NULL;
@@ -2123,9 +2130,11 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
          * このkeyringにv5が無ければ(フラグ無効のときも)すぐ戻る */
         if (rc != 0)
         {
-            rc = bm_pq_trial_decrypt_and_store(kr, NULL, messages_db, payload, payload_len, now, NULL, NULL);
+            rc = bm_pq_trial_decrypt_and_store(kr, NULL, identity_db, messages_db, payload, payload_len, now, NULL,
+                                               NULL);
         }
 #else
+        (void)identity_db;
         (void)now;
 #endif
         if (rc == 0)
@@ -2145,10 +2154,13 @@ int bm_object_sync_backfill_trial_decrypt(sqlite3 *object_pool_db, sqlite3 *mess
 }
 
 /* §11 2026-09-28 項目48(object_sync.h参照) */
-int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *messages_db,
-                                                    bm_keyring_t *kr, const char *const *addresses,
-                                                    size_t address_count, int64_t now)
+int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sqlite3 *identity_db,
+                                                    sqlite3 *messages_db, bm_keyring_t *kr,
+                                                    const char *const *addresses, size_t address_count, int64_t now)
 {
+#ifndef BM_HAVE_PQ
+    (void)identity_db;
+#endif
     unsigned char(*hashes)[32] = NULL;
     size_t count = 0;
     if (bm_object_store_list_hashes_by_type(object_pool_db, BM_OBJECT_MSG, &hashes, &count) != 0)
@@ -2237,8 +2249,8 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
 #ifdef BM_HAVE_PQ
         for (size_t j = 0; j < pq_count && !matched; j++)
         {
-            matched = bm_pq_trial_decrypt_and_store(kr, pq_addresses[j], messages_db, payload, payload_len, now, NULL,
-                                                    NULL)
+            matched = bm_pq_trial_decrypt_and_store(kr, pq_addresses[j], identity_db, messages_db, payload, payload_len,
+                                                    now, NULL, NULL)
                       == 0;
         }
 #endif
@@ -2263,3 +2275,43 @@ int bm_object_sync_backfill_trial_decrypt_addresses(sqlite3 *object_pool_db, sql
     }
     return decrypted_count;
 }
+
+#ifdef BM_HAVE_PQ
+/* §11 2026-11-05 項目57(object_sync.h参照) */
+int bm_object_sync_resolve_pq_pubkey_from_pool(sqlite3 *object_pool_db, sqlite3 *identity_db, uint64_t address_version,
+                                               uint64_t stream, const unsigned char id[32], int64_t now)
+{
+    unsigned char tag[32];
+    bm_pqv5_derive_secret_and_tag(address_version, stream, id, NULL, tag);
+    /* tagは共通ヘッダの直後。bm_pq_parse_pubkeyと同じく正規のvarintの長さで計算する */
+    size_t tag_offset = 8 + 8 + 4 + bm_varint_size(BM_PQ_PUBKEY_OBJECT_VERSION) + bm_varint_size(stream);
+
+    unsigned char(*hashes)[32] = NULL;
+    size_t count = 0;
+    if (bm_object_store_list_hashes_by_tag(object_pool_db, BM_OBJECT_PUBKEY, tag_offset, tag, &hashes, &count) != 0)
+    {
+        return -1;
+    }
+    struct bm_pq_pubkey_parsed *parsed = malloc(sizeof(*parsed)); /* 3KB超 */
+    int rc = -1;
+    for (size_t i = 0; i < count && rc != 0 && parsed != NULL; i++)
+    {
+        unsigned char *object = NULL;
+        size_t object_len = 0;
+        if (bm_object_store_get(object_pool_db, hashes[i], &object, &object_len) != 0)
+        {
+            continue;
+        }
+        if (bm_pq_parse_pubkey(object, object_len, address_version, stream, id, parsed) == 0
+            && bm_pq_pubkey_cache_upsert(identity_db, id, parsed, now) == 0)
+        {
+            bm_pq_pubkey_cache_clear_request(identity_db, tag);
+            rc = 0;
+        }
+        free(object);
+    }
+    free(parsed);
+    free(hashes);
+    return rc;
+}
+#endif

@@ -95,11 +95,20 @@ following is implemented and has been confirmed to work on the real network.
 - **Logging**: eight log levels (`BM_LOG_LEVEL`). Under systemd, timestamps are left to journald
 - **Installation**: `cmake --install`, systemd unit file (`systemd/bitmessaged.service`)
 
-### Experimental: post-quantum extension prototype
+### Experimental: post-quantum extension (v5 addresses)
 
-`src/pq/` holds a proposal for address and object formats using ML-DSA/ML-KEM (OpenSSL 3.5 or later)
-and a prototype of it. The daemon does not use it, and it is not used on the network. See
-[DESIGN-PQ.md](DESIGN-PQ.md) for details.
+A proposed address and object format using ML-DSA/ML-KEM together with Ed25519/X25519, implemented in
+`src/pq/` and the daemon. It needs a build with OpenSSL 3.5 or later and is off unless you enable it
+(`[pq] enabled = 1`, or `BM_PQ_ENABLED=1`). Other nodes relay v5 objects without understanding them, so
+only nodes that enable it can read them.
+
+- This is a proposal, not part of the Bitmessage protocol: PyBitmessage and other clients cannot use v5
+  addresses. A v5 address can only exchange messages with another v5 address.
+- Objects are about 7.4 KB larger than v4, so PoW takes longer: expect a few times longer per message, and
+  on the order of half a minute on 16 cores to answer a getpubkey request.
+- Not available for v5: random address generation, chans, and `export-address`.
+
+See [DESIGN-PQ.md](DESIGN-PQ.md) for details.
 
 ### Out of scope (known limitations, backlog)
 
@@ -178,6 +187,7 @@ variable > `bitmessage.conf` > default):
 | `BM_TESTNET` | (mainnet) | `1` switches to testnet |
 | `BM_NO_CONNECT` | (connect) | `1` makes no P2P connections at all (mainly for tests) |
 | `BM_MAX_OUTBOUND` | `3` | Maximum number of concurrent outbound connections |
+| `BM_PQ_ENABLED` | (disabled) | `1` enables the experimental post-quantum extension (v5 addresses). Requires a build with OpenSSL 3.5 or later |
 | `BM_API_PORT` | `8442` | Listen port of the JSON-RPC API |
 | `BM_INBOUND_PORT` | (disabled) | Port accepting inbound connections from a Tor hidden service etc. Disabled when 0 or unset |
 | `BM_DEFAULT_NONCE_TRIALS_PER_BYTE` | `1000` | Default PoW difficulty for new addresses (nonce trials per byte) |
@@ -233,6 +243,9 @@ CLI=./build-Debug/src/cli/bitmessage-cli
 $CLI create-address "my passphrase" 4 1 1 "label" "store passphrase"
 $CLI unlock BM-xxxxxxxx "store passphrase"
 $CLI list-addresses
+
+# With BM_PQ_ENABLED=1, version 5 creates a post-quantum address (see "Experimental" above)
+$CLI create-address "my passphrase" 5 1 1 "label" "store passphrase"
 
 # Sending to someone whose public key you don't have yet sends a getpubkey request automatically
 # (that send fails; send again once the pubkey has arrived)
@@ -292,7 +305,7 @@ src/
   infra/    P2P network layer (connection management, object sync, Dandelion++, Tor integration)
   pow/      PoW engine
   cli/      CLI client
-  pq/       Post-quantum extension prototype (not used by the daemon)
+  pq/       Post-quantum extension (v5 addresses and objects)
 po/         Translations of bitmessage-cli messages (gettext)
 tests/      ctest-based test suite
 seeds/      Fallback node list for when all mainnet seeds are down (observed_nodes.txt)

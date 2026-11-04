@@ -211,3 +211,51 @@ int bm_object_store_list_hashes_by_type(sqlite3 *db, int object_type,
     *out_count = n;
     return 0;
 }
+
+int bm_object_store_list_hashes_by_tag(sqlite3 *db, int object_type, size_t tag_offset, const unsigned char tag[32],
+                                       unsigned char (**out_hashes)[32], size_t *out_count)
+{
+    static const char *SQL = "SELECT hash FROM objects WHERE object_type = ?1 AND substr(payload, ?2, 32) = ?3 "
+                             "ORDER BY expires_time DESC;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &stmt, NULL) != SQLITE_OK)
+    {
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, object_type);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)tag_offset + 1); /* substrは1始まり */
+    sqlite3_bind_blob(stmt, 3, tag, 32, SQLITE_TRANSIENT);
+
+    size_t cap = 4;
+    size_t count = 0;
+    unsigned char(*hashes)[32] = malloc(sizeof(*hashes) * cap);
+    int rc;
+    while (hashes != NULL && (rc = sqlite3_step(stmt)) == SQLITE_ROW)
+    {
+        if (sqlite3_column_bytes(stmt, 0) != 32)
+        {
+            continue;
+        }
+        if (count == cap)
+        {
+            cap *= 2;
+            unsigned char(*grown)[32] = realloc(hashes, sizeof(*hashes) * cap);
+            if (grown == NULL)
+            {
+                free(hashes);
+                hashes = NULL;
+                break;
+            }
+            hashes = grown;
+        }
+        memcpy(hashes[count++], sqlite3_column_blob(stmt, 0), 32);
+    }
+    sqlite3_finalize(stmt);
+    if (hashes == NULL)
+    {
+        return -1;
+    }
+    *out_hashes = hashes;
+    *out_count = count;
+    return 0;
+}

@@ -61,3 +61,9 @@ virtual_port = 8444
 # 場合はここに自分のonionアドレス("xxxx.onion")を書く(PyBitmessageのkeys.dat
 # onionhostname相当、BM_ONION_ADDRESS)。controlと両方設定した場合はこちらが優先される
 onion_address =
+
+[pq]
+# enabled = 1 で実験的なポスト量子拡張(v5アドレス)を有効にします(既定0、BM_PQ_ENABLED)。
+# OpenSSL 3.5以降でビルドしたdaemonでだけ有効になります。無効でもv5のobjectの中継は変わりません。
+# 提案段階の形式で、PyBitmessage等の他のクライアントはv5アドレスを使えません(DESIGN-PQ.md)
+enabled = 0
