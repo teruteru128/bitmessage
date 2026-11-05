@@ -5,3 +5,4 @@ build-*/
 compile_commands.json
 bitmessage.conf
 watchdog_daemon_a.sh
+*.log
