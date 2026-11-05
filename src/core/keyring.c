@@ -80,8 +80,8 @@ static int derive_kek(const char *passphrase, const unsigned char salt[BM_IDENTI
 }
 
 /* out = nonce(12) || ciphertext(pt_len) || tag(16)。§7.1。
- * §11 2026-11-04 項目55の段3: 以前は平文32byte固定のaes256gcm_wrapだったが、v5の成分seed
- * (160byte)も同じKEKでラップするため任意長にした(keyring_internal.h)。32byteの鍵は
+ * §11 2026-11-04 項目55の段3: 以前は平文32byte固定のaes256gcm_wrapだったが、v5のseed
+ * (64byte)も同じKEKでラップするため任意長にした(keyring_internal.h)。32byteの鍵は
  * 下のaes256gcm_wrapが従来通りこれを呼ぶので、既存の行の形式は変わらない。 */
 int bm_keyring_internal_wrap(const unsigned char kek[32], const unsigned char *aad, size_t aad_len,
                              const unsigned char *plaintext, size_t pt_len, unsigned char *out)

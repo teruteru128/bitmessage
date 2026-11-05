@@ -307,7 +307,7 @@ static void bench_primitives(void)
 
 /*
  * 実際に使う2経路(決定性・ランダム)のアドレス生成コスト。
- * 決定性はKEM鍵ペアをX-Wing仕様通りseedから毎回作り直し、ランダムはX25519だけを
+ * 決定性はKEM鍵ペアをX-Wing仕様通りseedから毎回作り直し、ランダムはKEM seedだけを
  * 引き直す(address_v5.hの説明)。候補数は幾何分布なので単発ではぶれるため、
  * 1候補あたりのコストと、そこから計算した期待所要時間を併記する。
  */
@@ -361,7 +361,7 @@ static void bench_v5_random(const char *label, int null_bytes)
 
 /*
  * 参考測定: 探索で片方の鍵ペアだけ / id計算だけを回した場合の1候補あたりコスト。
- * 採用した方式(決定性=両鍵、ランダム=X25519のみ)の位置づけを示すための比較対象。
+ * 採用した方式(決定性=両鍵、ランダム=KEM鍵のみ)の位置づけを示すための比較対象。
  * 決定性側で「安いKEM鍵だけ回す」最適化を撤回した経緯はDESIGN-PQ.md §4.2.1。
  */
 static void bench_whole_keypair_redraw(const struct bm_pqv5_identity *base)
@@ -398,7 +398,7 @@ static void bench_whole_keypair_redraw(const struct bm_pqv5_identity *base)
         bm_pqv5_calc_id(base->sig_pk, pk, id);
     }
     per = (now_sec() - t0) * 1e3 / iters;
-    printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) KEM鍵まるごと(撤回案)", "-", "-",
+    printf("  %-32s %6s %9s  %6.3f ms/候補  期待%8.1f ms\n", "(参考) KEM鍵まるごと", "-", "-",
            per, per * 256.0);
 
     t0 = now_sec();
@@ -437,7 +437,7 @@ static void bench_addresses(struct bm_pqv5_identity *out_v5, struct bm_generated
     bench_v5_deterministic("v5 決定性 null=0 (探索なし)", 0, &tmp);
     bench_v5_deterministic("v5 決定性 null=1 (両鍵、v4と同じ)", BM_PQV5_DEFAULT_NULL_BYTES, out_v5);
     bench_v5_deterministic("v5 決定性 null=2 (両鍵)", 2, &tmp);
-    bench_v5_random("v5 ランダム null=1 (X25519のみ)", BM_PQV5_DEFAULT_NULL_BYTES);
+    bench_v5_random("v5 ランダム null=1 (KEM鍵のみ)", BM_PQV5_DEFAULT_NULL_BYTES);
     bench_whole_keypair_redraw(out_v5);
 
     printf("\n");

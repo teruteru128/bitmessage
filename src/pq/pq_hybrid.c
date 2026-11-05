@@ -169,23 +169,23 @@ static int x25519_shared(const unsigned char sk[X25519_LEN], const unsigned char
 
 /* --- ハイブリッド署名 --- */
 
-int bm_pqv5_sig_set_mldsa(const unsigned char xi[32], unsigned char *out_pk, unsigned char *out_sk)
+static int sig_set_mldsa(const unsigned char xi[32], unsigned char *out_pk, unsigned char *out_sk)
 {
     return bm_pq_sig_keypair_from_seed(PQV5_SIG_ALG, xi, out_pk, out_sk);
 }
 
-int bm_pqv5_sig_set_ed25519(const unsigned char seed[32], unsigned char *out_pk, unsigned char *out_sk)
+static int sig_set_ed25519(const unsigned char seed[32], unsigned char *out_pk, unsigned char *out_sk)
 {
     memcpy(out_sk + MLDSA_SK_LEN, seed, ED25519_SK_LEN);
     return ed25519_public_from_seed(seed, out_pk + MLDSA_PK_LEN);
 }
 
-int bm_pqv5_kem_set_mlkem(const unsigned char coins[64], unsigned char *out_pk, unsigned char *out_sk)
+static int kem_set_mlkem(const unsigned char coins[64], unsigned char *out_pk, unsigned char *out_sk)
 {
     return bm_pq_kem_keypair_from_seed(PQV5_KEM_ALG, coins, out_pk, out_sk);
 }
 
-int bm_pqv5_kem_set_x25519(const unsigned char sk32[32], unsigned char *out_pk, unsigned char *out_sk)
+static int kem_set_x25519(const unsigned char sk32[32], unsigned char *out_pk, unsigned char *out_sk)
 {
     memcpy(out_sk + MLKEM_SK_LEN, sk32, X25519_LEN);
     return x25519_public_from_private(sk32, out_pk + MLKEM_PK_LEN);
@@ -201,8 +201,8 @@ int bm_pqv5_sig_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
     {
         return -1;
     }
-    if (bm_pqv5_sig_set_mldsa(expanded, out_pk, out_sk) == 0 &&
-        bm_pqv5_sig_set_ed25519(expanded + 32, out_pk, out_sk) == 0)
+    if (sig_set_mldsa(expanded, out_pk, out_sk) == 0 &&
+        sig_set_ed25519(expanded + 32, out_pk, out_sk) == 0)
     {
         rc = 0;
     }
@@ -271,18 +271,17 @@ int bm_pqv5_kem_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
      * 前64byteがML-KEMの(d,z)、後32byteがX25519の秘密鍵。
      * §5.2 2026-11-05 当初はSHAKE128だった(draft-04までの形、-05でSHAKE256へ変更)。
      * 同じseedから違う鍵ができるので、他のX-Wing実装と相互運用できなかった。
-     * ただしdraftが秘密鍵を32byteのseedのまま保持するのに対し、この実装は
-     * 展開後の形(ML-KEM sk || X25519 sk)で保持する。アドレス由来鍵のように
-     * 「seedから毎回導出する」用途と、identityのように「保存した鍵を使う」用途の
-     * 両方があり、後者で毎回ML-KEMのKeyGenをやり直すのを避けるため。 */
+     * 保存するのはseed(draftの復号鍵)だが、呼び出し側へは展開後の形(ML-KEM sk || X25519 sk)で
+     * 返す。使うたびにML-KEMのKeyGenをやり直すのを避けるためで、draftの§5.5.1がキャッシュとして
+     * 認めている形(実装の外へは出さない)。 */
     unsigned char expanded[96];
     int rc = -1;
     if (bm_pq_shake256(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
     {
         return -1;
     }
-    if (bm_pqv5_kem_set_mlkem(expanded, out_pk, out_sk) == 0 &&
-        bm_pqv5_kem_set_x25519(expanded + 64, out_pk, out_sk) == 0)
+    if (kem_set_mlkem(expanded, out_pk, out_sk) == 0 &&
+        kem_set_x25519(expanded + 64, out_pk, out_sk) == 0)
     {
         rc = 0;
     }

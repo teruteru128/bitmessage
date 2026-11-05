@@ -6,7 +6,7 @@
  * BM_HAVE_PQのビルドでのみコンパイルされる。bm_keyring_t(keyring.h)のpq_headに
  * v4以前とは別のリストとして持ち、ロックはv4以前と共通のkr->lockを使う。
  *
- * 秘密鍵の持ち方: identity.dbには成分seed(160byte)だけをラップして保存し、unlockしても
+ * 秘密鍵の持ち方: identity.dbにはseed(64byte)だけをラップして保存し、unlockしても
  * seedを復号するだけで、展開済みの秘密鍵(sig_sk 4064byte・kem_sk 2432byte)は作らない。
  * 初めて秘密鍵が要るとき(bm_pq_keyring_get_secret_keys)に展開してキャッシュする(遅延生成)。
  * 展開は1 identityあたり0.4〜0.6ms(DESIGN-PQ.md §8.1.1)だが、v4で実際にあった規模
@@ -30,8 +30,8 @@ struct bm_unlocked_pq_identity
     unsigned char tag[32]; /* bm_pqv5_derive_secret_and_tagの後半。v5のgetpubkeyはこれで引く */
     unsigned char sig_pk[BM_PQV5_SIG_PK_LEN];
     unsigned char kem_pk[BM_PQV5_KEM_PK_LEN];
-    struct bm_pqv5_component_seeds seeds; /* 秘密 */
-    int expanded;                         /* 1ならsig_sk/kem_skが有効 */
+    struct bm_pqv5_seeds seeds; /* 秘密 */
+    int expanded;               /* 1ならsig_sk/kem_skが有効 */
     unsigned char sig_sk[BM_PQV5_SIG_SK_LEN];
     unsigned char kem_sk[BM_PQV5_KEM_SK_LEN];
     uint64_t nonce_trials_per_byte;
@@ -55,7 +55,7 @@ struct bm_pq_identity_public
 };
 
 /*
- * 生成したv5 identity(成分seedを含む)を、passphraseから行ごとのscryptで作ったKEKでラップして
+ * 生成したv5 identity(seedを含む)を、passphraseから行ごとのscryptで作ったKEKでラップして
  * identity.dbへ保存する(v4のbm_keyring_create_identityと同じ規則)。out_addressには
  * "BM-..."を書く(NULL可)。同じアドレスが既にあれば失敗する。成功時0。
  */
@@ -66,7 +66,7 @@ int bm_pq_keyring_create_identity(sqlite3 *db, const struct bm_pqv5_identity *id
 
 /*
  * identity.dbのv5の行を読み、公開鍵とアドレスのidの整合を確かめ、passphraseから求めたKEKで
- * 成分seedを復号してkeyringへ追加する。既にunlock済みなら何もせず0。passphrase誤り・改竄
+ * seedを復号してkeyringへ追加する。既にunlock済みなら何もせず0。passphrase誤り・改竄
  * (GCMタグ不一致・公開鍵とidの不一致)・アドレス不在は全て非0。
  */
 int bm_pq_keyring_unlock(bm_keyring_t *kr, sqlite3 *db, const char *address, const char *passphrase,
@@ -77,7 +77,7 @@ bool bm_pq_keyring_find_by_address(bm_keyring_t *kr, const char *address, struct
 bool bm_pq_keyring_find_by_tag(bm_keyring_t *kr, const unsigned char tag[32], struct bm_pq_identity_public *out);
 
 /*
- * unlock済みのv5 identityの展開済み秘密鍵をout_*へ写す(どちらもNULL可)。未展開なら成分seedから
+ * unlock済みのv5 identityの展開済み秘密鍵をout_*へ写す(どちらもNULL可)。未展開ならseedから
  * 展開し、展開した公開鍵が保存済みのものと一致することを確かめてからキャッシュする。
  * 未unlock・展開の失敗・公開鍵の不一致は非0。out_*は使い終わったらOPENSSL_cleanseすること。
  */

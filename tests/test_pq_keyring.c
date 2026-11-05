@@ -2,7 +2,7 @@
  * §11 2026-11-04 項目55の段3: v5(ポスト量子)identityのidentity.dbへの保存
  * (core/pq_identity_store.c)とkeyring(core/pq_keyring.c)のテスト。DESIGN-PQ.md §9.3。
  *
- * 背景: v5の秘密鍵は展開済みの鍵ブロブ(6.5KB)ではなく成分seed(160byte)だけを、v4以前と
+ * 背景: v5の秘密鍵は展開済みの鍵ブロブ(6.5KB)ではなくseed(64byte)だけを、v4以前と
  * 同じKEK(行ごとのscrypt、AES-256-GCM、AAD=アドレス)でラップして保存する。公開鍵は平文で
  * 保存し、unlock時にアドレスのidと照合する。展開済みの秘密鍵は初めて使うときに作る。
  *
@@ -123,7 +123,8 @@ int main(void)
     CHECK(memcmp(row->id, gen.id, BM_PQV5_ID_LEN) == 0 && memcmp(row->sig_pk, gen.sig_pk, BM_PQV5_SIG_PK_LEN) == 0
               && memcmp(row->kem_pk, gen.kem_pk, BM_PQV5_KEM_PK_LEN) == 0,
           "stored public keys and id");
-    CHECK(memmem(row->wrapped_seeds, BM_PQ_IDENTITY_WRAPPED_SEEDS_LEN, gen.seeds.mldsa_xi, 32) == NULL,
+    CHECK(memmem(row->wrapped_seeds, BM_PQ_IDENTITY_WRAPPED_SEEDS_LEN, gen.seeds.sig_seed, 32) == NULL
+              && memmem(row->wrapped_seeds, BM_PQ_IDENTITY_WRAPPED_SEEDS_LEN, gen.seeds.kem_seed, 32) == NULL,
           "seeds are not stored in plaintext");
     free(row);
 

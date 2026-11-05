@@ -48,9 +48,9 @@
  *   決定性: 署名鍵nonce(偶数側)とKEM鍵nonce(奇数側)を**両方**2ずつ進め、両方の鍵を
  *           作り直す。KEM鍵はX-Wing仕様通り32byteのseed 1本からML-KEMとX25519の
  *           両方を導出する(seedを分解しない)。約0.5 ms/候補 → 期待127ms(§8.2)。
- *   ランダム: 署名鍵とML-KEM鍵は最初に1回だけ引き、**X25519鍵だけ**を毎回引き直す。
- *           乱数から作る以上seedの圧縮表現を保つ必要が無く、一番安い成分だけを
- *           回せる。1本あたり実測15.5ms。
+ *   ランダム: 署名鍵は最初に1回だけ引き、**KEM seedだけ**を毎回引き直す(v4と同じ)。
+ *           期待39ms。§4.2.1 2026-11-05 当初はX25519鍵だけを回していたが、KEM鍵を
+ *           seed 1本で表せるようにするためにやめた(DESIGN-PQ.md §4.2.1)。
  *
  * 決定性側で「安いKEM鍵だけを回す」最適化は一度入れたが撤回した(節約83msに対し、
  * 同じアドレスのpubkey告知PoWが141秒。加えて、同じstart_nonceでnull_bytesだけ
@@ -69,27 +69,21 @@
 #define BM_PQV5_LABEL_DETERMINISTIC "BitmessagePQ-v5-deterministic"
 
 /*
- * §11 2026-11-04 項目55の段3: v5の秘密鍵を「展開済みの鍵ブロブ」ではなく「成分seed」として
- * 保存するための表現(DESIGN-PQ.md §9.3)。4成分それぞれのKeyGenの入力そのもの:
- *   mldsa_xi     ML-DSA-65のξ(FIPS 204 KeyGen_internalの入力)
- *   ed25519_seed Ed25519の32byte seed(sig_skの末尾32byteと同じ値)
- *   mlkem_coins  ML-KEM-768の(d,z)(FIPS 203 KeyGen_internalの入力)
- *   x25519_sk    X25519の秘密鍵(kem_skの末尾32byteと同じ値)
- * 決定性生成の鍵は32byteのseed 2本から再現できるが、ランダム生成はML-KEMとX25519を独立な
- * 乱数から作る(上の説明)のでKEM側を1本に畳めない。両方の経路を1つの形式で扱うため、
- * 1本のseedへ畳む前の成分で持つ。ML-DSAのξとML-KEMの(d,z)は展開済みの鍵ブロブから
- * 復元できないので、生成の時点で記録しておく必要がある。
+ * v5の秘密鍵を「展開済みの鍵ブロブ」ではなく、32byteのseed 2本として保存するための表現
+ * (DESIGN-PQ.md §9.3)。KEM側はX-Wing draftの復号鍵そのもので、署名側も同じく1本のseedから
+ * 全成分を展開する。決定性生成・ランダム生成のどちらの鍵もこの形で表せる。
  * 全てunsigned charの配列なので、構造体のままmemcpyしても詰め物は入らない
- * (BM_PQV5_COMPONENT_SEEDS_LENと一致することをaddress_v5.cでstatic_assertしている)。
+ * (BM_PQV5_SEEDS_LENと一致することをaddress_v5.cでstatic_assertしている)。
+ *
+ * §9.3 2026-11-05 以前は4成分のseedを分けて160byteで持っていた。ランダム生成がML-KEM鍵とX25519鍵を
+ * 独立に作っていて、KEM側を1本に畳めなかったため。ランダム生成をKEM seedごと回す形にして不要になった。
  */
-#define BM_PQV5_COMPONENT_SEEDS_LEN 160
+#define BM_PQV5_SEEDS_LEN 64
 
-struct bm_pqv5_component_seeds
+struct bm_pqv5_seeds
 {
-    unsigned char mldsa_xi[32];
-    unsigned char ed25519_seed[32];
-    unsigned char mlkem_coins[64];
-    unsigned char x25519_sk[32];
+    unsigned char sig_seed[BM_PQV5_SEED_LEN];
+    unsigned char kem_seed[BM_PQV5_SEED_LEN];
 };
 
 struct bm_pqv5_identity
@@ -105,9 +99,9 @@ struct bm_pqv5_identity
      * アドレスを完全に再現できる(v4のstruct bm_generated_addressと同じ役割) */
     uint64_t sig_nonce;
     uint64_t kem_nonce;
-    /* §11 2026-11-04 項目55の段3: 上の4本の鍵を作った成分seed(生成の全経路で埋まる)。
+    /* 上の4本の鍵を作ったseed(生成の全経路で埋まる)。
      * 秘密情報なので、使い終わったら構造体ごとOPENSSL_cleanseすること */
-    struct bm_pqv5_component_seeds seeds;
+    struct bm_pqv5_seeds seeds;
 };
 
 /* id = SHA3-256(sig_pk || kem_pk)。v3/v4のripeと同じく公開鍵だけのハッシュ */
@@ -141,32 +135,24 @@ char *bm_pqv5_address_encode(uint64_t version, uint64_t stream, const unsigned c
 int bm_pqv5_address_decode(const char *address, uint64_t *out_version, uint64_t *out_stream,
                             unsigned char out_id[BM_PQV5_ID_LEN]);
 
-/* 2本のseedからidentityを組み立てる(idまで計算する)。成功時0 */
+/*
+ * 2本のseed(identity.dbに保存したもの)からidentityを組み立てる。4本の鍵とidを計算し、
+ * seedsもそのまま写す(sig_nonce/kem_nonceは0)。成功時0。
+ */
 int bm_pqv5_identity_from_seeds(uint64_t stream,
                                  const unsigned char sig_seed[BM_PQV5_SEED_LEN],
                                  const unsigned char kem_seed[BM_PQV5_SEED_LEN],
                                  struct bm_pqv5_identity *out);
 
-/*
- * §11 2026-11-04 項目55の段3: 成分seed(identity.dbに保存したもの)からidentityを組み立て直す。
- * 4本の鍵とidを計算し、seedsもそのまま写す(sig_nonce/kem_nonceは0)。成功時0。
- */
-int bm_pqv5_identity_from_component_seeds(uint64_t stream, const struct bm_pqv5_component_seeds *seeds,
-                                          struct bm_pqv5_identity *out);
-
-/*
- * CSPRNGから新規identityを作る。X25519鍵だけを引き直して探索する(上記の説明参照)。
- * 生成されるKEM秘密鍵はX-Wingの32byte seed表現を持たない(ML-KEM鍵とX25519鍵が
- * 独立な乱数由来になるため)が、鍵ブロブとしては決定性生成のものと同じ形。成功時0。
- */
+/* CSPRNGから新規identityを作る。KEM seedだけを引き直して探索する(上記の説明参照)。成功時0 */
 int bm_pqv5_identity_generate_random(uint64_t stream, int null_bytes,
                                       struct bm_pqv5_identity *out);
 
 /*
  * パスフレーズ由来の決定性生成(v4と同じ2 nonce構成)。
  *   seed(n) = SHA3-512(BM_PQV5_LABEL_DETERMINISTIC || 0x00 || passphrase || varint(n))[0:32]
- * 署名鍵はstart_nonce(偶数側)で固定し、KEM鍵のnonce(start_nonce+1、奇数側)を
- * 2ずつ進めてidの先頭null_bytesバイトが0x00になるまで探索する
+ * 署名鍵のnonce(start_nonce、偶数側)とKEM鍵のnonce(start_nonce+1、奇数側)を両方
+ * 2ずつ進めて、idの先頭null_bytesバイトが0x00になるまで探索する
  * (null_bytes=0なら探索なし)。成功時0。
  */
 int bm_pqv5_identity_generate_deterministic(const char *passphrase, uint64_t stream,

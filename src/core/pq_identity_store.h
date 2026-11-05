@@ -6,7 +6,7 @@
  * (DESIGN-PQ.md §9.3)。BM_HAVE_PQのビルドでのみコンパイルされる。
  *
  * v4以前のidentities表とは別の表(pq_identities)にした。鍵の形が全く違い(公開鍵だけで
- * 3200byte、秘密は成分seed 160byte)、identities表の固定長の列(65byteの公開鍵・60byteの
+ * 3200byte、秘密はseed 64byte)、identities表の固定長の列(65byteの公開鍵・60byteの
  * ラップ済み鍵2本)へ押し込むと、既存の全ての読み手がv5の行を誤って解釈しうるため。
  * 秘密鍵はこのモジュールを常にラップ済みの状態でのみ通る(identity_store.hと同じ規律。
  * 平文のseedの扱いはpq_keyring.cの責務)。
@@ -24,7 +24,7 @@
 #include "identity_store.h"
 #include "keyring_internal.h"
 
-#define BM_PQ_IDENTITY_WRAPPED_SEEDS_LEN (BM_PQV5_COMPONENT_SEEDS_LEN + BM_KEYRING_WRAP_OVERHEAD)
+#define BM_PQ_IDENTITY_WRAPPED_SEEDS_LEN (BM_PQV5_SEEDS_LEN + BM_KEYRING_WRAP_OVERHEAD)
 
 struct bm_pq_identity_row
 {

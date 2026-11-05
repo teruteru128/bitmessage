@@ -49,7 +49,7 @@ int bm_pq_keyring_create_identity(sqlite3 *db, const struct bm_pqv5_identity *id
     unsigned char kek[32];
     if (bm_keyring_internal_new_scrypt_kek(passphrase, row->kdf_salt, row->kdf_params, kek) == 0
         && bm_keyring_internal_wrap(kek, (const unsigned char *)address, strlen(address),
-                                    (const unsigned char *)&identity->seeds, BM_PQV5_COMPONENT_SEEDS_LEN,
+                                    (const unsigned char *)&identity->seeds, BM_PQV5_SEEDS_LEN,
                                     row->wrapped_seeds)
                == 0
         && bm_pq_identity_store_insert(db, row) == 0)
@@ -232,7 +232,7 @@ int bm_pq_keyring_get_secret_keys(bm_keyring_t *kr, const char *address, unsigne
     /* 未展開: seedの写しを取ってロックを外し、展開(0.4〜0.6ms)はロックの外で行う。
      * keyring全体を書き込みロックで握ったまま鍵生成すると、その間ほかの全スレッドの
      * 鍵の参照が止まるため */
-    struct bm_pqv5_component_seeds seeds = cur->seeds;
+    struct bm_pqv5_seeds seeds = cur->seeds;
     uint64_t stream = cur->stream;
     pthread_rwlock_unlock(&kr->lock);
 
@@ -243,7 +243,7 @@ int bm_pq_keyring_get_secret_keys(bm_keyring_t *kr, const char *address, unsigne
         return -1;
     }
     int rc = -1;
-    if (bm_pqv5_identity_from_component_seeds(stream, &seeds, expanded) != 0)
+    if (bm_pqv5_identity_from_seeds(stream, seeds.sig_seed, seeds.kem_seed, expanded) != 0)
     {
         goto out;
     }

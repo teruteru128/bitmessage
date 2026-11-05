@@ -285,7 +285,7 @@ static int test_address_derived_kem_key(void)
  */
 /*
  * §11 2026-09-18 id先頭0x00の探索(既定null_bytes=1)を、決定性・ランダムの両経路で見る。
- * 経路によって引き直す鍵が違う(決定性=KEM鍵ペアまるごと、ランダム=X25519だけ)ので、
+ * 経路によって引き直す鍵が違う(決定性=両方の鍵、ランダム=KEM鍵だけ)ので、
  * どちらも条件を満たすidを返すこと、決定性側は再現すること、アドレス長が53文字に
  * 揃うことを確認する。
  */
@@ -342,7 +342,7 @@ static int test_null_byte_search(void)
     }
     free(address);
 
-    /* ランダム生成側(X25519だけを引き直す経路) */
+    /* ランダム生成側(KEM seedだけを引き直す経路) */
     if (bm_pqv5_identity_generate_random(1, BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0 ||
         bm_pqv5_identity_generate_random(1, BM_PQV5_DEFAULT_NULL_BYTES, &b) != 0)
     {
@@ -495,53 +495,16 @@ static int test_multiple_addresses_do_not_share_nonces(void)
 }
 
 /*
- * §11 2026-11-04 項目55の段3: 成分seedを記録するために鍵の作り方を「32byte seed→
- * bm_pqv5_*_keypair_from_seed」から「32byte seed→成分seedへ展開→成分から鍵」へ変えた。
- * 決定性アドレスはパスフレーズから再現できることが前提なので、鍵が1bitでも変わると
- * 既存のアドレスが作り直せなくなる。書き換えていない旧経路(keypair_from_seed)と
- * 同じ鍵になることを確かめる(このテストスイートには固定の期待値が無いため)。
- */
-static int test_component_seeds_match_old_path(void)
-{
-    for (int trial = 0; trial < 4; trial++)
-    {
-        unsigned char sig_seed[BM_PQV5_SEED_LEN];
-        unsigned char kem_seed[BM_PQV5_SEED_LEN];
-        RAND_bytes(sig_seed, sizeof(sig_seed));
-        RAND_bytes(kem_seed, sizeof(kem_seed));
-
-        static struct bm_pqv5_identity a;
-        static unsigned char sig_pk[BM_PQV5_SIG_PK_LEN], sig_sk[BM_PQV5_SIG_SK_LEN];
-        static unsigned char kem_pk[BM_PQV5_KEM_PK_LEN], kem_sk[BM_PQV5_KEM_SK_LEN];
-        if (bm_pqv5_identity_from_seeds(1, sig_seed, kem_seed, &a) != 0 ||
-            bm_pqv5_sig_keypair_from_seed(sig_seed, sig_pk, sig_sk) != 0 ||
-            bm_pqv5_kem_keypair_from_seed(kem_seed, kem_pk, kem_sk) != 0)
-        {
-            fprintf(stderr, "FAIL: key generation for the old-path comparison\n");
-            return -1;
-        }
-        if (memcmp(a.sig_pk, sig_pk, sizeof(sig_pk)) != 0 || memcmp(a.sig_sk, sig_sk, sizeof(sig_sk)) != 0 ||
-            memcmp(a.kem_pk, kem_pk, sizeof(kem_pk)) != 0 || memcmp(a.kem_sk, kem_sk, sizeof(kem_sk)) != 0)
-        {
-            fprintf(stderr, "FAIL: identity_from_seeds differs from the old keypair_from_seed path\n");
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/*
- * §11 2026-11-04 項目55の段3: 生成した(ランダム・決定性)identityの成分seedから組み立て直すと、
- * 4本の鍵とidが完全に一致すること。identity.dbには成分seedだけを保存するので、これが
- * 崩れるとunlockしたidentityが元のアドレスと別の鍵になる。あわせて、Ed25519のseedと
- * X25519の秘密鍵が鍵ブロブの末尾と一致すること(pq_hybrid.hの鍵ブロブの構成どおり)。
+ * identity.dbにはseed 2本だけを保存するので、生成した(ランダム・決定性)identityのseedから
+ * 組み立て直すと4本の鍵とidが完全に一致すること。崩れるとunlockしたidentityが元のアドレスと
+ * 別の鍵になる。
  */
 static int check_roundtrip(const struct bm_pqv5_identity *orig, const char *what)
 {
     static struct bm_pqv5_identity r;
-    if (bm_pqv5_identity_from_component_seeds(orig->stream, &orig->seeds, &r) != 0)
+    if (bm_pqv5_identity_from_seeds(orig->stream, orig->seeds.sig_seed, orig->seeds.kem_seed, &r) != 0)
     {
-        fprintf(stderr, "FAIL: %s: from_component_seeds failed\n", what);
+        fprintf(stderr, "FAIL: %s: from_seeds failed\n", what);
         return -1;
     }
     if (memcmp(r.id, orig->id, BM_PQV5_ID_LEN) != 0 || memcmp(r.sig_pk, orig->sig_pk, BM_PQV5_SIG_PK_LEN) != 0 ||
@@ -550,28 +513,33 @@ static int check_roundtrip(const struct bm_pqv5_identity *orig, const char *what
         memcmp(r.kem_sk, orig->kem_sk, BM_PQV5_KEM_SK_LEN) != 0 || r.stream != orig->stream ||
         r.version != BM_PQV5_ADDRESS_VERSION)
     {
-        fprintf(stderr, "FAIL: %s: identity rebuilt from component seeds differs\n", what);
-        return -1;
-    }
-    if (memcmp(orig->sig_sk + BM_PQV5_SIG_SK_LEN - 32, orig->seeds.ed25519_seed, 32) != 0 ||
-        memcmp(orig->kem_sk + BM_PQV5_KEM_SK_LEN - 32, orig->seeds.x25519_sk, 32) != 0)
-    {
-        fprintf(stderr, "FAIL: %s: Ed25519/X25519 seeds are not the tails of the key blobs\n", what);
+        fprintf(stderr, "FAIL: %s: identity rebuilt from seeds differs\n", what);
         return -1;
     }
     return 0;
 }
 
-static int test_component_seeds_roundtrip(void)
+/*
+ * §4.2.1 2026-11-05 ランダム生成のKEM鍵が、X-Wing draftの鍵生成(seed 1本から全成分を展開)で
+ * 作られたものであること。ML-KEM鍵とX25519鍵を別々に作る形へ戻すとここで落ちる。
+ * bm_pqv5_kem_keypair_from_seed自体はtest_pq_cryptoがdraftのベクタで検証している。
+ */
+static int test_seeds_roundtrip(void)
 {
     static struct bm_pqv5_identity a;
+    static unsigned char kem_pk[BM_PQV5_KEM_PK_LEN], kem_sk[BM_PQV5_KEM_SK_LEN];
     if (bm_pqv5_identity_generate_random(1, BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0 ||
         check_roundtrip(&a, "random") != 0)
     {
         return -1;
     }
-    if (bm_pqv5_identity_generate_deterministic("component seeds roundtrip", 1, 0, BM_PQV5_DEFAULT_NULL_BYTES,
-                                                &a) != 0 ||
+    if (bm_pqv5_kem_keypair_from_seed(a.seeds.kem_seed, kem_pk, kem_sk) != 0 ||
+        memcmp(kem_pk, a.kem_pk, sizeof(kem_pk)) != 0 || memcmp(kem_sk, a.kem_sk, sizeof(kem_sk)) != 0)
+    {
+        fprintf(stderr, "FAIL: random KEM key is not the X-Wing key of its seed\n");
+        return -1;
+    }
+    if (bm_pqv5_identity_generate_deterministic("seeds roundtrip", 1, 0, BM_PQV5_DEFAULT_NULL_BYTES, &a) != 0 ||
         check_roundtrip(&a, "deterministic") != 0)
     {
         return -1;
@@ -613,11 +581,7 @@ int main(void)
     {
         return 1;
     }
-    if (test_component_seeds_match_old_path() != 0)
-    {
-        return 1;
-    }
-    if (test_component_seeds_roundtrip() != 0)
+    if (test_seeds_roundtrip() != 0)
     {
         return 1;
     }
