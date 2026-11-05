@@ -3,6 +3,67 @@
 このプロジェクトの利用者向けリリースノート。[Keep a Changelog](https://keepachangelog.com/ja/1.0.0/)
 に緩く準拠する。開発の詳しい経緯・設計判断の背景(「なぜ」)は [DESIGN.md](DESIGN.md) を参照。
 
+## [1.4.0] - 2026-11-05
+
+### 互換性に関する注意
+
+- **`sendMessage` APIと`send-message` CLIの引数が変わった。** `toPubEncryptionHex`を廃止したので、
+  以降の引数の位置が1つ前へずれる(新: `[fromAddress, toAddress, subject, body, ttlSeconds?,
+  ackStealthLevel?]`)。v1.3までの呼び方のままだと、公開鍵の文字列が件名として扱われるので、呼び出し側を
+  必ず直すこと。渡された鍵が宛先と対応するかを検証しておらず、無関係の鍵で暗号化できてしまう問題への対応。
+  相手の鍵は`cachePubkey`で登録するか、自動のgetpubkey要求で取得する
+- **ビルドに必要なものが増えた。** libmicrohttpd・cJSON・pkg-config(JSON-RPC APIのHTTPとJSONの処理を
+  これらへ移行した)。gettextは任意
+- **daemonのログとusageが英語になった。** ログの文字列で検索している運用は見直しが必要
+- User Agentを`/BitmessageC:…/`から`/CBitmessage:…/`へ変更
+- `unlockAllAddresses`は10,000件を超えるidentityを断るようになった(受信msgごとの試行復号がネットワーク
+  スレッドを止めるため)。必要なアドレスだけを`unlockAddresses`でunlockする
+- `sendMessage`/`sendBroadcast`に本文長の上限を設けた(件名と本文の合計で2^18−500byte)。超えるとPoWの前に
+  エラーを返す
+
+### 追加
+
+- **実験的: ポスト量子拡張(v5アドレス)。** ML-DSA-65+Ed25519の署名とML-KEM-768+X25519(X-Wing)の鍵
+  カプセル化を使う、提案段階の形式。OpenSSL 3.5以降でのビルドと`[pq] enabled = 1`(`BM_PQ_ENABLED=1`)が
+  必要で、既定では無効。v5同士でmsg・broadcastを送受信できる。PyBitmessage等の他のクライアントはv5を
+  使えない(中継はする)。詳細は[DESIGN-PQ.md](DESIGN-PQ.md)
+- 数千件規模の鍵の運用: `import-keys-dat`(keys.datの一括インポート、`importAddressesBulk`)、`unlock-all`
+  (`unlockAllAddresses`)、`unlock-addresses`(`unlockAddresses`、指定したアドレスの一括unlock)、共通の
+  passphraseから導出するvault方式(2段階KDF)
+- WIFの`import-address`/`export-address`、`set-label`(`setAddressLabel`)、`fix-labels-from-keys-dat`
+- アドレス帳(`addAddressBookEntry`/`deleteAddressBookEntry`/`listAddressBookEntries`)、
+  `trash-message`(`trashMessage`)
+- v3アドレスを同じ鍵のv4へ移す`convert-to-v4`/`convert-all-v3-to-v4`。移行後もv3の要求には応答する
+- `send-message`/`send-broadcast`の`--body-file`(本文をファイルや標準入力から渡す)
+- `bitmessage-cli`のメッセージの日本語訳(gettext)、READMEの英語版と日本語版、`--version`/`--help`
+- ログレベルを8段階に拡張(`BM_LOG_LEVEL`)
+
+### 変更
+
+- 送信を接続ごとのキュー+EPOLLOUT駆動へ作り替え、getdataへの応答を保留+補充方式にした。遅い相手1本に
+  ネットワークスレッド全体が止められない
+- PoWを専用のワーカースレッドで行うようにした。getpubkeyへの自応答や送信のPoWの間も、ピア接続とAPIの
+  他の呼び出しは止まらない。`sendMessage`の応答の形は変わらない(PoWの完了後に返る)
+- 自分宛・chan宛の送信はackを作らず、再送の対象にせず、すぐinboxへ入れる(本家と同じ)
+- `unlockAddress`後の過去msgの読み直しを、unlockした1件だけに限定した(keyring全体を試すと数千件の運用で
+  APIが何時間も止まった)。`unlockAllAddresses`は読み直しをしない
+- 期限切れobjectの受信とGCに本家と同じ猶予期間を入れた
+- onionpeerの自己announceを、最初のピアが接続されてから行うようにした
+
+### 修正
+
+- **自応答のpubkeyとbroadcastのbitfieldにBITFIELD_DOESACKが立っていなかった。** 本家の送信者はこの場合
+  ackを付けないので、この鍵で送られたmsgにackが返らなかった。修正前に作った応答は再利用せず作り直す
+- **Dandelion++のstemのタイムアウトで、持っていないobjectのinvを無条件に流していた**
+- `peer_registry`のマルチスレッド競合によるdouble free
+- 同じ鍵のv3とv4のアドレスが共存すると、getpubkeyへの応答を取り違えていた
+- versionメッセージのaddrFromがephemeralポートを漏らしていた(0.0.0.0を送るようにした)
+- outbound接続数が`max_outbound`未満で頭打ちになっていた
+- JSON文字列の非ASCII文字の二重エンコード
+- `BM_TOR_CONTROL`を使う新規インストールでseedの投入が空振りしていた
+- 接続開始時のハング(connect_initial)
+- 時計のずれた相手による切断WARNを間引き、切断ログに理由を出すようにした
+
 ## [1.3.0] - 2026-08-26
 
 ### 追加

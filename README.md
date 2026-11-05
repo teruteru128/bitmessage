@@ -17,9 +17,8 @@ changes in each release in [CHANGELOG.md](CHANGELOG.md). These documents are wri
 
 ## Status
 
-The latest release is v1.3.0 (2026-08-26). master also contains later changes (bulk unlock,
-v3-to-v4 migration, `--body-file`, Japanese/English CLI messages, etc., described below). The
-following is implemented and has been confirmed to work on the real network.
+The latest release is v1.4.0 (2026-11-05). The following is implemented and has been confirmed to work
+on the real network, except for the experimental post-quantum extension described below.
 
 ### Protocol and cryptography
 
@@ -107,6 +106,8 @@ only nodes that enable it can read them.
 - Objects are about 7.4 KB larger than v4, so PoW takes longer: expect a few times longer per message, and
   on the order of half a minute on 16 cores to answer a getpubkey request.
 - Not available for v5: random address generation, chans, and `export-address`.
+- Not yet used on the real network. Two-way messaging and relaying through nodes that do not understand v5
+  (including PyBitmessage) were tested on an isolated network.
 
 See [DESIGN-PQ.md](DESIGN-PQ.md) for details.
 
@@ -315,3 +316,10 @@ DESIGN-LOG.md   Dated development history
 DESIGN-PQ.md    Post-quantum extension proposal
 CHANGELOG.md    Changes in each release
 ```
+
+## Contact
+
+Bitmessage: `BM-2cUcXwGMhcqfbbjrGE1Cxb92SBdQerarL6`
+
+Release announcements on Bitmessage are sent from this address. An announcement from any other address is not
+from this project.
