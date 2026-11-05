@@ -6,7 +6,7 @@
  * DESIGN-PQ.md §5(暗号プリミティブ)・§6。
  *
  *   署名: ML-DSA-65 + Ed25519 (両方の検証が通って初めて有効)
- *   KEM : X-Wing (ML-KEM-768 + X25519、draft-connolly-cfrg-xwing-kem の combiner)
+ *   KEM : X-Wing (ML-KEM-768 + X25519、draft-connolly-cfrg-xwing-kem-11に準拠)
  *   AEAD: AES-256-GCM (鍵はKEMの共有秘密そのもの、nonceは全0固定)
  *
  * 「PQ単独ではなくハイブリッド」にしている理由はDESIGN-PQ.md §3.3を参照
@@ -38,13 +38,17 @@
 void bm_pq_sha3_256(const unsigned char *data, size_t len, unsigned char out[32]);
 void bm_pq_sha3_512(const unsigned char *data, size_t len, unsigned char out[64]);
 int bm_pq_shake128(const unsigned char *data, size_t len, unsigned char *out, size_t out_len);
+int bm_pq_shake256(const unsigned char *data, size_t len, unsigned char *out, size_t out_len);
 
 /* --- ハイブリッド署名 --- */
 
 /*
  * seed(32byte)から署名鍵ペアを決定性生成する。内部で
  *   SHAKE128(seed, 64) = xi_MLDSA(32) || ed25519_seed(32)
- * に展開してから各アルゴリズムのKeyGenへ渡す(X-Wingの鍵展開と同じ作法)。成功時0。
+ * に展開してから各アルゴリズムのKeyGenへ渡す。成功時0。
+ * X-Wingと同じ「seed 1本を展開する」作法だが、このハイブリッド署名はこのプロジェクト独自の
+ * 構成なのでdraftの範囲外。§5.2 2026-11-05 X-Wing側はSHAKE256へ揃えたが、draftのChange logが
+ * 「この出力長ならSHAKE128と256で安全性は変わらない」としているので、こちらは変えていない。
  */
 int bm_pqv5_sig_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
                                    unsigned char out_pk[BM_PQV5_SIG_PK_LEN],
@@ -90,6 +94,15 @@ int bm_pqv5_verify(const unsigned char *msg, size_t msg_len,
 int bm_pqv5_kem_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
                                    unsigned char out_pk[BM_PQV5_KEM_PK_LEN],
                                    unsigned char out_sk[BM_PQV5_KEM_SK_LEN]);
+
+/*
+ * X-Wingのカプセル化・脱カプセル化(ss = 32byte)。封緘の内部処理だが、draftのテストベクタと
+ * 共有秘密を突き合わせるために公開している(AEADを通すと共有秘密を直接比べられない)。成功時0。
+ */
+int bm_pqv5_xwing_encaps(const unsigned char pk[BM_PQV5_KEM_PK_LEN],
+                         unsigned char out_ct[BM_PQV5_KEM_CT_LEN], unsigned char out_ss[32]);
+int bm_pqv5_xwing_decaps(const unsigned char sk[BM_PQV5_KEM_SK_LEN],
+                         const unsigned char ct[BM_PQV5_KEM_CT_LEN], unsigned char out_ss[32]);
 
 /*
  * 封緘: out = KEM暗号文(1120) || AES-256-GCM(平文) || GCMタグ(16)。

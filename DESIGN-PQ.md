@@ -368,15 +368,15 @@ ML-DSAとEd25519にはまったく同じ入力を与える。
 
 ### 5.2 ハイブリッドKEM: X-Wing
 
-`draft-connolly-cfrg-xwing-kem` をそのまま実装する。自前のcombinerを設計しないことが目的
+`draft-connolly-cfrg-xwing-kem` の **-11(2026-09-23公開)** に準拠する。自前のcombinerを設計しないことが目的
 (ハイブリッドKEMの合成は「共有秘密を単に連結してハッシュ」でも安全とは限らず、
 ct/pkの束縛まで含めて解析されたものを使うべき領域)。
 
 ```
-combiner(ss_M, ss_X, ct_X, pk_X) = SHA3-256( "\.//^\" || ss_M || ss_X || ct_X || pk_X )
+combiner(ss_M, ss_X, ct_X, pk_X) = SHA3-256( ss_M || ss_X || ct_X || pk_X || "\.//^\" )
 
-KeyGen(seed32): expanded = SHAKE128(seed32, 96)
-                (pk_M, sk_M) = ML-KEM-768.KeyGen_derand(expanded[0:64])
+KeyGen(seed32): expanded = SHAKE256(seed32, 96)
+                (pk_M, sk_M) = ML-KEM-768.KeyGen_internal(expanded[0:32], expanded[32:64])
                 sk_X = expanded[64:96], pk_X = X25519(sk_X, G)
 Encaps(pk):     ek_X ← random;  ct_X = X25519(ek_X, G);  ss_X = X25519(ek_X, pk_X)
                 (ct_M, ss_M) = ML-KEM-768.Encaps(pk_M)
@@ -392,6 +392,23 @@ draftと同一で、鍵の**作り方と保持の仕方**だけが違う:
 2. **ランダム生成のときだけ**、ML-KEM鍵とX25519鍵を独立な乱数から作る(draftの
    `XWingKeyGen(seed32)` を経由しない)。X25519だけを引き直す探索(§4.2.1)のため。
    決定性生成とアドレス由来鍵(§4.4)はdraft通り `XWingKeyGen(seed32)` を使う。
+
+**検証。** `tests/test_pq_crypto.c` が、draftのAppendix Cのベクタ3本
+(`tests/xwing_draft11_vectors.h`)とKeyGen・Decapsulateの結果を突き合わせる。
+
+**2026-11-05 draft-11へ揃えた。** 当初の実装は鍵展開がSHAKE128、combinerのラベルが先頭で、どちらも
+draft-04までの形だった。-05で両方変わった後の2026-09-17に古い版の形で実装していて、この節にも
+版を書かずに「draftをそのまま実装する」とだけ書いていた。自己往復テストは両側が同じ間違いをしていても通るので
+検出できず、ユーザーとのやり取りの中で最新版と照合して発覚した。draftのChange logによれば、この2点は
+安全性に影響しない(96byteの出力ではSHAKE128と256の差が出ず、ラベルの位置も1ブロックに収まるので
+関係ない)。問題だったのは他のX-Wing実装との相互運用で、鍵も共有秘密も一致しなかった。
+
+**draftの追随。** draftは今後も変わりうるので、準拠する版をこの節に明記し、確認した日を記録する:
+**最終確認 2026-11-05、最新は-11。** 確認するときは
+[datatracker](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/)で最新版を見て、
+新しい版が出ていればChange logとAppendix Cの変更を読む。KeyGen・combiner・ベクタが変わっていれば
+この節の式とテストのベクタを入れ替える。出したアドレスの鍵が変わる変更は、v5を正式に使い始める前なら
+そのまま追随でき、使い始めた後は別プロファイル(=別アドレス版)として扱うことになる。
 
 ### 5.3 封緘(seal)フォーマット
 
@@ -876,8 +893,9 @@ v4とv5は別アドレスとして共存する。同一ユーザーが両方を�
   組み込む段階(試行復号でdecapsを大量に呼ぶ)で必要になる。
   **2026-11-04 フェーズ2では入れなかった(DESIGN.md §11項目55の段5)。** 取り込み込みでも開封は
   1 identityあたり約0.3msで、v4の約0.6msより軽く、v4より悪くならないため。
-- **X-Wingのテストベクタによる検証。** 現状は自己往復テストのみで、draftの
-  公式テストベクタとの突合せをしていない。ML-KEM/ML-DSA本体については、NIST KATを
+- **X-Wingのテストベクタによる検証。** **2026-11-05 解決。** draft-11のAppendix Cのベクタとの突合せを
+  `tests/test_pq_crypto.c`へ入れた。この突合せが無かったために、古い版のdraftに沿った実装のまま
+  気づけなかった(§5.2)。ML-KEM/ML-DSA本体については、NIST KATを
   このリポジトリでは回していない(OpenSSLのテストに頼っている)。ただし2026-10-01の
   差し替え時に、独立した2つの実装(pq-crystals参照実装とOpenSSL)が鍵・署名・暗号文・
   implicit rejectionの出力までバイト単位で一致することは確認した(§6.1)。

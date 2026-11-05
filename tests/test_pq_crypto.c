@@ -10,6 +10,9 @@
  *   - ハイブリッドが「両方通って初めて有効」になっていること(片側だけ改竄した
  *     署名を弾けること)。ここが壊れるとハイブリッドにした意味が消える
  *   - 封緘がAADに束縛されていること(ヘッダを差し替えた封緘を弾けること)
+ *   - X-WingがdraftのテストベクタとKeyGen・Decapsulateで一致すること。§5.2 2026-11-05
+ *     自己往復だけでは送受信の両側が同じ間違いをしていても通るので、古い版のdraftに沿った
+ *     鍵展開とcombinerのまま気づけなかった
  */
 
 #include <stdio.h>
@@ -17,6 +20,7 @@
 
 #include "../src/pq/pq_crypto.h"
 #include "../src/pq/pq_hybrid.h"
+#include "xwing_draft11_vectors.h"
 
 #define MLDSA65_SIG_LEN 3309
 #define MLDSA65_PK_LEN 1952
@@ -304,6 +308,68 @@ static int test_hybrid_seal(void)
     return 0;
 }
 
+static int hex_digit(char c)
+{
+    return c <= '9' ? c - '0' : c - 'a' + 10;
+}
+
+static void hex_to_bytes(const char *hex, unsigned char *out, size_t out_len)
+{
+    for (size_t i = 0; i < out_len; i++)
+    {
+        out[i] = (unsigned char)(hex_digit(hex[2 * i]) * 16 + hex_digit(hex[2 * i + 1]));
+    }
+}
+
+/*
+ * §5.2 2026-11-05 draft-11 Appendix Cのベクタとの突合せ。seedから公開鍵が一致すること
+ * (鍵展開のSHAKE256とKeyGen)と、暗号文から共有秘密が一致すること(combiner)を確かめる。
+ * 乱数を使うカプセル化は直接突き合わせられないが、下の往復でDecapsulateと同じ共有秘密に
+ * なることを確かめているので、combinerの入力の取り違えも検出できる。
+ */
+static int test_xwing_vectors(void)
+{
+    for (size_t i = 0; i < sizeof(XWING_VECTORS) / sizeof(XWING_VECTORS[0]); i++)
+    {
+        static unsigned char seed[BM_PQV5_SEED_LEN];
+        static unsigned char want_pk[BM_PQV5_KEM_PK_LEN];
+        static unsigned char pk[BM_PQV5_KEM_PK_LEN];
+        static unsigned char sk[BM_PQV5_KEM_SK_LEN];
+        static unsigned char ct[BM_PQV5_KEM_CT_LEN];
+        unsigned char want_ss[32];
+        unsigned char ss[32];
+        unsigned char enc_ss[32];
+
+        hex_to_bytes(XWING_VECTORS[i].seed, seed, sizeof(seed));
+        hex_to_bytes(XWING_VECTORS[i].pk, want_pk, sizeof(want_pk));
+        hex_to_bytes(XWING_VECTORS[i].ct, ct, sizeof(ct));
+        hex_to_bytes(XWING_VECTORS[i].ss, want_ss, sizeof(want_ss));
+
+        if (bm_pqv5_kem_keypair_from_seed(seed, pk, sk) != 0)
+        {
+            fprintf(stderr, "FAIL: X-Wing vector %zu: keygen\n", i);
+            return 1;
+        }
+        if (memcmp(pk, want_pk, sizeof(pk)) != 0)
+        {
+            fprintf(stderr, "FAIL: X-Wing vector %zu: public key differs from the draft\n", i);
+            return 1;
+        }
+        if (bm_pqv5_xwing_decaps(sk, ct, ss) != 0 || memcmp(ss, want_ss, sizeof(ss)) != 0)
+        {
+            fprintf(stderr, "FAIL: X-Wing vector %zu: shared secret differs from the draft\n", i);
+            return 1;
+        }
+        if (bm_pqv5_xwing_encaps(pk, ct, enc_ss) != 0 || bm_pqv5_xwing_decaps(sk, ct, ss) != 0 ||
+            memcmp(ss, enc_ss, sizeof(ss)) != 0)
+        {
+            fprintf(stderr, "FAIL: X-Wing vector %zu: encaps/decaps round trip\n", i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_sizes() != 0)
@@ -323,6 +389,10 @@ int main(void)
         return 1;
     }
     if (test_hybrid_seal() != 0)
+    {
+        return 1;
+    }
+    if (test_xwing_vectors() != 0)
     {
         return 1;
     }

@@ -223,7 +223,7 @@ _Static_assert(sizeof(struct bm_pqv5_component_seeds) == BM_PQV5_COMPONENT_SEEDS
 
 /*
  * §11 2026-11-04 項目55の段3: 32byteのseed 1本を、bm_pqv5_sig_keypair_from_seed/
- * bm_pqv5_kem_keypair_from_seedと同じ展開(SHAKE128)で成分seedへ分ける。
+ * bm_pqv5_kem_keypair_from_seedと同じ展開(署名はSHAKE128、KEMはSHAKE256)で成分seedへ分ける。
  * 鍵ブロブはこの成分から作るので、両者は必ず同じ鍵になる。
  */
 static int expand_sig_seed(const unsigned char seed[BM_PQV5_SEED_LEN], struct bm_pqv5_component_seeds *out)
@@ -242,7 +242,7 @@ static int expand_sig_seed(const unsigned char seed[BM_PQV5_SEED_LEN], struct bm
 static int expand_kem_seed(const unsigned char seed[BM_PQV5_SEED_LEN], struct bm_pqv5_component_seeds *out)
 {
     unsigned char expanded[96];
-    if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
+    if (bm_pq_shake256(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
     {
         return -1;
     }

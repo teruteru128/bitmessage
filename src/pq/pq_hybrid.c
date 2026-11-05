@@ -36,7 +36,7 @@ void bm_pq_sha3_512(const unsigned char *data, size_t len, unsigned char out[64]
     EVP_Digest(data, len, out, &outlen, EVP_sha3_512(), NULL);
 }
 
-int bm_pq_shake128(const unsigned char *data, size_t len, unsigned char *out, size_t out_len)
+static int shake_xof(const EVP_MD *md, const unsigned char *data, size_t len, unsigned char *out, size_t out_len)
 {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     int ok = 0;
@@ -44,7 +44,7 @@ int bm_pq_shake128(const unsigned char *data, size_t len, unsigned char *out, si
     {
         return -1;
     }
-    if (EVP_DigestInit_ex(ctx, EVP_shake128(), NULL) == 1 &&
+    if (EVP_DigestInit_ex(ctx, md, NULL) == 1 &&
         EVP_DigestUpdate(ctx, data, len) == 1 &&
         EVP_DigestFinalXOF(ctx, out, out_len) == 1)
     {
@@ -52,6 +52,16 @@ int bm_pq_shake128(const unsigned char *data, size_t len, unsigned char *out, si
     }
     EVP_MD_CTX_free(ctx);
     return ok ? 0 : -1;
+}
+
+int bm_pq_shake128(const unsigned char *data, size_t len, unsigned char *out, size_t out_len)
+{
+    return shake_xof(EVP_shake128(), data, len, out, out_len);
+}
+
+int bm_pq_shake256(const unsigned char *data, size_t len, unsigned char *out, size_t out_len)
+{
+    return shake_xof(EVP_shake256(), data, len, out, out_len);
 }
 
 /* --- Ed25519 / X25519の薄いヘルパ(OpenSSL 3.0のEVP raw key APIのみ使用) --- */
@@ -230,21 +240,25 @@ int bm_pqv5_verify(const unsigned char *msg, size_t msg_len,
 /* --- X-Wing (ML-KEM-768 + X25519) --- */
 
 /*
- * draft-connolly-cfrg-xwing-kem のcombiner:
- *   ss = SHA3-256( XWingLabel || ss_M || ss_X || ct_X || pk_X )
+ * draft-connolly-cfrg-xwing-kem-11 §5.3のcombiner:
+ *   ss = SHA3-256( ss_M || ss_X || ct_X || pk_X || XWingLabel )
  * XWingLabelは6byteのASCII "\.//^\"。
+ *
+ * §5.2 2026-11-05 当初はラベルを先頭に置いていた。draft-04までの形で、-05で末尾へ移っている。
+ * draftのChange logによれば安全性は変わらないが、共有秘密の値が変わるので、他のX-Wing実装と
+ * 相互運用できなかった。
  */
 static void xwing_combiner(const unsigned char ss_m[32], const unsigned char ss_x[32],
                             const unsigned char ct_x[32], const unsigned char pk_x[32],
                             unsigned char out_ss[32])
 {
     static const unsigned char label[6] = { 0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c };
-    unsigned char buf[6 + 32 * 4];
-    memcpy(buf, label, sizeof(label));
-    memcpy(buf + 6, ss_m, 32);
-    memcpy(buf + 38, ss_x, 32);
-    memcpy(buf + 70, ct_x, 32);
-    memcpy(buf + 102, pk_x, 32);
+    unsigned char buf[32 * 4 + 6];
+    memcpy(buf, ss_m, 32);
+    memcpy(buf + 32, ss_x, 32);
+    memcpy(buf + 64, ct_x, 32);
+    memcpy(buf + 96, pk_x, 32);
+    memcpy(buf + 128, label, sizeof(label));
     bm_pq_sha3_256(buf, sizeof(buf), out_ss);
     OPENSSL_cleanse(buf, sizeof(buf));
 }
@@ -253,15 +267,17 @@ int bm_pqv5_kem_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
                                    unsigned char out_pk[BM_PQV5_KEM_PK_LEN],
                                    unsigned char out_sk[BM_PQV5_KEM_SK_LEN])
 {
-    /* X-Wing draftの鍵展開: expanded = SHAKE128(seed, 96)、
+    /* X-Wing draft-11 §5.2の鍵展開: expanded = SHAKE256(seed, 96)、
      * 前64byteがML-KEMの(d,z)、後32byteがX25519の秘密鍵。
+     * §5.2 2026-11-05 当初はSHAKE128だった(draft-04までの形、-05でSHAKE256へ変更)。
+     * 同じseedから違う鍵ができるので、他のX-Wing実装と相互運用できなかった。
      * ただしdraftが秘密鍵を32byteのseedのまま保持するのに対し、この実装は
      * 展開後の形(ML-KEM sk || X25519 sk)で保持する。アドレス由来鍵のように
      * 「seedから毎回導出する」用途と、identityのように「保存した鍵を使う」用途の
      * 両方があり、後者で毎回ML-KEMのKeyGenをやり直すのを避けるため。 */
     unsigned char expanded[96];
     int rc = -1;
-    if (bm_pq_shake128(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
+    if (bm_pq_shake256(seed, BM_PQV5_SEED_LEN, expanded, sizeof(expanded)) != 0)
     {
         return -1;
     }
@@ -274,7 +290,7 @@ int bm_pqv5_kem_keypair_from_seed(const unsigned char seed[BM_PQV5_SEED_LEN],
     return rc;
 }
 
-static int xwing_encaps(const unsigned char pk[BM_PQV5_KEM_PK_LEN],
+int bm_pqv5_xwing_encaps(const unsigned char pk[BM_PQV5_KEM_PK_LEN],
                          unsigned char out_ct[BM_PQV5_KEM_CT_LEN], unsigned char out_ss[32])
 {
     unsigned char eph_sk[X25519_LEN];
@@ -299,7 +315,7 @@ static int xwing_encaps(const unsigned char pk[BM_PQV5_KEM_PK_LEN],
     return rc;
 }
 
-static int xwing_decaps(const unsigned char sk[BM_PQV5_KEM_SK_LEN],
+int bm_pqv5_xwing_decaps(const unsigned char sk[BM_PQV5_KEM_SK_LEN],
                          const unsigned char ct[BM_PQV5_KEM_CT_LEN], unsigned char out_ss[32])
 {
     unsigned char ss_m[32];
@@ -387,7 +403,7 @@ int bm_pqv5_seal(const unsigned char recipient_pk[BM_PQV5_KEM_PK_LEN],
     unsigned char key[32];
     int rc = -1;
 
-    if (xwing_encaps(recipient_pk, out, key) == 0 &&
+    if (bm_pqv5_xwing_encaps(recipient_pk, out, key) == 0 &&
         aead_seal(key, aad, aad_len, pt, pt_len,
                   out + BM_PQV5_KEM_CT_LEN, out + BM_PQV5_KEM_CT_LEN + pt_len) == 0)
     {
@@ -415,7 +431,7 @@ int bm_pqv5_open(const unsigned char sk[BM_PQV5_KEM_SK_LEN],
 
     /* ML-KEMのDecapsはimplicit rejectionのため常に「成功」する(pq_crypto.c参照)。
      * 自分宛てでない封緘はここではなくAEADタグの検証で落ちる */
-    if (xwing_decaps(sk, in, key) == 0 &&
+    if (bm_pqv5_xwing_decaps(sk, in, key) == 0 &&
         aead_open(key, aad, aad_len, in + BM_PQV5_KEM_CT_LEN, ct_len,
                   in + BM_PQV5_KEM_CT_LEN + ct_len, out) == 0)
     {
