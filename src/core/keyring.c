@@ -211,6 +211,7 @@ static int add_unlocked_entry(bm_keyring_t *kr, const struct bm_identity_row *ro
     entry->stream = (uint64_t)row->stream;
     entry->nonce_trials_per_byte = row->nonce_trials_per_byte;
     entry->payload_length_extra_bytes = row->payload_length_extra_bytes;
+    entry->is_chan = row->is_chan; /* §11 2026-11-07 項目62 */
     entry->unlocked_at = time(NULL);
 
     pthread_rwlock_wrlock(&kr->lock);
@@ -219,6 +220,22 @@ static int add_unlocked_entry(bm_keyring_t *kr, const struct bm_identity_row *ro
     pthread_rwlock_unlock(&kr->lock);
 
     return 0;
+}
+
+/* §11 2026-11-07 項目62: unlock済みのentryのchanフラグを立てる。v3からv4への変換で、既にunlock済みの
+ * v4がchanになる場合に、再起動や再unlockを待たずに効かせるため。entryが無ければ何もしない */
+static void mark_unlocked_entry_as_chan(bm_keyring_t *kr, const char *address)
+{
+    pthread_rwlock_wrlock(&kr->lock);
+    for (struct bm_unlocked_identity *cur = kr->head; cur != NULL; cur = cur->next)
+    {
+        if (strcmp(cur->address, address) == 0)
+        {
+            cur->is_chan = 1;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&kr->lock);
 }
 
 /*
@@ -760,6 +777,9 @@ int bm_keyring_ensure_v4_sibling(bm_keyring_t *kr, sqlite3 *db, const char *v3_a
         if (v3.is_chan && !v4.is_chan)
         {
             bm_identity_store_set_is_chan(db, out_v4_address, 1);
+            /* §11 2026-11-07 項目62: 読み込み済みの行は古いままなので、下でunlockする経路にも写す */
+            v4.is_chan = 1;
+            mark_unlocked_entry_as_chan(kr, out_v4_address);
         }
     }
     else
@@ -789,6 +809,7 @@ int bm_keyring_ensure_v4_sibling(bm_keyring_t *kr, sqlite3 *db, const char *v3_a
         if (v3.is_chan)
         {
             bm_identity_store_set_is_chan(db, out_v4_address, 1);
+            v4.is_chan = 1; /* §11 2026-11-07 項目62: 同上。作ったばかりでentryはまだ無い */
         }
         *out_created = 1;
     }

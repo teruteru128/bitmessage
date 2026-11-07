@@ -686,6 +686,18 @@ static void handle_incoming_getpubkey(struct bm_object_sync_ctx *ctx, const stru
     {
         return; /* 自分宛てではない、ロックされたままのアドレス宛、またはversion/streamの不一致 */
     }
+    /*
+     * §11 2026-11-07 項目62: chanのアドレスには応答しない(本家class_objectProcessor.py l.257-261)。
+     * メンバーは同じパスフレーズから鍵を導出できるのでpubkeyを必要としない。応答すると、オンラインの
+     * メンバーがそれぞれPoWを払って別々のobjectを出すことになり、アドレスを知る者がCPUの消費と
+     * メンバーの在否の確認に使える。v3の要求でv4の兄弟を使うフォールバックも対象にする。
+     * 結果として、パスフレーズを知らない者はchanへ投稿できない(本家と同じ)。
+     */
+    if (id.is_chan)
+    {
+        OPENSSL_cleanse(&id, sizeof(id));
+        return;
+    }
 
     unsigned char ripe[BM_RIPE_LEN];
     memcpy(ripe, id.ripe, sizeof(ripe));

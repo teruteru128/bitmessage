@@ -240,7 +240,11 @@ static int trial_decrypt_body(const struct bm_unlocked_identity *identity, const
         out->body = dup_bytes_as_cstr(msg_data, msg_len);
     }
 
-    if (ack_len > 0)
+    /* §11 2026-11-07 項目62: chan宛てのmsgに埋め込まれたackは呼び出し側へ渡さない(本家
+     * class_objectProcessor.py l.728-734)。正規の投稿にackは埋め込まれない(自分宛ての送信はackを
+     * 作らない、send_pipeline.cのis_self)ので、埋め込まれているのは意図的なものだけで、取り込むと
+     * パスフレーズを知る者が、そのobjectが現れるかでメンバーの在否を確かめられる */
+    if (ack_len > 0 && !identity->is_chan)
     {
         out->ack_payload = malloc(ack_len);
         memcpy(out->ack_payload, ack_data, ack_len);

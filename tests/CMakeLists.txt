@@ -146,6 +146,10 @@ add_executable(test_chan test_chan.c)
 target_link_libraries(test_chan PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME chan COMMAND test_chan)
 
+add_executable(test_chan_silent test_chan_silent.c)
+target_link_libraries(test_chan_silent PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME chan_silent COMMAND test_chan_silent)
+
 add_executable(test_inbound test_inbound.c)
 target_link_libraries(test_inbound PRIVATE bm_core bm_infra)
 add_test(NAME inbound COMMAND test_inbound)

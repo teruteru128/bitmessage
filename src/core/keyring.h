@@ -31,6 +31,10 @@ struct bm_unlocked_identity
     uint64_t stream;
     uint64_t nonce_trials_per_byte;
     uint64_t payload_length_extra_bytes;
+    /* §11 2026-11-07 項目62: identities.is_chanの写し。getpubkeyへの自応答とackの取り込みの判定に使う。
+     * 受信msgごとにDBを引かずに済むようここへ持つ。unlock時に行から写し、以後はkeyringの
+     * ロック下で更新する */
+    int is_chan;
     time_t unlocked_at;
     struct bm_unlocked_identity *next;
 };
@@ -141,6 +145,8 @@ int bm_keyring_delete_identity(bm_keyring_t *kr, sqlite3 *db, const char *addres
  * deterministic addressと全く同じ扱い。共有passphraseから同じ鍵が導出されるpeer全員が
  * 同じアドレス/鍵を持つことで疑似グループチャットとして機能する)。該当行が無ければ
  * 何もしない。成功時0。
+ * §11 2026-11-07 項目62: 変えるのはDBだけで、unlock済みのkeyringには反映しない。呼び出し元
+ * (joinChan・importAddress系)はいずれもidentityを作った直後でunlock前なので、次のunlockで写る。
  */
 int bm_keyring_mark_as_chan(sqlite3 *db, const char *address);
 

@@ -1046,6 +1046,8 @@ static cJSON *h_setAddressLabel(const struct bm_api_server_config *config,
  * isChan(2026-08-29追記): ユーザーの指摘で発覚。keys.datインポート対象にchanアドレスが
  * 含まれる場合、is_chanフラグ(§11 chan仕様、暗号的には無意味だがUI/listAddressesの表示用
  * 識別フラグ)を再現できないと片手落ちになるため追加した。省略時false(通常アドレス扱い)。
+ * §11 2026-11-07 項目62: 表示だけでなく、getpubkeyへの応答とackの取り込みの判定にも使うように
+ * なった(暗号的に無意味なのは変わらない)。
  */
 static cJSON *h_importAddress(const struct bm_api_server_config *config,
                                          const cJSON *params, char **out_error)
