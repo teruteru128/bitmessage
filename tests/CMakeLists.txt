@@ -98,6 +98,11 @@ add_executable(test_getdata_upload test_getdata_upload.c)
 target_link_libraries(test_getdata_upload PRIVATE bm_core bm_infra bm_pow)
 add_test(NAME getdata_upload COMMAND test_getdata_upload)
 
+# §11 2026-11-19 項目64: 本家のピアへのgetdataを接続から一定時間遅らせる(anti-intersection delay対策)
+add_executable(test_getdata_defer_pybitmessage test_getdata_defer_pybitmessage.c)
+target_link_libraries(test_getdata_defer_pybitmessage PRIVATE bm_core bm_infra bm_pow)
+add_test(NAME getdata_defer_pybitmessage COMMAND test_getdata_defer_pybitmessage)
+
 add_executable(test_pow_engine test_pow_engine.c)
 target_link_libraries(test_pow_engine PRIVATE bm_pow bm_common OpenSSL::Crypto)
 add_test(NAME pow_engine COMMAND test_pow_engine)

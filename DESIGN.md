@@ -4890,8 +4890,8 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
         ことは上の4で担保する。
       - **テスト。** 時刻は`int64_t now`で渡す(CLAUDE.md)。「lockしている間に届いたmsgを、unlock後に一度だけ
         受信箱へ入れる」「backfillとワーカーが同じmsgを二重に入れない」「期限切れのobjectを広告しない」を確かめる。
-64. **本家は接続直後のgetdataを黙って捨てる(anti-intersection delay)。こちらは接続直後の要求を取りこぼす(未着手、
-    実ログで確認済み)**: 2026-11-19、ユーザーとの相談。ynotbit(項目63)の`ntb-network.c`に「PyBitmessageは
+64. **本家は接続直後のgetdataを黙って捨てる(anti-intersection delay)。こちらは接続直後の要求を取りこぼす(対策1を
+    実装済み・未デプロイ、2は未着手)**: 2026-11-19、ユーザーとの相談。ynotbit(項目63)の`ntb-network.c`に「PyBitmessageは
     ハンドシェイク直後のgetdataを黙って捨てるので、最初の要求を10秒遅らせる」というコメントがあり、本家の実ソースと
     実ログで確かめた。
     - **本家(dcbcc4a2)の動作。**
@@ -4937,6 +4937,27 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
          入れている(接続ごとの「欲しいhash」のキューと、止まったピアから別のピアへの切り替え)。記録する分の
          メモリと、二重に要求しないための管理が要る。
       先に1を入れ、2は必要が分かってから検討する。
+    - **対策1の実装(2026-11-19、ユーザー依頼)。**
+      - `struct bm_fd_data`に`connected_at`(`bm_fd_data_new`が`last_activity`の初期値と同じ値を入れる)と、
+        遅らせているhashの配列`deferred_getdata`を足した。`handle_inv`は、user agentが`/PyBitmessage:`で始まり、
+        `connected_at + BM_PYBITMESSAGE_GETDATA_DELAY_SECONDS`に達していない接続では、getdataを送らずに溜める。
+        user agentがまだ無い(versionを受け取る前の)接続と、本家以外の実装には遅らせない。MiNode等が同じ動作を
+        するかは確かめていないため。
+      - 送り出しは`bm_object_sync_flush_deferred_getdata`。verack応答の遅延送信と同じく、network_epoll_threadの
+        ループ末尾(`bm_object_sync_on_network_sweep`、1秒間隔)から接続ごとに呼ぶ。待っている間に他のピアから
+        受け取ったhashは要求しない。getdataの送信は`handle_inv`から切り出した`send_getdata`に一本化したので、
+        hash単位のDEBUG3ログ(`sent getdata item`)は遅らせた分も同じ書式で出る。上の実ログでの確認と同じ
+        突き合わせが、そのまま対策後の確認に使える。
+      - **遅延は上で「約22秒」と書いたが、25秒にした。** 20.8秒に次の誤差を足した。(1) `connected_at`は秒単位に
+        切り捨てた時刻なので、最大1秒早い。(2) 相手から接続してきた場合、こちらのacceptは、相手がTCP接続の成立を
+        知って`connectedAt`を記録するより前に起きる。Tor経由ではその差がストリーム確立の片道分あり、数秒に
+        なりうる。遅らせる代償は、本家のピアから最初にobjectを取るのが数秒遅れることだけ。
+      - 溜める件数は1接続あたり`BM_DEFERRED_GETDATA_MAX`(50000件、1回のinvの上限と同じで約1.6MB)まで。
+        user agentを偽った相手がinvを送り続けても、メモリを際限なく使わせないため。超えた分は捨てる。
+      - テスト: `tests/test_getdata_defer_pybitmessage.c`。接続直後は溜めること、送ってよい時刻の1秒前は送らない
+        こと、その時刻に1回のgetdataで溜めた順に送ること、他のピアから受け取ったhashを除くこと、遅延が明けた後と
+        本家以外のピアにはすぐ送ること、上限を確かめる。
+      - 効果は、空の`object_pool.db`で起動したノードで、上の「確かめ方」のとおり確かめる(未実施)。
     - **未解明の残り。** 接続から30秒以降でも、届かなかった要求が約0.2%(数十件)あった。2つ目の発動条件に
       当たった可能性はあるが、今のログからは判別できない。判別するには、送ったgetdataの1回ごとにhashの一覧と
       その結果を対応づけるログが要る。

@@ -198,6 +198,20 @@ struct bm_fd_data
     size_t upload_pending_cap;
     size_t upload_sent;
     size_t upload_not_found;
+    /* §11 2026-11-19 項目64: 接続が成立した時刻(bm_fd_data_newがlast_activityの初期値と同じ値を
+     * 入れる。outboundはTCP接続(SOCKS5ならCONNECT)の成立後、inboundはaccept直後に作られる)。
+     * 本家はTCP接続の時点(network/tcp.pyのconnectedAt)を起点に、接続直後のgetdataを黙って
+     * 捨てるので、こちらから本家へgetdataを送ってよい時刻をこれから決める
+     * (object_sync.cのBM_PYBITMESSAGE_GETDATA_DELAY_SECONDS参照)。 */
+    int64_t connected_at;
+    /* §11 2026-11-19 項目64: 本家のピアへ送るのを遅らせているgetdataのhash(到着順、
+     * 重複は除いていない)。object_sync.cのhandle_inv/dinvが積み、
+     * bm_object_sync_flush_deferred_getdataが送ってよい時刻に達したら送って空にする。
+     * どちらもnetwork_epoll_threadからしか呼ばれないため排他制御はしない。
+     * bm_fd_data_freeでfreeする。 */
+    unsigned char (*deferred_getdata)[32];
+    size_t deferred_getdata_count;
+    size_t deferred_getdata_cap;
 };
 
 /*

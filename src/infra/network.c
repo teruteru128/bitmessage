@@ -84,6 +84,7 @@ struct bm_fd_data *bm_fd_data_new(enum bm_fd_type type, int fd)
     data->size = INIT_RECV_BUFFER_SIZE;
     data->length = 0;
     data->last_activity = (int64_t)time(NULL);
+    data->connected_at = data->last_activity; /* §11 2026-11-19 項目64、network.hのdoc参照 */
 
     data->local_len = sizeof(data->local_addr);
     if (getsockname(fd, (struct sockaddr *)&data->local_addr, &data->local_len) == -1)
@@ -143,6 +144,7 @@ void bm_fd_data_free(struct bm_fd_data *data)
     free(data->user_agent);
     free(data->pending_inv_hashes);
     free(data->upload_pending);
+    free(data->deferred_getdata);
     free(data);
 }
 

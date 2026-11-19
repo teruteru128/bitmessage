@@ -1264,6 +1264,139 @@ static int is_routable_ipv4_peer_address(const unsigned char v4[4])
     return 1;
 }
 
+/* inv/dinvで知った未所持のhashをgetdataで要求する。§11 2026-11-19 項目64でhandle_invから
+ * 切り出した(遅らせたgetdataをbm_object_sync_flush_deferred_getdataからも同じ形で送るため。
+ * hash単位のDEBUG3ログを両方の経路で同じ書式にしておけば、journalの突き合わせ(項目64の
+ * 確認方法)がそのまま使える)。 */
+static void send_getdata(struct bm_fd_data *conn, unsigned char (*hashes)[32], size_t count, int64_t now)
+{
+    size_t packet_len = 0;
+    unsigned char *packet = bm_create_inventory_message("getdata", hashes, count, &packet_len);
+    if (packet != NULL)
+    {
+        if (bm_network_send(conn, packet, packet_len, now) != 0)
+        {
+            bm_log_warn("[object_sync] failed to send getdata\n");
+        }
+        else
+        {
+            /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
+             * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
+             * 受信側の可視化と同種の穴、ユーザー指摘)。 */
+            /* §11 2026-09-12: 8段階化に伴う移行。getdata送信1回につき1行のサマリ
+             * なので無番号のDEBUGにした(直後のhash単位ログは調査用途でDEBUG3、
+             * 下記参照)。 */
+            bm_log_debug("[object_sync] sent getdata: %zu item(s)\n", count);
+            /* §11 2026-09-07: not_found大量発生・sent getdataに対するreceived object
+             * 不足の調査用計測。従来は件数の集計しかできず、個々のhashが「いつ・どの
+             * 接続へ要求され、その後objectとして届いたか/相手からnot_foundで返されたか」
+             * を突き合わせられなかった(ユーザー指摘、journalctl集計でnot_found率63.9%
+             * を確認したが原因のhash単位追跡ができなかった)。hash+接続先を1行ずつ出す
+             * ことで、後でこのログとhandle_getdataのnot_found・handle_objectの
+             * received objectをhash文字列でgrep突合せできるようにする。日次で最大でも
+             * 数百〜数千件程度(実測796件/日)なのでログ量として許容範囲。 */
+            char ip[BM_PEER_IP_STRLEN];
+            int port = 0;
+            bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
+            for (size_t j = 0; j < count; j++)
+            {
+                char hex[65];
+                hash_hex(hashes[j], hex);
+                /* §11 2026-09-12: 8段階化に伴う移行。not_found調査用のhash単位ログ
+                 * (getdata 1件ごとに出るため、上のサマリ行より1桁以上多い)なので
+                 * DEBUG3にした。 */
+                bm_log_debug3("[object_sync] sent getdata item: hash=%s peer=%s:%d fd=%d\n", hex, ip, port,
+                             conn->fd);
+            }
+        }
+        free(packet);
+    }
+}
+
+/* §11 2026-11-19 項目64: このconnへgetdataを送ってよい最初の時刻。本家のピア(user agentが
+ * "/PyBitmessage:"で始まる)ならconnected_at + BM_PYBITMESSAGE_GETDATA_DELAY_SECONDS、
+ * それ以外(versionをまだ受け取っていない接続を含む)は0(いつでもよい)。本家以外の実装
+ * (MiNode等)は対象にしない。同じ動作をするという確認をしていないため。 */
+static int64_t getdata_not_before(const struct bm_fd_data *conn)
+{
+    static const char prefix[] = "/PyBitmessage:";
+    if (conn->user_agent == NULL || strncmp(conn->user_agent, prefix, sizeof(prefix) - 1) != 0)
+    {
+        return 0;
+    }
+    return conn->connected_at + BM_PYBITMESSAGE_GETDATA_DELAY_SECONDS;
+}
+
+/* §11 2026-11-19 項目64: conn->deferred_getdataの末尾へn件追加する。BM_DEFERRED_GETDATA_MAXを
+ * 超える分は捨てる(object_sync.hのdoc参照)。network_epoll_threadからのみ呼ばれる。 */
+static void defer_getdata(struct bm_fd_data *conn, unsigned char (*hashes)[32], size_t n, int64_t now)
+{
+    size_t room = BM_DEFERRED_GETDATA_MAX - conn->deferred_getdata_count;
+    size_t take = n < room ? n : room;
+    if (take > 0 && conn->deferred_getdata_count + take > conn->deferred_getdata_cap)
+    {
+        size_t cap = conn->deferred_getdata_cap == 0 ? 64 : conn->deferred_getdata_cap;
+        while (cap < conn->deferred_getdata_count + take)
+        {
+            cap *= 2;
+        }
+        if (cap > BM_DEFERRED_GETDATA_MAX)
+        {
+            cap = BM_DEFERRED_GETDATA_MAX;
+        }
+        unsigned char(*grown)[32] = realloc(conn->deferred_getdata, cap * sizeof(*grown));
+        if (grown == NULL)
+        {
+            take = 0;
+        }
+        else
+        {
+            conn->deferred_getdata = grown;
+            conn->deferred_getdata_cap = cap;
+        }
+    }
+    if (take > 0)
+    {
+        memcpy(conn->deferred_getdata[conn->deferred_getdata_count], hashes, take * sizeof(*hashes));
+        conn->deferred_getdata_count += take;
+    }
+    /* inv/dinv受信1回につき1行なので無番号のDEBUG(handle_invのサマリ行と同じ扱い)。 */
+    bm_log_debug("[object_sync] deferring getdata to PyBitmessage peer (fd=%d): %zu item(s) for %" PRId64
+                 "s, %zu dropped (anti-intersection delay)\n",
+                 conn->fd, take, getdata_not_before(conn) - now, n - take);
+}
+
+void bm_object_sync_flush_deferred_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, int64_t now)
+{
+    if (ctx == NULL || conn == NULL || conn->deferred_getdata_count == 0 || now < getdata_not_before(conn))
+    {
+        return;
+    }
+    /* 待っている間に他のピアから受け取ったものは要求しない(その場で詰める)。 */
+    size_t kept = 0;
+    for (size_t i = 0; i < conn->deferred_getdata_count; i++)
+    {
+        if (!bm_object_store_has(ctx->object_pool_db, conn->deferred_getdata[i]))
+        {
+            if (kept != i)
+            {
+                memcpy(conn->deferred_getdata[kept], conn->deferred_getdata[i], 32);
+            }
+            kept++;
+        }
+    }
+    bm_log_debug("[object_sync] flushing deferred getdata (fd=%d): %zu item(s), %zu already obtained elsewhere\n",
+                 conn->fd, kept, conn->deferred_getdata_count - kept);
+    if (kept > 0)
+    {
+        send_getdata(conn, conn->deferred_getdata, kept, now);
+    }
+    free(conn->deferred_getdata);
+    conn->deferred_getdata = NULL;
+    conn->deferred_getdata_count = 0;
+    conn->deferred_getdata_cap = 0;
+}
+
 static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, const struct bm_message *msg)
 {
     struct bm_inventory_message inv_msg;
@@ -1311,46 +1444,15 @@ static void handle_inv(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, 
 
     if (missing_count > 0)
     {
-        size_t packet_len = 0;
-        unsigned char *packet = bm_create_inventory_message("getdata", missing, missing_count, &packet_len);
-        if (packet != NULL)
+        /* §11 2026-11-19 項目64: 本家のピアには、接続直後に送ったgetdataが黙って捨てられるので、
+         * 送ってよい時刻まで溜めておく(bm_object_sync_flush_deferred_getdataが送る)。 */
+        if (now < getdata_not_before(conn))
         {
-            if (bm_network_send(conn, packet, packet_len, (int64_t)time(NULL)) != 0)
-            {
-                bm_log_warn("[object_sync] failed to send getdata\n");
-            }
-            else
-            {
-                /* §11 2026-08-24: これまで失敗時のログしか無く、正常系(実際に何件の
-                 * getdataを送れたか)が可視化されていなかった(handle_inv/handle_getdata
-                 * 受信側の可視化と同種の穴、ユーザー指摘)。 */
-                /* §11 2026-09-12: 8段階化に伴う移行。getdata送信1回につき1行のサマリ
-                 * なので無番号のDEBUGにした(直後のhash単位ログは調査用途でDEBUG3、
-                 * 下記参照)。 */
-                bm_log_debug("[object_sync] sent getdata: %zu item(s)\n", missing_count);
-                /* §11 2026-09-07: not_found大量発生・sent getdataに対するreceived object
-                 * 不足の調査用計測。従来は件数の集計しかできず、個々のhashが「いつ・どの
-                 * 接続へ要求され、その後objectとして届いたか/相手からnot_foundで返されたか」
-                 * を突き合わせられなかった(ユーザー指摘、journalctl集計でnot_found率63.9%
-                 * を確認したが原因のhash単位追跡ができなかった)。hash+接続先を1行ずつ出す
-                 * ことで、後でこのログとhandle_getdataのnot_found・handle_objectの
-                 * received objectをhash文字列でgrep突合せできるようにする。日次で最大でも
-                 * 数百〜数千件程度(実測796件/日)なのでログ量として許容範囲。 */
-                char ip[BM_PEER_IP_STRLEN];
-                int port = 0;
-                bm_network_resolve_peer_ip_port(conn, ip, sizeof(ip), &port);
-                for (size_t j = 0; j < missing_count; j++)
-                {
-                    char hex[65];
-                    hash_hex(missing[j], hex);
-                    /* §11 2026-09-12: 8段階化に伴う移行。not_found調査用のhash単位ログ
-                     * (getdata 1件ごとに出るため、上のサマリ行より1桁以上多い)なので
-                     * DEBUG3にした。 */
-                    bm_log_debug3("[object_sync] sent getdata item: hash=%s peer=%s:%d fd=%d\n", hex, ip, port,
-                                 conn->fd);
-                }
-            }
-            free(packet);
+            defer_getdata(conn, missing, missing_count, now);
+        }
+        else
+        {
+            send_getdata(conn, missing, missing_count, now);
         }
     }
     free(missing);
@@ -1743,6 +1845,14 @@ void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx,
     bm_peer_registry_for_each_locked(registry, flush_verack_reply_one, &fctx);
 }
 
+/* §11 2026-11-19 項目64: bm_peer_registry_for_each_lockedのコールバック。ctx/nowを運ぶのは
+ * flush_verack_reply_ctxと同じ構造体を使う。 */
+static void flush_deferred_getdata_one(struct bm_fd_data *conn, void *user_data)
+{
+    struct flush_verack_reply_ctx *f = user_data;
+    bm_object_sync_flush_deferred_getdata(f->ctx, conn, f->now);
+}
+
 void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t now, void *user_data)
 {
     if (user_data == NULL)
@@ -1750,6 +1860,15 @@ void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t 
         return;
     }
     bm_object_sync_flush_pending_verack_replies(user_data, registry, now);
+    /* §11 2026-11-19 項目64: 本家のピアへ遅らせていたgetdataを送る。verack応答の遅延送信と
+     * 同じく、registryのロックを保持したまま(reg->lock→send_lockの順)走査する。溜めたhashの
+     * bm_object_store_hasによる再確認もロックを保持したまま行うが、接続1本につき1回だけで、
+     * 件数も1回のinvの上限(50000件)以下に限られる。 */
+    if (registry != NULL)
+    {
+        struct flush_verack_reply_ctx fctx = {user_data, now};
+        bm_peer_registry_for_each_locked(registry, flush_deferred_getdata_one, &fctx);
+    }
 }
 
 void bm_object_sync_dispatch(struct bm_fd_data *conn, const struct bm_message *msg, void *user_data)

@@ -248,8 +248,41 @@ void bm_object_sync_flush_pending_verack_replies(struct bm_object_sync_ctx *ctx,
                                                   int64_t now);
 
 /* §11 2026-09-24 項目43: bm_epoll_thread_args.on_sweepに渡すためのアダプタ。user_dataは
- * struct bm_object_sync_ctx *。bm_object_sync_flush_pending_verack_repliesを呼ぶ。 */
+ * struct bm_object_sync_ctx *。bm_object_sync_flush_pending_verack_repliesを呼ぶ。
+ * §11 2026-11-19 項目64: bm_object_sync_flush_deferred_getdataも呼ぶ。 */
 void bm_object_sync_on_network_sweep(struct bm_peer_registry *registry, int64_t now, void *user_data);
+
+/*
+ * §11 2026-11-19 項目64: 本家(PyBitmessage、dcbcc4a2)は接続直後のgetdataを黙って捨てる
+ * (network/tcp.pyのantiIntersectionDelay、network/bmproto.pyのbm_command_getdata)。
+ * 捨てる時間はTCP接続の時点(connectedAt)からceil(log20(knownNodes+2))*5.2秒で、既定の
+ * maxnodes=20000では最大20.8秒。big invはまさにこの時間帯に届くので、すぐ応えたgetdataは
+ * 返ってこない(運用ログで、接続から15秒以内に送った要求がその接続から返らないことを確認した)。
+ * user agentが"/PyBitmessage:"で始まる接続では、conn->connected_atからこの秒数が経つまで
+ * getdataを送らずconn->deferred_getdataに溜める。
+ *
+ * 25秒の根拠: 20.8秒に次の誤差を足した。(1) connected_atは秒単位に切り捨てた時刻なので
+ * 最大1秒早い。(2) 相手から接続してきた場合、こちらのacceptは相手がconnectedAtを記録する
+ * (TCP接続が成立したと相手が知る)より前に起きる。Tor経由ではその差がストリーム確立の片道分
+ * (数秒になりうる)ある。運用ログでは19秒以降に送った要求は返ってきていたので、数秒の余裕で
+ * 足りる見込み。遅らせる代償は、本家のピアから最初にobjectを取るのが数秒遅れるだけ。
+ * ヘッダで公開しているのは、テストが実値で境界を検証できるようにするため。
+ */
+#define BM_PYBITMESSAGE_GETDATA_DELAY_SECONDS 25
+/* 1接続あたりに溜めるhashの上限(object_sync.cにある1回のinvの上限BM_MAX_INVENTORY_ITEMSと同じ
+ * 50000件、32byte/件で約1.6MB。1回のgetdataで送り切れる)。user agentを偽った相手がinvを
+ * 送り続けてもメモリを際限なく使わせないため。超えた分は捨てる(他のピアから広告されるか、
+ * 遅延が明けた後の同じ相手からのinvで取り直せる)。 */
+#define BM_DEFERRED_GETDATA_MAX 50000
+
+/*
+ * §11 2026-11-19 項目64: connに溜めたgetdataを、送ってよい時刻
+ * (conn->connected_at + BM_PYBITMESSAGE_GETDATA_DELAY_SECONDS)に達していれば送って空にする。
+ * 待っている間に他のピアから受け取ったhashは送らない。network_epoll_threadから
+ * (bm_object_sync_on_network_sweep経由で)接続ごとに呼ばれる。テストが接続1本に対して
+ * 直接呼べるよう公開している。
+ */
+void bm_object_sync_flush_deferred_getdata(struct bm_object_sync_ctx *ctx, struct bm_fd_data *conn, int64_t now);
 
 /*
  * §11 2026-08-25 join-chan後にchan宛の過去メッセージが読めない問題の対応。
