@@ -4827,3 +4827,51 @@ backlogとして記録するに留めた(下記backlog項目20参照)。
     - **直していないこと。** v5のgetpubkeyの経路には手を入れていない。v5にはまだchanが無い(項目61)。兄弟のv3とv4で
       片方だけがchanの行は、v4の要求には通常のアドレスとして応答する。本家もフラグはアドレスごとに持つ。
     - **デプロイ。** 動作の変更なので、daemonの再デプロイまでは効かない。
+63. **試行復号を「object_pool.dbの到着順を追う1つの消費者」に寄せ、保持期間をexpiresから切り離す(未着手、検討メモ)**:
+    2026-11-19、ユーザーとの相談。notbit派生のデスクトップクライアント
+    [ynotbit](https://github.com/yshurik/ynotbit)のソースを読んだときに出た案。項目44の残課題(試行復号が
+    network_epoll_threadを止める)と、項目49の改善案4(試し終えた組を記録して飛ばす)を、まとめて解決できる
+    見込みがある。
+    - **ynotbitの形。** 鍵を持たないリレーのプロセスだけがobjectを`objects.sqlite`へ書き、鍵を持つアプリは読むだけ
+      (`docs/superpowers/specs/2026-10-04-sqlite-object-store-design.md`)。テーブルは
+      `seq INTEGER PRIMARY KEY AUTOINCREMENT`(到着順、再利用しない)を持ち、アプリはメールボックスごとの
+      チェックポイントでseqを追いかけて試行復号する。ローカルでの保持はプロトコルのexpiresとは別に
+      サイズと日数で上限を決め(既定2GiB/90日)、vaultをロックしている間に届いたobjectも、後でアンロックしてから
+      試せる。identityを追加するとチェックポイントを0へ戻して全件を試し直す。プールが2つあるわけではなく、
+      「書く側と読む側」「保持期間」「復号の進み方」を分けている。
+    - **この実装の現状。** 試行復号の経路が2本ある。(1) 受信と同時にnetwork_epoll_thread上で試す
+      (`bm_trial_decrypt_msg`、項目44)。(2) `unlockAddress`時のbackfill(`bm_object_sync_backfill_trial_decrypt`、
+      項目21・49)。項目49の改善案4が「unlockしていた間にネットワーク経由で試した期間も含めて記録するには、
+      lockや停止の時刻も記録する必要があり、設計が複雑になる」となっているのは、この2本が同じ組を別々に試すため。
+      また`object_pool.db`はexpires+3時間(`BM_OBJECT_GC_GRACE_PERIOD_SECONDS`)で消すので、backfillで遡れるのも
+      そこまで。なお`objects`テーブルには`processed`列と`idx_unprocessed`の部分索引があるが、どこからも使われていない。
+    - **本家(dcbcc4a2)。** 復号はネットワークのスレッドではなく`objectProcessor`スレッドが行う
+      (`class_objectProcessor.py` l.41-72)。`bmproto.py` l.443が`objectProcessorQueue`へ入れ、キューは合計
+      32,000,000byteを上限に、満杯ならputが待つ(`queues.py` l.9-23)。終了時に残りをDBへ退避し、起動時に読み戻す
+      (`class_objectProcessor.py` l.56-65、l.121-128)。ネットワークから切り離す点はこの案と同じだが、過去のobjectを
+      後から試し直す仕組みは無い。
+    - **案。**
+      1. network_epoll_threadは`object_pool.db`へINSERTするだけにし、試行復号をしない。
+      2. 試行復号は1つのワーカーだけが行い、到着順の番号(seq)を追いかける。INSERTのたびに条件変数で起こし、
+         ポーリングの遅れを避ける。
+      3. 「どこまで試したか」はidentityごとにidentity.dbへ記録する(列の追加はCLAUDE.mdの`ALTER TABLE ... ADD COLUMN`
+         パターン)。lockは「そのidentityのカーソルが止まる」、unlockは「止まった位置から再開する」だけになり、
+         lockや停止の時刻を別に記録する必要が無くなる。backfillは「カーソルが末尾より後ろにあるidentityを追いつかせる」
+         ことになり、別の経路ではなくなる。
+      4. 保持期間はプロトコルのexpiresから切り離し、サイズと日数の上限で消す。expiresを過ぎたobjectは、invでの広告・
+         getdataへの応答・接続時の一覧・onionpeerの再announce等、ネットワークに出るすべての経路から外す。
+    - **実装するときに考えること。**
+      - **到着順の番号。** 今の`objects`は`hash BLOB PRIMARY KEY`の普通のrowidテーブルで、rowidは最大の行を消すと
+        再利用されうる。カーソルには単調増加の番号が要るが、`AUTOINCREMENT`や`PRIMARY KEY`は`ALTER TABLE ... ADD COLUMN`
+        では足せないので、テーブルの作り直しが要る。`received_time`は同じ秒に複数あり、時計も戻りうるので、
+        単独ではカーソルにできない。
+      - **identityが多いとき。** ynotbitのように「identityを足したら全件やり直し」は、件数の多い運用では重い。
+        カーソルが同じ位置にいるidentityはまとめて1回のパスで試す(普段は全員が末尾にいるので、msg1件につき1パス)。
+        追いつき中のidentityだけを別のパスで試す。項目49の改善案1(ECDHの準備をmsgごとに1回にまとめる)と組み合わせる。
+      - **期限切れのobjectを後から復号したとき。** 埋め込まれたackも期限切れなら発行しない。ピアに拒否されるだけで、
+        PoWも無駄になる。getpubkeyへの応答は試行復号と関係が無いので、この案の対象外(今のまま受信時に処理する)。
+      - **遅れとディスク。** 受信から受信箱に入るまでに、ワーカーが追いつく分の遅れが出る。保持期間を延ばす分だけ
+        ディスクを使う。保持しているobjectは公開ネットワークで誰でも受け取れたものだが、期限切れのものを外に出さない
+        ことは上の4で担保する。
+      - **テスト。** 時刻は`int64_t now`で渡す(CLAUDE.md)。「lockしている間に届いたmsgを、unlock後に一度だけ
+        受信箱へ入れる」「backfillとワーカーが同じmsgを二重に入れない」「期限切れのobjectを広告しない」を確かめる。
